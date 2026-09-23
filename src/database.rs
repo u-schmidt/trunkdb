@@ -1,0 +1,990 @@
+use crate::batch::Batch;
+use crate::catalog::Catalog;
+use crate::collection::{Collection, apply_write_op};
+use crate::durability::{Durability, WalDurability};
+use crate::id::UuidV7Generator;
+use crate::storage::{FileStore, PageId};
+use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
+use std::path::Path;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Opens the file and owns the whole stack — as a cheap, cloneable,
+/// thread-safe handle (SPEC §27): every clone refers to the same open
+/// database, and `Database`, `Collection` and `Batch` are all `Send +
+/// Sync`, so they can go into an app's shared state, a thread, or a
+/// `static`. The file stays open (and locked, §21.1) until the last clone
+/// — including those inside `Collection`s and `Batch`es — is dropped.
+///
+/// Reads (`get`, `find`) share a read lock and run in parallel; a write
+/// batch takes the write lock for its whole commit (stage to checkpoint,
+/// SPEC §19.3), so readers see a batch entirely or not at all.
+#[derive(Clone)]
+pub struct Database {
+    inner: Arc<Shared>,
+}
+
+/// What every clone shares. Only `state` changes after `open`, so only it
+/// sits behind the lock.
+struct Shared {
+    state: RwLock<State>,
+    id_gen: UuidV7Generator,
+    txn: GlobalLockTxnManager,
+}
+
+/// The mutable part of an open database. Index and data-page code take
+/// `&mut dyn PageStore` / `&mut Catalog` as plain parameters rather than
+/// holding handles of their own, so the lock guard is the one place they
+/// come from.
+pub(crate) struct State {
+    pub(crate) store: FileStore,
+    pub(crate) catalog: Catalog,
+    durability: WalDurability,
+    /// Set when a batch was durably logged but couldn't be written to the
+    /// main file, even on retry — see `write_batch`. From then on every
+    /// call fails with `Error::Poisoned` until the database is reopened.
+    poisoned: bool,
+}
+
+impl Database {
+    /// Opens the file, then recovers: if a prior run logged a batch and
+    /// crashed before checkpointing it (see `durability::WalDurability`),
+    /// its page images are still in the WAL. They're written back to the
+    /// main file before anything — including `Catalog::load` — reads it,
+    /// which is what makes the durability promise real rather than just
+    /// "nothing crashes while it's running."
+    ///
+    /// On a fresh file, `Catalog::load` bootstraps the catalog page. That
+    /// runs through the same stage/log/write-back path as any batch, so a
+    /// crash mid-bootstrap leaves either an empty file (fresh again next
+    /// time) or a WAL record that completes it — never a file with a
+    /// header but no catalog page.
+    ///
+    /// The store is opened first: it takes the file's exclusive lock
+    /// (`FileStore::open`), so a second `open` of a database in use fails
+    /// before it reads anything — not even the WAL, which the running
+    /// instance may be halfway through writing. To share one database
+    /// within a process, clone the handle instead of opening it again.
+    pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let path = path.as_ref();
+        let mut store = FileStore::open(path)?;
+        let (mut durability, pending) = WalDurability::open(path)?;
+        if !pending.is_empty() {
+            store.restore_pages(&pending)?;
+        }
+        // Always, not just after a restore: a WAL whose only content is a
+        // torn tail (a crash mid-`log`) yields nothing pending, but the
+        // next batch must not be appended after that garbage.
+        durability.checkpoint()?;
+
+        store.begin();
+        let catalog = match Catalog::load(&mut store) {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                store.rollback();
+                return Err(e.into());
+            }
+        };
+        let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
+        if pages.is_empty() {
+            drop(pages);
+            store.rollback(); // an existing file: nothing was bootstrapped
+        } else {
+            // No retry or poisoning here, unlike `write_batch`: a failure
+            // fails `open` itself, and the next `open` recovers from the WAL.
+            durability.log(&pages)?;
+            drop(pages);
+            store.write_back()?;
+            durability.checkpoint()?;
+        }
+
+        Ok(Self {
+            inner: Arc::new(Shared {
+                state: RwLock::new(State {
+                    store,
+                    catalog,
+                    durability,
+                    poisoned: false,
+                }),
+                id_gen: UuidV7Generator,
+                txn: GlobalLockTxnManager::default(),
+            }),
+        })
+    }
+
+    pub fn collection<T>(&self, name: &str) -> Collection<T> {
+        Collection::new(self.clone(), name)
+    }
+
+    /// Starts a typed, atomic multi-op write — see `Batch`.
+    pub fn batch(&self) -> Batch {
+        Batch::new(self.clone())
+    }
+
+    pub(crate) fn id_gen(&self) -> &UuidV7Generator {
+        &self.inner.id_gen
+    }
+
+    /// Whether `self` and `other` are handles to the same open database.
+    pub(crate) fn same_as(&self, other: &Database) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Shared access for a read. `Err(Error::Poisoned)` once a failed
+    /// write has left the main file possibly half-written (see
+    /// `write_batch`), or a thread panicked in the middle of one — which
+    /// poisons the lock and may have left the store staging (SPEC §27.3).
+    /// Every public entry point goes through this or `write`.
+    pub(crate) fn read(&self) -> crate::Result<RwLockReadGuard<'_, State>> {
+        let state = self
+            .inner
+            .state
+            .read()
+            .map_err(|_| crate::Error::Poisoned)?;
+        if state.poisoned {
+            return Err(crate::Error::Poisoned);
+        }
+        Ok(state)
+    }
+
+    /// Exclusive access for a write batch; poisoned as for `read`.
+    fn write(&self) -> crate::Result<RwLockWriteGuard<'_, State>> {
+        let state = self
+            .inner
+            .state
+            .write()
+            .map_err(|_| crate::Error::Poisoned)?;
+        if state.poisoned {
+            return Err(crate::Error::Poisoned);
+        }
+        Ok(state)
+    }
+
+    /// Applies every op in `ops` as one atomic, durable unit. Ops may name
+    /// different collections (each `WriteOp` carries its own) — that's the
+    /// actual point: a multi-entity update (SPEC.md §4.4) needs exactly
+    /// this, which a sequence of separate `Collection::insert`/`update`/
+    /// `delete` calls can't give you, since each of those is its own batch.
+    pub fn write_batch(&self, ops: Vec<WriteOp>) -> crate::Result<()> {
+        if ops.is_empty() {
+            drop(self.write()?); // still reports a poisoned database
+            return Ok(());
+        }
+        self.transact(|catalog, store| {
+            self.inner
+                .txn
+                .apply_batch(ops, &mut |op| apply_write_op(catalog, store, &op))
+        })
+    }
+
+    /// Runs `apply` — any change to the catalog and the pages — as one
+    /// atomic, durable unit, under the write lock. `write_batch` is one
+    /// use; building or dropping an index (SPEC §28) is another.
+    ///
+    /// The protocol (SPEC §19.3):
+    /// 1. **stage** — `FileStore::begin`; every page write from here on
+    ///    stays in memory.
+    /// 2. **apply**. On error: roll back the staged pages *and* the
+    ///    catalog cache, and return the error — nothing of it ever
+    ///    reached the file, so there's nothing else to undo.
+    /// 3. **log** every changed page to the WAL as one record, `fsync`.
+    /// 4. **write back** those pages to the main file, `fsync`.
+    /// 5. **checkpoint** — truncate the WAL.
+    ///
+    /// A crash before 3 completes leaves the state before; a crash after
+    /// it leaves a complete WAL record that `open` writes back, giving the
+    /// state after. Never anything in between.
+    pub(crate) fn transact<R>(
+        &self,
+        apply: impl FnOnce(&mut Catalog, &mut FileStore) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        let mut guard = self.write()?;
+        // Reborrow the guard as a plain `&mut State` once, so the borrow
+        // checker can see that `store`, `catalog` and `durability` below
+        // are separate fields, each borrowable on its own.
+        let state = &mut *guard;
+        let catalog_before = state.catalog.clone();
+
+        state.store.begin();
+        let result = match apply(&mut state.catalog, &mut state.store) {
+            Ok(result) => result,
+            Err(e) => {
+                state.store.rollback();
+                state.catalog = catalog_before;
+                return Err(e);
+            }
+        };
+
+        let pages: Vec<(PageId, &[u8])> = state.store.dirty_pages().collect();
+        if pages.is_empty() {
+            // Nothing changed (e.g. an index that already existed):
+            // nothing to log or write, just end staging.
+            drop(pages);
+            state.store.rollback();
+            return Ok(result);
+        }
+        let logged = state.durability.log(&pages);
+        drop(pages);
+        if let Err(e) = logged {
+            state.store.rollback();
+            state.catalog = catalog_before;
+            // A failed `log` may still have left a complete record behind
+            // (say the write landed but the fsync failed), which the next
+            // `open` would restore — for a batch this call reports as
+            // failed. Truncating the log rules that out; if even that
+            // fails, the batch's fate is genuinely unknown.
+            if state.durability.checkpoint().is_err() {
+                state.poisoned = true;
+            }
+            return Err(e.into());
+        }
+
+        // The batch is durable from here on: the WAL holds all its pages.
+        if let Err(first) = state.store.write_back() {
+            // The file may now be half-written. The staged pages are still
+            // intact, so try once more; failing that, only recovery at the
+            // next `open` (from the WAL) can repair the file.
+            if state.store.write_back().is_err() {
+                state.poisoned = true;
+                return Err(first.into());
+            }
+        }
+
+        // Not an error for this batch if it fails: the batch is complete
+        // in the main file. A leftover record is just written back once
+        // more at the next `open` — harmless, page images are idempotent —
+        // and a later batch appends after it in the right order.
+        let _ = state.durability.checkpoint();
+        Ok(result)
+    }
+
+    /// Direct access to the state for tests, bypassing the poisoned
+    /// checks — e.g. to inject write-back faults, or inspect the catalog.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> RwLockWriteGuard<'_, State> {
+        self.inner.state.write().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{DocId, Document};
+    use crate::query::Filter;
+    use crate::storage::PageType;
+    use crate::txn::WriteOp;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct Dummy;
+
+    fn insert(collection: &str, id: u8, value: i64) -> WriteOp {
+        WriteOp::Insert(
+            collection.to_string(),
+            DocId([id; 16]),
+            Document::Int(value),
+        )
+    }
+
+    fn get(db: &Database, collection: &str, id: u8) -> Option<Document> {
+        db.collection::<Document>(collection)
+            .get(&DocId([id; 16]))
+            .unwrap()
+    }
+
+    /// Where `log_batch_then_crash` stops, mirroring `write_batch`'s steps.
+    enum CrashPoint {
+        /// Ops applied to staged pages, nothing logged yet.
+        DuringApply,
+        /// Logged, but no page written to the main file yet.
+        AfterLog,
+        /// Logged, and the write-back got this many pages (ascending id
+        /// order) into the main file.
+        MidWriteBack { pages_written: usize },
+        /// Logged and fully written back, but never checkpointed.
+        BeforeCheckpoint,
+    }
+
+    /// Runs `ops` through `write_batch`'s protocol by hand, against its
+    /// own `FileStore`/`Catalog`/WAL on `path`, and stops at `crash` — as
+    /// if the process died there. `path` must already be a database.
+    /// Returns how many pages the batch changed.
+    fn log_batch_then_crash(path: &Path, ops: &[WriteOp], crash: CrashPoint) -> usize {
+        let (mut wal, pending) = WalDurability::open(path).unwrap();
+        assert!(pending.is_empty());
+        let mut store = FileStore::open(path).unwrap();
+        let mut catalog = Catalog::load(&mut store).unwrap();
+
+        store.begin();
+        for op in ops {
+            apply_write_op(&mut catalog, &mut store, op).unwrap();
+        }
+        let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
+        let page_count = pages.len();
+        if matches!(crash, CrashPoint::DuringApply) {
+            return page_count;
+        }
+        wal.log(&pages).unwrap();
+        drop(pages);
+
+        match crash {
+            CrashPoint::DuringApply | CrashPoint::AfterLog => {}
+            CrashPoint::MidWriteBack { pages_written } => {
+                assert!(pages_written < page_count, "that's not mid-write-back");
+                store.failing_write_backs = 1;
+                store.write_back_fails_after = pages_written;
+                store.write_back().unwrap_err();
+            }
+            CrashPoint::BeforeCheckpoint => store.write_back().unwrap(),
+        }
+        page_count
+    }
+
+    fn two_collection_batch() -> Vec<WriteOp> {
+        vec![insert("posts", 1, 10), insert("authors", 2, 20)]
+    }
+
+    fn assert_two_collection_batch_present(db: &Database) {
+        assert_eq!(get(db, "posts", 1), Some(Document::Int(10)));
+        assert_eq!(get(db, "authors", 2), Some(Document::Int(20)));
+    }
+
+    #[test]
+    fn two_collections_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+
+        let users = db.collection::<Dummy>("users");
+        let posts = db.collection::<Dummy>("posts");
+
+        // The point of this test: it wouldn't compile if `collection()`
+        // required `&mut self` instead of `&self`.
+        let _ = (&users, &posts);
+    }
+
+    /// A second `open` of a database in use fails, and leaves the first
+    /// instance's WAL alone — here a logged, not yet checkpointed record,
+    /// as if the first instance were between `log` and `checkpoint`.
+    #[test]
+    fn a_database_in_use_cannot_be_opened_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let catalog_page = crate::storage::PageStore::read_page(&db.state().store, 1).unwrap();
+        db.state().durability.log(&[(1, &catalog_page)]).unwrap();
+        let wal_path = dir.path().join("test.trunkdb.wal");
+        let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+
+        let Err(crate::Error::Io(err)) = Database::open(&path) else {
+            panic!("a second open must fail with an I/O error");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+
+        drop(db);
+        Database::open(&path).unwrap();
+    }
+
+    /// Pointing `open` at someone else's small file must neither
+    /// overwrite it nor leave a WAL file behind.
+    #[test]
+    fn opening_a_foreign_file_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"my notes").unwrap();
+
+        assert!(Database::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"my notes");
+        assert!(!dir.path().join("notes.txt.wal").exists());
+    }
+
+    #[test]
+    fn empty_batch_is_a_harmless_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        db.write_batch(Vec::new()).unwrap();
+    }
+
+    /// An op that can't apply as asked — inserting an id that exists,
+    /// updating or deleting one that doesn't — fails the whole batch
+    /// with a matchable error, instead of being silently skipped while
+    /// the batch reports success.
+    #[test]
+    fn ops_on_duplicate_or_missing_ids_fail_the_whole_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        db.write_batch(vec![insert("users", 1, 1)]).unwrap();
+        let missing = DocId([9; 16]);
+
+        let cases = [
+            (insert("users", 1, 2), "duplicate insert"),
+            (
+                WriteOp::Update("users".to_string(), missing, Document::Int(3)),
+                "update of a missing id",
+            ),
+            (
+                WriteOp::Delete("users".to_string(), missing),
+                "delete of a missing id",
+            ),
+            (
+                WriteOp::Update("nowhere".to_string(), missing, Document::Int(3)),
+                "update in a missing collection",
+            ),
+        ];
+        for (op, case) in cases {
+            // A valid op first, so the test also proves it's rolled back.
+            let result = db.write_batch(vec![insert("posts", 5, 5), op]);
+            match (case, result) {
+                ("duplicate insert", Err(crate::Error::DuplicateId { collection, id })) => {
+                    assert_eq!((collection.as_str(), id), ("users", DocId([1; 16])));
+                }
+                (_, Err(crate::Error::NotFound { id, .. })) if case != "duplicate insert" => {
+                    assert_eq!(id, missing);
+                }
+                (_, other) => panic!("{case}: unexpected {other:?}"),
+            }
+            assert_eq!(get(&db, "posts", 5), None, "{case}: batch not rolled back");
+        }
+        assert_eq!(get(&db, "users", 1), Some(Document::Int(1)));
+    }
+
+    /// The actual point of a batch: ops can target different collections
+    /// and still land as one atomic, durable unit.
+    #[test]
+    fn write_batch_applies_ops_across_different_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+
+        db.write_batch(two_collection_batch()).unwrap();
+        assert_two_collection_batch_present(&db);
+    }
+
+    #[test]
+    fn recovers_a_batch_that_was_logged_but_never_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+
+        assert_two_collection_batch_present(&Database::open(&path).unwrap());
+    }
+
+    /// The case the op-level WAL couldn't handle (SPEC §19.1): some of the
+    /// batch's pages are in the main file, others aren't — a structurally
+    /// half-written file. Writing back every logged page repairs it.
+    #[test]
+    fn recovers_a_batch_whose_write_back_was_cut_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+
+        let pages = log_batch_then_crash(
+            &path,
+            &two_collection_batch(),
+            CrashPoint::MidWriteBack { pages_written: 1 },
+        );
+        assert!(pages > 1);
+
+        assert_two_collection_batch_present(&Database::open(&path).unwrap());
+    }
+
+    /// Writing back pages that are already in the main file changes
+    /// nothing — no duplicate documents, no error.
+    #[test]
+    fn recovering_an_already_written_back_batch_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::BeforeCheckpoint);
+
+        let db = Database::open(&path).unwrap();
+        assert_two_collection_batch_present(&db);
+        assert_eq!(
+            db.collection::<Document>("posts")
+                .find(Filter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A crash during `log` that got only part of a batch onto disk must
+    /// leave the database showing none of it after recovery.
+    #[test]
+    fn a_batch_torn_while_being_logged_is_not_recovered_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+        let wal_path = dir.path().join("test.trunkdb.wal");
+        let len = std::fs::metadata(&wal_path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(get(&db, "posts", 1), None);
+        assert_eq!(get(&db, "authors", 2), None);
+    }
+
+    /// `open` must clear a torn tail even when nothing was recovered from
+    /// it — otherwise the next batch would be appended after the garbage,
+    /// and the open after that would find a bad checksum mid-file.
+    #[test]
+    fn a_torn_wal_tail_does_not_break_later_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+        let wal_path = dir.path().join("test.trunkdb.wal");
+        let len = std::fs::metadata(&wal_path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+
+        {
+            let db = Database::open(&path).unwrap();
+            db.write_batch(vec![insert("users", 3, 30)]).unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(get(&db, "users", 3), Some(Document::Int(30)));
+    }
+
+    /// Real rollback (formerly SPEC §17.3's known gap): op 1 succeeds and
+    /// even creates a new collection, op 2 writes a document large enough
+    /// for overflow pages; op 3 is a duplicate id. Nothing of the batch
+    /// may remain — not the documents, not the collection op 1 created
+    /// (neither in the file nor in the catalog cache), and not the pages
+    /// they took.
+    #[test]
+    fn a_failed_batch_leaves_no_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        db.write_batch(vec![insert("users", 1, 1)]).unwrap();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+
+        let large = Document::Binary(vec![0u8; 20_000]); // needs overflow pages
+        let result = db.write_batch(vec![
+            insert("posts", 2, 2),
+            WriteOp::Insert("posts".to_string(), DocId([3; 16]), large),
+            insert("users", 1, 5),
+        ]);
+
+        assert!(matches!(result, Err(crate::Error::DuplicateId { .. })));
+        assert_eq!(get(&db, "posts", 3), None);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file_len);
+        assert!(result.is_err());
+        assert_eq!(get(&db, "posts", 2), None);
+        assert!(db.state().catalog.get("posts").is_none());
+
+        // The database keeps working, and the next batch that does create
+        // "posts" gets a consistent collection, also after a reopen.
+        db.write_batch(vec![insert("posts", 4, 4)]).unwrap();
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(get(&db, "users", 1), Some(Document::Int(1)));
+        assert_eq!(get(&db, "posts", 4), Some(Document::Int(4)));
+        assert_eq!(
+            db.collection::<Document>("posts")
+                .find(Filter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_write_back_that_fails_once_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+
+        db.state().store.failing_write_backs = 1;
+        db.write_batch(two_collection_batch()).unwrap();
+
+        assert_two_collection_batch_present(&db);
+    }
+
+    /// Write-back fails twice: the file may be half-written, so the
+    /// database refuses every call until reopened — and reopening restores
+    /// the batch from the WAL.
+    #[test]
+    fn a_write_back_that_keeps_failing_poisons_the_database_until_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+
+        db.state().store.failing_write_backs = 2;
+        assert!(db.write_batch(two_collection_batch()).is_err());
+
+        let users = db.collection::<Document>("users");
+        assert!(matches!(
+            users.get(&DocId([1; 16])),
+            Err(crate::Error::Poisoned)
+        ));
+        assert!(matches!(
+            users.find(Filter::default()),
+            Err(crate::Error::Poisoned)
+        ));
+        assert!(matches!(
+            users.insert(Document::Int(5)),
+            Err(crate::Error::Poisoned)
+        ));
+        drop(users);
+        drop(db);
+
+        assert_two_collection_batch_present(&Database::open(&path).unwrap());
+    }
+
+    #[test]
+    fn a_crash_during_apply_leaves_the_pre_batch_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::DuringApply);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(get(&db, "posts", 1), None);
+        assert!(db.state().catalog.get("posts").is_none());
+    }
+
+    /// A fresh file's first write is the catalog bootstrap. A crash at any
+    /// point of it must leave a file that opens cleanly — either fresh
+    /// again, or completed from the WAL — never "header but no catalog".
+    #[test]
+    fn a_crash_at_any_point_of_the_catalog_bootstrap_leaves_an_openable_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Crash before anything was logged: the file stays empty.
+        let path = dir.path().join("unlogged.trunkdb");
+        {
+            let mut store = FileStore::open(&path).unwrap();
+            store.begin();
+            Catalog::load(&mut store).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        Database::open(&path).unwrap();
+
+        // Crash after the log, with 0..all of its pages written back.
+        let page_count = 2; // header + catalog page
+        for pages_written in 0..=page_count {
+            let path = dir.path().join(format!("cut{pages_written}.trunkdb"));
+            {
+                let (mut wal, _) = WalDurability::open(&path).unwrap();
+                let mut store = FileStore::open(&path).unwrap();
+                store.begin();
+                Catalog::load(&mut store).unwrap();
+                let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
+                assert_eq!(pages.len(), page_count);
+                wal.log(&pages).unwrap();
+                drop(pages);
+                if pages_written < page_count {
+                    store.failing_write_backs = 1;
+                    store.write_back_fails_after = pages_written;
+                    store.write_back().unwrap_err();
+                } else {
+                    store.write_back().unwrap();
+                }
+            }
+
+            let db = Database::open(&path).unwrap();
+            db.write_batch(vec![insert("users", 1, 1)]).unwrap();
+            drop(db);
+            assert_eq!(
+                get(&Database::open(&path).unwrap(), "users", 1),
+                Some(Document::Int(1)),
+                "cut after {pages_written} pages"
+            );
+        }
+    }
+
+    /// The regression test for the bug that motivated the page-image WAL
+    /// (SPEC §19.1, §19.8): with the op-level WAL, a crash between a B-tree
+    /// split's page writes permanently lost committed entries — replaying
+    /// the op couldn't repair the broken structure. Here the splitting
+    /// insert is cut off after every possible number of written pages;
+    /// every committed document must survive every cut, and at least one
+    /// cut must actually damage the tree when recovery is skipped (proof
+    /// the test reproduces the original failure, not just a no-op).
+    #[test]
+    fn a_crash_mid_b_tree_split_loses_nothing() {
+        use crate::index::{BTreeIndex, Index};
+
+        // Ascending ids, so every insert lands in the rightmost leaf.
+        fn key(i: u32) -> DocId {
+            let mut bytes = [0u8; 16];
+            bytes[12..].copy_from_slice(&i.to_be_bytes());
+            DocId(bytes)
+        }
+        fn op(i: u32) -> WriteOp {
+            WriteOp::Insert("pings".to_string(), key(i), Document::Int(i as i64))
+        }
+
+        /// Stages inserts from `from` on, one by one, until one splits a
+        /// leaf — recognizable as a new `IndexLeaf` page in the dirty set
+        /// (ascending ids only ever touch the rightmost leaf otherwise).
+        /// Rolls everything back — the pages and, like `write_batch`, the
+        /// catalog cache (the inserts may have moved `current_data_page`)
+        /// — and returns that insert's `i`.
+        fn first_splitting_insert(db: &Database, from: u32) -> u32 {
+            let mut state = db.state();
+            // Destructuring borrows both fields mutably at once, which
+            // two separate `state.catalog`/`state.store` borrows through
+            // the guard couldn't.
+            let State { catalog, store, .. } = &mut *state;
+            let snapshot = catalog.clone();
+            store.begin();
+            let mut leaves = None;
+            for i in from..from + 1000 {
+                apply_write_op(catalog, store, &op(i)).unwrap();
+                let now = store
+                    .dirty_pages()
+                    .filter(|(_id, page)| page[0] == PageType::IndexLeaf as u8)
+                    .count();
+                if leaves.is_some_and(|before| now > before) {
+                    store.rollback();
+                    *catalog = snapshot;
+                    return i;
+                }
+                leaves = Some(now);
+            }
+            panic!("no split within 1000 inserts");
+        }
+
+        /// Whether every one of `count` entries is reachable in the
+        /// `pings` index, reading the file raw — no WAL recovery.
+        fn intact_without_recovery(path: &Path, count: u32) -> bool {
+            let check = || -> crate::Result<bool> {
+                let mut store = FileStore::open(path)?;
+                let catalog = Catalog::load(&mut store)?;
+                let Some(meta) = catalog.get("pings") else {
+                    return Ok(false);
+                };
+                let index = BTreeIndex::new(meta.index_root);
+                if index.scan(&store)?.len() != count as usize {
+                    return Ok(false);
+                }
+                for i in 0..count {
+                    if index.lookup(&store, &key(i).0)?.is_none() {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
+            check().unwrap_or(false)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.trunkdb");
+        let committed = {
+            let db = Database::open(&base).unwrap();
+            db.write_batch((0..1000).map(op).collect()).unwrap();
+            let split_at = first_splitting_insert(&db, 1000);
+            db.write_batch((1000..split_at).map(op).collect()).unwrap();
+            split_at // documents 0..split_at are committed
+        };
+        let splitting = op(committed);
+
+        // How many pages the splitting insert changes — more than the
+        // two of a plain insert (data page, leaf), or three when the data
+        // page is new (plus the header).
+        let probe = dir.path().join("probe.trunkdb");
+        std::fs::copy(&base, &probe).unwrap();
+        let page_count = log_batch_then_crash(
+            &probe,
+            std::slice::from_ref(&splitting),
+            CrashPoint::DuringApply,
+        );
+        assert!(page_count > 3, "expected a split, got {page_count} pages");
+
+        let mut damaged_cuts = 0;
+        for pages_written in 1..page_count {
+            let path = dir.path().join(format!("cut{pages_written}.trunkdb"));
+            std::fs::copy(&base, &path).unwrap();
+            log_batch_then_crash(
+                &path,
+                std::slice::from_ref(&splitting),
+                CrashPoint::MidWriteBack { pages_written },
+            );
+            if !intact_without_recovery(&path, committed) {
+                damaged_cuts += 1;
+            }
+
+            let db = Database::open(&path).unwrap();
+            let pings = db.collection::<Document>("pings");
+            for i in 0..=committed {
+                assert_eq!(
+                    pings.get(&key(i)).unwrap(),
+                    Some(Document::Int(i as i64)),
+                    "document {i} after a cut at {pages_written} of {page_count} pages"
+                );
+            }
+            assert_eq!(
+                pings.find(Filter::default()).unwrap().len(),
+                committed as usize + 1
+            );
+        }
+        assert!(
+            damaged_cuts > 0,
+            "no cut damaged the tree without recovery — the test doesn't reproduce the bug"
+        );
+    }
+
+    // --- The thread-safe handle (SPEC §27) ---
+
+    fn open_temp() -> (tempfile::TempDir, std::path::PathBuf, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        (dir, path, db)
+    }
+
+    /// Compile-time: if any of these weren't `Send + Sync + 'static`, this
+    /// test wouldn't build. `Rc` is neither `Send` nor `Sync`, yet a
+    /// collection *of* it still is — the handle holds no `Rc`.
+    #[test]
+    fn handles_are_send_sync_and_static() {
+        fn thread_safe<T: Send + Sync + 'static>() {}
+        thread_safe::<Database>();
+        thread_safe::<Collection<Document>>();
+        thread_safe::<Collection<std::rc::Rc<i64>>>();
+        thread_safe::<Batch>();
+    }
+
+    #[test]
+    fn a_collection_handle_keeps_the_database_open() {
+        let (_dir, _path, db) = open_temp();
+        let numbers = db.collection::<i64>("numbers");
+        drop(db);
+
+        let id = numbers.insert(7).unwrap();
+        assert_eq!(numbers.get(&id).unwrap(), Some(7));
+    }
+
+    /// Clones are one open database: the file stays locked until the last
+    /// handle, wherever it is, is gone.
+    #[test]
+    fn the_file_is_released_when_the_last_handle_drops() {
+        let (_dir, path, db) = open_temp();
+        let clone = db.clone();
+        let users = db.collection::<i64>("users");
+        let id = clone.collection::<i64>("users").insert(1).unwrap();
+        assert_eq!(users.get(&id).unwrap(), Some(1), "one database, not two");
+
+        drop(db);
+        drop(clone);
+        assert!(Database::open(&path).is_err(), "`users` still holds it");
+        drop(users);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.collection::<i64>("users").get(&id).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn writers_on_several_threads_lose_nothing() {
+        let (_dir, path, db) = open_temp();
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                // Moved into the thread — possible only because the handle
+                // borrows nothing (`thread::spawn` needs `'static`).
+                let numbers = db.collection::<i64>("numbers");
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        numbers.insert(t * 100 + i).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let mut all = db
+            .collection::<i64>("numbers")
+            .find(Filter::default())
+            .unwrap();
+        all.sort();
+        let expected: Vec<i64> = (0..4)
+            .flat_map(|t| (0..10).map(move |i| t * 100 + i))
+            .collect();
+        assert_eq!(all, expected);
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            db.collection::<i64>("numbers")
+                .find(Filter::default())
+                .unwrap()
+                .len(),
+            40
+        );
+    }
+
+    /// Each batch inserts two documents; a reader running alongside must
+    /// never count an odd number — a batch holds the write lock from
+    /// staging to checkpoint.
+    #[test]
+    fn readers_never_see_half_a_batch() {
+        let (_dir, _path, db) = open_temp();
+        let pairs = db.collection::<i64>("pairs");
+        let done = std::sync::atomic::AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..30 {
+                    let mut batch = db.batch();
+                    batch.insert(&pairs, i).unwrap();
+                    batch.insert(&pairs, -i).unwrap();
+                    batch.commit().unwrap();
+                }
+                done.store(true, std::sync::atomic::Ordering::Release);
+            });
+            loop {
+                let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                let count = pairs.find(Filter::default()).unwrap().len();
+                assert_eq!(count % 2, 0, "saw {count} documents");
+                if finished {
+                    break;
+                }
+            }
+        });
+        assert_eq!(pairs.find(Filter::default()).unwrap().len(), 60);
+    }
+
+    /// A thread that panics mid-write may leave the store staging (SPEC
+    /// §22.4); the lock it held is poisoned, and every handle reports
+    /// `Error::Poisoned` instead of reading or writing half a batch.
+    /// Reopening — once all handles are gone — gets the committed state.
+    #[test]
+    fn a_panic_mid_write_poisons_every_handle() {
+        let (_dir, path, db) = open_temp();
+        let numbers = db.collection::<i64>("numbers");
+        let id = numbers.insert(1).unwrap();
+
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut state = db.state();
+                    state.store.begin();
+                    panic!("simulated bug mid-batch");
+                })
+                .join()
+        });
+        assert!(panicked.is_err());
+
+        assert!(matches!(numbers.get(&id), Err(crate::Error::Poisoned)));
+        assert!(matches!(numbers.insert(2), Err(crate::Error::Poisoned)));
+        drop((db, numbers));
+        let db = Database::open(&path).unwrap();
+        let numbers = db.collection::<i64>("numbers");
+        assert_eq!(numbers.find(Filter::default()).unwrap(), vec![1]);
+    }
+}
