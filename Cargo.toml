@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "An embedded, single-file, schema-less document database — a learning-first, from-scratch reimplementation of the LiteDB idea in Rust."
 license = "MIT"
+repository = "https://github.com/u-schmidt/trunkdb"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
