@@ -51,7 +51,7 @@ layer's own implementation is still incomplete in v0).
 | Layer | Trait | v0 implementation | Real from day one? |
 |---|---|---|---|
 | Storage/pages | `PageStore` | `FileStore` (real, tested — see §7) | Yes |
-| Document format | — (`Document` enum) | real enum + byte encode/decode (§11) + serde bridge (§13) | Yes |
+| Document format | — (`Document` enum) | real enum + byte encode/decode (§11) + serde bridge (§13) + tagged JSON (§30.1) | Yes |
 | Id generation | `IdGenerator` | `UuidV7Generator` | Yes |
 | Indexing | `Index` | `BTreeIndex` (persisted B-tree, O(log n), byte-string keys; primary `_id` index §10, secondary indexes §28) + `InMemoryIndex` (fake, tests only) | Yes |
 | Transactions | `TransactionManager` | `GlobalLockTxnManager` (one global lock), wired via `Database::write_batch` (§17); rollback via staged pages (§19.5) | Yes — atomicity and rollback; no isolation |
@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §30 for the roadmap.
+large-document workload (§5.2) the second; see §31 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -247,7 +247,8 @@ only.
   application code, per §5.1)
 - Concurrent multi-process access; concurrent writers (batches are
   serialized, §27)
-- Compaction/vacuum, encryption, backups, schema validation
+- Compaction/vacuum, encryption, schema validation; online backups
+  (export, §30, is a snapshot, but writers wait for it)
 
 ## 7. Page layout (`storage/`)
 
@@ -1233,12 +1234,12 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§30, "Later").
+future vacuum (§31, "Later").
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
 DocId][document]`. `0` means the whole document is in the cell — the
-only kind written today. `1` is reserved for overflow (§30, item 7): the
+only kind written today. `1` is reserved for overflow (§31, item 7): the
 cell will hold `[u32 total length][u64 first Overflow page]` and as much
 of the document as fits. Reading it today is an `InvalidData` error, not
 a misread. The page type tag `Overflow = 6` is reserved alongside it, so
@@ -1320,10 +1321,10 @@ which case it is:
 
 The magic stays `TRUNKDB1`: it answers "is this a trunkdb file at all",
 the version answers "which layout". The version is bumped whenever a
-page or cell layout changes; migrations will be written when there's
-real data to migrate (1.0.0 at the latest, per §30). The WAL keeps its
-own version (§19.3) — its record framing is independent of the page
-layout inside the images it carries.
+page or cell layout changes; a file moves from one version to the next
+by export and import (§30). The WAL keeps its own version (§19.3) — its
+record framing is independent of the page layout inside the images it
+carries.
 
 ## 22. Block A addendum: three data-risk fixes (`storage/file.rs`, `collection.rs`, `catalog.rs`, `txn/`)
 
@@ -1513,7 +1514,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is in "Later" (§30). A
+A pattern language (regex, `LIKE` wildcards) is in "Later" (§31). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1694,7 +1695,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§30, "Later").
+(§31, "Later").
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2057,7 +2058,154 @@ the next id; `Error::Poisoned` (§27.3) mid-iteration is such an item.
 - Four threads racing to upsert the same five keys leave exactly five
   documents.
 
-## 30. Open work / next milestones
+## 30. Export and import as JSON Lines (`json.rs`, `export.rs`)
+
+Real and tested:
+
+```rust
+db.export(File::create("backup.jsonl")?)?;       // Summary { collections, documents }
+new_db.import(File::open("backup.jsonl")?)?;     // same ids, same indexes
+db.collections()?;                               // ["pings", "users"]
+```
+
+The whole database becomes one text file that doesn't depend on the page
+layout. That makes it the migration path between file format versions
+(§21.2): export with the old trunkdb, import with the new one, and
+trunkdb never has to read an old format itself — which 1.0.0 needs
+(§31). It's also a backup that can be read and `diff`ed, and a way to
+bring data in from elsewhere.
+
+### 30.1 Tagged JSON (`json.rs`)
+`serde_json::Value` via the serde bridge (§13) loses information:
+`Binary` would come back as an array of numbers, an `Id` as a string,
+and JSON has no `NaN` or infinity. So `json.rs` converts `Document`
+directly, and marks what plain JSON can't hold with a one-key object
+whose key is a tag, like MongoDB's Extended JSON:
+- `Id` → `{"$id": "<uuid>"}`;
+- `Binary` → `{"$binary": "<base64>"}` (standard alphabet, padded; a
+  dozen lines in `json.rs` rather than a dependency);
+- `NaN`/`±inf` → `{"$float": "NaN"}`, `"Infinity"`, `"-Infinity"`;
+- an `Object` that *is* a one-key object with a tag name →
+  `{"$object": {...}}`, so it can't be mistaken for a tag.
+
+Everything else is plain JSON. `Int` and `Float` stay apart because
+`serde_json` always writes a float with a fraction or exponent (`3.0`,
+`1e300`) and reads such a number back as a float. So plain JSON is
+tagged JSON: a hand-written file needs no tags, and an object with an
+unknown `$` key (MongoDB's `$date`) is just an object. Integers outside
+`i64` are an error, not a rounded float.
+
+Two `serde_json` features are needed:
+- `preserve_order`: a `Value` object otherwise sorts its keys, and
+  field order is part of a document;
+- `float_roundtrip`: the default float parser is faster but can be one
+  bit off. The round-trip test found it: `4.1946076254797075e17` came
+  back as `4.194607625479707e17`.
+
+`serde_json` is now a regular dependency (it was only used by tests).
+A Cargo feature to make it optional was rejected for now: it's small,
+nearly every Rust app already has it, and a feature flag would split
+every build and test run in two. Easy to add if someone minds.
+
+### 30.2 The file
+```text
+{"$trunkdb_export":1}
+{"$collection":"users","$indexes":["age"]}
+{"name":"Ada","age":36,"_id":{"$id":"0199…"}}
+{"$collection":"pings","$indexes":[]}
+…
+```
+- **Header line** with the export format's own version — independent
+  of the file format version, which is the point.
+- **A collection line** per collection (name, indexed fields), then its
+  documents, one per line. Collections come in name order, documents in
+  id order, so exporting the same data twice gives the same bytes.
+- **A document line** is the document itself: an `Object` already
+  carries its `_id` (§18). Any other document (a bare `Int`, an array)
+  has nowhere to put an id, so it's wrapped:
+  `{"_id": {"$id": ...}, "$value": 5}`. An `Object` whose only field
+  besides `_id` has a tag name goes whole into `$object`, with the
+  `_id` repeated outside — so the wrapper stays unambiguous, and field
+  order is kept.
+- A collection line is recognized by `$collection` **and no `_id`**:
+  every exported document has an `_id`, so a document with a
+  `$collection` field isn't misread.
+
+One file per database, not one per collection: a backup or migration is
+one thing to move, and the collection lines already separate the parts.
+
+### 30.3 Import: ids kept, chunked, not atomic
+Every document keeps its id — documents that refer to others by id
+would otherwise point at nothing. This needed no new internal step:
+`WriteOp::Insert` has always carried the id, and `write_batch` is
+public. A document line without `_id` (hand-written) gets a new one;
+an `_id` that isn't `{"$id": ...}` is an error, not a guess.
+
+Documents are written in batches of 1000, or about 8 MB of JSON,
+whichever comes first: a batch holds every page it changes in memory
+until it commits (§19.9), so one batch for a whole import would need
+the database's size in memory. The price is that **an import isn't
+atomic**. It stops at the first bad line (`Error::Import { line,
+message }`) or existing id (`Error::DuplicateId`), and every batch
+before that stays. The documented safe way: import into a new file and
+switch over only if it succeeds.
+
+Each collection's indexes are built with `ensure_index` once its
+documents are in — one pass over the collection, instead of maintaining
+every index on every insert. A collection line with no documents still
+creates the collection, so empty collections survive the round trip.
+
+### 30.4 Export: one snapshot under the read lock
+The export holds the read lock from the first line to the last. So it
+is a consistent snapshot of the whole database: a batch lands entirely
+before or entirely after it, and documents in different collections
+that refer to each other agree. Readers go on in parallel; writers wait.
+
+That's the opposite of `cursor` (§29.4), which holds no lock between
+items, and the roadmap's sketch (§31) had planned to export through a
+cursor.
+Rejected, because an export is a backup: read-committed per document
+would let a batch that updates two collections appear half-applied. The
+reasons the cursor avoids the lock don't apply here — the export is one
+function call, so there's no forgotten guard and no lifetime problem,
+and nobody writes to the database from inside it. The one rule: the
+`Write` the export writes to must not write to the same database, which
+would deadlock. Memory stays at one document plus the ids of one
+collection.
+
+### 30.5 Tests
+- `export_then_import_reproduces_every_document_id_and_index`: 2500
+  documents of random shapes — every value type nested three deep, keys
+  that look like tags (`$id`, `$value`, `$object`, `$collection`, `_id`
+  inside nested objects), top-level documents that aren't objects — plus
+  a 100 KB document in overflow pages, an empty collection and an index
+  on an empty one. The import must reproduce every collection, index,
+  id and document byte for byte, also after a reopen; the rebuilt index
+  must answer a query; and exporting the copy must give the same text.
+- `floats_come_back_bit_for_bit` (`json.rs`): 200,000 random floats
+  through text and back. Fails without `float_roundtrip` — checked.
+- Tagged JSON: every value kind, `Int`/`Float` separation, plain JSON
+  as input, malformed tags rejected, document lines with and without
+  ids, base64 against RFC 4648's test vectors.
+- A hand-written file (no ids, no `$indexes` on one collection) imports.
+- Ten kinds of bad input each report their line number.
+- An existing id in the second batch: the first batch stays, the second
+  is rolled back entirely.
+- `export_is_a_snapshot_writers_wait_for`: halfway through an export,
+  another thread updates the last document. The export must contain the
+  old version, and the update must land afterwards.
+
+### 30.6 Limits
+- Not atomic on import (§30.3).
+- Writers wait for the whole export. For a large database that's
+  seconds; a snapshot that doesn't block writers needs MVCC (§31,
+  "Later").
+- Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
+  `$date`, `$numberLong`) is left out: its `$oid` values aren't
+  `DocId`s, so a migration from MongoDB needs decisions only the app
+  can make. A small program using `import`'s format can do it.
+
+## 31. Open work / next milestones
 
 Roadmap from v0 (crate 0.1.0) towards v1, agreed 2026-09-23. Ordered by
 priority: correctness and file format first, then what the sync workload (§5.3)
@@ -2121,38 +2269,14 @@ pure refactor that can happen anytime, independent of trunkdb.
 
 **Later** — export/import first, the rest unordered:
 
-- **Export/import as JSON Lines** (proposed 2026-09-23). The migration
-  path 1.0.0 needs: export with the old format version, import with the
-  new one, so trunkdb never has to read old formats itself. Also gives
-  backups that don't depend on the page layout, and data you can read
-  and `diff`. Sketch:
-  - **Tagged JSON, converting `Document` directly** (not through
-    `serde_json::Value`, which loses `Binary`, `Id` and `NaN`/`inf`):
-    `{"$binary": "<base64>"}`, `{"$id": "<uuid>"}`,
-    `{"$float": "NaN"}`, like MongoDB's Extended JSON. Plain JSON is
-    valid tagged JSON, so hand-written files import as they are.
-  - **One file per database**: a header line per collection (name,
-    indexed fields, export format version), then one document per line.
-    Export streams through `cursor` (§29.4), so memory stays flat.
-  - **Import keeps ids**: an internal insert-with-this-id step
-    (`WriteOp::Insert` already carries the id); the public `insert`
-    still generates them. An id that already exists is an error by
-    default.
-  - **Import in chunks** of about 1,000 documents per batch, since one
-    batch holds every page it touches in memory (§19.9). So an import
-    isn't atomic; the documented safe way is to import into a new file
-    and replace the old one. Indexes are built after the documents are
-    loaded, not maintained per insert.
-  - **API**: a library function first (`db.export(writer)`,
-    `db.import(reader)`); the CLI below would call it. `serde_json`
-    becomes a real dependency, possibly behind a Cargo feature.
-  - Left out at first: reading `mongoexport` output directly (`$oid`
-    is 12 bytes, not 16; `$date`, `$numberLong`). A MongoDB user can
-    migrate with a small program of their own.
+- **Export/import as JSON Lines — done** (§30): tagged JSON, one file
+  per database, ids kept, chunked import, and an export that is a
+  consistent snapshot. The migration path 1.0.0 needs.
 
 Unordered: `Filter` OR/nesting and regex; compaction/vacuum;
 per-page checksums; compound, unique and nested-field indexes, and
 using an index for `sort`; readers that don't wait for a write batch (MVCC
 or pre-batch page snapshots; reader/writer locking is done, §27);
 unique constraints; PyO3 bindings (for Python apps); a CLI for
-inspecting/verifying a file (and running export/import); benchmarks against SQLite/redb/sled.
+inspecting/verifying a file (and running export/import); benchmarks
+against SQLite/redb/sled.

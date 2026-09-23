@@ -118,6 +118,11 @@ impl Catalog {
         self.collections.get(name)
     }
 
+    /// Every collection's name, in no particular order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.collections.keys().map(String::as_str)
+    }
+
     /// The collection's secondary indexes — empty if it has none, or
     /// doesn't exist.
     pub fn indexes(&self, collection: &str) -> &[IndexMeta] {

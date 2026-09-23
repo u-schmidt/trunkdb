@@ -10,7 +10,7 @@ B-tree primary index, document encoding (both the untyped `Document` path
 and a serde bridge so any `T: Serialize + DeserializeOwned` works),
 scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
 `cursor`), `upsert`, single-field secondary indexes, overflow pages for documents larger
-than a page, a page-image write-ahead log making
+than a page, export/import as JSON Lines, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0: secondary
 indexes beyond single fields, a cost-based query planner, and concurrent writers (`Database` is a
@@ -60,6 +60,8 @@ src/
 ├── query.rs                     Filter/Condition/Sort — scan-based matching,
 │                                  comparisons + case-insensitive Contains
 ├── collection.rs                  Collection<T> — public CRUD API (real)
+├── json.rs                          tagged JSON <-> Document, lossless
+├── export.rs                        Database::export/import (JSON Lines)
 ├── cursor.rs                        Cursor — streaming find
 ├── batch.rs                         Batch — typed atomic multi-op writes
 └── database.rs                      Database — opens the file, recovers from
@@ -75,7 +77,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §30 for the full list and reasoning):
+Done so far (see SPEC.md §31 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -86,8 +88,10 @@ Done so far (see SPEC.md §30 for the full list and reasoning):
    thread-safe `Database` handle (§27), secondary indexes (§28), and
    `find_one`/`count`/`upsert`/`cursor` (§29) → 0.3.0.
 
-Next: export/import as JSON Lines, the migration path between file
-format versions; then an unordered list of further features.
+4. **Export/import** as JSON Lines (§30): a backup you can read, and the
+   migration path between file format versions.
+
+Next: an unordered list of further features (§31).
 
 ## License
 

@@ -10,8 +10,10 @@ pub mod data;
 pub mod database;
 pub mod document;
 pub mod durability;
+pub mod export;
 pub mod id;
 pub mod index;
+pub mod json;
 pub mod query;
 pub mod serde_bridge;
 pub mod storage;
@@ -22,6 +24,7 @@ pub use collection::{Collection, Upserted};
 pub use cursor::Cursor;
 pub use database::Database;
 pub use document::{DocId, Document};
+pub use export::Summary;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -58,6 +61,10 @@ pub enum Error {
     /// couldn't tell which to replace. Nothing was written.
     #[error("upsert into {collection:?}: {count} documents match the filter, expected at most one")]
     MultipleMatches { collection: String, count: usize },
+    /// `Database::import` found a line it can't use. Every chunk before
+    /// the one holding this line was already imported (SPEC §30.3).
+    #[error("import, line {line}: {message}")]
+    Import { line: usize, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
