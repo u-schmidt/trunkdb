@@ -146,16 +146,18 @@ impl FileStore {
     /// it only stops other trunkdb opens, not arbitrary programs, and it
     /// dies with the process — no stale lock file after a crash.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::open_with_lock(path, true)
-    }
-
-    fn open_with_lock(path: impl AsRef<Path>, lock: bool) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
+        Self::from_file(file, true)
+    }
+
+    /// `open` on an already-open file; `lock: false` only for tests, which
+    /// look at the file through a second handle (`on_disk`).
+    fn from_file(file: File, lock: bool) -> io::Result<Self> {
         if lock {
             // Before reading anything: what we'd read could be mid-change
             // by the holder.
@@ -699,11 +701,12 @@ mod tests {
     // ---------- staging ----------
 
     /// What a second, independent reader of the file sees — i.e. what's
-    /// actually on disk, bypassing `store`'s dirty set.
-    /// Skips the lock — `store` still holds it — which is fine for a
-    /// read-only look.
-    fn on_disk(path: &Path) -> FileStore {
-        FileStore::open_with_lock(path, false).unwrap()
+    /// actually on disk, bypassing `store`'s dirty set. Reads through a
+    /// clone of `store`'s own handle, which shares its lock: on Windows
+    /// the lock is mandatory, so a separately opened handle couldn't read
+    /// the locked file at all.
+    fn on_disk(store: &FileStore) -> FileStore {
+        FileStore::from_file(store.file.try_clone().unwrap(), false).unwrap()
     }
 
     #[test]
@@ -716,7 +719,7 @@ mod tests {
         store.write_page(id, &[7u8; PAGE_SIZE]).unwrap();
 
         assert_eq!(store.read_page(id).unwrap(), vec![7u8; PAGE_SIZE]);
-        let disk = on_disk(&path);
+        let disk = on_disk(&store);
         assert_eq!(
             disk.header.page_count, 1,
             "allocation must not reach the header on disk"
@@ -735,7 +738,7 @@ mod tests {
         store.write_back().unwrap();
 
         assert_eq!(store.dirty_pages().count(), 0, "write_back ends staging");
-        let disk = on_disk(&path);
+        let disk = on_disk(&store);
         assert_eq!(disk.header.page_count, 2);
         assert_eq!(disk.read_page(id).unwrap(), vec![9u8; PAGE_SIZE]);
     }
@@ -793,7 +796,7 @@ mod tests {
         assert_eq!(store.allocate_page().unwrap(), a);
         store.write_back().unwrap();
 
-        assert_eq!(on_disk(&path).header.free_list_head, NO_FREE_PAGE);
+        assert_eq!(on_disk(&store).header.free_list_head, NO_FREE_PAGE);
     }
 
     #[test]

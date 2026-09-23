@@ -135,7 +135,7 @@ fn decode_batch(body: &[u8], pages: &mut Vec<PageImage>) -> io::Result<()> {
             "WAL batch record's length doesn't match its page count",
         ));
     }
-    for entry in entries.chunks_exact(PAGE_ENTRY_LEN) {
+    for entry in entries.as_chunks::<PAGE_ENTRY_LEN>().0 {
         let id = PageId::from_le_bytes(entry[0..8].try_into().unwrap());
         pages.push((id, entry[8..].to_vec()));
     }
