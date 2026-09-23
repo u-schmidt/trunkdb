@@ -1,5 +1,7 @@
 # trunkdb
 
+[![CI](https://github.com/u-schmidt/trunkdb/actions/workflows/ci.yml/badge.svg)](https://github.com/u-schmidt/trunkdb/actions/workflows/ci.yml)
+
 An embedded, single-file, schema-less document database — a learning-first,
 from-scratch reimplementation of the [LiteDB](https://www.litedb.org/) idea
 in Rust. No tables, no joins, no schema migrations: open a file, get
