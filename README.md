@@ -161,7 +161,8 @@ cd bench && cargo run --release
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §53 for the full list and reasoning):
+Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and SPEC.md
+for the reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -243,7 +244,7 @@ Done so far (see SPEC.md §53 for the full list and reasoning):
     cell instead of rebuilding its page; batched inserts 3× faster,
     compaction 7×.
 
-What's still open: SPEC.md §53.2.
+What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License
 

@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §53 for the roadmap.
+large-document workload (§5.2) the second; see [ROADMAP.md](ROADMAP.md) for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1538,7 +1538,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§53.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (ROADMAP.md). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1719,7 +1719,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§53.2).
+(ROADMAP.md).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2109,7 +2109,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§53). It's also a backup that can be read and `diff`ed, and a way to
+(ROADMAP.md). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2236,7 +2236,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§53.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (ROADMAP.md).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2347,7 +2347,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§53.2);
+- Still one field per index: compound indexes are still open (ROADMAP.md);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2887,7 +2887,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§53.2).
+- Still no pattern language, no conditions on array elements (ROADMAP.md).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2974,7 +2974,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §53.2).
+  ROADMAP.md).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3310,7 +3310,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§53.2).
+  run on such a file. Repairing is open (ROADMAP.md).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -4580,7 +4580,7 @@ number from this benchmark before and after.
   `fsync` costs differently, and CI runs the benchmark on Linux without
   looking at the times.
 - **One thread.** Nothing measures readers during a write batch, which
-  is where MVCC (§53.2) would show.
+  is where MVCC (ROADMAP.md) would show.
 - **Warm caches only**; a cold start (first read after a reboot) isn't
   measured.
 - **JSON for the others**, where a binary format would be faster.
@@ -5029,7 +5029,7 @@ seconds instead of 26, since most of its tests commit.
 ## 52. B-tree pages changed in place (`storage/slotted.rs`, `index/btree.rs`)
 §48.4 put batched writes 4–7× behind the other stores and blamed page
 work; §51.4 confirmed that flushes weren't it. This section is the
-profile that §53.2 asked for first, and the fix it pointed at.
+profile that the roadmap asked for first, and the fix it pointed at.
 
 ### 52.1 The profile
 A scratch program inserting documents like the benchmark's, 1,000 per
@@ -5148,7 +5148,7 @@ program:
 A larger threshold lets a page rewritten by several batches be written
 back once. It costs memory (4,000 pages is 32 MB of unwritten pages),
 a larger WAL, and a longer checkpoint for the commit that crosses the
-threshold. That trade is left open (§53.2) rather than decided with
+threshold. That trade is left open (ROADMAP.md) rather than decided with
 this change.
 
 ### 52.5 Tests
@@ -5182,72 +5182,3 @@ this change.
   - a leaf position that is wrong, or at the front instead of the end;
   - a branch routing equal keys left;
   - the wrong slot rerouted, or the rightmost child not rerouted.
-
-## 53. Roadmap
-
-"v1" is a milestone name, not a semver promise: 0.x minor versions may
-still break API and file format. 1.0.0 is reserved for a stable format
-with a migration path — export/import (§30) is that path.
-
-### 53.1 Done
-The first roadmap (2026-09-23) was ordered by priority: correctness and
-the file format first, so real data never needs a migration; then what
-the sync workload (§5.3) needs; then the large-document workload (§5.2).
-All of it is done:
-
-| Version | What | Sections |
-|---|---|---|
-| 0.1.0 | The v0 core: pages, catalog, B-tree primary index, document encoding, serde bridge, filter/sort/limit, batches, a WAL | §6–§18 |
-| 0.3.0 | Block A, correctness and file format: page-image WAL, several documents per page, file lock and format version, three data-risk fixes | §19–§22 |
-| 0.3.0 | Block B, the sync workload: `find_with_ids`, typed batches, `Contains` (planned as 0.2.0, never released on its own) | §23–§25 |
-| 0.3.0 | Block C, the large-document workload: overflow pages, a thread-safe `Database`, secondary indexes, `find_one`/`count`/`upsert`/`cursor` | §26–§29 |
-| 0.4.0 | Export/import, nested-field paths, null and missing fields, unique indexes, sorting through an index; file format 5 | §30–§34 |
-| 0.5.0 | A filter builder; OR, NOT and nesting (`Condition` became a tree — breaking); `delete_many` and dropping a collection | §35–§37 |
-| 0.6.0 | `update_many`; the `trunkdb` command and `Database::check`; page checksums, file format 6 | §38–§40 |
-| 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
-| 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
-| 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
-| 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
-| next | One flush per commit (`Database::checkpoint`); B-tree pages changed in place | §51–§52 |
-
-### 53.2 Open
-Unordered within each group; each line says where the need or the
-limit is described.
-
-**Queries**
-- A pattern language: regex or `LIKE`-style wildcards (§25.4).
-
-**Indexes**
-
-**Storage and durability**
-- Scan resistance for the page cache, and shared pages instead of a
-  copy per read (§50.7).
-- A free-space map, so inserts refill half-empty data pages between
-  compactions (§20.1, §41.5).
-- Compaction without holding the whole new file in memory: a streamed
-  WAL record (§41.5). Leaves built from sorted entries instead of
-  inserted one by one would make it faster still (§48.4), though 1 s for
-  100,000 documents (§52.3) makes that less pressing.
-- Batched writes, still about 2× behind: nearly every batch of 1,000
-  crosses the checkpoint threshold once the indexes are large. A larger
-  `CHECKPOINT_PAGES`, or one set in `OpenOptions`, trades memory and WAL
-  size for it (§52.4). A staged page is also still copied whole on every
-  read and write.
-
-**Concurrency**
-- Readers that don't wait for a write batch: MVCC or pre-batch page
-  snapshots (§27). It would also stop an export from blocking writers
-  (§30.6).
-
-**API**
-- Update operators (`$set`, `$inc`, `$unset` on paths) next to
-  `update_many`'s closure (§38.1).
-- A struct with its own id field (`#[serde(rename = "_id")]`, §13.5,
-  §18) — `find_with_ids` (§23) covers most needs; unscheduled.
-
-**Tooling and reach**
-- Repairing what `check` finds, beyond export and import (§39.5).
-- PyO3 bindings, for Python apps.
-
-Not planned: a cost-based query planner, joins, aggregates, multiple
-writers, encryption, schema validation (§6).
