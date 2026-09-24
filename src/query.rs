@@ -76,18 +76,11 @@ impl Filter {
             .collect();
 
         if let Some(sort) = &self.sort {
+            // Stable: equal values keep the order they came in.
             results.sort_by(|a, b| {
-                let (a, b) = (doc_of(a), doc_of(b));
-                let (a, b) = (value_or_null(a, &sort.field), value_or_null(b, &sort.field));
-                // A value that isn't comparable to the other side's
-                // (including a missing field, which is null) doesn't
-                // error out — it just doesn't move relative to what it's
-                // being compared against.
-                let ord = compare(a, b).unwrap_or(std::cmp::Ordering::Equal);
-                match sort.order {
-                    SortOrder::Asc => ord,
-                    SortOrder::Desc => ord.reverse(),
-                }
+                let a = value_or_null(doc_of(a), &sort.field);
+                let b = value_or_null(doc_of(b), &sort.field);
+                sort_order(a, b, sort.order)
             });
         }
 
@@ -107,6 +100,10 @@ pub enum QueryPlan {
     /// Only the documents in a range of the index on `field` are read,
     /// then checked against the whole filter.
     Index { field: String },
+    /// The index on the sort field `field` is read in sort order, and
+    /// documents are checked one by one until `limit` of them match; the
+    /// rest are never read (SPEC §34.2).
+    IndexOrder { field: String },
 }
 
 impl Filter {
@@ -138,6 +135,38 @@ impl Filter {
             .filter(|c| c.field == chosen.field)
             .filter_map(|c| key::range_for(&c.op, &c.value))
             .reduce(KeyRange::intersect)?;
+        Some((index, range))
+    }
+}
+
+impl Filter {
+    /// The index `find` reads in sort order (SPEC §34.2) — for a filter
+    /// with a `sort` and a `limit`, on a field with an index, and no `Eq`
+    /// condition another index could answer (a few documents found by
+    /// value beat walking in order). With it, that field's own range
+    /// conditions narrowed to one range, or `None` for the whole index.
+    pub(crate) fn index_order<'a>(
+        &self,
+        indexes: &'a [IndexMeta],
+    ) -> Option<(&'a IndexMeta, Option<KeyRange>)> {
+        let sort = self.sort.as_ref()?;
+        self.limit?;
+        let index = indexes.iter().find(|i| i.field == sort.field)?;
+        let eq_elsewhere = self.conditions.iter().any(|c| {
+            matches!(c.op, Op::Eq)
+                && c.field != sort.field
+                && key::range_for(&c.op, &c.value).is_some()
+                && indexes.iter().any(|i| i.field == c.field)
+        });
+        if eq_elsewhere {
+            return None;
+        }
+        let range = self
+            .conditions
+            .iter()
+            .filter(|c| c.field == sort.field)
+            .filter_map(|c| key::range_for(&c.op, &c.value))
+            .reduce(KeyRange::intersect);
         Some((index, range))
     }
 }
@@ -200,18 +229,85 @@ pub(crate) fn equal(a: &Document, b: &Document) -> bool {
 
 /// Only values of one kind compare; `Null` equals `Null` (SPEC §32), so
 /// `Eq`/`Lte`/`Gte` against null match null and missing fields, `Ne`
-/// everything else, and `Lt`/`Gt` nothing.
+/// everything else, and `Lt`/`Gt` nothing. Numbers compare by their exact
+/// value, `Int` against `Float` too (SPEC §34.1).
 fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> {
     use Document::*;
     match (a, b) {
         (Null, Null) => Some(std::cmp::Ordering::Equal),
         (Int(x), Int(y)) => x.partial_cmp(y),
         (Float(x), Float(y)) => x.partial_cmp(y),
-        (Int(x), Float(y)) => (*x as f64).partial_cmp(y),
-        (Float(x), Int(y)) => x.partial_cmp(&(*y as f64)),
+        (Int(x), Float(y)) => int_vs_float(*x, *y),
+        (Float(x), Int(y)) => int_vs_float(*y, *x).map(std::cmp::Ordering::reverse),
         (String(x), String(y)) => x.partial_cmp(y),
         (Bool(x), Bool(y)) => x.partial_cmp(y),
         _ => None,
+    }
+}
+
+/// `i` against `f` by exact value — not `i as f64`, which rounds beyond
+/// 2^53: `2^53 + 1` would equal the float `2^53` and yet be greater than
+/// the int `2^53`, and a sort can't be consistent on top of that. `None`
+/// for NaN.
+fn int_vs_float(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= TWO_POW_63 {
+        return Some(Less); // above every i64
+    }
+    if f < -TWO_POW_63 {
+        return Some(Greater); // below every i64
+    }
+    // Within i64's range: the whole part is exact as an i64, and a
+    // fractional part decides between equal whole parts.
+    let whole = f.trunc();
+    Some(
+        i.cmp(&(whole as i64))
+            .then_with(|| whole.partial_cmp(&f).expect("neither is NaN")),
+    )
+}
+
+/// Kinds of value in sort order (SPEC §34.1): the order of the index's
+/// type tags (`index::key`), and a last kind for values nothing orders.
+fn sort_rank(value: &Document) -> u8 {
+    match value {
+        Document::Null => 0,
+        Document::Bool(_) => 1,
+        Document::Float(f) if f.is_nan() => UNORDERED,
+        Document::Int(_) | Document::Float(_) => 2,
+        Document::String(_) => 3,
+        _ => UNORDERED,
+    }
+}
+
+const UNORDERED: u8 = 4;
+
+/// Whether `sort_order` puts `value` among the values nothing orders —
+/// arrays, objects, binary, ids, NaN. No index holds them.
+pub(crate) fn is_unordered(value: &Document) -> bool {
+    sort_rank(value) == UNORDERED
+}
+
+/// The order a sort puts two field values in (SPEC §34.1) — a total
+/// order, so any sort is well-defined: null (and missing) before bools
+/// before numbers before strings, each by value, reversed for `Desc`;
+/// values nothing orders come after all of them in both directions, as
+/// equals. It is the order of an index's keys, so reading an index gives
+/// what sorting in memory gives.
+pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::cmp::Ordering {
+    let (rank_a, rank_b) = (sort_rank(a), sort_rank(b));
+    if rank_a == UNORDERED || rank_b == UNORDERED {
+        return rank_a.cmp(&rank_b);
+    }
+    let ord = rank_a
+        .cmp(&rank_b)
+        .then_with(|| compare(a, b).expect("values of one orderable kind compare"));
+    match order {
+        SortOrder::Asc => ord,
+        SortOrder::Desc => ord.reverse(),
     }
 }
 
@@ -499,24 +595,97 @@ mod tests {
         );
     }
 
+    /// One total order over every kind of value (SPEC §34.1), in both
+    /// directions: kinds in index order, values nothing orders last, and
+    /// equal values in the order they came.
     #[test]
-    fn sort_treats_missing_field_as_equal_rather_than_erroring() {
-        let docs = vec![
-            doc(&[("age", Document::Int(5))]),
-            doc(&[("name", Document::String("no age field".into()))]),
+    fn sort_orders_every_kind_of_value_totally() {
+        let big = 1i64 << 53;
+        let v = |value: Document| doc(&[("v", value), ("tag", Document::Int(0))]);
+        let missing = doc(&[("tag", Document::Int(1))]);
+        let unordered = [
+            v(Document::Array(vec![])),
+            v(Document::Float(f64::NAN)),
+            v(Document::Binary(vec![1])),
         ];
-
-        let filter = Filter {
-            sort: Some(Sort {
-                field: "age".into(),
-                order: SortOrder::Asc,
-            }),
-            ..Default::default()
+        // Ascending, as `sort` must return them (the null and the
+        // missing field are equal, so they keep their input order).
+        let ascending = vec![
+            v(Document::Null),
+            missing.clone(),
+            v(Document::Bool(false)),
+            v(Document::Bool(true)),
+            v(Document::Float(f64::NEG_INFINITY)),
+            v(Document::Int(-3)),
+            v(Document::Float(0.5)),
+            v(Document::Float(big as f64)),
+            v(Document::Int(big + 1)),
+            v(Document::Float(1e300)),
+            v(Document::String("".into())),
+            v(Document::String("B".into())),
+            v(Document::String("a".into())),
+        ];
+        // Compared as text: NaN isn't equal to itself.
+        let text = |docs: Vec<Document>| format!("{docs:?}");
+        let sorted = |order, docs: Vec<Document>| {
+            text(
+                Filter {
+                    sort: Some(Sort {
+                        field: "v".into(),
+                        order,
+                    }),
+                    ..Default::default()
+                }
+                .apply(docs),
+            )
         };
 
-        // Just needs to not panic and to return both documents — exact
-        // relative order for the missing-field case isn't the contract.
-        assert_eq!(filter.apply(docs).len(), 2);
+        // Input: everything reversed, with the unordered values mixed in.
+        let mut input: Vec<Document> = ascending.iter().rev().cloned().collect();
+        input.insert(3, unordered[0].clone());
+        input.insert(0, unordered[1].clone());
+        input.push(unordered[2].clone());
+        let unordered_in_input_order = [&unordered[1], &unordered[0], &unordered[2]];
+
+        let mut expected = ascending.clone();
+        // Null and missing are equal: reversed input keeps them reversed.
+        expected.swap(0, 1);
+        expected.extend(unordered_in_input_order.iter().map(|d| (*d).clone()));
+        assert_eq!(sorted(SortOrder::Asc, input.clone()), text(expected));
+
+        // Reversed, except null and missing: equal, so in input order —
+        // which the reversed input already gave them.
+        let mut expected: Vec<Document> = ascending.iter().rev().cloned().collect();
+        expected.extend(unordered_in_input_order.iter().map(|d| (*d).clone()));
+        assert_eq!(sorted(SortOrder::Desc, input), text(expected));
+    }
+
+    #[test]
+    fn ints_and_floats_compare_by_exact_value() {
+        use std::cmp::Ordering::*;
+        let big = 1i64 << 53;
+        for (int, float, expected) in [
+            (1, 1.0, Equal),
+            (0, -0.0, Equal),
+            (1, 1.5, Less),
+            (-1, -1.5, Greater),
+            (big + 1, big as f64, Greater), // `as f64` would say Equal
+            (big, big as f64, Equal),
+            (i64::MAX, 9_223_372_036_854_775_808.0, Less),
+            (i64::MIN, -9_223_372_036_854_775_808.0, Equal),
+            (i64::MIN, -1e19, Greater),
+            (0, f64::INFINITY, Less),
+            (0, f64::NEG_INFINITY, Greater),
+        ] {
+            let (i, f) = (Document::Int(int), Document::Float(float));
+            assert_eq!(compare(&i, &f), Some(expected), "{int} vs {float}");
+            assert_eq!(
+                compare(&f, &i),
+                Some(expected.reverse()),
+                "{float} vs {int}"
+            );
+        }
+        assert_eq!(compare(&Document::Int(0), &Document::Float(f64::NAN)), None);
     }
 
     #[test]

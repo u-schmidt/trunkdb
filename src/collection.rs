@@ -5,7 +5,7 @@ use crate::database::Database;
 use crate::document::{DocId, Document};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
-use crate::query::{Filter, QueryPlan};
+use crate::query::{Filter, QueryPlan, SortOrder};
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
 use serde::Serialize;
@@ -146,14 +146,18 @@ impl<T> Collection<T> {
     /// secondary index.
     pub fn explain(&self, filter: &Filter) -> crate::Result<QueryPlan> {
         let state = self.db.read()?;
-        Ok(
-            match filter.index_range(state.catalog.indexes(&self.name)) {
-                Some((index, _range)) => QueryPlan::Index {
-                    field: index.field.clone(),
-                },
-                None => QueryPlan::Scan,
+        let indexes = state.catalog.indexes(&self.name);
+        if let Some((index, _range)) = filter.index_order(indexes) {
+            return Ok(QueryPlan::IndexOrder {
+                field: index.field.clone(),
+            });
+        }
+        Ok(match filter.index_range(indexes) {
+            Some((index, _range)) => QueryPlan::Index {
+                field: index.field.clone(),
             },
-        )
+            None => QueryPlan::Scan,
+        })
     }
 }
 
@@ -215,7 +219,7 @@ where
     }
 
     pub fn find_one_with_id(&self, filter: Filter) -> crate::Result<Option<(DocId, T)>> {
-        self.cursor(filter)?.next().transpose()
+        self.cursor(first_only(filter))?.next().transpose()
     }
 
     /// How many documents match — see the untyped `count`. No document is
@@ -318,23 +322,38 @@ impl Collection<Document> {
     /// the whole filter — an index range may hold a few documents that
     /// don't match (SPEC §28.3). Without a `sort`, the order of the
     /// results is unspecified.
+    ///
+    /// With a `sort` and a `limit`, and an index on the sort field, it
+    /// reads that index in order instead and stops after `limit` matches
+    /// (SPEC §34.2). Equal sort values come in id order either way.
     pub fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, Document)>> {
         let state = self.db.read()?;
-        let candidates = read_candidates(&state.catalog, &state.store, &self.name, &filter)?;
+        let indexes = state.catalog.indexes(&self.name);
+        if let Some((index, range)) = filter.index_order(indexes) {
+            let (catalog, store) = (&state.catalog, &state.store);
+            return read_in_index_order(catalog, store, &self.name, &filter, index, range);
+        }
+        let mut candidates = read_candidates(&state.catalog, &state.store, &self.name, &filter)?;
         // Filtering needs no lock: the candidates are owned copies.
         drop(state);
+        if filter.sort.is_some() {
+            // So equal sort values end up in id order, as they do when
+            // read from an index (the sort is stable).
+            candidates.sort_unstable_by_key(|(id, _doc)| *id);
+        }
         Ok(filter.apply_to(candidates, |(_id, doc)| doc))
     }
 
     /// The first match, reading no further than it: the first in `sort`
-    /// order if the filter has one (which does read every match), any
-    /// match otherwise. `None` if nothing matches.
+    /// order if the filter has one, any match otherwise. `None` if nothing
+    /// matches. With a `sort` on an indexed field this reads one index
+    /// entry's worth of documents, not every match (SPEC §34.2).
     pub fn find_one(&self, filter: Filter) -> crate::Result<Option<Document>> {
         Ok(self.find_one_with_id(filter)?.map(|(_id, doc)| doc))
     }
 
     pub fn find_one_with_id(&self, filter: Filter) -> crate::Result<Option<(DocId, Document)>> {
-        self.cursor(filter)?.next().transpose()
+        self.cursor(first_only(filter))?.next().transpose()
     }
 
     /// How many documents match `filter`'s conditions, at most its
@@ -435,6 +454,95 @@ fn candidate_entries(
         Some((index, range)) => BTreeIndex::new(index.root).range(store, &range),
         None => BTreeIndex::new(meta.index_root).scan(store),
     }
+}
+
+/// `find` for a filter `Filter::index_order` chose (SPEC §34.2): walks the
+/// index on the sort field in sort order, checks each document against
+/// the whole filter, and stops as soon as `limit` match — the documents
+/// after that are never read. Already filtered, sorted and limited.
+///
+/// Entries sharing a key's value part come in id order, which is sort
+/// order when their values are all equal (`key::is_exact`); the rare
+/// group where they may differ (huge numbers, cut strings) is read whole
+/// and sorted. Values no index holds (§34.1: arrays, NaN, ...) sort after
+/// everything: if the index runs out before the limit and no range
+/// condition on the sort field ruled them out, a scan finds them.
+fn read_in_index_order(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    index: &IndexMeta,
+    range: Option<KeyRange>,
+) -> crate::Result<Vec<(DocId, Document)>> {
+    let (Some(sort), Some(limit)) = (&filter.sort, filter.limit) else {
+        unreachable!("index_order needs a sort and a limit");
+    };
+    let mut results = Vec::new();
+    if limit == 0 {
+        return Ok(results);
+    }
+    let unordered_can_match = range.is_none();
+    let entries =
+        BTreeIndex::new(index.root).range(store, &range.unwrap_or_else(KeyRange::everything))?;
+    let mut groups: Vec<_> = entries
+        .chunk_by(|(a, _), (b, _)| key::value_part(a) == key::value_part(b))
+        .collect();
+    if sort.order == SortOrder::Desc {
+        groups.reverse();
+    }
+    let read = |loc: &RecordLocation| data::get_record(store, *loc);
+    for group in groups {
+        if key::is_exact(key::value_part(&group[0].0)) {
+            for (_key, loc) in group {
+                let (id, doc) = read(loc)?;
+                if filter.matches(&doc) {
+                    results.push((id, doc));
+                    if results.len() == limit {
+                        return Ok(results);
+                    }
+                }
+            }
+        } else {
+            let docs = group
+                .iter()
+                .map(|(_key, loc)| read(loc))
+                .collect::<Result<Vec<_>, _>>()?;
+            let unlimited = Filter {
+                limit: None,
+                ..filter.clone()
+            };
+            for found in unlimited.apply_to(docs, |(_id, doc)| doc) {
+                results.push(found);
+                if results.len() == limit {
+                    return Ok(results);
+                }
+            }
+        }
+    }
+    if unordered_can_match {
+        let meta = catalog
+            .get(collection)
+            .expect("an indexed collection exists");
+        for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
+            let (id, doc) = read(&loc)?;
+            let value = crate::query::value_or_null(&doc, &sort.field);
+            if crate::query::is_unordered(value) && filter.matches(&doc) {
+                results.push((id, doc));
+                if results.len() == limit {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// `filter` stopping at its first match — what `find_one` asks for, so
+/// a sorted one can stop early too (SPEC §34.2).
+fn first_only(mut filter: Filter) -> Filter {
+    filter.limit = Some(filter.limit.map_or(1, |limit| limit.min(1)));
+    filter
 }
 
 /// The documents behind `candidate_entries`, not yet checked against the
@@ -1741,6 +1849,193 @@ mod tests {
         members.update(&bob, member("Bob", None, None)).unwrap();
         assert_eq!(names("nick", Op::Eq), ["Ada", "Bob", "Old"]);
         assert_eq!(names("team", Op::Eq), ["Ada", "Bob", "Cy", "Old"]);
+    }
+
+    // --- Sorting through an index (SPEC §34) ---
+
+    /// A sorted filter, mostly limited, sometimes with conditions: a range
+    /// on `v`, an `Eq` on `w` (which beats reading in order), or ones no
+    /// index answers. Mostly sorted by `v`; sometimes by `w`, whose three
+    /// values tie a lot — with a range on `v` and no limit, candidates
+    /// come in `v`'s order, and only the id order of ties makes the
+    /// result match.
+    fn random_sorted_filter(rng: &mut XorShift) -> Filter {
+        let ops = [Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
+        let conditions = match rng.below(6) {
+            0 => vec![cond("v", ops[rng.below(5)].clone(), random_value(rng))],
+            1 => vec![cond("w", Op::Eq, Document::Int(rng.below(3) as i64))],
+            2 => vec![cond("v", Op::Ne, random_value(rng))],
+            3 => vec![cond("pad", Op::Eq, Document::String(String::new()))],
+            _ => vec![],
+        };
+        let order = [SortOrder::Asc, SortOrder::Desc][rng.below(2)];
+        let field = ["v", "v", "w"][rng.below(3)].to_string();
+        let limits = [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(5),
+            Some(20),
+            Some(60),
+            Some(1000),
+        ];
+        Filter {
+            conditions,
+            sort: Some(crate::query::Sort { field, order }),
+            limit: limits[rng.below(limits.len())],
+        }
+    }
+
+    /// Every sorted, limited find must return exactly what sorting a full
+    /// scan in memory returns — same documents, same order, ties in id
+    /// order — whichever plan it runs.
+    fn assert_sorted_finds_agree_with_memory(docs: &Collection<Document>, rng: &mut XorShift) {
+        let mut all = docs.find_with_ids(Filter::default()).unwrap();
+        all.sort_by_key(|(id, _doc)| *id);
+        let mut plans = std::collections::HashSet::new();
+        for _ in 0..300 {
+            let f = random_sorted_filter(rng);
+            let expected: Vec<DocId> = f
+                .apply_to(all.clone(), |(_, doc)| doc)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let plan = docs.explain(&f).unwrap();
+            let found: Vec<DocId> = docs
+                .find_with_ids(f.clone())
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(found, expected, "{f:?} via {plan:?}");
+            plans.insert(format!("{plan:?}"));
+        }
+        for plan in [
+            r#"IndexOrder { field: "v" }"#,
+            r#"IndexOrder { field: "w" }"#,
+            r#"Index { field: "v" }"#,
+            r#"Index { field: "w" }"#,
+            "Scan",
+        ] {
+            assert!(plans.contains(plan), "{plan} never ran: {plans:?}");
+        }
+    }
+
+    #[test]
+    fn sorting_through_an_index_matches_sorting_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let mut rng = XorShift(0x0BAD_5EED_1234_5678);
+        {
+            let db = Database::open(&path).unwrap();
+            let docs = db.collection::<Document>("docs");
+            docs.ensure_index("v").unwrap();
+            docs.ensure_index("w").unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..12 {
+                let ops = (0..25)
+                    .map(|_| {
+                        let id = db.id_gen().generate();
+                        ids.push(id);
+                        WriteOp::Insert("docs".into(), id, random_document(&mut rng))
+                    })
+                    .collect();
+                db.write_batch(ops).unwrap();
+            }
+            let updates = (0..40)
+                .map(|_| {
+                    let id = ids[rng.below(ids.len())];
+                    WriteOp::Update("docs".into(), id, random_document(&mut rng))
+                })
+                .collect();
+            db.write_batch(updates).unwrap();
+            let deleted = (0..30).map(|_| ids.swap_remove(rng.below(ids.len())));
+            let ops = deleted.map(|id| WriteOp::Delete("docs".into(), id));
+            db.write_batch(ops.collect()).unwrap();
+            assert_sorted_finds_agree_with_memory(&docs, &mut rng);
+        }
+        let db = Database::open(&path).unwrap();
+        assert_sorted_finds_agree_with_memory(&db.collection("docs"), &mut rng);
+    }
+
+    fn records_read(f: impl FnOnce()) -> usize {
+        crate::data::RECORDS_READ.with(|n| n.set(0));
+        f();
+        crate::data::RECORDS_READ.with(|n| n.get())
+    }
+
+    #[test]
+    fn a_limit_stops_the_reading_when_an_index_gives_the_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<User>("users");
+        let mut batch = db.batch();
+        for age in 0..1000 {
+            batch
+                .insert(&users, user(&format!("user {age}"), age))
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        let oldest = |limit| Filter {
+            limit,
+            ..by_age(SortOrder::Desc)
+        };
+
+        // Without an index every document is read, then sorted.
+        let reads = records_read(|| assert_eq!(users.find(oldest(Some(5))).unwrap().len(), 5));
+        assert_eq!(reads, 1000);
+
+        users.ensure_index("age").unwrap();
+        assert_eq!(
+            users.explain(&oldest(Some(5))).unwrap(),
+            QueryPlan::IndexOrder {
+                field: "age".to_string()
+            }
+        );
+        let mut found = Vec::new();
+        let reads = records_read(|| found = users.find(oldest(Some(5))).unwrap());
+        assert_eq!(reads, 5);
+        let ages: Vec<i64> = found.iter().map(|u| u.age).collect();
+        assert_eq!(ages, [999, 998, 997, 996, 995]);
+
+        // `find_one` with a sort reads one.
+        let mut first = None;
+        let reads = records_read(|| first = users.find_one(by_age(SortOrder::Asc)).unwrap());
+        assert_eq!((reads, first.map(|u| u.age)), (1, Some(0)));
+
+        // A range on the sort field narrows the walk, and rules out the
+        // values no index holds — so running out of matches doesn't
+        // scan for them.
+        let young = Filter {
+            limit: Some(50),
+            ..filter(vec![cond("age", Op::Lt, Document::Int(10))])
+        };
+        let young = Filter {
+            sort: by_age(SortOrder::Asc).sort,
+            ..young
+        };
+        let reads = records_read(|| assert_eq!(users.find(young).unwrap().len(), 10));
+        assert_eq!(reads, 11, "a range includes its bound, age 10 (§28.4)");
+
+        // Without such a range, running out means one scan for them —
+        // here a document whose age is an array, sorted after the rest.
+        let docs = db.collection::<Document>("users");
+        docs.insert(object(vec![("age", Document::Array(vec![]))]))
+            .unwrap();
+        let all = docs
+            .find(Filter {
+                limit: Some(2000),
+                ..by_age(SortOrder::Desc)
+            })
+            .unwrap();
+        assert_eq!(all.len(), 1001);
+        assert!(matches!(
+            crate::query::field_value(all.last().unwrap(), "age"),
+            Some(Document::Array(_))
+        ));
+        // Without a limit, nothing stops early: the plan is a scan.
+        assert_eq!(users.explain(&oldest(None)).unwrap(), QueryPlan::Scan);
     }
 
     // --- Unique indexes (SPEC §33) ---

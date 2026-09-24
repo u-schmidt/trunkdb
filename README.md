@@ -80,7 +80,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §34 for the full list and reasoning):
+Done so far (see SPEC.md §35 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -99,8 +99,10 @@ Done so far (see SPEC.md §34 for the full list and reasoning):
    index too (file format 4).
 7. **Unique indexes** (§33): `ensure_unique_index("email")`; file format
    5, which still opens format-4 files as they are.
+8. **Sorting through an index** (§34): "the newest 20" reads 20
+   documents, not all of them.
 
-Next: an unordered list of further features (§34).
+Next: an unordered list of further features (§35).
 
 ## License
 

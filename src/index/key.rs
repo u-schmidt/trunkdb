@@ -37,6 +37,36 @@ pub fn doc_id(key: &[u8]) -> DocId {
     DocId(key[key.len() - 16..].try_into().unwrap())
 }
 
+/// A secondary key without its trailing `DocId`: the encoded value.
+pub fn value_part(key: &[u8]) -> &[u8] {
+    &key[..key.len() - 16]
+}
+
+/// Whether every value encoded as `value_part` is equal to every other
+/// (as `Filter` compares). Almost always: only numbers beyond 2^53 (where
+/// different `Int`s round to one `f64`) and strings cut to the key budget
+/// can share an encoding without being equal (SPEC §28.1). Errs towards
+/// `false` — a string exactly as long as the budget counts as cut.
+pub fn is_exact(value_part: &[u8]) -> bool {
+    match value_part[0] {
+        TAG_NUMBER => {
+            let sortable = u64::from_be_bytes(value_part[1..9].try_into().unwrap());
+            // `encode_number` backwards.
+            let bits = if sortable >> 63 == 1 {
+                sortable & !(1 << 63)
+            } else {
+                !sortable
+            };
+            f64::from_bits(bits).abs() < (1u64 << 53) as f64
+        }
+        // Tag, escaped bytes, two-byte terminator: a cut string used at
+        // least `STRING_BUDGET - 1` bytes, since the next byte (up to two
+        // escaped) didn't fit.
+        TAG_STRING => value_part.len() - 3 < STRING_BUDGET - 1,
+        _ => true,
+    }
+}
+
 /// The secondary-index key for a document whose field holds `value`, or
 /// `None` if that value isn't indexed (see `encode_value`).
 pub fn secondary(value: &Document, id: DocId) -> Option<Vec<u8>> {
@@ -123,6 +153,14 @@ pub struct KeyRange {
 }
 
 impl KeyRange {
+    /// Every key.
+    pub fn everything() -> Self {
+        KeyRange {
+            start: Vec::new(),
+            end: None,
+        }
+    }
+
     /// Every key that begins with `prefix`.
     pub fn prefixed(prefix: &[u8]) -> Self {
         KeyRange {
@@ -288,6 +326,40 @@ mod tests {
         let eq_null = range_for(&Op::Eq, &Document::Null).unwrap();
         assert!(eq_null.contains(&null) && !eq_null.contains(&boolean));
         assert!(!lt.contains(&null) && !gt.contains(&null));
+    }
+
+    #[test]
+    fn only_big_numbers_and_cut_strings_are_inexact() {
+        let exact = |value: Document| is_exact(&key(value));
+        let big = 1i64 << 53;
+        for value in [
+            Document::Null,
+            Document::Bool(true),
+            Document::Int(0),
+            Document::Int(big - 1),
+            Document::Int(-(big - 1)),
+            Document::Float(-0.5),
+            Document::Float(1e15),
+            Document::String("x".repeat(STRING_BUDGET - 2)),
+            Document::String("\0".repeat(STRING_BUDGET / 2 - 1)),
+        ] {
+            assert!(exact(value.clone()), "{value:?}");
+        }
+        for value in [
+            Document::Int(big),
+            Document::Int(-big),
+            Document::Int(i64::MAX),
+            Document::Float(1e300),
+            Document::Float(f64::NEG_INFINITY),
+            Document::String("x".repeat(STRING_BUDGET - 1)),
+            Document::String("x".repeat(5000)),
+            Document::String("\0".repeat(5000)),
+        ] {
+            assert!(!exact(value.clone()), "{value:?}");
+        }
+        // And a cut string does share its key with a different one.
+        let cut = |tail: &str| key(Document::String("x".repeat(STRING_BUDGET) + tail));
+        assert_eq!(cut("a"), cut("b"));
     }
 
     #[test]

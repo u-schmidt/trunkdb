@@ -21,7 +21,8 @@ use crate::query::Filter;
 ///
 /// With a `sort`, nothing can stream: every match has to be read to know
 /// which comes first. Such a cursor runs the whole `find` when it's
-/// created and hands out its results.
+/// created and hands out its results — which, with a `limit` and an index
+/// on the sort field, reads only as far as the limit (SPEC §34.2).
 #[must_use = "a cursor reads nothing until it's iterated"]
 pub struct Cursor<T> {
     source: Source<T>,

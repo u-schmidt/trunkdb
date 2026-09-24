@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §34 for the roadmap.
+large-document workload (§5.2) the second; see §35 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -775,7 +775,9 @@ compares as `Equal`, so it just doesn't move relative to whatever it's
 being compared against (`sort_by`'s stability preserves the rest of the
 original order). Matches the project's general stance of trusting the
 caller rather than inventing validation for a case a schema-less document
-store can't really define as "wrong" anyway.
+store can't really define as "wrong" anyway. (Since §34 there's a fixed
+order across kinds instead: null and missing first, values nothing
+orders last.)
 
 Since §23, `apply` delegates to `apply_to(items, doc_of)`, the same
 pipeline for items that *carry* a document — `find_with_ids` runs it
@@ -1234,12 +1236,12 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§34, "Later").
+future vacuum (§35, "Later").
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
 DocId][document]`. `0` means the whole document is in the cell — the
-only kind written today. `1` is reserved for overflow (§34, item 7): the
+only kind written today. `1` is reserved for overflow (§35, item 7): the
 cell will hold `[u32 total length][u64 first Overflow page]` and as much
 of the document as fits. Reading it today is an `InvalidData` error, not
 a misread. The page type tag `Overflow = 6` is reserved alongside it, so
@@ -1518,7 +1520,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is in "Later" (§34). A
+A pattern language (regex, `LIKE` wildcards) is in "Later" (§35). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1699,7 +1701,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§34, "Later").
+(§35, "Later").
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -1945,7 +1947,7 @@ it, as `free_chain` does (§26.5).
 - One field per index (top-level at first; dotted paths since §31);
   no compound, unique, or sparse/partial
   options; no index-ordered `sort` (results are still sorted in
-  memory). Each is a natural next step, none is needed by the reference workloads yet.
+  memory — until §34). Each is a natural next step, none is needed by the reference workloads yet.
 
 ## 29. API rounding-out: `find_one`, `count`, `upsert`, `cursor` (`collection.rs`, `cursor.rs`)
 
@@ -1968,7 +1970,8 @@ ends with the `DocId` in both kinds of index (`key::doc_id`).
 The first item of a `cursor` (§29.4): without a `sort` it stops reading
 at the first match, rather than reading everything and dropping all
 but one. With a `sort`, "first" means first in that order, which needs
-every match anyway. `find_one_with_id` exists for the same reason as
+every match anyway — unless an index on the sort field gives the order
+(§34.2). `find_one_with_id` exists for the same reason as
 `find_with_ids` (§23): a typed caller that wants to update what it
 found needs the id.
 
@@ -2080,7 +2083,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§34). It's also a backup that can be read and `diff`ed, and a way to
+(§35). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2171,7 +2174,7 @@ before or entirely after it, and documents in different collections
 that refer to each other agree. Readers go on in parallel; writers wait.
 
 That's the opposite of `cursor` (§29.4), which holds no lock between
-items, and the roadmap's sketch (§34) had planned to export through a
+items, and the roadmap's sketch (§35) had planned to export through a
 cursor.
 Rejected, because an export is a backup: read-committed per document
 would let a batch that updates two collections appear half-applied. The
@@ -2207,7 +2210,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§34,
+  seconds; a snapshot that doesn't block writers needs MVCC (§35,
   "Later").
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
@@ -2318,7 +2321,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
 - Still one field per index: compound and unique indexes remain in
-  "Later" (§34).
+  "Later" (§35).
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
 
@@ -2424,6 +2427,7 @@ documented path (§21.2) and already tested.
 - No `Exists` operator: "null or missing" is one state for queries.
 - A sort still leaves null and missing where they are relative to other
   values (not first or last): `compare` orders only values of one kind.
+  (§34.1 fixed that: they sort first.)
 - Every index grows by one entry per document without the field (§32.2).
 
 ## 33. Unique indexes (`collection.rs`, `catalog.rs`, `storage/file.rs`, `export.rs`)
@@ -2556,7 +2560,113 @@ naming the two, and without that index.
 - Case-insensitive uniqueness would need a case-folded key; it isn't
   there. An app that wants it stores a folded copy and indexes that.
 
-## 34. Open work / next milestones
+## 34. Sorting through an index (`query.rs`, `collection.rs`, `index/key.rs`)
+
+Real and tested: a `find` with a `sort` and a `limit` on an indexed
+field reads the index in order and stops after `limit` matches — the
+documents after that are never read.
+
+```rust
+runs.ensure_index("started_at")?;
+runs.find(Filter {
+    sort: Some(Sort { field: "started_at".into(), order: SortOrder::Desc }),
+    limit: Some(20),
+    ..Filter::default()
+})?;   // reads 20 documents, not every run; explain: IndexOrder { field: "started_at" }
+runs.find_one(newest_first)?;   // reads one
+```
+
+### 34.1 One sort order: the index's
+Reading an index gives its keys' order. For that to be a way of
+sorting rather than a different result, in-memory sorting had to use
+the same order, and before this it had none worth copying: values that
+don't compare (a number and a string, a null and anything) counted as
+equal. That isn't a total order — `1 = null = 0`, yet `1 > 0` — and
+Rust's `sort_by` may panic on a comparison that isn't one, or return an
+order that depends on the input's. Now `query::sort_order` is total:
+
+- null (and missing, §32) before bools before numbers before strings —
+  the index's type tags (§28.1, §32.2) — each kind by value, all of it
+  reversed for `Desc`;
+- values nothing orders (arrays, objects, binary, ids, NaN) after all of
+  those in **both** directions, as equals — no index holds them;
+- equal values in id order, on every plan: ids are UUIDv7, so that's
+  insertion order. The in-memory path sorts its candidates by id before
+  its stable sort; an index keeps equal values in id order anyway.
+
+Nulls come first ascending, like SQLite and MongoDB (Postgres puts them
+last). Rejected: nulls last in both directions — the index has them at
+the low end, so a descending walk would have to find them separately.
+
+Numbers now compare by exact value, `Int` against `Float` too. Before,
+an `Int` was cast to `f64`, which rounds beyond 2^53: `2^53 + 1` equaled
+the float `2^53` but was greater than the int `2^53` — no total order
+survives that. This also changes filters, for numbers beyond 2^53 only:
+`Int(2^53 + 1) == Float(2^53)` is now false. Index keys stay valid:
+rounding keeps order, so `a < b` still implies `key(a) <= key(b)`.
+
+### 34.2 When and how the index is read in order
+`Filter::index_order` picks it when the filter has a `sort` and a
+`limit`, the sort field has an index, and no `Eq` condition could be
+answered by another index — a few documents found by value beat a walk
+in order. Range conditions on the sort field itself narrow the walk.
+`explain` says `IndexOrder { field }`. Rule-based like §28.4: a very
+selective range condition on another field loses to the walk.
+
+`read_in_index_order` walks the index's range, grouping entries by
+their key's value part:
+- a group whose values are all equal (`key::is_exact` — everything but
+  numbers beyond 2^53 and strings cut to the key budget) is already in
+  id order; documents are read one by one, and reading stops at the
+  limit;
+- the rare group that isn't is read whole and sorted exactly;
+- for `Desc`, the groups are walked in reverse, each still in id order.
+
+If the index runs out before the limit, the values no index holds may
+still be missing: they sort last. A scan then finds them — unless a
+range condition on the sort field is there, which none of them can match.
+
+`find_one` asks for `limit: 1`, so a sorted `find_one` reads one entry's
+document instead of every match. A sorted `cursor` runs `find` (§29.4),
+so it benefits the same way.
+
+Rejected: using the index without a limit. Every match is read either
+way, plus a possible scan for unordered values; sorting in memory costs
+little next to the reads. Rejected for now: a lazy B-tree walk. `range`
+still collects the range's entries (keys and locations, no documents),
+a few hundred per leaf page — the documents are what's expensive. A
+lazy walk, with backward leaf links for `Desc`, is a later step.
+
+### 34.3 Tests
+- `sorting_through_an_index_matches_sorting_in_memory`: every kind of
+  value (huge numbers sharing a key, strings cut to one key, nulls,
+  missing fields, arrays, NaN) through inserts, updates that move
+  documents, deletes, and a reopen. 300 random sorted filters, each
+  compared element by element — same documents, same order — with a
+  full scan sorted in memory. Sorts by two indexed fields, with and
+  without limits, with range, `Eq`, `Ne` and unindexed conditions, so
+  every plan runs (`IndexOrder` on either field, `Index`, `Scan`).
+- `a_limit_stops_the_reading_when_an_index_gives_the_order`: with a
+  test-only counter of documents read (`data::RECORDS_READ`): 1000 read
+  without an index, 5 with it for `limit 5`, 1 for a sorted `find_one`,
+  11 for a range of ten (the bound is included, §28.4) — and an array
+  value sorted after everything else.
+- `sort_orders_every_kind_of_value_totally`: the order itself, both
+  directions, with ties keeping input order.
+- `ints_and_floats_compare_by_exact_value`, and which keys are exact.
+- Checked by breaking it on purpose, four ways: every group treated as
+  exact; `Desc` reversing entries instead of groups (ties in reverse id
+  order); no scan for unordered values; no id pre-sort in memory. Each
+  fails a test.
+
+### 34.4 Limits
+- One sort field; no index for a sort on several.
+- `range` collects a range's entries before the walk (§34.2).
+- Sorting by `_id` gives id order in both directions: ids are among the
+  values nothing orders (§34.1), so they all tie.
+- `count` ignores `sort`, as before.
+
+## 35. Open work / next milestones
 
 Roadmap from v0 (crate 0.1.0) towards v1, agreed 2026-09-23. Ordered by
 priority: correctness and file format first, then what the sync workload (§5.3)
@@ -2630,10 +2740,13 @@ pure refactor that can happen anytime, independent of trunkdb.
 - **Unique indexes — done** (§33): `ensure_unique_index`; equal as `Eq`
   sees it, nulls exempt, checked per op; format 5, which reads format 4
   as it is.
+- **Sorting through an index — done** (§34): a sort with a limit reads
+  the index in order and stops at the limit; one total sort order for
+  every kind of value.
 
 Unordered: `Filter` OR/nesting and regex; compaction/vacuum;
 per-page checksums; compound and sparse indexes, an `Exists` operator,
-and using an index for `sort`; conditions on array elements (and
+and a lazy B-tree walk (§34.2); conditions on array elements (and
 multikey indexes, §31.3); readers that don't wait for a write batch
 (MVCC or pre-batch page snapshots; reader/writer locking is done, §27);
 PyO3 bindings (for Python apps); a CLI for inspecting/verifying a file

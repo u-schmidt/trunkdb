@@ -90,10 +90,19 @@ pub fn insert_record(
     place_cell(store, current, &cell)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many documents `get_record` has read on this thread — so a
+    /// test can check a query reads no more than it has to.
+    pub(crate) static RECORDS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn get_record(
     store: &dyn PageStore,
     loc: RecordLocation,
 ) -> std::io::Result<(DocId, Document)> {
+    #[cfg(test)]
+    RECORDS_READ.with(|n| n.set(n.get() + 1));
     let page = read_data_page(store, loc.page)?;
     match Cell::parse(live_cell(&page, loc)?)? {
         Cell::Inline(id, encoded) => Ok((id, decode(encoded)?)),
