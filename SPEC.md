@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §50 for the roadmap.
+large-document workload (§5.2) the second; see §51 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1531,7 +1531,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§50.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§51.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1712,7 +1712,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§50.2).
+(§51.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2102,7 +2102,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§50). It's also a backup that can be read and `diff`ed, and a way to
+(§51). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2229,7 +2229,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§50.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§51.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2340,7 +2340,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§50.2);
+- Still one field per index: compound indexes are still open (§51.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2880,7 +2880,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§50.2).
+- Still no pattern language, no conditions on array elements (§51.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2967,7 +2967,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §50.2).
+  §51.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3303,7 +3303,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§50.2).
+  run on such a file. Repairing is open (§51.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -4553,7 +4553,7 @@ measured gap and effort:
 1. **The lazy B-tree walk** (§34.2, done in §49): 1,000× on the one query compound
    indexes were built for (§43), and a contained change in `btree.rs`
    and the sorted read.
-2. **A page cache**, which is new: about 10× on lookups and 2.5–4× on
+2. **A page cache** (done in §50), which is new: about 10× on lookups and 2.5–4× on
    every other read. It holds decoded or checked pages in memory, with
    dirty pages already staged per batch (§19.3). Its size and eviction
    are the design questions.
@@ -4571,7 +4571,7 @@ number from this benchmark before and after.
   `fsync` costs differently, and CI runs the benchmark on Linux without
   looking at the times.
 - **One thread.** Nothing measures readers during a write batch, which
-  is where MVCC (§50.2) would show.
+  is where MVCC (§51.2) would show.
 - **Warm caches only**; a cold start (first read after a reboot) isn't
   measured.
 - **JSON for the others**, where a binary format would be faster.
@@ -4705,13 +4705,174 @@ checksum and an allocation without a page cache (§48.4).
 - **Each leaf's entries are copied** before they're handed out, which
   costs an allocation per key.
 
-## 50. Roadmap
+## 50. A page cache (`storage/cache.rs`, `storage/file.rs`, `database.rs`)
+
+Real and measured: pages read from the file stay in memory, up to a
+size the caller chooses (256 MiB by default). A lookup by id went from
+30 µs to 6.7 µs in the benchmark (§48). That's faster than SQLite's
+16 µs, and close to sled (5.7 µs) and redb (2.4 µs).
+
+```rust
+use trunkdb::{Database, OpenOptions};
+
+let db = Database::open("app.trunkdb")?;                     // 256 MiB at most
+let db = Database::open_with("big.trunkdb", OpenOptions::default().cache_size(1 << 30))?;
+let db = Database::open_with("tiny.trunkdb", OpenOptions::default().cache_size(0))?;   // none
+```
+
+### 50.1 What it holds
+- **Committed pages only**, checked, as they are in the file. A read
+  looks in this order:
+  1. the batch's staged pages, while a batch runs (§19.3);
+  2. the cache;
+  3. the file, with the checksum verified (§40), after which the page
+     goes into the cache.
+
+  A staged page therefore never reaches the cache before it's in the
+  file, and a rolled-back batch leaves nothing behind.
+- **After a write-back**, every page written goes into the cache,
+  replacing its older copy. Those are the pages the next reads want: a
+  B-tree's path, the current data page.
+- **A write-back that fails halfway** clears the whole cache. The file
+  then holds some new pages and some old, and the cache can't know
+  which (§19.6). Crash recovery (`restore_pages`) clears it too, before
+  it writes. Pages cut off the end of the file (§41) leave it.
+- **Eviction is CLOCK** (second chance). A hand sweeps the slots, spares
+  once each page read since it last passed, and replaces the first that
+  wasn't read. A read only sets a flag, with no reordering and no list to
+  maintain, which is close enough to least-recently-used for a page
+  cache.
+- **A mutex around it:** reads take `&self` and run in parallel under
+  the read lock (§27), and a cache read changes the cache, both the flag
+  and a page put in on a miss. It's held for a copy of one page.
+
+### 50.2 What a read costs now
+`read_page` copies the page out of the cache into a new `Vec`, because
+`PageStore` hands out owned pages that `SlottedPage` may change. The
+first version filled a zeroed 8 KB buffer and copied into it, and a
+profile of two million lookups found `memset` second only to `memmove`.
+Allocating straight from the cached bytes (`read_vec`) took a lookup
+there from 4.6 to 3.8 µs. What's left is mostly that copy. Sharing
+cached pages instead (an `Arc` handed out, and a copy only to change
+it) would remove it; that changes `PageStore` and is left for later.
+
+### 50.3 Damage and `check`
+A page damaged on disk after it was cached keeps being read from the
+cache: the checksum is checked once, when the page comes in. `check`
+(§39) still finds the damage, because its damaged-page scan reads the
+file itself (`read_disk_page`) and not through the cache. A test
+damages a cached page on disk and checks both.
+
+### 50.4 The size
+- **`OpenOptions`** is new: `Database::open_with(path, options)`, with
+  `open` using the default. It's `#[non_exhaustive]`, made with
+  `OpenOptions::default()` and setters, so options added later break no
+  caller.
+- **The default is 256 MiB.** The cache fills only as pages are read,
+  so a small file costs its own size and no more. redb and sled default
+  to 1 GiB. SQLite defaults to 2 MB, but reads through the OS cache,
+  with no checksum to verify.
+- **The first default was 32 MiB**, and the benchmark showed it was too
+  small for its own 45 MB file:
+
+  | 100,000 documents | no cache | 32 MiB | 256 MiB |
+  |---|---:|---:|---:|
+  | get by id | 30 µs | 26 µs | 5–7 µs |
+  | find tenant == x (1000 docs) | 4.6 ms | 3.2 ms | 2.2–2.4 ms |
+  | status == x, oldest 20 | 92–126 µs | 118 µs | 46–47 µs |
+  | scan, unindexed | 162–179 ms | 214 ms | 151–152 ms |
+
+  Random lookups over a working set bigger than the cache mostly miss.
+  A full scan got *slower* with the small cache: every page it passed
+  was copied in, and replaced one a lookup would have wanted.
+
+Rejected:
+- **A default the size of the file, or no limit.** An embedded
+  database shouldn't grow to its file's size in memory without being
+  asked.
+- **Memory-mapping the file**, as LMDB does. Reads would cost almost
+  nothing, but a failing disk would become a `SIGBUS` instead of an
+  error, and each page's checksum would have to be verified on some
+  first use rather than when it's read. The positional reads and writes
+  work the same on every platform.
+
+### 50.5 Measured
+100,000 documents, all four stores, on the same machine as §48.3:
+
+| | trunkdb | SQLite | redb | sled |
+|---|---:|---:|---:|---:|
+| insert 100000, 1000 per commit | 6800/s | 43k/s | 44k/s | 27k/s |
+| insert 1000, one per commit | 16158 µs | 4990 µs | 5611 µs | 11073 µs |
+| get by id | 6.7 µs | 16.0 µs | 2.4 µs | 5.7 µs |
+| find tenant == x (1000 docs) | 2.21 ms | 1.61 ms | 0.96 ms | 1.68 ms |
+| find created in a range (1000 docs) | 2.19 ms | 1.71 ms | 1.57 ms | 2.11 ms |
+| status == x, oldest 20 | 46.6 µs | 22.5 µs | 15.4 µs | 21.0 µs |
+| status == x, newest 20 | 49.5 µs | 22.9 µs | 15.4 µs | 21.6 µs |
+| scan: tries > 7, unindexed | 151 ms | 44 ms | 49 ms | 67 ms |
+| update 9528, 1000 per commit | 5852/s | 15k/s | 20k/s | 24k/s |
+| delete 10000, 1000 per commit | 11k/s | 21k/s | 25k/s | 37k/s |
+
+Reads are now within 1.3–3× of the others, and lookups by id beat
+SQLite's. The unindexed scan (3×) spends its time decoding documents,
+not reading pages. Writes haven't changed: they're bound by three
+flushes per commit, which is the next item (§48.4).
+
+`BENCH_TRUNKDB_CACHE_MB` sets trunkdb's cache size in the benchmark;
+the others run with their defaults.
+
+### 50.6 Tests
+- `storage/cache.rs`:
+  - pages kept and replaced;
+  - a full cache evicting the page nobody read, and sparing the ones
+    read;
+  - `retain`, `clear` and `resize`, with pages still found after slots
+    moved;
+  - a cache of size 0 keeping nothing.
+- `storage/file.rs`, one test for each way a stale page could appear:
+  - a page read twice comes from the file once (hits and misses
+    counted);
+  - size 0 reads the file every time;
+  - a rolled-back staged page isn't read back, and a written-back one
+    is, from the cache;
+  - a write-back that failed halfway leaves reads saying what the file
+    says;
+  - restored pages replace cached ones;
+  - pages cut off the end leave the cache;
+  - a page damaged after it was cached is still found by the scan.
+- `database.rs`: `open_with` with no cache, three pages and 1 MiB reads
+  the same 500 documents, twice each; the default is 256 MiB.
+- Every other test runs with the cache on, as a database opens by
+  default.
+- Checked by breaking it on purpose, fourteen ways. Each of these fails
+  a test:
+  - a page read from the file not put in;
+  - written-back pages not put in, leaving an older copy;
+  - a failed write-back, or a recovery, not clearing it;
+  - cut-off pages kept;
+  - a page written outside a batch not updated in it;
+  - the cache asked before the batch's staged pages;
+  - a page from the file not checked;
+  - CLOCK ignoring the flag, or new pages starting as read;
+  - an older copy not replaced;
+  - slots moved without their index;
+  - `resize` not shrinking, or never called.
+
+### 50.7 Limits
+- **Not scan-resistant.** A scan over more pages than the cache holds
+  pushes out everything else. Databases often keep scanned pages out of
+  the cache, or put them in a probationary part of it; it wasn't needed
+  at 256 MiB.
+- **A copy per page read** (§50.2).
+- **One mutex.** Many threads reading at once contend on it; a sharded
+  cache would spread them.
+
+## 51. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 50.1 Done
+### 51.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -4729,9 +4890,9 @@ All of it is done:
 | 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
-| next | Benchmarks against SQLite, redb and sled; a lazy B-tree walk | §48–§49 |
+| next | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache | §48–§50 |
 
-### 50.2 Open
+### 51.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -4741,7 +4902,8 @@ limit is described.
 **Indexes**
 
 **Storage and durability**
-- A page cache: lookups 10× behind redb, other reads 2.5–4× (§48.4).
+- Scan resistance for the page cache, and shared pages instead of a
+  copy per read (§50.7).
 - A free-space map, so inserts refill half-empty data pages between
   compactions (§20.1, §41.5).
 - Compaction without holding the whole new file in memory: a streamed

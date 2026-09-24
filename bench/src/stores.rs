@@ -64,7 +64,13 @@ pub struct Trunk {
 impl Trunk {
     pub fn open(dir: &Path) -> Self {
         let path = dir.join("bench.trunkdb");
-        let db = Database::open(&path).unwrap();
+        // The default cache unless `BENCH_TRUNKDB_CACHE_MB` says (redb's
+        // and sled's default is 1 GiB, SQLite's 2 MB).
+        let mut options = trunkdb::OpenOptions::default();
+        if let Ok(mb) = std::env::var("BENCH_TRUNKDB_CACHE_MB") {
+            options = options.cache_size(mb.parse::<usize>().unwrap() << 20);
+        }
+        let db = Database::open_with(&path, options).unwrap();
         let tasks = db.collection::<Task>("tasks");
         tasks.ensure_index("tenant").unwrap();
         tasks.ensure_index("created").unwrap();

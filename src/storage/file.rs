@@ -1,9 +1,11 @@
+use super::cache::PageCache;
 use super::{PageId, PageImage, PageStore, PageType};
 use crate::crc32::Crc32;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// A page's size in the file. Matches LiteDB's page size, partly so
 /// numbers stay comparable to it later, and because a document DB's
@@ -18,6 +20,11 @@ const CHECKSUM_LEN: usize = 4;
 /// `write_page` takes — `PAGE_SIZE` without the checksum, which only this
 /// file ever sees. The WAL logs pages of this size too.
 pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - CHECKSUM_LEN;
+/// How much of the file `FileStore` keeps in memory unless told
+/// otherwise (`OpenOptions::cache_size`, SPEC §50): 256 MiB, 32,768
+/// pages. It fills only as pages are read, so a small file costs its own
+/// size; redb and sled default to 1 GiB.
+pub const DEFAULT_CACHE_SIZE: usize = 256 << 20;
 
 const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// The on-disk format this build reads and writes — bumped whenever a
@@ -140,6 +147,9 @@ impl Header {
 pub struct FileStore {
     file: File,
     header: Header,
+    /// Checked pages as they are in the file (SPEC §50). Behind a mutex
+    /// because reads take `&self` and run in parallel (§27).
+    cache: Mutex<PageCache>,
     /// Whether the header's checksum has been checked — not yet between
     /// `open_before_recovery` and `check_header` (SPEC §40.4).
     header_checked: bool,
@@ -246,6 +256,7 @@ impl FileStore {
         Ok(Self {
             file,
             header,
+            cache: Mutex::new(PageCache::new(DEFAULT_CACHE_SIZE / PAGE_SIZE)),
             // A fresh file's header isn't on disk yet: nothing to check.
             header_checked: is_fresh,
             staging: None,
@@ -327,7 +338,8 @@ impl FileStore {
     }
 
     /// Reads a page's current bytes: from the dirty set if it's there,
-    /// otherwise from the file. No bounds check — callers do that.
+    /// otherwise from the cache, otherwise from the file — and keeps it in
+    /// the cache. No bounds check — callers do that.
     fn read_raw(&self, id: PageId, buf: &mut [u8]) -> io::Result<()> {
         if let Some(staging) = &self.staging
             && let Some(page) = staging.dirty.get(&id)
@@ -335,19 +347,82 @@ impl FileStore {
             buf.copy_from_slice(page);
             return Ok(());
         }
-        read_page_at(&self.file, id, buf)
+        if self.cache().read(id, buf) {
+            return Ok(());
+        }
+        read_page_at(&self.file, id, buf)?;
+        self.cache().put(id, buf);
+        Ok(())
+    }
+
+    /// `read_raw` into a new `Vec`, copied straight from wherever the page
+    /// is — no zeroed buffer first; a lookup reads several pages, and
+    /// clearing 8 KB each time showed in the profile (SPEC §50.2).
+    fn read_vec(&self, id: PageId) -> io::Result<Vec<u8>> {
+        if let Some(staging) = &self.staging
+            && let Some(page) = staging.dirty.get(&id)
+        {
+            return Ok(page.clone());
+        }
+        if let Some(page) = self.cache().get(id) {
+            return Ok(page.to_vec());
+        }
+        let disk = read_disk_page(&self.file, id)?;
+        if !checksum_matches(id, &disk) {
+            return Err(damaged(id));
+        }
+        let page = &disk[..USABLE_PAGE_SIZE];
+        self.cache().put(id, page);
+        Ok(page.to_vec())
     }
 
     /// Writes a page: into the dirty set while staging, otherwise
-    /// straight to the file. No bounds check — callers do that.
+    /// straight to the file — and the cache. No bounds check — callers do
+    /// that.
     fn write_raw(&mut self, id: PageId, data: &[u8]) -> io::Result<()> {
         match &mut self.staging {
             Some(staging) => {
                 staging.dirty.insert(id, data.to_vec());
                 Ok(())
             }
-            None => write_page_at(&self.file, id, data),
+            None => {
+                self.cache().put(id, data);
+                write_page_at(&self.file, id, data)
+            }
         }
+    }
+
+    /// The page cache. A panic while it was held can't have left it
+    /// half-changed in a way that matters — at worst a page is missing —
+    /// so a poisoned lock is taken over, not passed on.
+    fn cache(&self) -> std::sync::MutexGuard<'_, PageCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// How many bytes of pages the cache holds at most (SPEC §50); 0
+    /// turns it off. Pages over the new size are forgotten.
+    pub fn set_cache_size(&mut self, bytes: usize) {
+        self.cache().resize(bytes / PAGE_SIZE);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_size(&self) -> usize {
+        self.cache().capacity()
+    }
+
+    /// Hits and misses so far.
+    #[cfg(test)]
+    pub(crate) fn cache_stats(&self) -> (usize, usize) {
+        let cache = self.cache();
+        (cache.hits, cache.misses)
+    }
+
+    #[cfg(test)]
+    fn cached(&self, id: PageId) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
+        self.cache().read(id, &mut buf).then_some(buf)
     }
 
     fn check_bounds(&self, id: PageId) -> io::Result<()> {
@@ -448,6 +523,8 @@ impl FileStore {
         let len = self.header.page_count * PAGE_SIZE as u64;
         if self.file.metadata()?.len() > len {
             self.file.set_len(len)?;
+            let page_count = self.header.page_count;
+            self.cache().retain(|id| id < page_count);
         }
         Ok(())
     }
@@ -458,6 +535,27 @@ impl FileStore {
     /// the file may hold some of the pages already (SPEC §19.6's
     /// poisoning covers that case).
     pub fn write_back(&mut self) -> io::Result<()> {
+        let written = self.write_dirty_pages();
+        if written.is_err() {
+            // Some pages may have reached the file, some not: what the
+            // cache holds of them can't be trusted.
+            self.cache().clear();
+        }
+        written?;
+        self.truncate_to_page_count()?;
+        self.file.sync_all()?;
+        let staging = self.staging.take().expect("still staging");
+        // What was written back is what the next reads want; the pages
+        // are in the file now, so the cache may hold them.
+        let mut cache = self.cache();
+        for (id, page) in &staging.dirty {
+            cache.put(*id, page);
+        }
+        Ok(())
+    }
+
+    /// `write_back`'s writes: every dirty page, in ascending id order.
+    fn write_dirty_pages(&mut self) -> io::Result<()> {
         let staging = self
             .staging
             .as_ref()
@@ -478,9 +576,6 @@ impl FileStore {
             }
             write_page_at(&self.file, id, page)?;
         }
-        self.truncate_to_page_count()?;
-        self.file.sync_all()?;
-        self.staging = None;
         Ok(())
     }
 
@@ -495,6 +590,8 @@ impl FileStore {
             self.staging.is_none(),
             "FileStore::restore_pages while staging"
         );
+        // Pages are about to change under it.
+        self.cache().clear();
         for (id, page) in pages {
             write_page_at(&self.file, *id, page)?;
         }
@@ -540,18 +637,14 @@ impl PageStore for FileStore {
 
     fn read_page(&self, id: PageId) -> io::Result<Vec<u8>> {
         self.check_bounds(id)?;
-        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
-        self.read_raw(id, &mut buf)?;
-        Ok(buf)
+        self.read_vec(id)
     }
 
     fn try_read_page(&self, id: PageId) -> io::Result<Option<Vec<u8>>> {
         if id >= self.header.page_count {
             return Ok(None);
         }
-        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
-        self.read_raw(id, &mut buf)?;
-        Ok(Some(buf))
+        self.read_vec(id).map(Some)
     }
 
     fn write_page(&mut self, id: PageId, data: &[u8]) -> io::Result<()> {
@@ -1301,5 +1394,131 @@ mod tests {
         let mut store = FileStore::open(&path).unwrap();
         store.begin();
         store.begin();
+    }
+
+    fn filled(fill: u8) -> Vec<u8> {
+        vec![fill; USABLE_PAGE_SIZE]
+    }
+
+    /// Hits and misses since `before`.
+    fn since(store: &FileStore, before: (usize, usize)) -> (usize, usize) {
+        let now = store.cache_stats();
+        (now.0 - before.0, now.1 - before.1)
+    }
+
+    /// A page is read from the file once, then from the cache (SPEC §50).
+    #[test]
+    fn a_page_read_twice_comes_from_the_file_once() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let store = FileStore::open(&path).unwrap();
+        let before = store.cache_stats();
+        for id in [1, 1, 2, 1] {
+            assert_eq!(store.read_page(id).unwrap(), filled(id as u8));
+        }
+        assert_eq!(since(&store, before), (2, 2));
+    }
+
+    #[test]
+    fn a_cache_of_size_zero_reads_the_file_every_time() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let mut store = FileStore::open(&path).unwrap();
+        store.set_cache_size(0);
+        let before = store.cache_stats();
+        store.read_page(1).unwrap();
+        store.read_page(1).unwrap();
+        assert_eq!(since(&store, before), (0, 2));
+    }
+
+    /// Staged pages never reach the cache: a rolled-back write isn't read
+    /// back, a written-back one is, from the cache.
+    #[test]
+    fn the_cache_holds_the_file_never_a_staged_page() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        assert_eq!(store.read_page(1).unwrap(), filled(1));
+        store.begin();
+        store.write_page(1, &filled(9)).unwrap();
+        assert_eq!(store.read_page(1).unwrap(), filled(9));
+        store.rollback();
+        assert_eq!(store.read_page(1).unwrap(), filled(1));
+
+        store.begin();
+        store.write_page(1, &filled(8)).unwrap();
+        store.write_back().unwrap();
+        let before = store.cache_stats();
+        assert_eq!(store.read_page(1).unwrap(), filled(8));
+        assert_eq!(since(&store, before), (1, 0));
+        assert_eq!(on_disk(&store).read_page(1).unwrap(), filled(8));
+    }
+
+    /// A write-back that failed halfway left some pages new in the file
+    /// and some old: the cache forgets them all, and reads say what the
+    /// file says.
+    #[test]
+    fn a_failed_write_back_forgets_the_cache() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        for id in 1..=3 {
+            store.read_page(id).unwrap();
+        }
+        store.begin();
+        for id in 1..=3 {
+            store.write_page(id, &filled(7)).unwrap();
+        }
+        store.failing_write_backs = 1;
+        store.write_back_fails_after = 1;
+        assert!(store.write_back().is_err());
+        store.rollback();
+        let disk = on_disk(&store);
+        for id in 1..=3 {
+            assert_eq!(
+                store.read_page(id).unwrap(),
+                disk.read_page(id).unwrap(),
+                "{id}"
+            );
+        }
+        assert_eq!(store.read_page(1).unwrap(), filled(7));
+        assert_eq!(store.read_page(2).unwrap(), filled(2));
+    }
+
+    #[test]
+    fn restored_pages_replace_what_the_cache_held() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        assert_eq!(store.read_page(2).unwrap(), filled(2));
+        store.restore_pages(&[(2, filled(6))]).unwrap();
+        assert_eq!(store.read_page(2).unwrap(), filled(6));
+    }
+
+    /// Pages cut off the end of the file leave the cache too.
+    #[test]
+    fn pages_cut_off_leave_the_cache() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.read_page(5).unwrap();
+        assert!(store.cached(5).is_some());
+        store.begin();
+        store.replace_all([(1, filled(8))], 2).unwrap();
+        store.write_back().unwrap();
+        assert!(store.cached(5).is_none());
+        assert_eq!(store.cached(1), Some(filled(8)));
+    }
+
+    /// The cache answers for a page that was damaged on disk after it was
+    /// read — the scan `check` runs still finds it, since it reads the
+    /// file itself (SPEC §50.3).
+    #[test]
+    fn a_page_damaged_after_it_was_cached_is_still_found_by_the_scan() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let store = FileStore::open(&path).unwrap();
+        assert_eq!(store.read_page(1).unwrap(), filled(1));
+        change_file(&path, |bytes| bytes[PAGE_SIZE + 100] ^= 1);
+        assert_eq!(store.read_page(1).unwrap(), filled(1));
+        assert_eq!(store.damaged_pages().unwrap(), [1]);
+        drop(store);
+        assert_damaged(FileStore::open(&path).unwrap().read_page(1), 1);
     }
 }

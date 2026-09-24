@@ -1,8 +1,9 @@
+mod cache;
 mod file;
 mod memory;
 mod slotted;
 
-pub use file::{FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
+pub use file::{DEFAULT_CACHE_SIZE, FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
 pub(crate) use memory::MemoryStore;
 pub use slotted::SlottedPage;
 

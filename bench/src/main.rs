@@ -4,7 +4,8 @@
 //! query must return the same answer everywhere before its time counts.
 //!
 //! `cargo run --release -- [documents]` from `bench/` (default 100000);
-//! `BENCH_ONLY=trunkdb,redb` runs only those.
+//! `BENCH_ONLY=trunkdb,redb` runs only those; `BENCH_TRUNKDB_CACHE_MB=256`
+//! gives trunkdb a cache of that size instead of its default.
 
 mod stores;
 

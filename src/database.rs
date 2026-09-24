@@ -47,6 +47,33 @@ pub(crate) struct State {
     poisoned: bool,
 }
 
+/// How `Database::open_with` opens a database. `#[non_exhaustive]`: made
+/// with `OpenOptions::default()` and its setters, so a new option breaks
+/// nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OpenOptions {
+    /// At most this many bytes of the file's pages kept in memory (SPEC
+    /// §50); 0 keeps none. Default: `storage::DEFAULT_CACHE_SIZE`, 256 MiB.
+    /// It fills only as pages are read.
+    pub cache_size: usize,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        OpenOptions {
+            cache_size: crate::storage::DEFAULT_CACHE_SIZE,
+        }
+    }
+}
+
+impl OpenOptions {
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = bytes;
+        self
+    }
+}
+
 impl Database {
     /// Opens the file, then recovers: if a prior run logged a batch and
     /// crashed before checkpointing it (see `durability::WalDurability`),
@@ -67,8 +94,24 @@ impl Database {
     /// instance may be halfway through writing. To share one database
     /// within a process, clone the handle instead of opening it again.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
+        Self::open_with(path, OpenOptions::default())
+    }
+
+    /// `open`, with `options`: how much of the file to keep in memory,
+    /// for now (SPEC §50).
+    ///
+    /// ```
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let path = dir.path().join("app.trunkdb");
+    /// use trunkdb::{Database, OpenOptions};
+    ///
+    /// let db = Database::open_with(&path, OpenOptions::default().cache_size(256 << 20))?;
+    /// # Ok::<(), trunkdb::Error>(())
+    /// ```
+    pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> crate::Result<Self> {
         let path = path.as_ref();
         let mut store = FileStore::open_before_recovery(path)?;
+        store.set_cache_size(options.cache_size);
         let (mut durability, pending) = WalDurability::open(path)?;
         if !pending.is_empty() {
             store.restore_pages(&pending)?;
@@ -356,6 +399,40 @@ mod tests {
             .unwrap();
         all.sort_by_key(|(id, _)| *id);
         all
+    }
+
+    /// The cache's size is an option; any size, none included, gives
+    /// the same data (SPEC §50).
+    #[test]
+    fn open_with_any_cache_size_reads_the_same() {
+        assert_eq!(OpenOptions::default().cache_size, 256 << 20);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let ids: Vec<_> = {
+            let db = Database::open(&path).unwrap();
+            let docs = db.collection::<crate::Document>("docs");
+            use crate::id::IdGenerator;
+            let ids: Vec<_> = (0..500).map(|_| db.id_gen().generate()).collect();
+            let ops = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| WriteOp::Insert("docs".into(), *id, crate::Document::Int(i as i64)))
+                .collect();
+            db.write_batch(ops).unwrap();
+            drop(docs);
+            ids
+        };
+        for size in [0, 8192 * 3, 1 << 20] {
+            let options = OpenOptions::default().cache_size(size);
+            let db = Database::open_with(&path, options).unwrap();
+            let docs = db.collection::<crate::Document>("docs");
+            for _ in 0..2 {
+                for (i, id) in ids.iter().enumerate() {
+                    assert_eq!(docs.get(id).unwrap(), Some(crate::Document::Int(i as i64)));
+                }
+            }
+            assert_eq!(db.read().unwrap().store.cache_size(), size / 8192);
+        }
     }
 
     #[test]

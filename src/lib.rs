@@ -28,7 +28,7 @@ pub use check::{CheckReport, FileInfo};
 pub use collection::{Collection, IndexFields, Upserted};
 pub use compact::Compacted;
 pub use cursor::Cursor;
-pub use database::Database;
+pub use database::{Database, OpenOptions};
 pub use document::{DocId, Document};
 pub use export::Summary;
 

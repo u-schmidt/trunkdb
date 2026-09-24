@@ -140,18 +140,18 @@ documents:
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 6.3k/s | 41k/s | 41k/s | 29k/s |
-| one commit | 16 ms | 5.3 ms | 5.8 ms | 10 ms |
-| get by id | 32 µs | 18 µs | 2.7 µs | 3.6 µs |
-| 1000 documents by index | 4.7 ms | 1.9 ms | 1.1 ms | 1.9 ms |
-| oldest 20 of a status | 0.1 ms | 23 µs | 16 µs | 21 µs |
+| insert, 1000 per commit | 6.8k/s | 43k/s | 44k/s | 27k/s |
+| one commit | 16 ms | 5.0 ms | 5.6 ms | 11 ms |
+| get by id | 6.7 µs | 16 µs | 2.4 µs | 5.7 µs |
+| 1000 documents by index | 2.2 ms | 1.6 ms | 1.0 ms | 1.7 ms |
+| oldest 20 of a status | 47 µs | 23 µs | 15 µs | 21 µs |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
-Each gap has a known cause (SPEC.md §48). The first one found, a
-sorted read that collected the whole range before stopping at the
-limit, is fixed: "oldest 20" took 19 ms before the lazy B-tree walk
-(§49). What's left: there's no page cache, and a commit flushes three
-times. Those are the next steps on the roadmap.
+Each gap has a known cause (SPEC.md §48), and the first two are fixed:
+"oldest 20" took 19 ms before the lazy B-tree walk (§49), a lookup by
+id 32 µs before the page cache (§50). What's left for reads is decoding
+and a copy per page; for writes, a commit flushes three times where the
+others flush once. That's the next step on the roadmap.
 
 ```
 cd bench && cargo run --release
@@ -159,7 +159,7 @@ cd bench && cargo run --release
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §50 for the full list and reasoning):
+Done so far (see SPEC.md §51 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -230,8 +230,10 @@ Done so far (see SPEC.md §50 for the full list and reasoning):
     measured gaps order what comes next.
 23. **A lazy B-tree walk** (§49): reading in sort order stops at the
     limit, forward or backward — "oldest 20" 150–200× faster.
+24. **A page cache** (§50): 256 MiB by default, `OpenOptions::cache_size`
+    to change it; lookups by id 4× faster.
 
-What's still open: SPEC.md §50.2.
+What's still open: SPEC.md §51.2.
 
 ## License
 
