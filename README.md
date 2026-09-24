@@ -128,7 +128,7 @@ Done so far (see SPEC.md §36 for the full list and reasoning):
    Items 4–8 → 0.4.0.
 9. **A filter builder** (§35): `Filter::new().eq("status", "Complete")`.
 
-Next: an unordered list of further features (§36).
+What's still open: SPEC.md §36.2.
 
 ## License
 

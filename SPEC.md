@@ -56,7 +56,7 @@ layer's own implementation is still incomplete in v0).
 | Indexing | `Index` | `BTreeIndex` (persisted B-tree, O(log n), byte-string keys; primary `_id` index §10, secondary indexes §28) + `InMemoryIndex` (fake, tests only) | Yes |
 | Transactions | `TransactionManager` | `GlobalLockTxnManager` (one global lock), wired via `Database::write_batch` (§17); rollback via staged pages (§19.5) | Yes — atomicity and rollback; no isolation |
 | Durability | `Durability` | `WalDurability` (page-image write-ahead log, §19; op-level before that, §16) + `NoopDurability` (fake, tests only) | Yes |
-| Query execution | — (`Filter`) | flat AND of comparisons; a full scan, or one secondary index's range by a fixed rule (§28.4) | No — deliberately minimal |
+| Query execution | — (`Filter`) | flat AND of comparisons, built with a builder (§35); a full scan, one secondary index's range (§28.4), or an index read in sort order up to the limit (§34.2), by a fixed rule | No — deliberately minimal |
 | Public API | `Collection<T>`, `Database` | Both `Collection<Document>` (§12) and typed `Collection<T>` (§13.3) real | Yes |
 
 ## 4. Key decisions and rationale
@@ -1190,7 +1190,7 @@ Considered and rejected:
   common; see §20.4.
 
 One collection per page, never mixed: a scan of one collection then
-touches only its own pages, and dropping a collection (later) can free
+touches only its own pages, and dropping a collection (§36.2) can free
 whole pages.
 
 ### 20.2 `SlottedPage`: compaction, slot reuse, in-place update
@@ -1236,12 +1236,12 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§36, "Later").
+future vacuum (§36.2).
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
 DocId][document]`. `0` means the whole document is in the cell — the
-only kind written today. `1` is reserved for overflow (§36, item 7): the
+only kind written at the time. `1` was reserved for overflow, since in use (§26): the
 cell will hold `[u32 total length][u64 first Overflow page]` and as much
 of the document as fits. Reading it today is an `InvalidData` error, not
 a misread. The page type tag `Overflow = 6` is reserved alongside it, so
@@ -1354,8 +1354,8 @@ Inside `write_batch`, an `Insert` of an id that already existed, and an
 `Update`/`Delete` of one that didn't (or of a collection that didn't),
 were skipped — and the batch returned `Ok`. A leftover of op replay
 (§16.1), which page-image recovery (§19.4) no longer needs; for a
-caller, "saved" when nothing was saved. Block B's typed batch API (item
-5, the sync workload's batch) would have inherited it.
+caller, "saved" when nothing was saved. Block B's typed batch API (§24,
+the sync workload's batch) would have inherited it.
 
 Now `apply_write_op` returns `Error::DuplicateId { collection, id }` or
 `Error::NotFound { collection, id }`, and the whole batch rolls back.
@@ -1388,9 +1388,9 @@ pages holding dozens of entries.
   matter if a power loss tore the header page, and all of the header's
   fields sit in its first 512 bytes, which disks write atomically.
 - **`u16` lengths** in the document encoding can't wrap today, since a
-  whole document must fit in one page; item 7 (overflow) must widen
+  whole document must fit in one page; overflow pages (§26) had to widen
   them, as already planned. *Done in §26.1.*
-- **Bit rot** stays undetected until per-page checksums ("Later").
+- **Bit rot** stays undetected until per-page checksums (§36.2).
 
 ## 23. `find_with_ids` (`collection.rs`, `query.rs`)
 
@@ -1520,7 +1520,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is in "Later" (§36). A
+A pattern language (regex, `LIKE` wildcards) is still open (§36.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1701,7 +1701,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§36, "Later").
+(§36.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2004,8 +2004,8 @@ test every time — checked.
 
 **Several matches are an error**, not "update the first" as in MongoDB:
 there's no meaningful first without a sort, and a key the caller thought
-unique but isn't is a bug worth surfacing. Unique indexes ("Later") would
-catch it at insert instead.
+unique but isn't is a bug worth surfacing. A unique index (§33) catches
+it at insert instead.
 
 Not in `Batch`: a batch op's outcome (insert or update, which id) would
 only be known at `commit`, unlike `Batch::insert`'s id (§24.3). Add it
@@ -2174,7 +2174,7 @@ before or entirely after it, and documents in different collections
 that refer to each other agree. Readers go on in parallel; writers wait.
 
 That's the opposite of `cursor` (§29.4), which holds no lock between
-items, and the roadmap's sketch (§36) had planned to export through a
+items, and the first roadmap sketch had planned to export through a
 cursor.
 Rejected, because an export is a backup: read-committed per document
 would let a batch that updates two collections appear half-applied. The
@@ -2210,8 +2210,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§36,
-  "Later").
+  seconds; a snapshot that doesn't block writers needs MVCC (§36.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2320,8 +2319,8 @@ through export and import anyway, and this can't happen.)
 - A lookup splits the path as it walks — no allocation — so a top-level
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
-- Still one field per index: compound and unique indexes remain in
-  "Later" (§36).
+- Still one field per index: compound indexes are still open (§36.2);
+  unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
 
@@ -2739,100 +2738,75 @@ timestamp struct, an enum — go through `serde_bridge::to_document`.
 - The doc example on `Filter`'s builder `impl` runs as a doc test.
 
 ### 35.4 Limits
-- Still AND only: OR and nesting remain in "Later" (§36); the builder
+- Still AND only: OR and nesting are still open (§36.2); the builder
   is where `.or(...)` will go.
 - No compile-time check of field names — they're strings, as in
   MongoDB's drivers (a closure like LiteDB's `x => x.Name` can't be
   inspected in Rust).
 
-## 36. Open work / next milestones
+## 36. Roadmap
 
-Roadmap from v0 (crate 0.1.0) towards v1, agreed 2026-09-23. Ordered by
-priority: correctness and file format first, then what the sync workload (§5.3)
-needs, then the large-document workload (§5.2). "v1" is a milestone name, not a semver promise:
-0.x minor versions may still break API and file format; 1.0.0 is
-reserved for a stable format with a migration path.
+"v1" is a milestone name, not a semver promise: 0.x minor versions may
+still break API and file format. 1.0.0 is reserved for a stable format
+with a migration path — export/import (§30) is that path.
 
-**Block A — correctness and file format** (before the sync workload stores real
-data, so real data never needs a format migration):
-1. **Page-image WAL — done** (§19). Fixed the crash-safety hole in §16
-   and made §17.3's rollback real.
-2. **Several documents per data page — done** (§20). Was one document
-   per 8 KB page, ~9× space overhead on the sync workload's real data; overflow
-   pages have their page type and a cell flag reserved.
-3. **Exclusive file lock + a format version in the header — done**
-   (§21). A second open of a file in use is an error; so is a format
-   this build doesn't know.
+### 36.1 Done
+The first roadmap (2026-09-23) was ordered by priority: correctness and
+the file format first, so real data never needs a migration; then what
+the sync workload (§5.3) needs; then the large-document workload (§5.2).
+All of it is done:
 
-*Addendum — done* (§22): a review for data-damage risks after items
-1–3 found three more, all fixed: `open` overwrote small foreign files;
-batch ops on duplicate or missing ids were silently skipped; an
-overlong collection name hung `insert`.
+| Version | What | Sections |
+|---|---|---|
+| 0.1.0 | The v0 core: pages, catalog, B-tree primary index, document encoding, serde bridge, filter/sort/limit, batches, a WAL | §6–§18 |
+| 0.3.0 | Block A, correctness and file format: page-image WAL, several documents per page, file lock and format version, three data-risk fixes | §19–§22 |
+| 0.3.0 | Block B, the sync workload: `find_with_ids`, typed batches, `Contains` (planned as 0.2.0, never released on its own) | §23–§25 |
+| 0.3.0 | Block C, the large-document workload: overflow pages, a thread-safe `Database`, secondary indexes, `find_one`/`count`/`upsert`/`cursor` | §26–§29 |
+| 0.4.0 | Export/import, nested-field paths, null and missing fields, unique indexes, sorting through an index; file format 5 | §30–§34 |
+| next | A filter builder | §35 |
 
-**Block B — the sync workload** (all small):
+### 36.2 Open
+Unordered within each group; each line says where the need or the
+limit is described.
 
-4. **`find` with ids — done** (§23): `find_with_ids(filter) ->
-   Vec<(DocId, T)>`, on both paths. Takes most of the pressure off the
-   "struct with its own id field" question (§13.5, §18), which stays
-   unscheduled.
-5. **A typed batch API — done** (§24): `db.batch()`, ops against typed
-   `Collection` handles, one atomic `commit` — one batch per
-   sync run.
-6. **`Op::Contains`, case-insensitive — done** (§25), for the
-   dashboard's search fields. Deliberately narrower than general regex.
+**Queries**
+- OR and nested conditions in `Filter` — the builder is where `.or(...)`
+  goes (§35.4).
+- A pattern language: regex or `LIKE`-style wildcards (§25.4).
+- Conditions on array elements (`tags` contains `x`), with multikey
+  indexes (§31.3).
+- An `Exists` operator, to tell a missing field from a null one (§32.5).
 
-→ **0.2.0: the sync workload can move from MongoDB to trunkdb.** Block B is
-complete. No 0.2.0 was released on its own: the bump waited until Block
-C was done too, and went straight to 0.3.0.
+**Indexes**
+- Compound indexes: several fields in one key, also unique across
+  several (`(tenant, email)`, §33.7).
+- Sparse indexes, skipping missing fields, for fields few documents
+  have (§32.2).
+- A lazy B-tree walk, with backward leaf links for `Desc` (§34.2).
 
-**Block C — the large-document workload:**
+**Storage and durability**
+- Compaction/vacuum: half-empty data pages are only refilled by updates
+  of their own documents (§20), and the file never shrinks.
+- Per-page checksums, to detect a damaged page instead of misreading it
+  (a format change).
 
-7. **Overflow pages — done** (§26): documents larger than a page (long-form
-   text) go to a chain of overflow pages; lengths in the document
-   encoding are `u32`.
-8. **`Database` as a thread-safe, cloneable handle — done** (§27):
-   `Arc` inside, one `RwLock` instead of `RefCell`s, `Collection` and
-   `Batch` without the `'db` borrow — the first practical step of
-   concurrent access (§4.6).
-9. **Secondary indexes — done** (§28): single top-level field,
-   byte-string B-tree keys, pages split by bytes with a key-size cap
-   that restores §10.4's guarantee, and a fixed rule for when `find`
-   uses one.
-10. **API rounding-out — done** (§29): `find_one`, `count`, `upsert`
-    (by filter, atomic), and a streaming `cursor` that holds only ids
-    and no lock between items.
+**Concurrency**
+- Readers that don't wait for a write batch: MVCC or pre-batch page
+  snapshots (§27). It would also stop an export from blocking writers
+  (§30.6).
 
-→ **0.3.0: the large-document workload can use trunkdb.** Block C is complete; `Cargo.toml` is
-0.3.0 (it covers Block B's milestone as well). Per §5.2's sequencing, that app
-first gets a `Storage` trait around its existing file-based writer — a
-pure refactor that can happen anytime, independent of trunkdb.
+**API**
+- Dropping a collection, freeing its pages whole — a data page never
+  holds two collections (§20).
+- Deleting by filter (`delete_many`), atomic like `upsert` (§29.3);
+  today it's `find_with_ids` and then a batch of deletes.
+- A struct with its own id field (`#[serde(rename = "_id")]`, §13.5,
+  §18) — `find_with_ids` (§23) covers most needs; unscheduled.
 
-**Later** — export/import first, the rest unordered:
+**Tooling and reach**
+- A CLI: inspect and check a file, run export/import.
+- PyO3 bindings, for Python apps.
+- Benchmarks against SQLite, redb and sled.
 
-- **Export/import as JSON Lines — done** (§30): tagged JSON, one file
-  per database, ids kept, chunked import, and an export that is a
-  consistent snapshot. The migration path 1.0.0 needs.
-- **Nested-field paths — done** (§31): `address.city` in conditions,
-  sorts and indexes; a dot always separates, arrays aren't entered.
-- **Null and missing fields — done** (§32): `== null` matches both,
-  through indexes too; format version 4.
-- **Unique indexes — done** (§33): `ensure_unique_index`; equal as `Eq`
-  sees it, nulls exempt, checked per op; format 5, which reads format 4
-  as it is.
-- **Sorting through an index — done** (§34): a sort with a limit reads
-  the index in order and stops at the limit; one total sort order for
-  every kind of value.
-
-→ **0.4.0** (2026-09-24): the five items above — new API, a changed sort
-order and file format 5 (which opens format-4 files as they are).
-
-- **A filter builder — done** (§35): `Filter::new().eq(...).sort_desc(...)
-  .limit(...)`, and plain Rust values as `Document`s.
-
-Unordered: `Filter` OR/nesting and regex; compaction/vacuum;
-per-page checksums; compound and sparse indexes, an `Exists` operator,
-and a lazy B-tree walk (§34.2); conditions on array elements (and
-multikey indexes, §31.3); readers that don't wait for a write batch
-(MVCC or pre-batch page snapshots; reader/writer locking is done, §27);
-PyO3 bindings (for Python apps); a CLI for inspecting/verifying a file
-(and running export/import); benchmarks against SQLite/redb/sled.
+Not planned: a cost-based query planner, joins, aggregates, multiple
+writers, encryption, schema validation (§6).
