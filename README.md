@@ -198,6 +198,8 @@ Done so far (see SPEC.md §48 for the full list and reasoning):
     an index serves the leading keys its fields match, the rest are
     sorted in memory. `Filter.sort` is now a `Vec<Sort>`.
 
+    Items 19–21 → 0.9.0.
+
 What's still open: SPEC.md §48.2.
 
 ## License
