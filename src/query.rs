@@ -49,6 +49,114 @@ pub struct Filter {
     pub limit: Option<usize>,
 }
 
+/// Building a filter one call at a time (SPEC §35) — every condition is
+/// ANDed to the ones before:
+///
+/// ```
+/// use trunkdb::query::Filter;
+///
+/// let newest_complete = Filter::new()
+///     .eq("status", "Complete")
+///     .gte("seen", 10)
+///     .sort_desc("started_at")
+///     .limit(1);
+/// # assert_eq!(newest_complete.conditions.len(), 2);
+/// ```
+///
+/// Values are anything that converts into a `Document` — `bool`, the
+/// integer and float types that fit, `&str`/`String`, `DocId`, an
+/// `Option` of those (`None` is null) — or a `Document` itself. Fields
+/// can be dotted paths (`"address.city"`, SPEC §31).
+impl Filter {
+    /// Matches every document: no conditions, no sort, no limit.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a condition: the field `op`-compares true against `value`.
+    pub fn condition(
+        mut self,
+        field: impl Into<String>,
+        op: Op,
+        value: impl Into<Document>,
+    ) -> Self {
+        self.conditions.push(Condition {
+            field: field.into(),
+            op,
+            value: value.into(),
+        });
+        self
+    }
+
+    /// `field == value`. Against null, also true for a missing field
+    /// (SPEC §32).
+    pub fn eq(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.condition(field, Op::Eq, value)
+    }
+
+    /// `field != value` — true for a null or missing field unless `value`
+    /// is null (SPEC §32).
+    pub fn ne(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.condition(field, Op::Ne, value)
+    }
+
+    pub fn lt(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.condition(field, Op::Lt, value)
+    }
+
+    pub fn lte(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.condition(field, Op::Lte, value)
+    }
+
+    pub fn gt(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.condition(field, Op::Gt, value)
+    }
+
+    pub fn gte(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.condition(field, Op::Gte, value)
+    }
+
+    /// The field is a string containing `needle`, ignoring case (see
+    /// `Op::Contains`).
+    pub fn contains(self, field: impl Into<String>, needle: impl Into<String>) -> Self {
+        self.condition(field, Op::Contains, needle.into())
+    }
+
+    /// The field is null or missing (SPEC §32).
+    pub fn is_null(self, field: impl Into<String>) -> Self {
+        self.condition(field, Op::Eq, Document::Null)
+    }
+
+    /// The field is there and not null.
+    pub fn is_not_null(self, field: impl Into<String>) -> Self {
+        self.condition(field, Op::Ne, Document::Null)
+    }
+
+    /// Sorts by `field`, smallest first — replacing any earlier sort.
+    pub fn sort_asc(self, field: impl Into<String>) -> Self {
+        self.sort_by(field, SortOrder::Asc)
+    }
+
+    /// Sorts by `field`, largest first — replacing any earlier sort.
+    pub fn sort_desc(self, field: impl Into<String>) -> Self {
+        self.sort_by(field, SortOrder::Desc)
+    }
+
+    pub fn sort_by(mut self, field: impl Into<String>, order: SortOrder) -> Self {
+        self.sort = Some(Sort {
+            field: field.into(),
+            order,
+        });
+        self
+    }
+
+    /// At most `n` results — replacing any earlier limit.
+    pub fn limit(mut self, n: usize) -> Self {
+        self.limit = Some(n);
+        self
+    }
+}
+
 impl Filter {
     pub fn matches(&self, doc: &Document) -> bool {
         self.conditions.iter().all(|c| condition_matches(c, doc))
@@ -413,6 +521,55 @@ mod tests {
             ..Default::default()
         };
         assert!(!non_string_needle.matches(&doc(&[("n", Document::String("1".into()))])));
+    }
+
+    #[test]
+    fn the_builder_builds_what_the_literal_spells_out() {
+        let cond = |field: &str, op, value| Condition {
+            field: field.into(),
+            op,
+            value,
+        };
+        let built = Filter::new()
+            .eq("a", 1)
+            .ne("b", "x")
+            .lt("c", 1.5)
+            .lte("d", true)
+            .gt("e", 2u8)
+            .gte("f.g", -3i64)
+            .contains("h", "Rust")
+            .is_null("i")
+            .is_not_null("j")
+            .condition("k", Op::Eq, Document::Array(vec![]))
+            .sort_asc("x")
+            .sort_desc("y") // replaces the first
+            .limit(10)
+            .limit(5); // replaces the first
+        let spelled_out = Filter {
+            conditions: vec![
+                cond("a", Op::Eq, Document::Int(1)),
+                cond("b", Op::Ne, Document::String("x".into())),
+                cond("c", Op::Lt, Document::Float(1.5)),
+                cond("d", Op::Lte, Document::Bool(true)),
+                cond("e", Op::Gt, Document::Int(2)),
+                cond("f.g", Op::Gte, Document::Int(-3)),
+                cond("h", Op::Contains, Document::String("Rust".into())),
+                cond("i", Op::Eq, Document::Null),
+                cond("j", Op::Ne, Document::Null),
+                cond("k", Op::Eq, Document::Array(vec![])),
+            ],
+            sort: Some(Sort {
+                field: "y".into(),
+                order: SortOrder::Desc,
+            }),
+            limit: Some(5),
+        };
+        // `Filter` has no `PartialEq` (a `Float` NaN isn't equal to itself).
+        assert_eq!(format!("{built:?}"), format!("{spelled_out:?}"));
+        assert_eq!(
+            format!("{:?}", Filter::new()),
+            format!("{:?}", Filter::default())
+        );
     }
 
     fn city_is(path: &str, city: &str) -> Filter {

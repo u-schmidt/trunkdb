@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §35 for the roadmap.
+large-document workload (§5.2) the second; see §36 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1236,12 +1236,12 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§35, "Later").
+future vacuum (§36, "Later").
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
 DocId][document]`. `0` means the whole document is in the cell — the
-only kind written today. `1` is reserved for overflow (§35, item 7): the
+only kind written today. `1` is reserved for overflow (§36, item 7): the
 cell will hold `[u32 total length][u64 first Overflow page]` and as much
 of the document as fits. Reading it today is an `InvalidData` error, not
 a misread. The page type tag `Overflow = 6` is reserved alongside it, so
@@ -1520,7 +1520,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is in "Later" (§35). A
+A pattern language (regex, `LIKE` wildcards) is in "Later" (§36). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1701,7 +1701,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§35, "Later").
+(§36, "Later").
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2083,7 +2083,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§35). It's also a backup that can be read and `diff`ed, and a way to
+(§36). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2174,7 +2174,7 @@ before or entirely after it, and documents in different collections
 that refer to each other agree. Readers go on in parallel; writers wait.
 
 That's the opposite of `cursor` (§29.4), which holds no lock between
-items, and the roadmap's sketch (§35) had planned to export through a
+items, and the roadmap's sketch (§36) had planned to export through a
 cursor.
 Rejected, because an export is a backup: read-committed per document
 would let a batch that updates two collections appear half-applied. The
@@ -2210,7 +2210,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§35,
+  seconds; a snapshot that doesn't block writers needs MVCC (§36,
   "Later").
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
@@ -2321,7 +2321,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
 - Still one field per index: compound and unique indexes remain in
-  "Later" (§35).
+  "Later" (§36).
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
 
@@ -2666,7 +2666,86 @@ lazy walk, with backward leaf links for `Desc`, is a later step.
   values nothing orders (§34.1), so they all tie.
 - `count` ignores `sort`, as before.
 
-## 35. Open work / next milestones
+## 35. A filter builder (`query.rs`, `document.rs`)
+
+Real and tested: a `Filter` can be built one call at a time.
+
+```rust
+Filter::new()
+    .eq("status", "Complete")
+    .gte("seen", 10)
+    .sort_desc("started_at")
+    .limit(1)
+```
+
+What it replaces, still valid (the fields stay public):
+
+```rust
+Filter {
+    conditions: vec![
+        Condition { field: "status".into(), op: Op::Eq, value: Document::String("Complete".into()) },
+        Condition { field: "seen".into(), op: Op::Gte, value: Document::Int(10) },
+    ],
+    sort: Some(Sort { field: "started_at".into(), order: SortOrder::Desc }),
+    limit: Some(1),
+}
+```
+
+### 35.1 Methods, starting from `Filter::new()`
+`eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `contains`, `is_null`,
+`is_not_null`, and `condition(field, op, value)` for any `Op`; each adds
+one condition, ANDed with the rest. `sort_asc`/`sort_desc`/`sort_by` and
+`limit` replace what was there — there's one sort and one limit.
+Fields are any `impl Into<String>`, dotted paths included (§31). Each
+method takes `self` and returns it, so building conditionally is
+`filter = filter.eq(...)` inside an `if`.
+
+Rejected: starting points like `Filter::eq("status", ...)` next to the
+chaining `.eq(...)`. A type can't have an associated function and a
+method of the same name, so it would take a second set of names
+(`Filter::where_eq`) or free functions (LiteDB's `Query.EQ`, which
+builds a query object, with `Query.And` to combine). One starting point
+and one set of names is less to learn; `Filter::new()` costs one call.
+
+Rejected: a borrowing builder (`&mut self -> &mut Self`). It chains the
+same way, but `let f = Filter::new().eq(...)` would then borrow a
+temporary that is dropped at the end of the statement; the consuming
+form just works, and a `Filter` is cheap to move.
+
+### 35.2 Plain values as `Document`s
+`From` implementations turn plain values into `Document`s, so a value
+is `36` or `"Berlin"` rather than `Document::Int(36)`: `bool`; `i8`–`i64`
+and `u8`–`u32`; `f32`, `f64`; `&str`, `String`; `DocId`; and `Option`
+of any of these, with `None` as `Null` — so a typed `Option` field's
+value goes into a filter as it is, and `None` finds null and missing
+(§32). A `Document` can always be passed directly.
+
+Left out on purpose: `u64` and `usize` (they can exceed `i64`; a
+`TryFrom` would turn every filter into a `Result`), and `Vec<T>` (is
+`Vec<u8>` an `Array` or `Binary`?). Values of an app's own types — a
+timestamp struct, an enum — go through `serde_bridge::to_document`.
+
+### 35.3 Tests
+- The builder produces exactly what the struct literal spells out —
+  every method, a dotted path, a replaced sort and limit.
+- Every `From` conversion, including an unsuffixed literal (`i32`) and
+  nested `Option`s.
+- End to end through a typed collection: conditions, sort and limit,
+  an `Option` value, and a built filter reading an index in order
+  (§34).
+- The time-series integration test (§15) now builds its filters this
+  way — including one assembled from optional parameters — and needs
+  only `Filter` from `query` for it.
+- The doc example on `Filter`'s builder `impl` runs as a doc test.
+
+### 35.4 Limits
+- Still AND only: OR and nesting remain in "Later" (§36); the builder
+  is where `.or(...)` will go.
+- No compile-time check of field names — they're strings, as in
+  MongoDB's drivers (a closure like LiteDB's `x => x.Name` can't be
+  inspected in Rust).
+
+## 36. Open work / next milestones
 
 Roadmap from v0 (crate 0.1.0) towards v1, agreed 2026-09-23. Ordered by
 priority: correctness and file format first, then what the sync workload (§5.3)
@@ -2743,6 +2822,12 @@ pure refactor that can happen anytime, independent of trunkdb.
 - **Sorting through an index — done** (§34): a sort with a limit reads
   the index in order and stops at the limit; one total sort order for
   every kind of value.
+
+→ **0.4.0** (2026-09-24): the five items above — new API, a changed sort
+order and file format 5 (which opens format-4 files as they are).
+
+- **A filter builder — done** (§35): `Filter::new().eq(...).sort_desc(...)
+  .limit(...)`, and plain Rust values as `Document`s.
 
 Unordered: `Filter` OR/nesting and regex; compaction/vacuum;
 per-page checksums; compound and sparse indexes, an `Exists` operator,

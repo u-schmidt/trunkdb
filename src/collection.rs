@@ -2038,6 +2038,62 @@ mod tests {
         assert_eq!(users.explain(&oldest(None)).unwrap(), QueryPlan::Scan);
     }
 
+    /// The builder end to end (SPEC §35): conditions, a sort, a limit and
+    /// an `Option` passed as it is — `None` finds what serde stored as
+    /// `None`.
+    #[test]
+    fn a_built_filter_finds_through_a_typed_collection() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Member {
+            name: String,
+            age: i64,
+            nick: Option<String>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let members = db.collection::<Member>("members");
+        for (name, age, nick) in [("Ada", 36, None), ("Bob", 41, Some("B")), ("Cy", 17, None)] {
+            let nick = nick.map(String::from);
+            members
+                .insert(Member {
+                    name: name.into(),
+                    age,
+                    nick,
+                })
+                .unwrap();
+        }
+        members.ensure_index("age").unwrap();
+        let names = |filter| -> Vec<String> {
+            members
+                .find(filter)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.name)
+                .collect()
+        };
+
+        let wanted_nick: Option<&str> = None;
+        assert_eq!(
+            names(Filter::new().eq("nick", wanted_nick).sort_asc("name")),
+            ["Ada", "Cy"]
+        );
+        assert_eq!(
+            names(Filter::new().gte("age", 18).sort_desc("age").limit(1)),
+            ["Bob"]
+        );
+        assert_eq!(
+            names(Filter::new().contains("name", "a").is_null("nick")),
+            ["Ada"]
+        );
+        let oldest_adult = Filter::new().gte("age", 18).sort_desc("age").limit(1);
+        assert_eq!(
+            members.explain(&oldest_adult).unwrap(),
+            QueryPlan::IndexOrder {
+                field: "age".to_string()
+            }
+        );
+    }
+
     // --- Unique indexes (SPEC §33) ---
 
     fn duplicate(result: crate::Result<impl std::fmt::Debug>) -> (DocId, DocId) {

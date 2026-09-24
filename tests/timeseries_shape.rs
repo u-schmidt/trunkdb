@@ -16,8 +16,8 @@
 //!   should grow support for.
 
 use serde::{Deserialize, Serialize};
-use trunkdb::query::{Condition, Filter, Op, QueryPlan, Sort, SortOrder};
-use trunkdb::{Database, Document};
+use trunkdb::Database;
+use trunkdb::query::{Filter, QueryPlan};
 
 /// A location ping — high-frequency, append-only data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,25 +60,10 @@ fn time_range_filter_combined_with_sort_and_limit() {
     }
 
     // tst >= 200 AND tst <= 400, ordered oldest-first.
-    let filter = Filter {
-        conditions: vec![
-            Condition {
-                field: "tst".to_string(),
-                op: Op::Gte,
-                value: Document::Int(200),
-            },
-            Condition {
-                field: "tst".to_string(),
-                op: Op::Lte,
-                value: Document::Int(400),
-            },
-        ],
-        sort: Some(Sort {
-            field: "tst".to_string(),
-            order: SortOrder::Asc,
-        }),
-        limit: None,
-    };
+    let filter = Filter::new()
+        .gte("tst", 200)
+        .lte("tst", 400)
+        .sort_asc("tst");
 
     let found = pings.find(filter.clone()).unwrap();
     let tsts: Vec<i64> = found.iter().map(|p| p.tst).collect();
@@ -108,16 +93,7 @@ fn most_recent_ping_is_sort_desc_limit_one() {
         .insert(ping("phone-1", 200, 52.55, 13.45, 88))
         .unwrap();
 
-    let filter = Filter {
-        sort: Some(Sort {
-            field: "tst".to_string(),
-            order: SortOrder::Desc,
-        }),
-        limit: Some(1),
-        ..Default::default()
-    };
-
-    let found = pings.find(filter).unwrap();
+    let found = pings.find(Filter::new().sort_desc("tst").limit(1)).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].tst, 300);
 }
@@ -132,33 +108,24 @@ fn dynamically_built_optional_filters_are_anded_together() {
     pings.insert(ping("phone-1", 200, 52.5, 13.4, 15)).unwrap();
     pings.insert(ping("phone-2", 200, 52.5, 13.4, 15)).unwrap();
 
-    // Mirrors how a real query endpoint builds `conditions` incrementally
+    // Mirrors how a real query endpoint builds a filter incrementally
     // from whichever optional query params were actually supplied.
     let tid_param: Option<&str> = Some("phone-1");
     let max_batt_param: Option<i64> = Some(50);
+    let no_param: Option<i64> = None;
 
-    let mut conditions = Vec::new();
+    let mut filter = Filter::new();
     if let Some(tid) = tid_param {
-        conditions.push(Condition {
-            field: "tid".to_string(),
-            op: Op::Eq,
-            value: Document::String(tid.to_string()),
-        });
+        filter = filter.eq("tid", tid);
     }
     if let Some(max_batt) = max_batt_param {
-        conditions.push(Condition {
-            field: "batt".to_string(),
-            op: Op::Lte,
-            value: Document::Int(max_batt),
-        });
+        filter = filter.lte("batt", max_batt);
+    }
+    if let Some(min_batt) = no_param {
+        filter = filter.gte("batt", min_batt);
     }
 
-    let found = pings
-        .find(Filter {
-            conditions,
-            ..Default::default()
-        })
-        .unwrap();
+    let found = pings.find(filter).unwrap();
 
     assert_eq!(found, vec![ping("phone-1", 200, 52.5, 13.4, 15)]);
 }

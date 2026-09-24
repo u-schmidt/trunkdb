@@ -32,6 +32,44 @@ impl std::fmt::Display for DocId {
     }
 }
 
+// Plain Rust values as `Document`s, so a filter can say
+// `.eq("age", 36)` instead of `Document::Int(36)` (SPEC §35.2). Only
+// lossless ones: no `u64`/`usize`, which can exceed `i64`, and no `Vec`,
+// which could mean `Array` or `Binary`.
+macro_rules! document_from {
+    ($($from:ty => $variant:ident as $as:ty),* $(,)?) => {$(
+        impl From<$from> for Document {
+            fn from(value: $from) -> Self {
+                Document::$variant(<$as>::from(value))
+            }
+        }
+    )*};
+}
+
+document_from! {
+    bool => Bool as bool,
+    i8 => Int as i64,
+    i16 => Int as i64,
+    i32 => Int as i64,
+    i64 => Int as i64,
+    u8 => Int as i64,
+    u16 => Int as i64,
+    u32 => Int as i64,
+    f32 => Float as f64,
+    f64 => Float as f64,
+    String => String as String,
+    &str => String as String,
+    DocId => Id as DocId,
+}
+
+/// `None` is `Null`, so an `Option` field's value can go into a filter
+/// as it is.
+impl<T: Into<Document>> From<Option<T>> for Document {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Document::Null, Into::into)
+    }
+}
+
 const TAG_NULL: u8 = 0;
 const TAG_BOOL: u8 = 1;
 const TAG_INT: u8 = 2;
@@ -233,6 +271,35 @@ mod tests {
             Document::String("two".to_string()),
             Document::Bool(false),
         ]));
+    }
+
+    #[test]
+    fn plain_values_convert_into_documents() {
+        let id = DocId([7; 16]);
+        let cases: Vec<(Document, Document)> = vec![
+            (true.into(), Document::Bool(true)),
+            ((-8i8).into(), Document::Int(-8)),
+            (300i16.into(), Document::Int(300)),
+            (5.into(), Document::Int(5)), // an unsuffixed literal is i32
+            (i64::MIN.into(), Document::Int(i64::MIN)),
+            (255u8.into(), Document::Int(255)),
+            (u16::MAX.into(), Document::Int(65535)),
+            (u32::MAX.into(), Document::Int(4_294_967_295)),
+            (1.5f32.into(), Document::Float(1.5)),
+            (0.1.into(), Document::Float(0.1)),
+            ("text".into(), Document::String("text".into())),
+            (
+                String::from("owned").into(),
+                Document::String("owned".into()),
+            ),
+            (id.into(), Document::Id(id)),
+            (Some("x").into(), Document::String("x".into())),
+            (None::<i64>.into(), Document::Null),
+            (Some(None::<bool>).into(), Document::Null),
+        ];
+        for (converted, expected) in cases {
+            assert_eq!(converted, expected);
+        }
     }
 
     #[test]

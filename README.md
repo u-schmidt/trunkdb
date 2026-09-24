@@ -71,6 +71,29 @@ src/
                                        the WAL, wires layers, write_batch
 ```
 
+## Usage
+
+```rust
+use serde::{Deserialize, Serialize};
+use trunkdb::{Database, query::Filter};
+
+#[derive(Serialize, Deserialize)]
+struct User {
+    name: String,
+    email: String,
+    age: i64,
+}
+
+let db = Database::open("app.trunkdb")?;
+let users = db.collection::<User>("users");
+users.ensure_unique_index("email")?; // once at startup; a no-op after
+users.ensure_index("age")?;
+
+users.insert(User { name: "Ada".into(), email: "ada@example.com".into(), age: 36 })?;
+
+let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
+```
+
 ## Building
 
 ```
@@ -80,7 +103,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §35 for the full list and reasoning):
+Done so far (see SPEC.md §36 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -102,7 +125,10 @@ Done so far (see SPEC.md §35 for the full list and reasoning):
 8. **Sorting through an index** (§34): "the newest 20" reads 20
    documents, not all of them.
 
-Next: an unordered list of further features (§35).
+   Items 4–8 → 0.4.0.
+9. **A filter builder** (§35): `Filter::new().eq("status", "Complete")`.
+
+Next: an unordered list of further features (§36).
 
 ## License
 
