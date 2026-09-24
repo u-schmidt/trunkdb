@@ -447,23 +447,30 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
-    /// The compaction's write-back fails twice, after part of the file:
-    /// the database is poisoned, and the next open completes it from the
-    /// WAL — the file cut to the new length, everything still there.
+    /// The compaction's write-back fails twice, after part of the file —
+    /// its own checkpoint, and the one at drop: the compaction is still
+    /// committed and readable (SPEC §51), and the next open completes it
+    /// from the WAL — the file cut to the new length, everything there.
     #[test]
     fn a_compaction_cut_short_is_completed_by_the_next_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let db = churned(&path);
+        // The churn in the file, not just in the WAL (SPEC §51).
+        db.checkpoint().unwrap();
         let before = contents(&db);
         let pages_before = db.file_info().unwrap().pages;
+        assert_eq!(file_pages(&path), pages_before);
         {
             let mut state = db.state();
             state.store.failing_write_backs = 2;
             state.store.write_back_fails_after = 5;
         }
-        assert!(db.compact().is_err());
-        assert!(matches!(db.check(), Err(crate::Error::Poisoned)));
+        let compacted = db.compact().unwrap();
+        assert!(compacted.pages_after < compacted.pages_before);
+        assert!(db.checkpoint().is_err());
+        assert_eq!(contents(&db), before);
+        assert!(db.check().unwrap().is_ok());
         drop(db);
         assert_eq!(file_pages(&path), pages_before, "not cut yet");
 

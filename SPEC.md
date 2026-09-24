@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §51 for the roadmap.
+large-document workload (§5.2) the second; see §52 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1055,6 +1055,9 @@ unchanged; nothing above it knows staging exists.
 4. **write back** — the same pages to the main file, `fsync`.
 5. **checkpoint** — truncate the WAL.
 
+(Since §51, steps 4 and 5 happen at a checkpoint, once 1,000 pages have
+been committed, not in every commit.)
+
 A crash before step 3 completes leaves the pre-batch state (the file was
 never touched); a crash after it leaves a complete WAL record that
 recovery writes back, giving the post-batch state. Never anything in
@@ -1111,6 +1114,10 @@ images the WAL holds). If that fails too, the `Database` poisons itself:
 every call — reads included — returns `Error::Poisoned` until it's
 reopened, and reopening restores the batch from the WAL. The same idea
 as `Mutex` poisoning, or SQLite going read-only after I/O errors.
+
+(§51 replaced this part: a write-back now happens at a checkpoint, and
+one that fails keeps its pages in memory, readable, for the next
+checkpoint — no poisoning needed.)
 
 A failed `log` is handled too: it may have left a complete record behind
 (the write landed, the `fsync` failed), which the next `open` would
@@ -1531,7 +1538,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§51.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§52.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1712,7 +1719,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§51.2).
+(§52.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2102,7 +2109,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§51). It's also a backup that can be read and `diff`ed, and a way to
+(§52). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2229,7 +2236,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§51.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§52.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2340,7 +2347,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§51.2);
+- Still one field per index: compound indexes are still open (§52.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2880,7 +2887,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§51.2).
+- Still no pattern language, no conditions on array elements (§52.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2967,7 +2974,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §51.2).
+  §52.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3303,7 +3310,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§51.2).
+  run on such a file. Repairing is open (§52.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -4557,7 +4564,7 @@ measured gap and effort:
    every other read. It holds decoded or checked pages in memory, with
    dirty pages already staged per batch (§19.3). Its size and eviction
    are the design questions.
-3. **Fewer flushes per commit**, also new: the first step (three to
+3. **Fewer flushes per commit** (done in §51, straight to one), also new: the first step (three to
    two) is small, and the second (one, with the WAL read at lookup)
    builds on the page cache.
 4. **Faster compaction**, new: building leaves directly from sorted
@@ -4571,7 +4578,7 @@ number from this benchmark before and after.
   `fsync` costs differently, and CI runs the benchmark on Linux without
   looking at the times.
 - **One thread.** Nothing measures readers during a write batch, which
-  is where MVCC (§51.2) would show.
+  is where MVCC (§52.2) would show.
 - **Warm caches only**; a cold start (first read after a reboot) isn't
   measured.
 - **JSON for the others**, where a binary format would be faster.
@@ -4866,13 +4873,164 @@ the others run with their defaults.
 - **One mutex.** Many threads reading at once contend on it; a sharded
   cache would spread them.
 
-## 51. Roadmap
+## 51. One flush per commit (`database.rs`, `storage/file.rs`)
+
+Real and measured: a commit now flushes once, the WAL. Its pages are
+written back to the main file later, at a checkpoint, together with
+those of the commits before it. One commit went from 16 ms to 4.6–4.8 ms in
+the benchmark (§48), level with SQLite and redb (4.6–5.6 ms across
+runs) and twice as fast as sled. No file or WAL format changed.
+
+### 51.1 The commit protocol, again
+§19.3's steps 4 and 5 moved out of the commit:
+1. **stage**, 2. **apply**, 3. **log** — as before; the WAL's `fsync` is
+   the one flush a commit waits for.
+4. **commit** (`FileStore::commit`): the staged pages join the
+   *unwritten* pages, committed and durable in the WAL but not in the
+   main file, with the newest image of each. Nothing touches the file.
+5. **checkpoint**, only once 1,000 or more pages are unwritten (8 MB,
+   SQLite's default for its WAL mode too): write them all back, `fsync`
+   the main file, truncate the WAL. Also at `Database::checkpoint()`,
+   which is new and public, and when the last handle is dropped.
+
+A read looks in the batch's staged pages, then the unwritten ones, then
+the cache (§50), then the file. A page allocated past the file's end
+lives only in the unwritten pages until the checkpoint writes it. The
+main file lags behind the WAL between checkpoints, and the WAL holds
+every batch since the last one, in order.
+
+Recovery doesn't change (§19.4): it writes back every complete record in
+the WAL, in log order, so each page ends at its latest image. That was
+already how it handled several records, which a failed checkpoint could
+leave behind (§19.6).
+
+### 51.2 Why not three flushes to two first
+The plan in §48.4 was to drop only the flush after truncating the WAL
+first, and it doesn't survive a closer look. If the truncation isn't
+durable, a power cut during the *next* commit's log can leave that
+commit's partial record written over the start of the old record. The
+old record then fails its checksum, but it isn't the last record: bytes
+of the old record follow it. §19.3 treats a checksum mismatch before the
+tail as corruption, not as a torn write, so the database would refuse to
+open. Making that safe would need a WAL format that recognizes stale
+records (SQLite stamps each frame with a salt that changes at every
+checkpoint).
+
+Checkpointing less often gets to one flush without that. The truncation
+keeps its flush, and it's paid once per checkpoint, not per commit.
+
+### 51.3 Failures got simpler
+- **A checkpoint that fails** (a full disk, say) may leave the main file
+  half-written. Nothing reads those pages from the file, though: they're
+  all still unwritten, and reads find them there first. So the pages
+  stay, the WAL isn't truncated, and the next checkpoint writes them all
+  again. The batch that triggered it succeeds, because it is durable.
+  Before, a write-back that failed twice poisoned the database (§19.6).
+- **The WAL is truncated only after the checkpoint's own flush.** If the
+  truncation fails, the next open writes the records back once more,
+  which is harmless.
+- **Poisoning** remains for a failed `log` that can't be undone (§19.6),
+  and for a panic mid-batch (§27.3).
+- **`check`** skips unwritten pages in its damaged-page scan (§50.3):
+  their file copy is older or missing, and the WAL holds them.
+
+### 51.4 What it costs
+- **Memory:** up to 1,000 unwritten pages (8 MB), plus whatever one
+  batch adds past that before its checkpoint. A compaction's whole image
+  goes through them and is checkpointed at once (§41).
+- **The main file isn't complete on its own between checkpoints.** A
+  backup that copies only the `.trunkdb` file needs `db.checkpoint()`
+  first, or the WAL too. Export (§30) needs neither.
+- **The commit that crosses the threshold pays for the checkpoint:**
+  writing back up to 8 MB and two flushes. Batches of 1,000 documents
+  cross it every few commits, which is why batched writes gained less
+  (6,800 to 7,500 per second). They're bound by page work, not flushes
+  (§48.4).
+
+Rejected:
+- **A checkpoint thread.** It would take commits' checkpoints off their
+  own time, but it adds a second writer to coordinate with, which is
+  exactly what §27 avoids. A synchronous checkpoint every 8 MB is
+  predictable.
+- **A per-page index into the WAL file**, as SQLite keeps, instead of
+  the pages in memory. It would save the 8 MB, but it costs a file read
+  per unwritten page read and a format for the index. The cache already
+  holds pages in memory; these are the same kind.
+
+### 51.5 Measured
+100,000 documents, trunkdb alone:
+
+| | before | after, two runs |
+|---|---:|---:|
+| insert 1000, one per commit | 16,158 µs | 4,623–4,792 µs |
+| insert 100000, 1000 per commit | 6,800/s | 7,504–7,518/s |
+| update, 1000 per commit | 5,852/s | 6,187–6,409/s |
+| delete, 1000 per commit | 11k/s | 14–15k/s |
+
+Reads stayed within the run-to-run spread. The full run, with the
+others:
+
+| | trunkdb | SQLite | redb | sled |
+|---|---:|---:|---:|---:|
+| insert 100000, 1000 per commit | 7518/s | 39k/s | 43k/s | 30k/s |
+| insert 1000, one per commit | 4623 µs | 4565 µs | 4835 µs | 9536 µs |
+| get by id | 3.9 µs | 4.4 µs | 1.8 µs | 2.2 µs |
+| find tenant == x (1000 docs) | 2.37 ms | 1.66 ms | 1.04 ms | 2.40 ms |
+| status == x, oldest 20 | 47.0 µs | 22.8 µs | 21.7 µs | 20.3 µs |
+| scan: tries > 7, unindexed | 180 ms | 43 ms | 52 ms | 67 ms |
+| update 9528, 1000 per commit | 6187/s | 13k/s | 18k/s | 24k/s |
+| delete 10000, 1000 per commit | 14k/s | 19k/s | 22k/s | 36k/s |
+
+SQLite's lookup came out at 4.4 µs in this run and 16–18 µs in every
+earlier one; the small figures move between runs. The test suite runs in 16
+seconds instead of 26, since most of its tests commit.
+
+### 51.6 Tests
+- `database.rs`:
+  - A commit leaves the main file as it was and the WAL non-empty; the
+    batch is readable; `checkpoint` writes it back and empties the WAL.
+  - Commits of 50 pages each until one crosses 1,000 pages: that commit
+    checkpoints by itself, and the WAL is empty after it.
+  - Dropping one of two handles keeps the WAL; dropping the last
+    empties it, and the file opens complete without it.
+  - A failed checkpoint keeps the batch readable and the WAL full, and
+    the next checkpoint writes it back.
+  - Checkpoints that keep failing, the one at drop included: the next
+    open restores the batch.
+  - Three batches rewriting the same 30 one-page documents, with the
+    checkpoint and the one at drop cut short after 0, 1, 3, 7 or 20
+    pages: the next open has the last batch's values everywhere, and
+    `check` finds nothing.
+- `storage/file.rs`:
+  - Committed pages are read before the checkpoint writes them,
+    including a page past the file's end; `damaged_pages` skips them.
+  - A checkpoint that failed halfway: reads still say the committed
+    pages; the next checkpoint writes all of them, and the cache holds
+    them after.
+- `compact.rs`: a compaction whose checkpoints fail is still committed,
+  readable and checked clean; the next open completes it and cuts the
+  file.
+- The recovery tests of §19 run unchanged: they drive the protocol by
+  hand, with a full write-back where the crash point asks for it.
+- Checked by breaking it on purpose, ten ways. Each of these fails a
+  test:
+  - a commit never checkpointing;
+  - reads skipping the unwritten pages, in either read path;
+  - the damaged-page scan reading them from the file;
+  - a checkpoint not cutting the file, or keeping its pages unwritten
+    after writing them;
+  - the WAL truncated before the checkpoint's write-back, or even if it
+    failed;
+  - no checkpoint when the last handle goes;
+  - an older image of a page kept over a newer one.
+
+## 52. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 51.1 Done
+### 52.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -4891,8 +5049,9 @@ All of it is done:
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
+| next | One flush per commit (`Database::checkpoint`) | §51 |
 
-### 51.2 Open
+### 52.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -4909,9 +5068,9 @@ limit is described.
 - Compaction without holding the whole new file in memory: a streamed
   WAL record (§41.5). And faster: leaves built from sorted entries, not
   inserted one by one (§48.4).
-- Fewer flushes per commit: three today, 16 ms against 5–6 ms for
-  SQLite and redb (§48.4). Two by not flushing the WAL's truncation;
-  one by writing back at checkpoints instead of every commit.
+- Batched writes, 5× behind: page work, not flushes — a staged page
+  copied whole on every write and read, a leaf rebuilt for every insert
+  (§48.4, §51.4). Profile first.
 
 **Concurrency**
 - Readers that don't wait for a write batch: MVCC or pre-batch page

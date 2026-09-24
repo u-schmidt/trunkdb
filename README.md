@@ -140,18 +140,18 @@ documents:
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 6.8k/s | 43k/s | 44k/s | 27k/s |
-| one commit | 16 ms | 5.0 ms | 5.6 ms | 11 ms |
-| get by id | 6.7 µs | 16 µs | 2.4 µs | 5.7 µs |
-| 1000 documents by index | 2.2 ms | 1.6 ms | 1.0 ms | 1.7 ms |
-| oldest 20 of a status | 47 µs | 23 µs | 15 µs | 21 µs |
+| insert, 1000 per commit | 7.5k/s | 39k/s | 43k/s | 30k/s |
+| one commit | 4.6 ms | 4.6 ms | 4.8 ms | 9.5 ms |
+| get by id | 3.9 µs | 4.4 µs | 1.8 µs | 2.2 µs |
+| 1000 documents by index | 2.4 ms | 1.7 ms | 1.0 ms | 2.4 ms |
+| oldest 20 of a status | 47 µs | 23 µs | 22 µs | 20 µs |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
-Each gap has a known cause (SPEC.md §48), and the first two are fixed:
-"oldest 20" took 19 ms before the lazy B-tree walk (§49), a lookup by
-id 32 µs before the page cache (§50). What's left for reads is decoding
-and a copy per page; for writes, a commit flushes three times where the
-others flush once. That's the next step on the roadmap.
+Each gap has a known cause (SPEC.md §48), and the first three are
+fixed: "oldest 20" took 19 ms before the lazy B-tree walk (§49), a
+lookup by id 32 µs before the page cache (§50), a commit 16 ms before it
+flushed once instead of three times (§51). What's left: page work in
+batched writes, decoding in scans, and a copy per page read.
 
 ```
 cd bench && cargo run --release
@@ -159,7 +159,7 @@ cd bench && cargo run --release
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §51 for the full list and reasoning):
+Done so far (see SPEC.md §52 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -234,8 +234,11 @@ Done so far (see SPEC.md §51 for the full list and reasoning):
     to change it; lookups by id 4× faster.
 
     Items 22–24 → 0.10.0.
+25. **One flush per commit** (§51): pages are written back at a
+    checkpoint every 8 MB, not every commit; a commit takes 4.6 ms
+    instead of 16. `db.checkpoint()` makes the file complete on its own.
 
-What's still open: SPEC.md §51.2.
+What's still open: SPEC.md §52.2.
 
 ## License
 

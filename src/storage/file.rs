@@ -150,6 +150,10 @@ pub struct FileStore {
     /// Checked pages as they are in the file (SPEC §50). Behind a mutex
     /// because reads take `&self` and run in parallel (§27).
     cache: Mutex<PageCache>,
+    /// Pages of committed batches — durable in the WAL — not yet written
+    /// back to the file (SPEC §51): the newest image of each. Reads look
+    /// here before the cache and the file; `checkpoint` writes them back.
+    unwritten: BTreeMap<PageId, Vec<u8>>,
     /// Whether the header's checksum has been checked — not yet between
     /// `open_before_recovery` and `check_header` (SPEC §40.4).
     header_checked: bool,
@@ -257,6 +261,7 @@ impl FileStore {
             file,
             header,
             cache: Mutex::new(PageCache::new(DEFAULT_CACHE_SIZE / PAGE_SIZE)),
+            unwritten: BTreeMap::new(),
             // A fresh file's header isn't on disk yet: nothing to check.
             header_checked: is_fresh,
             staging: None,
@@ -321,10 +326,15 @@ impl FileStore {
 
     /// The pages whose checksum doesn't match their bytes on disk, in id
     /// order — what a disk error or a change from outside trunkdb leaves.
-    /// Reads the file itself, past any staged changes.
+    /// Reads the file itself, past any staged changes. Pages not written
+    /// back yet are skipped: the WAL holds them, and the file's copy is
+    /// older or missing (SPEC §51).
     pub(crate) fn damaged_pages(&self) -> io::Result<Vec<PageId>> {
         let mut damaged = Vec::new();
         for id in 0..self.header.page_count {
+            if self.unwritten.contains_key(&id) {
+                continue;
+            }
             if !checksum_matches(id, &read_disk_page(&self.file, id)?) {
                 damaged.push(id);
             }
@@ -347,6 +357,10 @@ impl FileStore {
             buf.copy_from_slice(page);
             return Ok(());
         }
+        if let Some(page) = self.unwritten.get(&id) {
+            buf.copy_from_slice(page);
+            return Ok(());
+        }
         if self.cache().read(id, buf) {
             return Ok(());
         }
@@ -362,6 +376,9 @@ impl FileStore {
         if let Some(staging) = &self.staging
             && let Some(page) = staging.dirty.get(&id)
         {
+            return Ok(page.clone());
+        }
+        if let Some(page) = self.unwritten.get(&id) {
             return Ok(page.clone());
         }
         if let Some(page) = self.cache().get(id) {
@@ -529,43 +546,60 @@ impl FileStore {
         Ok(())
     }
 
-    /// Writes every dirty page to the file, cuts it to the page count,
-    /// `fsync`s, and ends staging. On error the dirty set is kept, still
-    /// staging, so the caller can retry or `rollback` — though by then
-    /// the file may hold some of the pages already (SPEC §19.6's
-    /// poisoning covers that case).
-    pub fn write_back(&mut self) -> io::Result<()> {
-        let written = self.write_dirty_pages();
-        if written.is_err() {
-            // Some pages may have reached the file, some not: what the
-            // cache holds of them can't be trusted.
-            self.cache().clear();
+    /// Ends staging for a batch the WAL now holds (SPEC §51): its pages
+    /// become the newest committed ones, read from memory until
+    /// `checkpoint` writes them back. Nothing is written to the file.
+    pub fn commit(&mut self) {
+        let staging = self
+            .staging
+            .take()
+            .expect("FileStore::commit without begin");
+        self.unwritten.extend(staging.dirty);
+    }
+
+    /// How many committed pages wait for `checkpoint`.
+    pub fn unwritten_pages(&self) -> usize {
+        self.unwritten.len()
+    }
+
+    /// Writes every committed page not written back yet to the file,
+    /// cuts it to the page count, and `fsync`s; then they're read from
+    /// the cache like any other page. On error they stay where they were,
+    /// and reads still find them there — the file may now be half
+    /// written, but none of the pages it's half-written with is read from
+    /// it. A later call writes them all again.
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        if self.unwritten.is_empty() {
+            return Ok(());
         }
-        written?;
+        self.write_unwritten_pages()?;
         self.truncate_to_page_count()?;
         self.file.sync_all()?;
-        let staging = self.staging.take().expect("still staging");
-        // What was written back is what the next reads want; the pages
-        // are in the file now, so the cache may hold them.
+        let written = std::mem::take(&mut self.unwritten);
+        let page_count = self.header.page_count;
         let mut cache = self.cache();
-        for (id, page) in &staging.dirty {
+        // Not pages a later batch cut off the end: they're gone.
+        for (id, page) in written.range(..page_count) {
             cache.put(*id, page);
         }
         Ok(())
     }
 
-    /// `write_back`'s writes: every dirty page, in ascending id order.
-    fn write_dirty_pages(&mut self) -> io::Result<()> {
-        let staging = self
-            .staging
-            .as_ref()
-            .expect("FileStore::write_back without begin");
+    /// `commit`, then `checkpoint`: the batch in the file at once — for
+    /// the fresh file's bootstrap, and tests.
+    pub fn write_back(&mut self) -> io::Result<()> {
+        self.commit();
+        self.checkpoint()
+    }
+
+    /// `checkpoint`'s writes: every unwritten page, in ascending id order.
+    fn write_unwritten_pages(&mut self) -> io::Result<()> {
         #[cfg(test)]
         let mut written = 0;
         // The counter only exists in test builds, so `enumerate` would be
         // an unused index everywhere else.
         #[allow(clippy::explicit_counter_loop)]
-        for (&id, page) in &staging.dirty {
+        for (&id, page) in &self.unwritten {
             #[cfg(test)]
             {
                 if self.failing_write_backs > 0 && written == self.write_back_fails_after {
@@ -587,8 +621,8 @@ impl FileStore {
     /// on-disk header says, and its header image is what makes them valid.
     pub fn restore_pages(&mut self, pages: &[PageImage]) -> io::Result<()> {
         assert!(
-            self.staging.is_none(),
-            "FileStore::restore_pages while staging"
+            self.staging.is_none() && self.unwritten.is_empty(),
+            "FileStore::restore_pages while staging, or with pages to write back"
         );
         // Pages are about to change under it.
         self.cache().clear();
@@ -1453,11 +1487,12 @@ mod tests {
         assert_eq!(on_disk(&store).read_page(1).unwrap(), filled(8));
     }
 
-    /// A write-back that failed halfway left some pages new in the file
-    /// and some old: the cache forgets them all, and reads say what the
-    /// file says.
+    /// A checkpoint that failed halfway left some pages new in the file
+    /// and some old: reads still find every committed page, from memory,
+    /// and a checkpoint that works puts all of them in the file (SPEC
+    /// §51).
     #[test]
-    fn a_failed_write_back_forgets_the_cache() {
+    fn a_failed_checkpoint_keeps_its_pages_until_one_works() {
         let (_dir, path) = open_temp();
         let mut store = five_page_file(&path);
         for id in 1..=3 {
@@ -1467,20 +1502,57 @@ mod tests {
         for id in 1..=3 {
             store.write_page(id, &filled(7)).unwrap();
         }
+        store.commit();
         store.failing_write_backs = 1;
         store.write_back_fails_after = 1;
-        assert!(store.write_back().is_err());
-        store.rollback();
+        assert!(store.checkpoint().is_err());
+        let disk = on_disk(&store);
+        assert_eq!(disk.read_page(1).unwrap(), filled(7));
+        assert_eq!(disk.read_page(2).unwrap(), filled(2), "not written yet");
+        for id in 1..=3 {
+            assert_eq!(store.read_page(id).unwrap(), filled(7), "{id}");
+        }
+        assert_eq!(store.unwritten_pages(), 3);
+        store.checkpoint().unwrap();
+        assert_eq!(store.unwritten_pages(), 0);
         let disk = on_disk(&store);
         for id in 1..=3 {
-            assert_eq!(
-                store.read_page(id).unwrap(),
-                disk.read_page(id).unwrap(),
-                "{id}"
-            );
+            assert_eq!(disk.read_page(id).unwrap(), filled(7), "{id}");
+            assert_eq!(store.cached(id), Some(filled(7)), "{id}");
         }
-        assert_eq!(store.read_page(1).unwrap(), filled(7));
-        assert_eq!(store.read_page(2).unwrap(), filled(2));
+    }
+
+    /// Committed pages are read from memory, not the file, until the
+    /// checkpoint — including pages past the file's end.
+    #[test]
+    fn committed_pages_are_read_before_the_checkpoint_writes_them() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store.write_page(2, &filled(9)).unwrap();
+        let new = store.allocate_page().unwrap();
+        store.write_page(new, &filled(6)).unwrap();
+        store.commit();
+        // A second batch, with a page past the file's end.
+        store.begin();
+        let beyond = store.allocate_page().unwrap();
+        store.write_page(beyond, &filled(5)).unwrap();
+        store.commit();
+        let disk = on_disk(&store);
+        assert_eq!(disk.read_page(2).unwrap(), filled(2));
+        assert_ne!(
+            disk.read_page(new).unwrap(),
+            filled(6),
+            "the freed page, as it was"
+        );
+        assert_eq!(disk.try_read_page(beyond).unwrap(), None);
+        assert_eq!(store.read_page(beyond).unwrap(), filled(5));
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        assert_eq!(store.read_page(new).unwrap(), filled(6));
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+        store.checkpoint().unwrap();
+        assert_eq!(on_disk(&store).read_page(new).unwrap(), filled(6));
+        assert_eq!(on_disk(&store).read_page(beyond).unwrap(), filled(5));
     }
 
     #[test]

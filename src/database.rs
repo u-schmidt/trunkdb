@@ -74,6 +74,36 @@ impl OpenOptions {
     }
 }
 
+/// How many committed pages may wait in memory, logged but not written
+/// back, before a commit writes them back (SPEC §51): 1,000 pages, 8 MB —
+/// SQLite's default for its WAL mode too.
+const CHECKPOINT_PAGES: usize = 1000;
+
+impl State {
+    /// `Database::checkpoint`: the pages to the file, then the WAL
+    /// emptied — only after they're durably in the file. If the WAL can't
+    /// be emptied, its records are written back once more at the next
+    /// open: harmless, page images are idempotent.
+    fn checkpoint(&mut self) -> std::io::Result<()> {
+        self.store.checkpoint()?;
+        let _ = self.durability.checkpoint();
+        Ok(())
+    }
+}
+
+/// The last handle gone: what's committed goes to the main file, so it's
+/// complete without its WAL. Best effort — if it fails, the next open
+/// recovers the same pages from the WAL.
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if let Ok(state) = self.state.get_mut()
+            && !state.poisoned
+        {
+            let _ = state.checkpoint();
+        }
+    }
+}
+
 impl Database {
     /// Opens the file, then recovers: if a prior run logged a batch and
     /// crashed before checkpointing it (see `durability::WalDurability`),
@@ -262,12 +292,15 @@ impl Database {
     /// 2. **apply**. On error: roll back the staged pages *and* the
     ///    catalog cache, and return the error — nothing of it ever
     ///    reached the file, so there's nothing else to undo.
-    /// 3. **log** every changed page to the WAL as one record, `fsync`.
-    /// 4. **write back** those pages to the main file, `fsync`.
-    /// 5. **checkpoint** — truncate the WAL.
+    /// 3. **log** every changed page to the WAL as one record, `fsync` —
+    ///    the one flush a commit waits for (SPEC §51).
+    /// 4. **commit** — the pages become the newest committed ones, read
+    ///    from memory; the main file isn't touched.
+    /// 5. **checkpoint**, once `CHECKPOINT_PAGES` or more are waiting:
+    ///    write them back to the main file, `fsync`, truncate the WAL.
     ///
     /// A crash before 3 completes leaves the state before; a crash after
-    /// it leaves a complete WAL record that `open` writes back, giving the
+    /// it leaves complete WAL records that `open` writes back, giving the
     /// state after. Never anything in between.
     pub(crate) fn transact<R>(
         &self,
@@ -315,22 +348,21 @@ impl Database {
         }
 
         // The batch is durable from here on: the WAL holds all its pages.
-        if let Err(first) = state.store.write_back() {
-            // The file may now be half-written. The staged pages are still
-            // intact, so try once more; failing that, only recovery at the
-            // next `open` (from the WAL) can repair the file.
-            if state.store.write_back().is_err() {
-                state.poisoned = true;
-                return Err(first.into());
-            }
+        state.store.commit();
+        if state.store.unwritten_pages() >= CHECKPOINT_PAGES {
+            // Not an error for this batch if it fails: it's durable, and
+            // reads find its pages in memory. The next one tries again.
+            let _ = state.checkpoint();
         }
-
-        // Not an error for this batch if it fails: the batch is complete
-        // in the main file. A leftover record is just written back once
-        // more at the next `open` — harmless, page images are idempotent —
-        // and a later batch appends after it in the right order.
-        let _ = state.durability.checkpoint();
         Ok(result)
+    }
+
+    /// Writes every committed page back to the main file and empties the
+    /// WAL (SPEC §51) — which a commit does by itself once enough pages
+    /// wait, and dropping the last handle does too. For a file that is
+    /// complete on its own: before copying it, say.
+    pub fn checkpoint(&self) -> crate::Result<()> {
+        Ok(self.write()?.checkpoint()?)
     }
 
     /// Direct access to the state for tests, bypassing the poisoned
@@ -847,44 +879,159 @@ mod tests {
         );
     }
 
+    fn wal_len(path: &Path) -> u64 {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push(".wal");
+        std::fs::metadata(wal).unwrap().len()
+    }
+
+    /// A commit only logs (SPEC §51): the batch is in the WAL, not the
+    /// main file, until a checkpoint — and readable all along.
     #[test]
-    fn a_write_back_that_fails_once_is_retried() {
+    fn a_commit_logs_and_a_checkpoint_writes_back() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let empty = std::fs::read(&path).unwrap();
 
-        db.state().store.failing_write_backs = 1;
         db.write_batch(two_collection_batch()).unwrap();
+        assert_two_collection_batch_present(&db);
+        assert_eq!(std::fs::read(&path).unwrap(), empty, "the main file waits");
+        assert!(wal_len(&path) > 0);
 
+        db.checkpoint().unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), empty);
+        assert_eq!(wal_len(&path), 0);
         assert_two_collection_batch_present(&db);
     }
 
-    /// Write-back fails twice: the file may be half-written, so the
-    /// database refuses every call until reopened — and reopening restores
-    /// the batch from the WAL.
+    /// Enough waiting pages, and the commit writes them back itself.
     #[test]
-    fn a_write_back_that_keeps_failing_poisons_the_database_until_reopened() {
+    fn a_commit_checkpoints_once_enough_pages_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let big = Document::String("x".repeat(6000));
+        let mut waiting = 0;
+        for commit in 0..100u8 {
+            let ops = (0..50u8)
+                .map(|i| {
+                    let id = DocId([commit, i, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]);
+                    WriteOp::Insert("big".into(), id, big.clone())
+                })
+                .collect();
+            db.write_batch(ops).unwrap();
+            let now = db.state().store.unwritten_pages();
+            if now < waiting {
+                // This commit's pages brought it over the line.
+                assert_eq!(now, 0);
+                assert!(waiting < CHECKPOINT_PAGES, "{waiting}");
+                assert!(commit > 5, "{commit}");
+                assert_eq!(wal_len(&path), 0);
+                return;
+            }
+            assert!(wal_len(&path) > 0);
+            waiting = now;
+        }
+        panic!("no checkpoint after {waiting} pages");
+    }
+
+    /// Dropping the last handle writes back what's committed: the main
+    /// file is complete without its WAL.
+    #[test]
+    fn dropping_the_last_handle_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let other = db.clone();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        assert!(wal_len(&path) > 0, "a handle is left");
+        drop(other);
+        assert_eq!(wal_len(&path), 0);
+        std::fs::remove_file(dir.path().join("test.trunkdb.wal")).unwrap();
+        assert_two_collection_batch_present(&Database::open(&path).unwrap());
+    }
+
+    /// A checkpoint that fails leaves the batch committed and readable;
+    /// the next one writes it back.
+    #[test]
+    fn a_failed_checkpoint_is_retried_by_the_next() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let db = Database::open(&path).unwrap();
 
-        db.state().store.failing_write_backs = 2;
-        assert!(db.write_batch(two_collection_batch()).is_err());
+        db.write_batch(two_collection_batch()).unwrap();
+        db.state().store.failing_write_backs = 1;
+        assert!(db.checkpoint().is_err());
+        assert_two_collection_batch_present(&db);
+        assert!(wal_len(&path) > 0, "the WAL still holds the batch");
+        db.checkpoint().unwrap();
+        assert_eq!(wal_len(&path), 0);
+        assert_two_collection_batch_present(&db);
+    }
 
-        let users = db.collection::<Document>("users");
-        assert!(matches!(
-            users.get(&DocId([1; 16])),
-            Err(crate::Error::Poisoned)
-        ));
-        assert!(matches!(
-            users.find(Filter::default()),
-            Err(crate::Error::Poisoned)
-        ));
-        assert!(matches!(
-            users.insert(Document::Int(5)),
-            Err(crate::Error::Poisoned)
-        ));
-        drop(users);
+    /// Several committed batches wait, each rewriting the same documents;
+    /// the checkpoint writing them back is cut short after any number of
+    /// pages, and so is the one at drop — as if the process died there.
+    /// The next open restores all of them in order: the last batch's
+    /// values everywhere (SPEC §51).
+    #[test]
+    fn batches_cut_short_mid_checkpoint_are_recovered_in_order() {
+        // A page each: the batches span dozens of pages.
+        let big =
+            |round: i64, id: u8| Document::String(format!("{round}-{id}-{}", "x".repeat(5000)));
+        for fails_after in [0, 1, 3, 7, 20] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.trunkdb");
+            let db = Database::open(&path).unwrap();
+            for round in 0..3i64 {
+                let ops = (1..=30u8)
+                    .map(|id| {
+                        let (id, value) = (DocId([id; 16]), big(round, id));
+                        match round {
+                            0 => WriteOp::Insert("docs".into(), id, value),
+                            _ => WriteOp::Update("docs".into(), id, value),
+                        }
+                    })
+                    .collect();
+                db.write_batch(ops).unwrap();
+            }
+            {
+                let mut state = db.state();
+                assert!(state.store.unwritten_pages() > fails_after);
+                state.store.failing_write_backs = 2;
+                state.store.write_back_fails_after = fails_after;
+            }
+            assert!(db.checkpoint().is_err());
+            drop(db);
+
+            let db = Database::open(&path).unwrap();
+            for id in 1..=30u8 {
+                assert_eq!(
+                    get(&db, "docs", id),
+                    Some(big(2, id)),
+                    "{fails_after}: {id}"
+                );
+            }
+            assert!(db.check().unwrap().is_ok(), "{fails_after}");
+        }
+    }
+
+    /// Checkpoints that keep failing, the one at drop included, lose
+    /// nothing: the next open writes the batch back from the WAL.
+    #[test]
+    fn checkpoints_that_keep_failing_leave_it_to_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+
+        db.write_batch(two_collection_batch()).unwrap();
+        db.state().store.failing_write_backs = 2;
+        assert!(db.checkpoint().is_err());
+        assert_two_collection_batch_present(&db);
         drop(db);
+        assert!(wal_len(&path) > 0);
 
         assert_two_collection_batch_present(&Database::open(&path).unwrap());
     }
