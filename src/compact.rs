@@ -3,7 +3,7 @@
 //! system.
 
 use crate::catalog::{Catalog, IndexMeta};
-use crate::collection::secondary_key;
+use crate::collection::{secondary_entries, secondary_keys};
 use crate::data;
 use crate::database::Database;
 use crate::index::{BTreeIndex, Index, key};
@@ -76,7 +76,7 @@ fn rebuild(catalog: &Catalog, store: &FileStore) -> crate::Result<(Catalog, Memo
             let new_loc = data::insert_record(&mut image, &mut current, id, &doc)?;
             primary.insert(&mut image, &primary_key, new_loc)?;
             for (entries, index) in index_entries.iter_mut().zip(indexes) {
-                if let Some(key) = secondary_key(&doc, &index.field, id) {
+                for key in secondary_keys(&doc, &index.field, id) {
                     entries.push((key, new_loc));
                 }
             }
@@ -114,24 +114,32 @@ fn refuse_duplicates(
     let groups = entries.chunk_by(|(a, _), (b, _)| key::value_part(a) == key::value_part(b));
     for group in groups.filter(|group| group.len() > 1) {
         let mut seen: Vec<(crate::DocId, crate::Document)> = Vec::new();
-        for (_key, loc) in group {
+        for (key, loc) in group {
             let (id, doc) = data::get_record(image, *loc)?;
-            let value = crate::query::value_or_null(&doc, &index.field).clone();
-            if matches!(value, crate::Document::Null) {
-                continue;
-            }
-            if let Some((existing, _)) = seen
+            // The values this entry is for — in a multikey index, some of
+            // the document's elements (SPEC §42.2).
+            let entries = secondary_entries(&doc, &index.field, id);
+            let (_, values) = entries
                 .iter()
-                .find(|(_, other)| crate::query::equal(other, &value))
-            {
-                return Err(crate::Error::DuplicateValue {
-                    collection: collection.to_string(),
-                    field: index.field.clone(),
-                    id,
-                    existing: *existing,
-                });
+                .find(|(k, _)| k == key)
+                .expect("the entry came from this document");
+            for value in values {
+                if matches!(value, crate::Document::Null) {
+                    continue;
+                }
+                if let Some((existing, _)) = seen
+                    .iter()
+                    .find(|(other_id, other)| *other_id != id && crate::query::equal(other, value))
+                {
+                    return Err(crate::Error::DuplicateValue {
+                        collection: collection.to_string(),
+                        field: index.field.clone(),
+                        id,
+                        existing: *existing,
+                    });
+                }
+                seen.push((id, (*value).clone()));
             }
-            seen.push((id, value));
         }
     }
     Ok(())

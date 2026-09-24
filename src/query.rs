@@ -357,7 +357,8 @@ enum BoundKind {
 
 /// The best bounds for conditions that must all hold — `None` if no index
 /// can bound any of them. The comparisons on one indexed field are
-/// intersected, so `a >= 10 AND a <= 20` reads just that stretch; a
+/// intersected, so `a >= 10 AND a <= 20` reads just that stretch (on a
+/// path with `[*]` only one of them counts, SPEC §42.3); a
 /// nested group is bounded on its own; the best of all that wins, the
 /// first among equals. `Ne` and `Contains` never use an index, nor does a
 /// `Not`.
@@ -389,9 +390,17 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
                     } if f == field => Some((op, key::range_for(op, value)?)),
                     _ => None,
                 });
-                let (by_value, ranges): (Vec<bool>, Vec<KeyRange>) = on_field
+                let (by_value, mut ranges): (Vec<bool>, Vec<KeyRange>) = on_field
                     .map(|(op, range)| (matches!(op, Op::Eq), range))
                     .unzip();
+                if is_multi(field) && !ranges.is_empty() {
+                    // Different elements may meet different comparisons —
+                    // `tags[*] > 5 AND tags[*] < 3` holds for `[1, 10]` —
+                    // so their ranges can't be intersected (SPEC §42.3).
+                    // One of them bounds the documents: an `Eq`'s if any.
+                    let one = by_value.iter().position(|&b| b).unwrap_or(0);
+                    ranges = vec![ranges.swap_remove(one)];
+                }
                 if let Some(range) = ranges.into_iter().reduce(KeyRange::intersect) {
                     let kind = match by_value.contains(&true) {
                         true => BoundKind::ByValue,
@@ -461,7 +470,11 @@ impl Filter {
     ) -> Option<(&'a IndexMeta, Option<KeyRange>)> {
         let sort = self.sort.as_ref()?;
         self.limit?;
-        let index = indexes.iter().find(|i| i.field == sort.field)?;
+        // A multikey index holds a document once per element, in element
+        // order: no order of documents (SPEC §42.3).
+        let index = indexes
+            .iter()
+            .find(|i| i.field == sort.field && !is_multi(&i.field))?;
         let on_sort_field =
             |c: &&Condition| matches!(c, Condition::Compare { field, .. } if *field == sort.field);
         let others: Vec<Condition> = self
@@ -506,8 +519,61 @@ pub(crate) fn value_or_null<'a>(doc: &'a Document, path: &str) -> &'a Document {
     field_value(doc, path).unwrap_or(&Document::Null)
 }
 
+/// Whether `path` has an `[*]` step (SPEC §42): it reaches each element
+/// of an array, so it reaches any number of values, not one.
+pub(crate) fn is_multi(path: &str) -> bool {
+    path.contains("[*]")
+}
+
+/// Every value at `path` in `doc` (SPEC §42). A step is a field name
+/// followed by any number of `[*]`, each of which goes on with every
+/// element of the array there. The rules:
+/// - a missing field is null, as everywhere (§32) — so an element
+///   without the field gives a null;
+/// - `[*]` on anything but an array gives nothing: a missing, null or
+///   scalar `tags` has no elements;
+/// - a path without `[*]` gives exactly `value_or_null`.
+pub(crate) fn values_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> {
+    let mut values = vec![doc];
+    for step in path.split('.') {
+        let name = step.trim_end_matches("[*]");
+        let fan_outs = (step.len() - name.len()) / 3;
+        values = values
+            .into_iter()
+            .map(|value| match value {
+                Document::Object(map) => map.get(name).unwrap_or(&Document::Null),
+                _ => &Document::Null,
+            })
+            .collect();
+        for _ in 0..fan_outs {
+            values = values
+                .into_iter()
+                .flat_map(|value| match value {
+                    Document::Array(elements) => elements.iter().collect(),
+                    _ => Vec::new(),
+                })
+                .collect();
+        }
+    }
+    values
+}
+
+/// A comparison on a path with `[*]` holds if it holds for any value
+/// there (SPEC §42.1) — except `Ne`, which stays what it is everywhere:
+/// `Eq` negated. So `tags[*] != "x"` means no tag is `"x"`.
 fn compare_matches(field: &str, op: &Op, value: &Document, doc: &Document) -> bool {
-    let field_value = value_or_null(doc, field);
+    if is_multi(field) {
+        let values = values_at(doc, field);
+        return match op {
+            Op::Ne => !values.iter().any(|v| value_matches(&Op::Eq, v, value)),
+            op => values.iter().any(|v| value_matches(op, v, value)),
+        };
+    }
+    value_matches(op, value_or_null(doc, field), value)
+}
+
+/// `field_value op value`, for one value.
+fn value_matches(op: &Op, field_value: &Document, value: &Document) -> bool {
     if let Op::Contains = op {
         return match (field_value, value) {
             (Document::String(haystack), Document::String(needle)) => {
@@ -638,6 +704,122 @@ mod tests {
             map.insert(k.to_string(), v.clone());
         }
         Document::Object(map)
+    }
+
+    /// `{tags: [1, "a", [2]], items: [{n: 1}, {m: 2}, 3], s: "x",
+    /// o: {t: [5]}}` — arrays of mixed things, objects missing the
+    /// field, a scalar where an array might be.
+    fn with_arrays() -> Document {
+        let array = |values: Vec<Document>| Document::Array(values);
+        doc(&[
+            (
+                "tags",
+                array(vec![
+                    Document::Int(1),
+                    "a".into(),
+                    array(vec![Document::Int(2)]),
+                ]),
+            ),
+            (
+                "items",
+                array(vec![
+                    doc(&[("n", Document::Int(1))]),
+                    doc(&[("m", Document::Int(2))]),
+                    Document::Int(3),
+                ]),
+            ),
+            ("s", "x".into()),
+            ("o", doc(&[("t", array(vec![Document::Int(5)]))])),
+        ])
+    }
+
+    #[test]
+    fn values_at_walks_into_arrays_only_at_brackets() {
+        let d = with_arrays();
+        let at = |path| values_at(&d, path).into_iter().cloned().collect::<Vec<_>>();
+        let tags = match field_value(&d, "tags") {
+            Some(Document::Array(tags)) => tags.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(at("tags[*]"), tags);
+        assert_eq!(at("tags[*][*]"), vec![Document::Int(2)]);
+        // An element without the field gives null, as a missing field
+        // does; so does one that isn't an object.
+        assert_eq!(
+            at("items[*].n"),
+            vec![Document::Int(1), Document::Null, Document::Null]
+        );
+        assert_eq!(at("o.t[*]"), vec![Document::Int(5)]);
+        // No array, no elements: a scalar, a missing field, null.
+        assert_eq!(at("s[*]"), vec![]);
+        assert_eq!(at("missing[*]"), vec![]);
+        assert_eq!(at("items[*].n[*]"), vec![]);
+        // Without brackets, exactly one value, as before.
+        assert_eq!(at("tags"), vec![field_value(&d, "tags").unwrap().clone()]);
+        assert_eq!(at("missing"), vec![Document::Null]);
+        assert_eq!(at("items.n"), vec![Document::Null]);
+    }
+
+    #[test]
+    fn a_comparison_on_elements_holds_if_it_holds_for_any_of_them() {
+        let d = with_arrays();
+        let holds = |c: Condition| c.matches(&d);
+        assert!(holds(Condition::eq("tags[*]", "a")));
+        assert!(!holds(Condition::eq("tags[*]", "b")));
+        assert!(holds(Condition::gt("tags[*]", 0)));
+        assert!(!holds(Condition::lt("tags[*]", 1)));
+        assert!(holds(Condition::lte("tags[*]", 1)));
+        assert!(holds(Condition::contains("tags[*]", "A")));
+        assert!(holds(Condition::eq("items[*].n", 1)));
+        assert!(holds(Condition::is_null("items[*].n")));
+        assert!(holds(Condition::eq("tags[*][*]", 2)));
+        // `Ne` is `Eq` negated: no element equal.
+        assert!(!holds(Condition::ne("tags[*]", "a")));
+        assert!(holds(Condition::ne("tags[*]", "b")));
+        assert!(holds(!Condition::eq("tags[*]", "b")));
+        // No elements: nothing holds but `Ne`.
+        assert!(!holds(Condition::eq("s[*]", "x")));
+        assert!(!holds(Condition::is_null("missing[*]")));
+        assert!(holds(Condition::ne("s[*]", "x")));
+        // Without brackets an array is one value, equal to no scalar.
+        assert!(!holds(Condition::eq("tags", "a")));
+        assert!(holds(Condition::ne("tags", "a")));
+    }
+
+    /// Several elements may be in range; nothing ties them to one order
+    /// of documents, so a multikey index is never read for a sort.
+    #[test]
+    fn a_multikey_index_is_not_read_in_sort_order() {
+        let indexes = [index("tags[*]"), index("age")];
+        let sorted = |field: &str| Filter::new().sort_asc(field).limit(5);
+        assert!(sorted("tags[*]").index_order(&indexes).is_none());
+        assert!(sorted("age").index_order(&indexes).is_some());
+        let ranges = Filter::new()
+            .eq("tags[*]", "a")
+            .index_ranges(&indexes)
+            .unwrap();
+        assert_eq!(ranges[0].0.field, "tags[*]");
+    }
+
+    /// `tags[*] > 5 AND tags[*] < 3` holds for `[1, 10]`: one element is
+    /// above 5, another below 3. Intersected, the two ranges would be
+    /// empty; one of them alone holds the document.
+    #[test]
+    fn ranges_on_elements_are_not_intersected() {
+        let indexes = [index("tags[*]")];
+        let d = doc(&[("tags", Document::Array(vec![1.into(), 10.into()]))]);
+        let filter = Filter::new().gt("tags[*]", 5).lt("tags[*]", 3);
+        assert!(filter.matches(&d));
+        let ranges = filter.index_ranges(&indexes).unwrap();
+        assert_eq!(ranges.len(), 1);
+        let key = key::secondary(&Document::Int(10), crate::DocId([0; 16])).unwrap();
+        assert!(ranges[0].1.contains(&key), "{:?}", ranges[0].1);
+
+        // An `Eq` among them is the one that bounds.
+        let filter = Filter::new().gt("tags[*]", 5).eq("tags[*]", 1);
+        let ranges = filter.index_ranges(&indexes).unwrap();
+        let key = key::secondary(&Document::Int(1), crate::DocId([0; 16])).unwrap();
+        assert!(ranges[0].1.contains(&key));
     }
 
     #[test]

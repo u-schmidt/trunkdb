@@ -4,7 +4,7 @@
 //! documents.
 
 use crate::catalog::{Catalog, IndexMeta};
-use crate::collection::secondary_key;
+use crate::collection::{secondary_entries, secondary_keys};
 use crate::data;
 use crate::database::Database;
 use crate::document::{DocId, Document};
@@ -272,8 +272,10 @@ fn check_index(
         .collect();
     let expected: BTreeSet<(Vec<u8>, PageId, u16)> = documents
         .iter()
-        .filter_map(|(id, doc, loc)| {
-            Some((secondary_key(doc, &index.field, *id)?, loc.page, loc.slot))
+        .flat_map(|(id, doc, loc)| {
+            secondary_keys(doc, &index.field, *id)
+                .into_iter()
+                .map(|key| (key, loc.page, loc.slot))
         })
         .collect();
     for (key, _, _) in expected.difference(&found) {
@@ -288,22 +290,26 @@ fn check_index(
 
     if index.unique {
         // Equal values share a key's value part (SPEC §28.1): compare
-        // within each group.
+        // within each group — values of two documents, not two elements
+        // of one (SPEC §42.2).
         let mut groups: BTreeMap<Vec<u8>, Vec<(DocId, &Document)>> = BTreeMap::new();
         for (id, doc, _) in documents {
-            let value = crate::query::value_or_null(doc, &index.field);
-            if matches!(value, Document::Null) {
-                continue;
-            }
-            if let Some(encoded) = key::encode_value(value) {
-                groups.entry(encoded).or_default().push((*id, value));
+            for (_key, values) in secondary_entries(doc, &index.field, *id) {
+                for value in values {
+                    if matches!(value, Document::Null) {
+                        continue;
+                    }
+                    if let Some(encoded) = key::encode_value(value) {
+                        groups.entry(encoded).or_default().push((*id, value));
+                    }
+                }
             }
         }
         for group in groups.values() {
             for (i, (a, a_value)) in group.iter().enumerate() {
                 if let Some((b, _)) = group[i + 1..]
                     .iter()
-                    .find(|(_, b_value)| crate::query::equal(a_value, b_value))
+                    .find(|(b, b_value)| b != a && crate::query::equal(a_value, b_value))
                 {
                     check.problem(format!(
                         "{what} is unique, but documents {a} and {b} share a value"
@@ -449,7 +455,7 @@ mod tests {
         assert_eq!(report.problems, Vec::<String>::new());
         assert_eq!((report.collections, report.documents), (2, 200));
         let info = db.file_info().unwrap();
-        assert_eq!((info.format_version, info.page_size), (6, PAGE_SIZE));
+        assert_eq!((info.format_version, info.page_size), (7, PAGE_SIZE));
         assert_eq!(info.pages, report.pages);
         assert!(info.free_pages > 0, "the deletes freed pages");
 
@@ -480,7 +486,7 @@ mod tests {
         db.transact(|catalog, store| {
             let index = &catalog.indexes("people")[0];
             let mut tree = BTreeIndex::new(index.root);
-            tree.remove(store, &secondary_key(&doc, "age", id).unwrap())?;
+            tree.remove(store, &secondary_keys(&doc, "age", id)[0])?;
             // And an entry claiming the document holds 99.
             let loc = BTreeIndex::new(catalog.get("people").unwrap().index_root)
                 .lookup(store, &key::primary(id))?
@@ -520,6 +526,42 @@ mod tests {
                 "page {page} belongs to both \"notes\"'s documents and \"people\"'s documents"
             ),
         );
+    }
+
+    /// In a unique multikey index, a duplicate hiding behind a shared key:
+    /// one document's `…a` and `…b` (one entry, the key cut, SPEC §28.1),
+    /// another's `…b`. Each value counts, not each key.
+    #[test]
+    fn a_duplicate_among_elements_under_a_shared_key_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<Document>("users");
+        let long = |end: &str| Document::String("x".repeat(1200) + end);
+        let aliases = |names: Vec<Document>| object(&[("aliases", Document::Array(names))]);
+        users.ensure_unique_index("aliases[*]").unwrap();
+        users.insert(aliases(vec![long("b")])).unwrap();
+        let id = users.insert(aliases(vec![long("a"), long("c")])).unwrap();
+        // Rewritten in place, past the index's check: `…c` becomes `…b`,
+        // the same length, under the same key.
+        let copy = object(&[
+            ("_id", Document::Id(id)),
+            ("aliases", Document::Array(vec![long("a"), long("b")])),
+        ]);
+        db.transact(|catalog, store| {
+            let meta = *catalog.get("users").unwrap();
+            let loc = BTreeIndex::new(meta.index_root)
+                .lookup(store, &key::primary(id))?
+                .unwrap();
+            let mut current = meta.current_data_page;
+            assert_eq!(
+                data::update_record(store, &mut current, loc, id, &copy)?,
+                loc
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(problems(&db).len(), 1, "{:#?}", problems(&db));
+        assert_found(&db, "is unique, but documents");
     }
 
     #[test]

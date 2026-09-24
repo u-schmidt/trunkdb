@@ -71,7 +71,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["info", &db]);
     assert!(output.status.success());
     let info = stdout(&output);
-    assert!(info.contains("format 6"), "{info}");
+    assert!(info.contains("format 7"), "{info}");
     assert!(
         info.contains("users: 2 documents, indexes: age, email (unique)"),
         "{info}"

@@ -12,7 +12,8 @@ B-tree primary index, document encoding (both the untyped `Document` path
 and a serde bridge so any `T: Serialize + DeserializeOwned` works),
 scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
 `cursor`), `upsert`, single-field secondary indexes (also unique, and on nested
-paths like `address.city`), overflow pages for documents larger
+paths like `address.city`, and multikey on array elements like `tags[*]`),
+conditions on array elements, overflow pages for documents larger
 than a page, export/import as JSON Lines, a checksum on every page so a
 damaged one is an error instead of garbage, compaction that rebuilds the file
 into as few pages as it needs, a page-image write-ahead log making
@@ -122,7 +123,7 @@ trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §42 for the full list and reasoning):
+Done so far (see SPEC.md §43 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -164,8 +165,11 @@ Done so far (see SPEC.md §42 for the full list and reasoning):
 15. **Compaction** (§41): `db.compact()` or `trunkdb compact` rebuilds
     the file into as few pages as it needs; index leaves now fill when
     keys come in order.
+16. **Array conditions and multikey indexes** (§42): `eq("tags[*]",
+    "rust")`, `gt("comments[*].likes", 10)`, `ensure_index("tags[*]")`;
+    file format 7, which still opens format 6 as it is.
 
-What's still open: SPEC.md §42.2.
+What's still open: SPEC.md §43.2.
 
 ## License
 
