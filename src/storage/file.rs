@@ -17,8 +17,16 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// or a development build between 0.1.0 and this field (SPEC §21.2).
 /// History: 1 = SPEC §21; 2 = `u32` lengths in documents and overflow
 /// pages (SPEC §26); 3 = catalog cells with a kind byte, and index
-/// entries (SPEC §28); 4 = indexes hold null and missing fields (SPEC §32).
-const FORMAT_VERSION: u32 = 4;
+/// entries (SPEC §28); 4 = indexes hold null and missing fields (SPEC §32);
+/// 5 = unique indexes, a new catalog cell kind (SPEC §33).
+const FORMAT_VERSION: u32 = 5;
+/// Older formats this build opens as they are, because such a file *is*
+/// a valid `FORMAT_VERSION` file — one that uses none of what came since
+/// (for 4: unique indexes). Every header write stamps `FORMAT_VERSION`,
+/// and creating anything newer allocates a page, which writes the header
+/// in the same batch — so a file that uses something newer always says
+/// so, and an older build refuses it instead of misreading it (SPEC §33.4).
+const COMPATIBLE_OLDER_FORMATS: [u32; 1] = [4];
 const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
@@ -58,12 +66,11 @@ impl Header {
         // Checked before anything else in the header: another format
         // version may not even lay the rest of the header out this way.
         let format_version = u32::from_le_bytes(buf[28..32].try_into().unwrap());
-        if format_version != FORMAT_VERSION {
+        if format_version != FORMAT_VERSION && !COMPATIBLE_OLDER_FORMATS.contains(&format_version) {
             let message = match format_version {
-                0 => format!(
-                    "file was written before format versioning (trunkdb 0.1.0 or an early \
-                     development build); this build reads format {FORMAT_VERSION} only"
-                ),
+                0 => "file was written before format versioning (trunkdb 0.1.0 or an early \
+                      development build), which this build can't read"
+                    .to_string(),
                 v if v > FORMAT_VERSION => format!(
                     "file has format {v}, newer than this build's {FORMAT_VERSION} — \
                      open it with a newer trunkdb"
@@ -651,11 +658,34 @@ mod tests {
     }
 
     #[test]
+    fn a_compatible_older_format_opens_and_is_stamped_on_the_next_allocation() {
+        let (_dir, path) = open_temp();
+        let version = |path: &Path| std::fs::read(path).unwrap()[28..32].to_vec();
+        for older in COMPATIBLE_OLDER_FORMATS {
+            file_with_format_version(&path, older);
+            {
+                let store = FileStore::open(&path).unwrap();
+                drop(store);
+            }
+            assert_eq!(
+                version(&path),
+                older.to_le_bytes(),
+                "opening alone keeps it"
+            );
+
+            let mut store = FileStore::open(&path).unwrap();
+            store.allocate_page().unwrap();
+            drop(store);
+            assert_eq!(version(&path), FORMAT_VERSION.to_le_bytes());
+        }
+    }
+
+    #[test]
     fn other_format_versions_are_rejected_with_a_clear_error() {
         let (_dir, path) = open_temp();
         for (version, expected) in [
             (0, "before format versioning"),
-            (FORMAT_VERSION - 1, "older than this build"),
+            (3, "older than this build"),
             (FORMAT_VERSION + 1, "newer than this build"),
         ] {
             file_with_format_version(&path, version);

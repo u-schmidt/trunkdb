@@ -11,8 +11,8 @@ collections of documents.
 B-tree primary index, document encoding (both the untyped `Document` path
 and a serde bridge so any `T: Serialize + DeserializeOwned` works),
 scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
-`cursor`), `upsert`, single-field secondary indexes (also on nested paths like
-`address.city`), overflow pages for documents larger
+`cursor`), `upsert`, single-field secondary indexes (also unique, and on nested
+paths like `address.city`), overflow pages for documents larger
 than a page, export/import as JSON Lines, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0: secondary
@@ -80,7 +80,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §33 for the full list and reasoning):
+Done so far (see SPEC.md §34 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -97,8 +97,10 @@ Done so far (see SPEC.md §33 for the full list and reasoning):
    `ensure_index`.
 6. **Null and missing fields** (§32): `x == null` finds both, through an
    index too (file format 4).
+7. **Unique indexes** (§33): `ensure_unique_index("email")`; file format
+   5, which still opens format-4 files as they are.
 
-Next: an unordered list of further features (§33).
+Next: an unordered list of further features (§34).
 
 ## License
 

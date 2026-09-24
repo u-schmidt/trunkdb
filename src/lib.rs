@@ -49,6 +49,20 @@ pub enum Error {
         collection: String,
         id: document::DocId,
     },
+    /// A write would give document `id` a value in a unique index's
+    /// `field` equal to document `existing`'s (SPEC §33) — or, from
+    /// `ensure_unique_index`, two stored documents already share one.
+    /// Null and missing values never count. The whole batch was rolled
+    /// back; `ensure_unique_index` created no index.
+    #[error(
+        "collection {collection:?} has a unique index on {field:?}, and documents {existing} and {id} would have the same value there"
+    )]
+    DuplicateValue {
+        collection: String,
+        field: String,
+        id: document::DocId,
+        existing: document::DocId,
+    },
     /// A batch tried to update or delete a document its collection
     /// doesn't have (or the collection doesn't exist). The whole batch
     /// was rolled back.

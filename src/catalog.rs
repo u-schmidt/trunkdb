@@ -14,6 +14,8 @@ pub const MAX_FIELD_NAME_LEN: usize = 255;
 // The first byte of every catalog cell says what it describes.
 const KIND_COLLECTION: u8 = 0;
 const KIND_INDEX: u8 = 1;
+/// Laid out like `KIND_INDEX` (SPEC §33).
+const KIND_UNIQUE_INDEX: u8 = 2;
 
 #[derive(Clone, Copy)]
 pub struct CollectionMeta {
@@ -30,6 +32,9 @@ pub struct CollectionMeta {
 pub struct IndexMeta {
     pub field: String,
     pub root: PageId,
+    /// No two documents may have equal non-null values in `field`
+    /// (SPEC §33).
+    pub unique: bool,
 }
 
 /// `Clone` so `Database::write_batch` can snapshot it before a batch and
@@ -153,6 +158,7 @@ impl Catalog {
         store: &mut dyn PageStore,
         collection: &str,
         field: &str,
+        unique: bool,
     ) -> Result<IndexMeta> {
         check_len("field name", field, MAX_FIELD_NAME_LEN)?;
         assert!(self.collections.contains_key(collection));
@@ -160,6 +166,7 @@ impl Catalog {
         let index = IndexMeta {
             field: field.to_string(),
             root: allocate_index_root(store)?,
+            unique,
         };
         append_cell(store, &encode_index(collection, &index))?;
         self.indexes
@@ -316,12 +323,16 @@ fn encode_collection(name: &str, meta: &CollectionMeta) -> Vec<u8> {
     buffer
 }
 
-/// An index cell: `[u8 kind = 1][u64 root][u8 collection name
-/// length][collection name][field name]` — a collection name is at most
-/// 255 bytes, so one length byte does.
+/// An index cell: `[u8 kind = 1, or 2 if unique][u64 root][u8
+/// collection name length][collection name][field name]` — a collection
+/// name is at most 255 bytes, so one length byte does.
 fn encode_index(collection: &str, index: &IndexMeta) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(10 + collection.len() + index.field.len());
-    buffer.push(KIND_INDEX);
+    buffer.push(if index.unique {
+        KIND_UNIQUE_INDEX
+    } else {
+        KIND_INDEX
+    });
     buffer.extend_from_slice(&index.root.to_le_bytes());
     buffer.push(collection.len() as u8);
     buffer.extend_from_slice(collection.as_bytes());
@@ -342,7 +353,7 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
                 current_data_page: u64_at(9),
             },
         )),
-        KIND_INDEX => {
+        kind @ (KIND_INDEX | KIND_UNIQUE_INDEX) => {
             let name_len = cell[9] as usize;
             let (collection, field) = cell[10..].split_at(name_len);
             Ok(Entry::Index(
@@ -350,6 +361,7 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
                 IndexMeta {
                     field: utf8(field)?,
                     root: u64_at(1),
+                    unique: kind == KIND_UNIQUE_INDEX,
                 },
             ))
         }
@@ -476,10 +488,18 @@ mod tests {
             let mut catalog = Catalog::load(&mut store).unwrap();
             catalog.create_collection(&mut store, "users").unwrap();
             catalog.create_collection(&mut store, "posts").unwrap();
-            let email = catalog.create_index(&mut store, "users", "email").unwrap();
-            let age = catalog.create_index(&mut store, "users", "age").unwrap();
-            catalog.create_index(&mut store, "posts", "title").unwrap();
+            let email = catalog
+                .create_index(&mut store, "users", "email", true)
+                .unwrap();
+            let age = catalog
+                .create_index(&mut store, "users", "age", false)
+                .unwrap();
+            // Unique, so dropping it has to find a kind-2 cell.
+            catalog
+                .create_index(&mut store, "posts", "title", true)
+                .unwrap();
             assert_eq!(catalog.indexes("users"), [email.clone(), age.clone()]);
+            assert!(email.unique && !age.unique);
 
             let dropped = catalog.drop_index(&mut store, "posts", "title").unwrap();
             assert_eq!(dropped.map(|i| i.field), Some("title".to_string()));
@@ -511,10 +531,11 @@ mod tests {
         catalog.create_collection(&mut store, &longest).unwrap();
 
         catalog
-            .create_index(&mut store, &longest, &"f".repeat(MAX_FIELD_NAME_LEN))
+            .create_index(&mut store, &longest, &"f".repeat(MAX_FIELD_NAME_LEN), false)
             .unwrap();
         let too_long = "f".repeat(MAX_FIELD_NAME_LEN + 1);
-        let Err(crate::Error::Io(err)) = catalog.create_index(&mut store, &longest, &too_long)
+        let Err(crate::Error::Io(err)) =
+            catalog.create_index(&mut store, &longest, &too_long, false)
         else {
             panic!("an overlong field name must be an I/O InvalidInput error");
         };

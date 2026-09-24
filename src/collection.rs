@@ -4,7 +4,7 @@ use crate::data;
 use crate::database::Database;
 use crate::document::{DocId, Document};
 use crate::id::IdGenerator;
-use crate::index::{BTreeIndex, Index, key};
+use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::query::{Filter, QueryPlan};
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
@@ -74,7 +74,29 @@ impl<T> Collection<T> {
     /// no entry. `_id` is always indexed (the primary index) and is
     /// rejected here, and so are paths below it and paths with an empty
     /// part (`a..b`, `.a`).
+    ///
+    /// An existing unique index on `field` is an error, not a match —
+    /// see `ensure_unique_index`.
     pub fn ensure_index(&self, field: &str) -> crate::Result<bool> {
+        self.ensure(field, false)
+    }
+
+    /// `ensure_index`, plus a constraint (SPEC §33): no two documents may
+    /// have equal values in `field` — equal as a filter's `Eq` sees it,
+    /// so `1` and `1.0` count as equal, `"a"` and `"A"` don't. Null and
+    /// missing values are exempt: any number of documents may lack the
+    /// field. A write that would break it fails with
+    /// `Error::DuplicateValue`, and its whole batch is rolled back.
+    ///
+    /// Creating it over documents that already break it fails the same
+    /// way, naming two of them, and creates nothing. An existing
+    /// non-unique index on `field` is an error too: drop it first, then
+    /// call this.
+    pub fn ensure_unique_index(&self, field: &str) -> crate::Result<bool> {
+        self.ensure(field, true)
+    }
+
+    fn ensure(&self, field: &str, unique: bool) -> crate::Result<bool> {
         let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
         if field.split('.').next() == Some("_id") {
             return Err(invalid("`_id` is the primary key; it needs no secondary index").into());
@@ -83,7 +105,7 @@ impl<T> Collection<T> {
             return Err(invalid("an index path needs a name between every two dots").into());
         }
         self.db
-            .transact(|catalog, store| build_index(catalog, store, &self.name, field))
+            .transact(|catalog, store| build_index(catalog, store, &self.name, field, unique))
     }
 
     /// Drops the secondary index on `field` and frees its pages: `false`
@@ -99,13 +121,23 @@ impl<T> Collection<T> {
     }
 
     /// The fields this collection has secondary indexes on, in creation
-    /// order.
+    /// order — unique ones included.
     pub fn indexes(&self) -> crate::Result<Vec<String>> {
+        self.index_fields(|_| true)
+    }
+
+    /// The fields of `indexes` whose index is unique (SPEC §33).
+    pub fn unique_indexes(&self) -> crate::Result<Vec<String>> {
+        self.index_fields(|index| index.unique)
+    }
+
+    fn index_fields(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
         let state = self.db.read()?;
         Ok(state
             .catalog
             .indexes(&self.name)
             .iter()
+            .filter(|index| keep(index))
             .map(|index| index.field.clone())
             .collect())
     }
@@ -472,7 +504,7 @@ pub(crate) fn apply_write_op(
             let loc = data::insert_record(store, &mut current, *id, &doc)?;
             index.insert(store, &key::primary(*id), loc)?;
             let secondary = catalog.indexes(collection);
-            update_secondary_indexes(secondary, store, *id, None, Some((&doc, loc)))?;
+            update_secondary_indexes(collection, secondary, store, *id, None, Some((&doc, loc)))?;
             save_current_data_page(catalog, store, collection, &meta, current)
         }
         WriteOp::Update(collection, id, doc) => {
@@ -489,7 +521,14 @@ pub(crate) fn apply_write_op(
                 index.insert(store, &key::primary(*id), new_loc)?;
             }
             let old = old.as_ref().map(|old| (old, loc));
-            update_secondary_indexes(secondary, store, *id, old, Some((&doc, new_loc)))?;
+            update_secondary_indexes(
+                collection,
+                secondary,
+                store,
+                *id,
+                old,
+                Some((&doc, new_loc)),
+            )?;
             save_current_data_page(catalog, store, collection, &meta, current)
         }
         WriteOp::Delete(collection, id) => {
@@ -500,7 +539,7 @@ pub(crate) fn apply_write_op(
             data::delete_record(store, meta.current_data_page, loc)?;
             index.remove(store, &key::primary(*id))?;
             let old = old.as_ref().map(|old| (old, loc));
-            update_secondary_indexes(secondary, store, *id, old, None)?;
+            update_secondary_indexes(collection, secondary, store, *id, old, None)?;
             Ok(())
         }
     }
@@ -548,14 +587,17 @@ fn secondary_key(doc: &Document, field: &str, id: DocId) -> Option<Vec<u8>> {
 /// Brings every secondary index from a document's `old` state to its
 /// `new` one — each `(document, location)`, `None` for "not there":
 /// insert is `(None, new)`, delete `(old, None)`. An index whose key and
-/// location both stayed the same isn't touched.
+/// location both stayed the same isn't touched. A unique index is checked
+/// before its new entry goes in, unless the key stayed the same (only
+/// the document moved).
 fn update_secondary_indexes(
+    collection: &str,
     indexes: &[IndexMeta],
     store: &mut dyn PageStore,
     id: DocId,
     old: Option<(&Document, RecordLocation)>,
     new: Option<(&Document, RecordLocation)>,
-) -> std::io::Result<()> {
+) -> crate::Result<()> {
     for index in indexes {
         let entry = |state: Option<(&Document, RecordLocation)>| {
             state.and_then(|(doc, loc)| Some((secondary_key(doc, &index.field, id)?, loc)))
@@ -565,33 +607,101 @@ fn update_secondary_indexes(
             continue;
         }
         let mut tree = BTreeIndex::new(index.root);
-        if let Some((key, _loc)) = before {
-            tree.remove(store, &key)?;
+        let before = before.map(|(key, _loc)| key);
+        if let Some(key) = &before {
+            tree.remove(store, key)?;
         }
-        if let Some((key, loc)) = after {
+        if let (Some((key, loc)), Some((doc, _))) = (after, new) {
+            if index.unique && before.as_ref() != Some(&key) {
+                check_unique(store, collection, index, id, doc)?;
+            }
             tree.insert(store, &key, loc)?;
         }
     }
     Ok(())
 }
 
+/// Before document `id`'s entry goes into the unique `index`:
+/// `Error::DuplicateValue` if another document's value in the field
+/// equals `doc`'s (SPEC §33). Equal means equal to a filter's `Eq` — so
+/// `1` and `1.0` collide, `"a"` and `"A"` don't. Null and missing values
+/// are exempt. Keys can't decide it alone: different values can share a
+/// key's value part (large ints rounding to one `f64`, strings cut to the
+/// key budget, §28.1), so every document under the same value part is
+/// read and compared — normally none.
+fn check_unique(
+    store: &dyn PageStore,
+    collection: &str,
+    index: &IndexMeta,
+    id: DocId,
+    doc: &Document,
+) -> crate::Result<()> {
+    let value = crate::query::value_or_null(doc, &index.field);
+    if matches!(value, Document::Null) {
+        return Ok(());
+    }
+    let Some(encoded) = key::encode_value(value) else {
+        return Ok(());
+    };
+    let tree = BTreeIndex::new(index.root);
+    for (entry, loc) in tree.range(store, &KeyRange::prefixed(&encoded))? {
+        let existing = key::doc_id(&entry);
+        if existing == id {
+            continue;
+        }
+        let (_, other) = data::get_record(store, loc)?;
+        if crate::query::equal(crate::query::value_or_null(&other, &index.field), value) {
+            return Err(crate::Error::DuplicateValue {
+                collection: collection.to_string(),
+                field: index.field.clone(),
+                id,
+                existing,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Creates the secondary index on `field` and fills it from every
-/// document in the collection — `false` if it already exists.
+/// document in the collection — `false` if it already exists as asked.
+/// An existing index that differs in `unique` is an error, not changed:
+/// the caller drops it first (SPEC §33.2). A unique index checks each
+/// document as it goes in, so the first duplicate fails the batch.
 fn build_index(
     catalog: &mut Catalog,
     store: &mut dyn PageStore,
     collection: &str,
     field: &str,
+    unique: bool,
 ) -> crate::Result<bool> {
-    if catalog.indexes(collection).iter().any(|i| i.field == field) {
-        return Ok(false);
+    if let Some(existing) = catalog
+        .indexes(collection)
+        .iter()
+        .find(|i| i.field == field)
+    {
+        if existing.unique == unique {
+            return Ok(false);
+        }
+        let kind = |unique| if unique { "a unique" } else { "a non-unique" };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{collection:?} already has {} index on {field:?}, not {}; drop it first",
+                kind(existing.unique),
+                kind(unique)
+            ),
+        )
+        .into());
     }
     let meta = get_or_create_meta(catalog, store, collection)?;
-    let index = catalog.create_index(store, collection, field)?;
+    let index = catalog.create_index(store, collection, field, unique)?;
     let mut tree = BTreeIndex::new(index.root);
     for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
         let (id, doc) = data::get_record(store, loc)?;
         if let Some(key) = secondary_key(&doc, field, id) {
+            if unique {
+                check_unique(store, collection, &index, id, &doc)?;
+            }
             tree.insert(store, &key, loc)?;
         }
     }
@@ -1631,6 +1741,225 @@ mod tests {
         members.update(&bob, member("Bob", None, None)).unwrap();
         assert_eq!(names("nick", Op::Eq), ["Ada", "Bob", "Old"]);
         assert_eq!(names("team", Op::Eq), ["Ada", "Bob", "Cy", "Old"]);
+    }
+
+    // --- Unique indexes (SPEC §33) ---
+
+    fn duplicate(result: crate::Result<impl std::fmt::Debug>) -> (DocId, DocId) {
+        match result {
+            Err(crate::Error::DuplicateValue { id, existing, .. }) => (id, existing),
+            other => panic!("expected DuplicateValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_unique_index_refuses_equal_values_and_rolls_back_the_whole_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let email = |s: &str| object(vec![("email", Document::String(s.to_string()))]);
+        let (ada, bob) = {
+            let db = Database::open(&path).unwrap();
+            let docs = db.collection::<Document>("docs");
+            assert!(docs.ensure_unique_index("email").unwrap());
+            assert!(!docs.ensure_unique_index("email").unwrap());
+            assert_eq!(docs.unique_indexes().unwrap(), ["email"]);
+
+            let ada = docs.insert(email("ada@x")).unwrap();
+            let (id, existing) = duplicate(docs.insert(email("ada@x")));
+            assert_eq!(existing, ada);
+            assert_ne!(id, ada);
+            // Equal as `Eq` sees it: case matters.
+            let bob = docs.insert(email("ADA@x")).unwrap();
+            assert_eq!(docs.count(Filter::default()).unwrap(), 2);
+
+            // The first insert of a failing batch is rolled back too.
+            let insert = |doc| WriteOp::Insert("docs".into(), db.id_gen().generate(), doc);
+            duplicate(db.write_batch(vec![insert(email("cy@x")), insert(email("cy@x"))]));
+            assert_eq!(docs.count(Filter::default()).unwrap(), 2);
+
+            // An update onto a taken value fails and changes nothing...
+            duplicate(docs.update(&bob, email("ada@x")));
+            assert_eq!(docs.get(&bob).unwrap(), Some(with_id(email("ADA@x"), bob)));
+            // ...keeping one's own value is fine, even when the document
+            // grows and moves (SPEC §20.3)...
+            let mut grown = email("ada@x");
+            if let Document::Object(fields) = &mut grown {
+                fields.insert("pad".into(), Document::String("p".repeat(9000)));
+            }
+            docs.update(&ada, grown).unwrap();
+            // ...and a value is free again once its document is gone.
+            docs.delete(&bob).unwrap();
+            let bob = docs.insert(email("ADA@x")).unwrap();
+
+            // Any number of documents may lack the field or hold null.
+            for doc in [object(vec![]), object(vec![]), email("x")] {
+                docs.insert(doc).unwrap();
+            }
+            for _ in 0..2 {
+                docs.insert(object(vec![("email", Document::Null)]))
+                    .unwrap();
+            }
+            (ada, bob)
+        };
+
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("docs");
+        assert_eq!(docs.unique_indexes().unwrap(), ["email"]);
+        assert_eq!(duplicate(docs.insert(email("ada@x"))).1, ada);
+        assert_eq!(duplicate(docs.insert(email("ADA@x"))).1, bob);
+    }
+
+    #[test]
+    fn unique_means_equal_values_not_equal_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_unique_index("k").unwrap();
+        let k = |value: Document| object(vec![("k", value)]);
+        let long = |tail: &str| Document::String("x".repeat(1200) + tail);
+        let big = 1i64 << 53;
+
+        docs.insert(k(Document::Int(1))).unwrap();
+        duplicate(docs.insert(k(Document::Float(1.0))));
+        docs.insert(k(Document::Float(0.0))).unwrap();
+        duplicate(docs.insert(k(Document::Float(-0.0))));
+        // Same key (§28.1), different values: both allowed.
+        docs.insert(k(Document::Int(big))).unwrap();
+        docs.insert(k(Document::Int(big + 1))).unwrap();
+        docs.insert(k(long("a"))).unwrap();
+        docs.insert(k(long("b"))).unwrap();
+        duplicate(docs.insert(k(long("a"))));
+        // Values no condition can match equal aren't checked.
+        for _ in 0..2 {
+            docs.insert(k(Document::Float(f64::NAN))).unwrap();
+            docs.insert(k(Document::Array(vec![Document::Int(1)])))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn ensure_unique_index_over_duplicates_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<User>("users");
+        let first = users.insert(user("Ada", 36)).unwrap();
+        users.insert(user("Bob", 41)).unwrap();
+        let second = users.insert(user("Ada", 20)).unwrap();
+
+        assert_eq!(
+            duplicate(users.ensure_unique_index("name")),
+            (second, first)
+        );
+        assert!(users.indexes().unwrap().is_empty());
+
+        users.delete(&second).unwrap();
+        assert!(users.ensure_unique_index("name").unwrap());
+
+        // The other kind of index on the same field is refused, not
+        // swapped: dropping it first is the caller's call.
+        users.ensure_index("age").unwrap();
+        for result in [users.ensure_unique_index("age"), users.ensure_index("name")] {
+            let Err(crate::Error::Io(err)) = result else {
+                panic!("expected a refusal, got {result:?}");
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(users.indexes().unwrap(), ["name", "age"]);
+        assert_eq!(users.unique_indexes().unwrap(), ["name"]);
+    }
+
+    /// A format-4 file (SPEC §32) is a format-5 file without unique
+    /// indexes: it opens as it is, and the batch that creates its first
+    /// unique index stamps it 5 (SPEC §33.4).
+    #[test]
+    fn a_format_4_file_opens_and_becomes_5_with_its_first_unique_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let version = || std::fs::read(&path).unwrap()[28..32].to_vec();
+        {
+            let db = Database::open(&path).unwrap();
+            let users = db.collection::<User>("users");
+            users.insert(user("Ada", 36)).unwrap();
+            users.ensure_index("age").unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[28..32].copy_from_slice(&4u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        {
+            let db = Database::open(&path).unwrap();
+            let users = db.collection::<User>("users");
+            assert_eq!(users.find(age_filter(Op::Gte, 0)).unwrap().len(), 1);
+            users.insert(user("Bob", 41)).unwrap();
+        }
+        assert_eq!(version(), 4u32.to_le_bytes(), "no page allocated yet");
+
+        let db = Database::open(&path).unwrap();
+        db.collection::<User>("users")
+            .ensure_unique_index("name")
+            .unwrap();
+        assert_eq!(version(), 5u32.to_le_bytes());
+    }
+
+    /// Random single-op batches against a unique index on `v`: each must
+    /// fail exactly when a scan finds another document with an equal,
+    /// non-null `v` — and a failed one must change nothing.
+    #[test]
+    fn a_unique_index_refuses_exactly_what_a_scan_finds_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_unique_index("v").unwrap();
+        let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+        let mut ids: Vec<DocId> = Vec::new();
+        let (mut accepted, mut refused) = (0, 0);
+
+        // Single-op batches, so each outcome can be checked — each one
+        // syncs to disk twice, which is what keeps the count low.
+        for _ in 0..300 {
+            let before = docs.find_with_ids(Filter::default()).unwrap();
+            let doc = random_document(&mut rng);
+            let (op, id) = match rng.below(4) {
+                0 if !ids.is_empty() => {
+                    let id = ids[rng.below(ids.len())];
+                    (WriteOp::Delete("docs".into(), id), None)
+                }
+                1 | 2 if !ids.is_empty() => {
+                    let id = ids[rng.below(ids.len())];
+                    (WriteOp::Update("docs".into(), id, doc.clone()), Some(id))
+                }
+                _ => {
+                    let id = db.id_gen().generate();
+                    (WriteOp::Insert("docs".into(), id, doc.clone()), Some(id))
+                }
+            };
+            let value = crate::query::value_or_null(&doc, "v");
+            let taken = id.is_some()
+                && !matches!(value, Document::Null)
+                && before.iter().any(|(other, stored)| {
+                    Some(*other) != id
+                        && crate::query::equal(crate::query::value_or_null(stored, "v"), value)
+                });
+
+            match (db.write_batch(vec![op.clone()]), taken) {
+                (Ok(()), false) => {
+                    accepted += 1;
+                    match op {
+                        WriteOp::Insert(_, id, _) => ids.push(id),
+                        WriteOp::Delete(_, id) => ids.retain(|other| *other != id),
+                        WriteOp::Update(..) => {}
+                    }
+                }
+                (Err(crate::Error::DuplicateValue { .. }), true) => {
+                    refused += 1;
+                    let after = docs.find_with_ids(Filter::default()).unwrap();
+                    assert_eq!(sorted_ids(after), sorted_ids(before));
+                }
+                (result, taken) => panic!("{op:?}: {result:?}, but taken = {taken}"),
+            }
+        }
+        assert!(accepted > 100 && refused > 20, "{accepted} / {refused}");
+        assert_index_agrees_with_scan(&docs, &mut rng, "v");
     }
 
     /// A batch that fails after touching an index leaves no entry behind.

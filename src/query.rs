@@ -192,6 +192,12 @@ fn fold_case(s: &str) -> String {
     s.to_lowercase().replace('ß', "ss")
 }
 
+/// `a == b` as a filter's `Eq` sees it — what a unique index forbids
+/// twice (SPEC §33).
+pub(crate) fn equal(a: &Document, b: &Document) -> bool {
+    compare(a, b) == Some(std::cmp::Ordering::Equal)
+}
+
 /// Only values of one kind compare; `Null` equals `Null` (SPEC §32), so
 /// `Eq`/`Lte`/`Gte` against null match null and missing fields, `Ne`
 /// everything else, and `Lt`/`Gt` nothing.
@@ -556,6 +562,7 @@ mod tests {
         IndexMeta {
             field: field.into(),
             root: 1,
+            unique: false,
         }
     }
 

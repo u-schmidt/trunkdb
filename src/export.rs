@@ -30,6 +30,8 @@ const EXPORT_VERSION: u64 = 1;
 const HEADER_KEY: &str = "$trunkdb_export";
 const COLLECTION_KEY: &str = "$collection";
 const INDEXES_KEY: &str = "$indexes";
+const FIELD_KEY: &str = "field";
+const UNIQUE_KEY: &str = "unique";
 
 /// An import writes a batch at most this many documents…
 const CHUNK_DOCUMENTS: usize = 1000;
@@ -74,7 +76,13 @@ impl Database {
                 .catalog
                 .indexes(name)
                 .iter()
-                .map(|index| Value::String(index.field.clone()))
+                .map(|index| match index.unique {
+                    false => Value::String(index.field.clone()),
+                    true => object([
+                        (FIELD_KEY, index.field.clone().into()),
+                        (UNIQUE_KEY, true.into()),
+                    ]),
+                })
                 .collect();
             let header = object([
                 (COLLECTION_KEY, name.into()),
@@ -198,10 +206,11 @@ impl Chunk {
     }
 }
 
-/// A `{"$collection": ..., "$indexes": [...]}` line.
+/// A `{"$collection": ..., "$indexes": [...]}` line. An index is its
+/// field as a string, or `{"field": ..., "unique": true}` (SPEC §33.5).
 struct CollectionHeader {
     name: String,
-    indexes: Vec<String>,
+    indexes: Vec<(String, bool)>,
 }
 
 impl CollectionHeader {
@@ -220,13 +229,9 @@ impl CollectionHeader {
         };
         let indexes = match object.get(INDEXES_KEY) {
             None => Vec::new(),
-            Some(Value::Array(fields)) => fields
-                .iter()
-                .map(|field| match field {
-                    Value::String(field) => Ok(field.clone()),
-                    other => Err(format!("`{INDEXES_KEY}` must hold strings, got {other}")),
-                })
-                .collect::<Result<_, _>>()?,
+            Some(Value::Array(indexes)) => {
+                indexes.iter().map(parse_index).collect::<Result<_, _>>()?
+            }
             Some(other) => return Err(format!("`{INDEXES_KEY}` must be an array, got {other}")),
         };
         if let Some(key) = object
@@ -243,10 +248,42 @@ impl CollectionHeader {
 
     fn build_indexes(self, db: &Database) -> crate::Result<()> {
         let collection = db.collection::<crate::Document>(&self.name);
-        for field in &self.indexes {
-            collection.ensure_index(field)?;
+        for (field, unique) in &self.indexes {
+            match unique {
+                false => collection.ensure_index(field)?,
+                true => collection.ensure_unique_index(field)?,
+            };
         }
         Ok(())
+    }
+}
+
+/// One `$indexes` entry: `"field"`, or `{"field": "...", "unique":
+/// bool}`.
+fn parse_index(index: &Value) -> Result<(String, bool), String> {
+    let wrong = || {
+        format!(
+            "an `{INDEXES_KEY}` entry must be a field name or \
+             {{\"{FIELD_KEY}\": ..., \"{UNIQUE_KEY}\": true}}, got {index}"
+        )
+    };
+    match index {
+        Value::String(field) => Ok((field.clone(), false)),
+        Value::Object(object) => {
+            let Some(Value::String(field)) = object.get(FIELD_KEY) else {
+                return Err(wrong());
+            };
+            let unique = match object.get(UNIQUE_KEY) {
+                None => false,
+                Some(Value::Bool(unique)) => *unique,
+                Some(_) => return Err(wrong()),
+            };
+            if object.keys().any(|k| k != FIELD_KEY && k != UNIQUE_KEY) {
+                return Err(wrong());
+            }
+            Ok((field.clone(), unique))
+        }
+        _ => Err(wrong()),
     }
 }
 
@@ -326,7 +363,10 @@ mod tests {
                     .map(|(id, doc)| (id, crate::document::encode_document(&doc)))
                     .collect();
                 docs.sort();
-                (name, collection.indexes().unwrap(), docs)
+                let mut indexes = collection.indexes().unwrap();
+                let unique = collection.unique_indexes().unwrap();
+                indexes.extend(unique.into_iter().map(|field| format!("unique: {field}")));
+                (name, indexes, docs)
             })
             .collect()
     }
@@ -428,6 +468,7 @@ mod tests {
         let big = source.collection::<Document>("big");
         big.insert(object(&[("text", Document::String("x".repeat(100_000)))]))
             .unwrap();
+        big.ensure_unique_index("text").unwrap();
         // A collection that exists but is empty, and one with only an
         // index, on a nested path.
         source
@@ -436,6 +477,10 @@ mod tests {
         source
             .collection::<Document>("indexed")
             .ensure_index("k.a")
+            .unwrap();
+        source
+            .collection::<Document>("indexed")
+            .ensure_unique_index("u")
             .unwrap();
 
         let text = export_text(&source);
@@ -484,7 +529,7 @@ mod tests {
         let db = open(&dir, "db.trunkdb");
         let text = r#"{"$trunkdb_export": 1}
 
-{"$collection": "people", "$indexes": ["name"]}
+{"$collection": "people", "$indexes": ["name", {"field": "born", "unique": true}]}
 {"name": "Ada", "born": 1815, "tags": ["math"]}
 {"name": "Grace", "born": 1906}
 {"$collection": "notes"}
@@ -499,7 +544,8 @@ mod tests {
         );
         assert_eq!(db.collections().unwrap(), ["notes", "people"]);
         let people = db.collection::<Document>("people");
-        assert_eq!(people.indexes().unwrap(), ["name"]);
+        assert_eq!(people.indexes().unwrap(), ["name", "born"]);
+        assert_eq!(people.unique_indexes().unwrap(), ["born"]);
         let found = people
             .find_one(Filter {
                 conditions: vec![Condition {
@@ -516,6 +562,26 @@ mod tests {
         };
         assert_eq!(map["born"], Document::Int(1906));
         assert!(matches!(map["_id"], Document::Id(_)), "got a new id");
+    }
+
+    /// The documents are in before the indexes are built (SPEC §30.3), so
+    /// a duplicate for a unique index fails after them, and names both.
+    #[test]
+    fn an_import_that_breaks_a_unique_index_fails_after_its_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir, "db.trunkdb");
+        let text = r#"{"$trunkdb_export": 1}
+{"$collection": "people", "$indexes": [{"field": "email", "unique": true}]}
+{"email": "a@x"}
+{"email": "a@x"}
+"#;
+        let Err(Error::DuplicateValue { field, .. }) = import_text(&db, text) else {
+            panic!("expected DuplicateValue");
+        };
+        assert_eq!(field, "email");
+        let people = db.collection::<Document>("people");
+        assert_eq!(people.count(Filter::default()).unwrap(), 2);
+        assert!(people.indexes().unwrap().is_empty());
     }
 
     #[test]
@@ -553,6 +619,18 @@ mod tests {
                 format!("{header}{{\"$collection\":\"c\",\"$index\":[]}}\n"),
                 2,
                 "unknown key",
+            ),
+            (
+                format!("{header}{{\"$collection\":\"c\",\"$indexes\":[{{\"unique\":true}}]}}\n"),
+                2,
+                "must be a field name",
+            ),
+            (
+                format!(
+                    "{header}{{\"$collection\":\"c\",\"$indexes\":[{{\"field\":\"a\",\"unique\":1}}]}}\n"
+                ),
+                2,
+                "must be a field name",
             ),
         ];
         for (i, (text, line, needle)) in cases.iter().enumerate() {

@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §33 for the roadmap.
+large-document workload (§5.2) the second; see §34 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1234,12 +1234,12 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§33, "Later").
+future vacuum (§34, "Later").
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
 DocId][document]`. `0` means the whole document is in the cell — the
-only kind written today. `1` is reserved for overflow (§33, item 7): the
+only kind written today. `1` is reserved for overflow (§34, item 7): the
 cell will hold `[u32 total length][u64 first Overflow page]` and as much
 of the document as fits. Reading it today is an `InvalidData` error, not
 a misread. The page type tag `Overflow = 6` is reserved alongside it, so
@@ -1310,8 +1310,9 @@ The header gained `[28..32) format_version: u32`, first `1` — the
 format of §20 (packed data pages, flags byte, catalog cells with
 `current_data_page`), `2` since §26 (`u32` document lengths,
 overflow pages), `3` since §28 (catalog cells with a kind byte,
-index entries), and `4` since §32 (indexes hold null and missing
-fields). `Header::decode` checks it right after the magic,
+index entries), `4` since §32 (indexes hold null and missing
+fields), and `5` since §33 (unique indexes; format 4 is still read as
+it is, §33.4). `Header::decode` checks it right after the magic,
 before anything else in the header (another version may lay it out
 differently), and only its own version is accepted. The error says
 which case it is:
@@ -1517,7 +1518,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is in "Later" (§33). A
+A pattern language (regex, `LIKE` wildcards) is in "Later" (§34). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1698,7 +1699,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§33, "Later").
+(§34, "Later").
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -1880,6 +1881,7 @@ cell; the collection's cell keeps its fixed length, so
 `set_current_data_page` still rewrites it in place.
 - collection cell: `[u8 kind = 0][u64 index_root][u64 current_data_page][name]`
 - index cell: `[u8 kind = 1][u64 root][u8 name length][collection name][field name]`
+  (kind `2`, same layout: a unique index, §33.3)
 
 Field names are capped at 255 bytes like collection names (§22.3), so
 an index cell always fits. `CollectionMeta` stays a small `Copy` value;
@@ -2078,7 +2080,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§33). It's also a backup that can be read and `diff`ed, and a way to
+(§34). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2123,7 +2125,8 @@ every build and test run in two. Easy to add if someone minds.
 ```
 - **Header line** with the export format's own version — independent
   of the file format version, which is the point.
-- **A collection line** per collection (name, indexed fields), then its
+- **A collection line** per collection (name, indexed fields — a unique
+  index as `{"field": ..., "unique": true}`, §33.5), then its
   documents, one per line. Collections come in name order, documents in
   id order, so exporting the same data twice gives the same bytes.
 - **A document line** is the document itself: an `Object` already
@@ -2168,7 +2171,7 @@ before or entirely after it, and documents in different collections
 that refer to each other agree. Readers go on in parallel; writers wait.
 
 That's the opposite of `cursor` (§29.4), which holds no lock between
-items, and the roadmap's sketch (§33) had planned to export through a
+items, and the roadmap's sketch (§34) had planned to export through a
 cursor.
 Rejected, because an export is a backup: read-committed per document
 would let a batch that updates two collections appear half-applied. The
@@ -2204,7 +2207,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§33,
+  seconds; a snapshot that doesn't block writers needs MVCC (§34,
   "Later").
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
@@ -2315,7 +2318,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
 - Still one field per index: compound and unique indexes remain in
-  "Later" (§33).
+  "Later" (§34).
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
 
@@ -2423,7 +2426,137 @@ documented path (§21.2) and already tested.
   values (not first or last): `compare` orders only values of one kind.
 - Every index grows by one entry per document without the field (§32.2).
 
-## 33. Open work / next milestones
+## 33. Unique indexes (`collection.rs`, `catalog.rs`, `storage/file.rs`, `export.rs`)
+
+Real and tested: an index can also be a constraint — no two documents
+may have equal values in its field.
+
+```rust
+users.ensure_unique_index("email")?;   // like LiteDB's EnsureIndex(x => x.Email, true)
+users.insert(ada)?;                     // ok
+users.insert(also_ada)?;                // Err(Error::DuplicateValue { collection, field, id, existing })
+users.unique_indexes()?;                // ["email"]
+```
+
+A unique index is an ordinary secondary index (§28) plus a check: it
+answers the same queries the same way, and `indexes()` lists it too.
+
+### 33.1 What counts as a duplicate
+Two values are duplicates if a filter's `Eq` says they're equal
+(`query::equal`): `1` and `1.0` collide, `0.0` and `-0.0` too; `"a"` and
+`"A"` don't. So "no duplicates" means exactly "`find(field == v)` never
+returns two documents" — the index and the filter agree on what equal
+means.
+
+**Null and missing values are exempt**: any number of documents may lack
+the field or hold null. That's what SQL's `UNIQUE` does (Postgres,
+SQLite; SQL Server allows one `NULL`). MongoDB counts missing as a
+duplicate null, so an optional field there needs a partial index as
+well. Here an optional field like `email` can be unique as it is.
+Values no condition can match as equal — arrays, objects, binary, ids,
+`NaN` — aren't in the index (§28.1) and aren't checked either.
+
+Keys alone can't decide it. Different values can share a key's value
+part: `Int`s beyond 2^53 that round to one `f64`, strings cut to the
+key budget (§28.1). So `check_unique` reads every document under the
+same value part and compares the real values — normally there are none,
+so the check costs one B-tree range lookup.
+
+### 33.2 When it's checked
+Right before a unique index gets a new entry, in
+`update_secondary_indexes`: on every insert, and on every update that
+changes the field's value. An update that keeps its value (even if the
+document moves, §20.3) isn't checked. A failure is
+`Error::DuplicateValue`, naming both documents, and like any failed op
+it rolls back the whole batch (§17.3, §22.2).
+
+The check runs per op, against the state after the batch's earlier ops.
+So a batch that swaps two documents' values fails, even though the end
+state would be fine — MongoDB behaves the same. The workaround is three
+ops through a temporary value. Rejected: checking once at the end of
+the batch. It would need every changed key collected across the batch
+and a second pass — for a case that barely comes up.
+
+`ensure_unique_index` over existing documents checks each one as it
+goes into the new index: the first duplicate fails, names two documents
+that share a value, and nothing is created.
+
+Asking for the other kind of index on a field that has one is an error
+(`InvalidInput`), not a match and not a conversion — `ensure_*` means
+"make sure this exists as declared", and a declaration that disagrees
+with the file is a bug to surface. Dropping and recreating it is one
+line. LiteDB also refuses a different definition for an existing index.
+
+### 33.3 Catalog: a new cell kind
+A unique index is a catalog cell of kind `2`, laid out like kind `1`
+(§28.5). Rejected: a flags byte in the index cell. That changes the
+layout of every existing index cell; a new kind leaves them alone.
+
+### 33.4 Format 5, and reading format 4 as it is
+An older build would read a kind-`2` cell as corruption ("unknown
+catalog entry kind 2 — file may be corrupt") — wrong, and alarming. So
+the format version is now 5, and a format-5 file is refused by older
+builds with the clear "newer than this build" error.
+
+But a format-4 file needs no migration: it *is* a valid format-5 file,
+one without unique indexes. So this build opens format 4 as it is
+(`COMPATIBLE_OLDER_FORMATS`). The header gets stamped 5 on its next
+write — every header write stamps the current version, and the header
+is written whenever a page is allocated or freed. Creating a unique
+index always allocates its root page, so the batch that adds the first
+kind-`2` cell also writes version 5, atomically. A file that uses
+something new always says so; a file that doesn't may keep saying 4,
+which is true. The first time a format change doesn't need export and
+import (§21.2).
+
+### 33.5 Export and import
+`$indexes` lists a unique index as an object instead of a string:
+
+```text
+{"$collection":"users","$indexes":["age",{"field":"email","unique":true}]}
+```
+
+Files without unique indexes are unchanged, so the export format stays
+version 1. An older build reading the object form stops with an error
+naming the line. On import, the indexes are built after the
+collection's documents (§30.3), so a file whose data breaks a unique
+index fails after its documents are in — `Error::DuplicateValue`,
+naming the two, and without that index.
+
+### 33.6 Tests
+- `a_unique_index_refuses_exactly_what_a_scan_finds_taken`: 300 random
+  single-op batches (insert, update, delete; values of every type, with
+  frequent duplicates, large ints that share a key, long strings cut to
+  the same key, nulls, missing fields, documents that grow and move).
+  Each must fail exactly when a scan finds another document with an
+  equal non-null value, and a failed one must change nothing; at the end
+  the index must still agree with a scan.
+- The rules one by one: case-sensitive strings, `1` vs `1.0`, `0.0` vs
+  `-0.0`, same key but different values, `NaN` and arrays unchecked,
+  nulls and missing fields exempt; a batch whose second insert fails
+  loses its first; an update onto a taken value; keeping a value while
+  moving; freeing a value by delete; all of it again after a reopen.
+- `ensure_unique_index` over duplicates creates nothing and names them;
+  the other kind on an indexed field is refused.
+- A format-4 file opens, stays 4 through a write that allocates nothing,
+  and becomes 5 in the batch that creates its first unique index; the
+  same for the header alone (`storage/file.rs`). Format 3 is still
+  refused.
+- Export and import keep the unique flag; a hand-written file declares
+  one; a duplicate in the data fails the import; malformed `$indexes`
+  entries name their line; the catalog keeps the kind across a reopen
+  and drops a kind-`2` cell.
+- Checked by breaking it on purpose, three ways: duplicates decided by
+  key instead of value, nulls not exempt, no check on writes (only when
+  building). Each fails two or three of these tests.
+
+### 33.7 Limits
+- One field per unique index; no compound uniqueness (`(tenant, email)`).
+- A value swap inside one batch fails (§33.2).
+- Case-insensitive uniqueness would need a case-folded key; it isn't
+  there. An app that wants it stores a folded copy and indexes that.
+
+## 34. Open work / next milestones
 
 Roadmap from v0 (crate 0.1.0) towards v1, agreed 2026-09-23. Ordered by
 priority: correctness and file format first, then what the sync workload (§5.3)
@@ -2494,11 +2627,14 @@ pure refactor that can happen anytime, independent of trunkdb.
   sorts and indexes; a dot always separates, arrays aren't entered.
 - **Null and missing fields — done** (§32): `== null` matches both,
   through indexes too; format version 4.
+- **Unique indexes — done** (§33): `ensure_unique_index`; equal as `Eq`
+  sees it, nulls exempt, checked per op; format 5, which reads format 4
+  as it is.
 
 Unordered: `Filter` OR/nesting and regex; compaction/vacuum;
-per-page checksums; compound, unique and sparse indexes, an `Exists`
-operator, and using an index for `sort`; conditions on array elements (and multikey indexes, §31.3); readers that don't wait for a write batch (MVCC
-or pre-batch page snapshots; reader/writer locking is done, §27);
-unique constraints; PyO3 bindings (for Python apps); a CLI for
-inspecting/verifying a file (and running export/import); benchmarks
-against SQLite/redb/sled.
+per-page checksums; compound and sparse indexes, an `Exists` operator,
+and using an index for `sort`; conditions on array elements (and
+multikey indexes, §31.3); readers that don't wait for a write batch
+(MVCC or pre-batch page snapshots; reader/writer locking is done, §27);
+PyO3 bindings (for Python apps); a CLI for inspecting/verifying a file
+(and running export/import); benchmarks against SQLite/redb/sled.
