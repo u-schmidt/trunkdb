@@ -1,8 +1,10 @@
 use crate::batch::Batch;
 use crate::catalog::Catalog;
 use crate::collection::{Collection, apply_write_op};
+use crate::data;
 use crate::durability::{Durability, WalDurability};
 use crate::id::UuidV7Generator;
+use crate::index::{BTreeIndex, Index};
 use crate::storage::{FileStore, PageId};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
 use std::path::Path;
@@ -113,6 +115,34 @@ impl Database {
 
     pub fn collection<T>(&self, name: &str) -> Collection<T> {
         Collection::new(self.clone(), name)
+    }
+
+    /// Deletes the collection `name` — its documents, its indexes, its
+    /// catalog entry — and frees all of their pages for reuse, in one
+    /// atomic batch (SPEC §37). `false` if there was no such collection.
+    /// `Collection` handles for it stay usable: the next write creates
+    /// it again, empty.
+    pub fn drop_collection(&self, name: &str) -> crate::Result<bool> {
+        self.transact(|catalog, store| {
+            let Some(meta) = catalog.get(name).copied() else {
+                return Ok(false);
+            };
+            let primary = BTreeIndex::new(meta.index_root);
+            let locs: Vec<_> = primary
+                .scan(store)?
+                .into_iter()
+                .map(|(_key, loc)| loc)
+                .collect();
+            data::free_collection_pages(store, meta.current_data_page, locs)?;
+            let (_meta, indexes) = catalog
+                .drop_collection(store, name)?
+                .expect("it was just there");
+            primary.free_all(store)?;
+            for index in indexes {
+                BTreeIndex::new(index.root).free_all(store)?;
+            }
+            Ok(true)
+        })
     }
 
     /// Starts a typed, atomic multi-op write — see `Batch`.
@@ -276,6 +306,103 @@ mod tests {
 
     #[derive(Serialize, Deserialize)]
     struct Dummy;
+
+    // --- Dropping a collection (SPEC §37) ---
+
+    /// Fills `name` with the same documents every time — same ids, same
+    /// sizes — so two collections filled this way take the same pages:
+    /// 300 documents of very different sizes (so a few pages empty out
+    /// when some are deleted, the current one among them), one in
+    /// overflow pages, and a plain and a unique index.
+    fn fill(db: &Database, name: &str) {
+        let docs = db.collection::<Document>(name);
+        docs.ensure_index("n").unwrap();
+        docs.ensure_unique_index("u").unwrap();
+        let doc = |i: usize| {
+            let pad = if i == 7 { 100_000 } else { i * 37 % 3000 };
+            let fields = [
+                ("n", Document::Int((i % 7) as i64)),
+                ("u", Document::Int(i as i64)),
+                ("pad", Document::String("p".repeat(pad))),
+            ];
+            Document::Object(
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            )
+        };
+        let id = |i: usize| DocId((i as u128).to_be_bytes());
+        let ops = (0..300).map(|i| WriteOp::Insert(name.into(), id(i), doc(i)));
+        db.write_batch(ops.collect()).unwrap();
+        // The last 20 too: that empties the current data page, which
+        // stays (inserts go there) though no document points to it.
+        let deletes = (0..300).filter(|i| i % 5 == 0 || (40..80).contains(i) || *i >= 280);
+        db.write_batch(
+            deletes
+                .map(|i| WriteOp::Delete(name.into(), id(i)))
+                .collect(),
+        )
+        .unwrap();
+    }
+
+    fn contents(db: &Database, name: &str) -> Vec<(DocId, Document)> {
+        let mut all = db
+            .collection::<Document>(name)
+            .find_with_ids(Filter::new())
+            .unwrap();
+        all.sort_by_key(|(id, _)| *id);
+        all
+    }
+
+    #[test]
+    fn dropping_a_collection_frees_every_page_it_had() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let file_len = || std::fs::metadata(&path).unwrap().len();
+        let (keep1, keep2) = {
+            let db = Database::open(&path).unwrap();
+            // Interleaved in the file: the kept ones' pages sit among the
+            // dropped one's.
+            fill(&db, "keep1");
+            fill(&db, "gone");
+            fill(&db, "keep2");
+            let kept = (contents(&db, "keep1"), contents(&db, "keep2"));
+            let len = file_len();
+
+            assert!(db.drop_collection("gone").unwrap());
+            assert!(!db.drop_collection("gone").unwrap());
+            assert_eq!(db.collections().unwrap(), ["keep1", "keep2"]);
+            assert!(contents(&db, "gone").is_empty());
+
+            // Everything it had comes back: the same collection again
+            // takes no new page.
+            fill(&db, "again");
+            assert_eq!(file_len(), len);
+            assert_eq!(contents(&db, "again").len(), 192);
+            assert_eq!((contents(&db, "keep1"), contents(&db, "keep2")), kept);
+            kept
+        };
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.collections().unwrap(), ["again", "keep1", "keep2"]);
+        assert_eq!(
+            (contents(&db, "keep1"), contents(&db, "keep2")),
+            (keep1, keep2)
+        );
+        let again = db.collection::<Document>("again");
+        assert_eq!(again.indexes().unwrap(), ["n", "u"]);
+        assert_eq!(again.unique_indexes().unwrap(), ["u"]);
+        let n_is_3 = Filter::new().eq("n", 3);
+        assert_eq!(again.find(n_is_3).unwrap().len(), 28);
+
+        // A handle to a dropped collection still works: it starts over.
+        let gone = db.collection::<Document>("gone");
+        assert_eq!(gone.count(Filter::new()).unwrap(), 0);
+        gone.insert(Document::Int(1)).unwrap();
+        assert_eq!(gone.count(Filter::new()).unwrap(), 1);
+        assert!(gone.indexes().unwrap().is_empty());
+    }
 
     fn insert(collection: &str, id: u8, value: i64) -> WriteOp {
         WriteOp::Insert(

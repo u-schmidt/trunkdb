@@ -201,6 +201,11 @@ where
         self.as_document().delete(id)
     }
 
+    /// See the untyped `delete_many`. No document is converted to `T`.
+    pub fn delete_many(&self, filter: Filter) -> crate::Result<usize> {
+        self.as_document().delete_many(filter)
+    }
+
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<T>> {
         Ok(self
             .find_with_ids(filter)?
@@ -312,6 +317,22 @@ impl Collection<Document> {
         found(self.write(WriteOp::Delete(self.name.clone(), *id)))
     }
 
+    /// Deletes exactly the documents `find(filter)` would return — `sort`
+    /// and `limit` included, so "the oldest 100" works — and says how many
+    /// (SPEC §37). One batch under one write lock, like `upsert`: all of
+    /// them go or none, and no write lands between the lookup and the
+    /// deletes. A collection that doesn't exist has nothing to delete and
+    /// isn't created.
+    pub fn delete_many(&self, filter: Filter) -> crate::Result<usize> {
+        self.db.transact(|catalog, store| {
+            let doomed = find_in(catalog, store, &self.name, &filter)?;
+            for (id, _doc) in &doomed {
+                apply_write_op(catalog, store, &WriteOp::Delete(self.name.clone(), *id))?;
+            }
+            Ok(doomed.len())
+        })
+    }
+
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<Document>> {
         Ok(self
             .find_with_ids(filter)?
@@ -336,20 +357,7 @@ impl Collection<Document> {
     /// (SPEC §34.2). Equal sort values come in id order either way.
     pub fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, Document)>> {
         let state = self.db.read()?;
-        let indexes = state.catalog.indexes(&self.name);
-        if let Some((index, range)) = filter.index_order(indexes) {
-            let (catalog, store) = (&state.catalog, &state.store);
-            return read_in_index_order(catalog, store, &self.name, &filter, index, range);
-        }
-        let mut candidates = read_candidates(&state.catalog, &state.store, &self.name, &filter)?;
-        // Filtering needs no lock: the candidates are owned copies.
-        drop(state);
-        if filter.sort.is_some() {
-            // So equal sort values end up in id order, as they do when
-            // read from an index (the sort is stable).
-            candidates.sort_unstable_by_key(|(id, _doc)| *id);
-        }
-        Ok(filter.apply_to(candidates, |(_id, doc)| doc))
+        find_in(&state.catalog, &state.store, &self.name, &filter)
     }
 
     /// The first match, reading no further than it: the first in `sort`
@@ -444,6 +452,26 @@ impl Collection<Document> {
             Ok(outcome)
         })
     }
+}
+
+/// What `find_with_ids` returns, against a catalog and store the caller
+/// has locked — for a read, or inside a write batch (`delete_many`).
+fn find_in(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+) -> crate::Result<Vec<(DocId, Document)>> {
+    if let Some((index, range)) = filter.index_order(catalog.indexes(collection)) {
+        return read_in_index_order(catalog, store, collection, filter, index, range);
+    }
+    let mut candidates = read_candidates(catalog, store, collection, filter)?;
+    if filter.sort.is_some() {
+        // So equal sort values end up in id order, as they do when read
+        // from an index (the sort is stable).
+        candidates.sort_unstable_by_key(|(id, _doc)| *id);
+    }
+    Ok(filter.apply_to(candidates, |(_id, doc)| doc))
 }
 
 /// The index entries `find` has to look at for `filter`: the secondary
@@ -2261,6 +2289,106 @@ mod tests {
         assert_eq!(found.len(), 180);
         assert!(found.iter().all(|r| r.status != "Complete" && r.seen >= 30));
         assert_eq!(runs.count(active).unwrap(), 180);
+    }
+
+    // --- delete_many (SPEC §37) ---
+
+    #[test]
+    fn delete_many_deletes_what_find_would_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<User>("users");
+        let mut batch = db.batch();
+        for age in 0..100 {
+            batch
+                .insert(&users, user(&format!("user {age}"), age))
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        users.ensure_index("age").unwrap();
+        users.ensure_unique_index("name").unwrap();
+        let ages = || -> Vec<i64> {
+            let mut ages: Vec<i64> = users
+                .find(Filter::new())
+                .unwrap()
+                .iter()
+                .map(|u| u.age)
+                .collect();
+            ages.sort();
+            ages
+        };
+
+        assert_eq!(users.delete_many(Filter::new().lt("age", 18)).unwrap(), 18);
+        assert_eq!(ages().first(), Some(&18));
+        // Sort and limit count: the five youngest left.
+        assert_eq!(
+            users
+                .delete_many(Filter::new().sort_asc("age").limit(5))
+                .unwrap(),
+            5
+        );
+        assert_eq!(ages().first(), Some(&23));
+        let either =
+            Filter::new().any_of([Condition::eq("name", "user 50"), Condition::eq("age", 60)]);
+        assert_eq!(users.delete_many(either).unwrap(), 2);
+        assert_eq!(users.delete_many(Filter::new().eq("age", 500)).unwrap(), 0);
+        assert_eq!(ages().len(), 75);
+        // Indexes lost their entries: a deleted unique value is free again,
+        // and a query through the age index finds nothing deleted.
+        users.insert(user("user 50", 50)).unwrap();
+        assert_eq!(users.count(Filter::new().lt("age", 23)).unwrap(), 0);
+
+        // Nothing to delete in a collection that isn't there, and it
+        // isn't created.
+        let nobody = db.collection::<User>("nobody");
+        assert_eq!(nobody.delete_many(Filter::new()).unwrap(), 0);
+        assert_eq!(db.collections().unwrap(), ["users"]);
+    }
+
+    /// Random nested filters, sometimes sorted and limited: each
+    /// `delete_many` removes exactly what `find` returned just before,
+    /// and the indexes still agree with a scan afterwards.
+    #[test]
+    fn delete_many_matches_find_through_random_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("v").unwrap();
+        docs.ensure_index("w").unwrap();
+        let mut rng = XorShift(0x7777_1234_ABCD_0001);
+        let mut deleted_any = 0;
+        for _ in 0..40 {
+            let ops = (0..20)
+                .map(|_| {
+                    WriteOp::Insert(
+                        "docs".into(),
+                        db.id_gen().generate(),
+                        random_document(&mut rng),
+                    )
+                })
+                .collect();
+            db.write_batch(ops).unwrap();
+
+            let mut f = Filter::new().and(random_condition(&mut rng, 2));
+            if rng.below(2) == 0 {
+                f = f
+                    .sort_by("v", [SortOrder::Asc, SortOrder::Desc][rng.below(2)])
+                    .limit(rng.below(8));
+            }
+            let before = sorted_ids(docs.find_with_ids(Filter::new()).unwrap());
+            let doomed = sorted_ids(docs.find_with_ids(f.clone()).unwrap());
+            assert_eq!(docs.delete_many(f.clone()).unwrap(), doomed.len(), "{f:?}");
+            let after = sorted_ids(docs.find_with_ids(Filter::new()).unwrap());
+            let expected: Vec<DocId> = before
+                .into_iter()
+                .filter(|id| !doomed.contains(id))
+                .collect();
+            assert_eq!(after, expected, "{f:?}");
+            deleted_any += doomed.len();
+        }
+        assert!(deleted_any > 100, "only {deleted_any} deleted");
+        assert_index_agrees_with_scan(&docs, &mut rng, "v");
+        assert_nested_filters_agree_with_a_scan(&docs, &mut rng);
     }
 
     // --- Unique indexes (SPEC §33) ---

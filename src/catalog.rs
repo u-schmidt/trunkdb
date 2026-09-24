@@ -199,6 +199,31 @@ impl Catalog {
         Ok(Some(index))
     }
 
+    /// Removes a collection and its indexes from the catalog and returns
+    /// them, so the caller can free their pages (SPEC §37); `None` if
+    /// there's no such collection.
+    pub fn drop_collection(
+        &mut self,
+        store: &mut dyn PageStore,
+        name: &str,
+    ) -> Result<Option<(CollectionMeta, Vec<IndexMeta>)>> {
+        let Some(meta) = self.collections.get(name).copied() else {
+            return Ok(None);
+        };
+        let indexes = self.indexes(name).to_vec();
+        for index in &indexes {
+            self.drop_index(store, name, &index.field)?;
+        }
+        let cell = encode_collection(name, &meta);
+        let (page_id, mut page, slot) = find_cell(store, |c| c == cell.as_slice())?
+            .ok_or_else(|| corrupt(format!("collection {name:?} has no catalog entry")))?;
+        page.delete_cell(slot);
+        store.write_page(page_id, &page.into_bytes())?;
+        self.collections.remove(name);
+        self.indexes.remove(name);
+        Ok(Some((meta, indexes)))
+    }
+
     /// Records a collection's new current data page — in its catalog
     /// cell and in the cache. Only called when an insert had to allocate
     /// a new data page, not on every insert. The cell keeps its length

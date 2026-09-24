@@ -166,6 +166,36 @@ pub fn delete_record(
     write_or_free(store, current, loc.page, page)
 }
 
+/// Frees every page a dropped collection's documents use (SPEC §37): the
+/// data pages at `locs`, their documents' overflow chains, and the
+/// collection's `current` data page, which may hold none of them (it
+/// stays even when empty). A data page never holds two collections'
+/// documents (SPEC §20), so every page here is the collection's own.
+/// Everything is read before anything is freed — freeing overwrites.
+pub fn free_collection_pages(
+    store: &mut dyn PageStore,
+    current: PageId,
+    locs: impl IntoIterator<Item = RecordLocation>,
+) -> std::io::Result<()> {
+    let mut data_pages = std::collections::BTreeSet::new();
+    let mut chain_pages = Vec::new();
+    for loc in locs {
+        let page = read_data_page(store, loc.page)?;
+        if let Some((len, first)) = Cell::parse(live_cell(&page, loc)?)?.chain() {
+            walk_chain(store, first, len, |page, _bytes| chain_pages.push(page))?;
+        }
+        data_pages.insert(loc.page);
+    }
+    if current != 0 {
+        read_data_page(store, current)?; // a data page, as the catalog says
+        data_pages.insert(current);
+    }
+    for page in chain_pages.into_iter().chain(data_pages) {
+        store.free_page(page)?;
+    }
+    Ok(())
+}
+
 /// Encodes `doc` into the cell that will represent it: inline if that
 /// fits on an empty data page, otherwise an overflow cell pointing at a
 /// newly written chain. The choice depends on the size alone, so a
