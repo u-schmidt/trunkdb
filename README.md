@@ -233,6 +233,8 @@ Done so far (see SPEC.md §51 for the full list and reasoning):
 24. **A page cache** (§50): 256 MiB by default, `OpenOptions::cache_size`
     to change it; lookups by id 4× faster.
 
+    Items 22–24 → 0.10.0.
+
 What's still open: SPEC.md §51.2.
 
 ## License
