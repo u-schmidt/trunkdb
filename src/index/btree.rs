@@ -31,9 +31,26 @@ impl BTreeIndex {
     /// index. Leaves aren't reached through their sibling links but
     /// through their parents, like every other page.
     pub fn free_all(&self, store: &mut dyn PageStore) -> std::io::Result<()> {
+        // Only once the whole tree was readable: freeing overwrites pages.
+        for page_id in self.pages(store)? {
+            store.free_page(page_id)?;
+        }
+        Ok(())
+    }
+
+    /// Every page of the tree, root first. A page reached twice is an
+    /// error: a tree is a tree.
+    pub fn pages(&self, store: &dyn PageStore) -> std::io::Result<Vec<PageId>> {
         let mut pending = vec![self.root];
         let mut pages = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         while let Some(page_id) = pending.pop() {
+            if !seen.insert(page_id) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("index page {page_id} is reached twice — file may be corrupt"),
+                ));
+            }
             let page = SlottedPage::from_bytes(store.read_page(page_id)?)?;
             match page.page_type() {
                 PageType::IndexLeaf => {}
@@ -45,11 +62,7 @@ impl BTreeIndex {
             }
             pages.push(page_id);
         }
-        // Only once the whole tree was readable: freeing overwrites pages.
-        for page_id in pages {
-            store.free_page(page_id)?;
-        }
-        Ok(())
+        Ok(pages)
     }
 }
 

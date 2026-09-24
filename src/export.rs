@@ -374,6 +374,10 @@ mod tests {
     /// Same collections, indexes, ids and documents — naming the first
     /// document that differs, decoded, instead of dumping two encodings.
     fn assert_same_contents(got: &Database, want: &Database) {
+        for db in [got, want] {
+            let report = db.check().unwrap();
+            assert!(report.is_ok(), "{:#?}", report.problems);
+        }
         let (got, want) = (contents(got), contents(want));
         let names = |c: &[Contents]| {
             c.iter()

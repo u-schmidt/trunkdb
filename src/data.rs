@@ -177,6 +177,22 @@ pub fn free_collection_pages(
     current: PageId,
     locs: impl IntoIterator<Item = RecordLocation>,
 ) -> std::io::Result<()> {
+    let (data_pages, chain_pages) = collection_pages(store, current, locs)?;
+    for page in chain_pages.into_iter().chain(data_pages) {
+        store.free_page(page)?;
+    }
+    Ok(())
+}
+
+/// A collection's data pages — the ones holding the documents at `locs`,
+/// and its `current` one — and its documents' overflow pages. What
+/// `free_collection_pages` frees, and what `Database::check` expects the
+/// collection to own (SPEC §39).
+pub fn collection_pages(
+    store: &dyn PageStore,
+    current: PageId,
+    locs: impl IntoIterator<Item = RecordLocation>,
+) -> std::io::Result<(std::collections::BTreeSet<PageId>, Vec<PageId>)> {
     let mut data_pages = std::collections::BTreeSet::new();
     let mut chain_pages = Vec::new();
     for loc in locs {
@@ -190,10 +206,7 @@ pub fn free_collection_pages(
         read_data_page(store, current)?; // a data page, as the catalog says
         data_pages.insert(current);
     }
-    for page in chain_pages.into_iter().chain(data_pages) {
-        store.free_page(page)?;
-    }
-    Ok(())
+    Ok((data_pages, chain_pages))
 }
 
 /// Encodes `doc` into the cell that will represent it: inline if that

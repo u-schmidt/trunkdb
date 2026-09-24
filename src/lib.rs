@@ -4,6 +4,7 @@
 
 pub mod batch;
 pub mod catalog;
+pub mod check;
 pub mod collection;
 pub mod cursor;
 pub mod data;
@@ -20,6 +21,7 @@ pub mod storage;
 pub mod txn;
 
 pub use batch::Batch;
+pub use check::{CheckReport, FileInfo};
 pub use collection::{Collection, Upserted};
 pub use cursor::Cursor;
 pub use database::Database;

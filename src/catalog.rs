@@ -120,6 +120,22 @@ impl Catalog {
         })
     }
 
+    /// The catalog's own pages: the chain from page 1.
+    pub fn pages(store: &dyn PageStore) -> std::io::Result<Vec<PageId>> {
+        let mut pages = Vec::new();
+        let mut page_id = CATALOG_PAGE_ID;
+        while page_id != 0 {
+            if pages.contains(&page_id) {
+                return Err(corrupt(format!(
+                    "the catalog chain loops at page {page_id}"
+                )));
+            }
+            pages.push(page_id);
+            page_id = SlottedPage::from_bytes(store.read_page(page_id)?)?.next_page();
+        }
+        Ok(pages)
+    }
+
     pub fn get(&self, name: &str) -> Option<&CollectionMeta> {
         self.collections.get(name)
     }

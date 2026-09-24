@@ -225,6 +225,46 @@ impl FileStore {
         })
     }
 
+    /// How many pages the file has, the header included.
+    pub(crate) fn page_count(&self) -> u64 {
+        self.header.page_count
+    }
+
+    /// The format version the header says — `FORMAT_VERSION`, or an older
+    /// one this build reads as it is (`COMPATIBLE_OLDER_FORMATS`) until
+    /// the header is next written.
+    pub(crate) fn format_version(&self) -> io::Result<u32> {
+        let mut buf = [0u8; PAGE_SIZE];
+        self.read_raw(HEADER_PAGE, &mut buf)?;
+        Ok(u32::from_le_bytes(buf[28..32].try_into().unwrap()))
+    }
+
+    /// The pages on the free list, in list order. An error if the list
+    /// runs past the file's end, visits a page that isn't tagged free, or
+    /// loops — each would make allocation hand out a page twice.
+    pub(crate) fn free_pages(&self) -> io::Result<Vec<PageId>> {
+        let corrupt =
+            |what: String| io::Error::new(io::ErrorKind::InvalidData, format!("free list: {what}"));
+        let mut pages = Vec::new();
+        let mut next = self.header.free_list_head;
+        while next != NO_FREE_PAGE {
+            if next >= self.header.page_count {
+                return Err(corrupt(format!("page {next} is past the end")));
+            }
+            if pages.len() as u64 >= self.header.page_count {
+                return Err(corrupt("it loops".to_string()));
+            }
+            let mut buf = [0u8; PAGE_SIZE];
+            self.read_raw(next, &mut buf)?;
+            if buf[0] != PageType::Free as u8 {
+                return Err(corrupt(format!("page {next} isn't tagged free")));
+            }
+            pages.push(next);
+            next = PageId::from_le_bytes(buf[1..9].try_into().unwrap());
+        }
+        Ok(pages)
+    }
+
     fn write_header(&mut self) -> io::Result<()> {
         let header = self.header.encode();
         self.write_raw(HEADER_PAGE, &header)

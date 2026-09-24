@@ -803,7 +803,7 @@ fn old_document(
 /// A document's key in the secondary index on `field`, if it has one: the
 /// field must hold an indexed type (`key::encode_value`). A missing field
 /// is indexed as null, so `field == null` can use the index (SPEC §32).
-fn secondary_key(doc: &Document, field: &str, id: DocId) -> Option<Vec<u8>> {
+pub(crate) fn secondary_key(doc: &Document, field: &str, id: DocId) -> Option<Vec<u8>> {
     key::secondary(crate::query::value_or_null(doc, field), id)
 }
 
@@ -1584,9 +1584,17 @@ mod tests {
         ids
     }
 
+    /// The whole file checks out (SPEC §39): no leaked or doubly used
+    /// page, every index agreeing with the documents.
+    fn assert_consistent(db: &Database) {
+        let report = db.check().unwrap();
+        assert!(report.is_ok(), "{:#?}", report.problems);
+    }
+
     /// Every random filter must find through the index exactly what it
     /// finds by checking every document.
     fn assert_index_agrees_with_scan(docs: &Collection<Document>, rng: &mut XorShift, path: &str) {
+        assert_consistent(docs.db());
         let all = docs.find_with_ids(Filter::default()).unwrap();
         for _ in 0..300 {
             let f = random_filter(rng, path);
@@ -2006,6 +2014,7 @@ mod tests {
     /// scan in memory returns — same documents, same order, ties in id
     /// order — whichever plan it runs.
     fn assert_sorted_finds_agree_with_memory(docs: &Collection<Document>, rng: &mut XorShift) {
+        assert_consistent(docs.db());
         let mut all = docs.find_with_ids(Filter::default()).unwrap();
         all.sort_by_key(|(id, _doc)| *id);
         let mut plans = std::collections::HashSet::new();
@@ -2247,6 +2256,7 @@ mod tests {
     /// Every random nested filter must find, count and stream exactly
     /// what checking every document finds — whichever plan it runs.
     fn assert_nested_filters_agree_with_a_scan(docs: &Collection<Document>, rng: &mut XorShift) {
+        assert_consistent(docs.db());
         let mut all = docs.find_with_ids(Filter::default()).unwrap();
         all.sort_by_key(|(id, _doc)| *id);
         let mut plans = std::collections::HashSet::new();

@@ -65,6 +65,9 @@ src/
 ├── collection.rs                  Collection<T> — public CRUD API (real)
 ├── json.rs                          tagged JSON <-> Document, lossless
 ├── export.rs                        Database::export/import (JSON Lines)
+├── check.rs                         Database::check — consistency check
+├── bin/trunkdb.rs                   the `trunkdb` command (info, check,
+│                                      export, import)
 ├── cursor.rs                        Cursor — streaming find
 ├── batch.rs                         Batch — typed atomic multi-op writes
 └── database.rs                      Database — opens the file, recovers from
@@ -101,9 +104,19 @@ cargo build
 cargo test
 ```
 
+## Command line
+
+```
+cargo install --path .
+trunkdb info app.trunkdb                 # format, pages, collections, indexes
+trunkdb check app.trunkdb                # consistency check; exit code 1 on problems
+trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
+trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
+```
+
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §39 for the full list and reasoning):
+Done so far (see SPEC.md §40 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -135,8 +148,10 @@ Done so far (see SPEC.md §39 for the full list and reasoning):
     Items 9–11 → 0.5.0.
 12. **`update_many`** (§38): change what a filter finds with a closure,
     `|task| task.status = ...`, in one atomic batch.
+13. **The `trunkdb` command** (§39): `info`, `check`, `export`, `import`;
+    `Database::check` finds leaked pages and indexes that disagree.
 
-What's still open: SPEC.md §39.2.
+What's still open: SPEC.md §40.2.
 
 ## License
 

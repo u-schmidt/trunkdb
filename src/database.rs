@@ -379,6 +379,7 @@ mod tests {
             // takes no new page.
             fill(&db, "again");
             assert_eq!(file_len(), len);
+            assert!(db.check().unwrap().is_ok(), "{:#?}", db.check().unwrap());
             assert_eq!(contents(&db, "again").len(), 192);
             assert_eq!((contents(&db, "keep1"), contents(&db, "keep2")), kept);
             kept
@@ -396,6 +397,7 @@ mod tests {
         let n_is_3 = Filter::new().eq("n", 3);
         assert_eq!(again.find(n_is_3).unwrap().len(), 28);
 
+        assert!(db.check().unwrap().is_ok(), "{:#?}", db.check().unwrap());
         // A handle to a dropped collection still works: it starts over.
         let gone = db.collection::<Document>("gone");
         assert_eq!(gone.count(Filter::new()).unwrap(), 0);

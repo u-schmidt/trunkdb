@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §39 for the roadmap.
+large-document workload (§5.2) the second; see §40 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1236,7 +1236,7 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§39.2).
+future vacuum (§40.2).
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
@@ -1390,7 +1390,7 @@ pages holding dozens of entries.
 - **`u16` lengths** in the document encoding can't wrap today, since a
   whole document must fit in one page; overflow pages (§26) had to widen
   them, as already planned. *Done in §26.1.*
-- **Bit rot** stays undetected until per-page checksums (§39.2).
+- **Bit rot** stays undetected until per-page checksums (§40.2).
 
 ## 23. `find_with_ids` (`collection.rs`, `query.rs`)
 
@@ -1520,7 +1520,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§39.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§40.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1701,7 +1701,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§39.2).
+(§40.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2083,7 +2083,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§39). It's also a backup that can be read and `diff`ed, and a way to
+(§40). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2210,7 +2210,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§39.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§40.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2319,7 +2319,7 @@ through export and import anyway, and this can't happen.)
 - A lookup splits the path as it walks — no allocation — so a top-level
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
-- Still one field per index: compound indexes are still open (§39.2);
+- Still one field per index: compound indexes are still open (§40.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2854,7 +2854,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§39.2).
+- Still no pattern language, no conditions on array elements (§40.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2941,7 +2941,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §39.2).
+  §40.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3010,13 +3010,107 @@ writer (§30.4).
 - No update operators (§38.1).
 - One big batch, like `delete_many` (§37.4).
 
-## 39. Roadmap
+## 39. The `trunkdb` command and `Database::check` (`src/bin/trunkdb.rs`, `check.rs`)
+
+Real and tested: a command to look into a file, check it, export it and
+import into it — and the consistency check behind it, in the library.
+
+```text
+$ trunkdb info app.trunkdb
+app.trunkdb
+  format 5, 120 pages of 8192 bytes, 3 free
+  users: 1200 documents, indexes: age, email (unique)
+  runs: 40 documents, indexes: started_at
+$ trunkdb check app.trunkdb
+ok: 2 collections, 1240 documents, 120 pages
+$ trunkdb export app.trunkdb backup.jsonl       # or to standard output
+$ trunkdb import copy.trunkdb backup.jsonl      # `-` reads standard input
+```
+
+### 39.1 The command
+A binary in the same package, so `cargo install` gives both the library
+and the command. Arguments are parsed by hand: a package's dependencies
+are compiled for every user of the library, and four subcommands don't
+justify a parser crate. Exit codes: `0` fine, `1` an error or a failed
+check, `2` a usage error. Counts go to standard error during `export`, so
+standard output stays pure JSON Lines.
+
+`Database::open` creates a missing file, so `info`, `check` and `export`
+first make sure it exists — a typo mustn't leave an empty database
+behind. A file another program has open is locked (§21.1); the command
+says so in words instead of `WouldBlock`.
+
+What it can't do: read an older format this build refuses (§21.2). To
+migrate, export with the old version's command and import with the new
+one — from now on each version has its own.
+
+### 39.2 `Database::check`
+Reads the whole file under the read lock and returns a `CheckReport`
+with every problem found — problems are collected, not raised, so one
+damaged index doesn't hide another:
+- **Every page has exactly one owner**: the header, the catalog chain,
+  the free list, or a collection's data pages (every page one of its
+  documents is on, plus its current one), overflow chains, primary or
+  secondary index trees. A page claimed twice, one past the file's end,
+  and one nobody claims (a leak) are all problems. That's the check
+  §37's drop test did by comparing file sizes, now exact.
+- **Every document is readable** and stored under the id its primary
+  index files it by.
+- **Every index matches the documents**: its entries are in strictly
+  ascending order, and they are exactly one per document with an indexed
+  value — none missing, none extra, all pointing at the right place. A
+  unique index (§33) holds no two equal non-null values.
+
+To walk what a collection owns, the page-listing parts of `drop_index`
+(`BTreeIndex::pages`) and `drop_collection` (`data::collection_pages`)
+became functions of their own, used by both the freeing and the check —
+so the two can't disagree about what a collection owns. `FileStore`
+lists its free list, refusing one that loops or runs past the end.
+
+`Database::file_info` gives the header's facts: format version, page
+size, page count, free pages. Before the header is next written, a
+format-4 file says 4 here (§33.4).
+
+### 39.3 Every randomized test now checks the whole file
+The helpers the randomized tests end with (§28.7, §34.3, §36.4) call
+`check` as well, and so do the export round trip (§30.5) and the drop
+test (§37.3). So every scenario since §28 — inserts, updates that move
+documents, deletes, unique indexes, drops, `delete_many`, `update_many`,
+import — now also verifies that no page leaked or is used twice and that
+every index agrees with its documents. All of them passed as they were:
+no feature so far leaked a page.
+
+### 39.4 Tests
+- `check.rs`: a consistent file reports nothing, also after a reopen and
+  a drop; five kinds of damage made on purpose — a leaked page, an index
+  missing an entry, an index entry that doesn't match its document, a
+  page owned by two collections, a duplicate in a unique index — are
+  each named. Checked by breaking `check` itself, four ways: no leak
+  scan, no double-owner detection, no missing-entry detection, no unique
+  check. Each fails a test. (The double-owner test first accepted
+  another symptom as well and so let that mutation pass; it now demands
+  the exact problem.)
+- `tests/cli.rs`, running the real binary: usage and help, a missing
+  file refused and not created, import → info → check → export to a file
+  and to standard output → import from standard input, identical; a leak
+  made in the file's bytes makes `check` exit with `1` and name the page;
+  a file held open by another handle is reported as in use.
+- By hand: `info` and `check` on a copy of the sync workload's real
+  database: format 4, consistent.
+
+### 39.5 Limits
+- `check` reads everything under the read lock: writers wait.
+- It finds problems; it doesn't repair them. Export and import (§30)
+  rebuild a file from its readable documents.
+- The command reads only this build's formats (§39.1).
+
+## 40. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 39.1 Done
+### 40.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -3030,9 +3124,9 @@ All of it is done:
 | 0.3.0 | Block C, the large-document workload: overflow pages, a thread-safe `Database`, secondary indexes, `find_one`/`count`/`upsert`/`cursor` | §26–§29 |
 | 0.4.0 | Export/import, nested-field paths, null and missing fields, unique indexes, sorting through an index; file format 5 | §30–§34 |
 | 0.5.0 | A filter builder; OR, NOT and nesting (`Condition` became a tree — breaking); `delete_many` and dropping a collection | §35–§37 |
-| next | `update_many` | §38 |
+| next | `update_many`; the `trunkdb` command and `Database::check` | §38–§39 |
 
-### 39.2 Open
+### 40.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -3067,7 +3161,7 @@ limit is described.
   §18) — `find_with_ids` (§23) covers most needs; unscheduled.
 
 **Tooling and reach**
-- A CLI: inspect and check a file, run export/import.
+- Repairing what `check` finds, beyond export and import (§39.5).
 - PyO3 bindings, for Python apps.
 - Benchmarks against SQLite, redb and sled.
 
