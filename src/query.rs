@@ -2,7 +2,10 @@ use crate::catalog::IndexMeta;
 use crate::document::Document;
 use crate::index::{KeyRange, key};
 
+/// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
+/// arm, so a new operator isn't a breaking change (SPEC §45.4).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Op {
     Eq,
     Ne,
@@ -19,9 +22,12 @@ pub enum Op {
     Contains,
 }
 
-/// What a document must satisfy (SPEC §36): a comparison of one field, or
-/// several conditions combined — nested as deep as needed.
+/// What a document must satisfy (SPEC §36): a comparison of one field,
+/// a test of its shape — there at all, an array of some size (§45) — or
+/// several conditions combined, nested as deep as needed.
+/// `#[non_exhaustive]`, like `Op`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Condition {
     /// `field op value`.
     Compare {
@@ -29,6 +35,13 @@ pub enum Condition {
         op: Op,
         value: Document,
     },
+    /// The field is there — even if it holds null, unlike `is_not_null`
+    /// (SPEC §45.1). On a path with `[*]`: some element has it.
+    Exists { field: String },
+    /// The field is an array whose length `op`-compares true against
+    /// `size` (SPEC §45.2) — `Op::Eq` and 0 for an empty one. `Ne` is
+    /// `Eq` negated, so it also holds where there's no array at all.
+    Size { field: String, op: Op, size: usize },
     /// Every one of them holds (AND) — true if there are none.
     All(Vec<Condition>),
     /// At least one of them holds (OR) — false if there are none.
@@ -86,6 +99,28 @@ impl Condition {
         Self::compare(field, Op::Ne, Document::Null)
     }
 
+    /// The field is there, null or not (SPEC §45.1).
+    pub fn exists(field: impl Into<String>) -> Self {
+        Condition::Exists {
+            field: field.into(),
+        }
+    }
+
+    /// The field isn't there: `!Condition::exists(field)`.
+    pub fn missing(field: impl Into<String>) -> Self {
+        !Self::exists(field)
+    }
+
+    /// The field is an array whose length `op`-compares true against
+    /// `size` (SPEC §45.2).
+    pub fn size(field: impl Into<String>, op: Op, size: usize) -> Self {
+        Condition::Size {
+            field: field.into(),
+            op,
+            size,
+        }
+    }
+
     /// AND.
     pub fn all(conditions: impl IntoIterator<Item = Condition>) -> Self {
         Condition::All(conditions.into_iter().collect())
@@ -99,6 +134,8 @@ impl Condition {
     pub fn matches(&self, doc: &Document) -> bool {
         match self {
             Condition::Compare { field, op, value } => compare_matches(field, op, value, doc),
+            Condition::Exists { field } => !present_at(doc, field).is_empty(),
+            Condition::Size { field, op, size } => size_matches(field, op, *size, doc),
             Condition::All(conditions) => conditions.iter().all(|c| c.matches(doc)),
             Condition::Any(conditions) => conditions.iter().any(|c| c.matches(doc)),
             Condition::Not(condition) => !condition.matches(doc),
@@ -212,6 +249,25 @@ impl Filter {
     /// The field is there and not null.
     pub fn is_not_null(self, field: impl Into<String>) -> Self {
         self.condition(field, Op::Ne, Document::Null)
+    }
+
+    /// The field is there, null or not — where `is_null` can't tell a
+    /// stored null from a missing field (SPEC §45.1).
+    pub fn exists(self, field: impl Into<String>) -> Self {
+        self.and(Condition::exists(field))
+    }
+
+    /// The field isn't there at all; a stored null doesn't count.
+    pub fn missing(self, field: impl Into<String>) -> Self {
+        self.and(Condition::missing(field))
+    }
+
+    /// The field is an array whose length `op`-compares true against
+    /// `size`: `.size("tags", Op::Eq, 0)` for no tags, `.size("tags",
+    /// Op::Gte, 3)` for three or more (SPEC §45.2). Not an array — or
+    /// missing — matches only `Ne`.
+    pub fn size(self, field: impl Into<String>, op: Op, size: usize) -> Self {
+        self.and(Condition::size(field, op, size))
     }
 
     /// Sorts by `field`, smallest first — replacing any earlier sort.
@@ -451,7 +507,8 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
 
 /// Bounds for one condition: an `All` like the filter's own list, an
 /// `Any` only if every branch can be bounded (the union of theirs), a
-/// `Not` never.
+/// `Not` never — nor `Exists` or `Size`, which no index can tell
+/// (SPEC §45.3).
 fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
     match condition {
         Condition::Compare { .. } => bounds_for_all(std::slice::from_ref(condition), indexes),
@@ -467,7 +524,7 @@ fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bou
                 fields: 1,
             })
         }
-        Condition::Not(_) => None,
+        Condition::Not(_) | Condition::Exists { .. } | Condition::Size { .. } => None,
     }
 }
 
@@ -663,15 +720,28 @@ pub(crate) fn is_multi(path: &str) -> bool {
 ///   scalar `tags` has no elements;
 /// - a path without `[*]` gives exactly `value_or_null`.
 pub(crate) fn values_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> {
+    walk(doc, path, true)
+}
+
+/// The values actually stored at `path` in `doc` (SPEC §45.1): like
+/// `values_at`, but a missing field — or a step into something that isn't
+/// an object — gives nothing instead of a null.
+fn present_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> {
+    walk(doc, path, false)
+}
+
+/// `values_at`, or with `missing_is_null` false `present_at`.
+fn walk<'a>(doc: &'a Document, path: &str, missing_is_null: bool) -> Vec<&'a Document> {
+    let missing = missing_is_null.then_some(&Document::Null);
     let mut values = vec![doc];
     for step in path.split('.') {
         let name = step.trim_end_matches("[*]");
         let fan_outs = (step.len() - name.len()) / 3;
         values = values
             .into_iter()
-            .map(|value| match value {
-                Document::Object(map) => map.get(name).unwrap_or(&Document::Null),
-                _ => &Document::Null,
+            .filter_map(|value| match value {
+                Document::Object(map) => map.get(name).or(missing),
+                _ => missing,
             })
             .collect();
         for _ in 0..fan_outs {
@@ -692,13 +762,36 @@ pub(crate) fn values_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> 
 /// `Eq` negated. So `tags[*] != "x"` means no tag is `"x"`.
 fn compare_matches(field: &str, op: &Op, value: &Document, doc: &Document) -> bool {
     if is_multi(field) {
-        let values = values_at(doc, field);
-        return match op {
-            Op::Ne => !values.iter().any(|v| value_matches(&Op::Eq, v, value)),
-            op => values.iter().any(|v| value_matches(op, v, value)),
-        };
+        return any_matches(op, value, values_at(doc, field));
     }
     value_matches(op, value_or_null(doc, field), value)
+}
+
+/// `op` against `value` for any of `values` — `Ne` for none being equal.
+fn any_matches<'a>(
+    op: &Op,
+    value: &Document,
+    values: impl IntoIterator<Item = &'a Document>,
+) -> bool {
+    let mut values = values.into_iter();
+    match op {
+        Op::Ne => !values.any(|v| value_matches(&Op::Eq, v, value)),
+        op => values.any(|v| value_matches(op, v, value)),
+    }
+}
+
+/// `Condition::Size` (SPEC §45.2): the lengths of the arrays at `field`
+/// — none if it isn't one; on a path with `[*]`, one per element that
+/// is one — compared as `compare_matches` compares values.
+fn size_matches(field: &str, op: &Op, size: usize, doc: &Document) -> bool {
+    let lengths: Vec<Document> = values_at(doc, field)
+        .into_iter()
+        .filter_map(|value| match value {
+            Document::Array(elements) => Some(Document::Int(elements.len() as i64)),
+            _ => None,
+        })
+        .collect();
+    any_matches(op, &Document::Int(size as i64), &lengths)
 }
 
 /// `field_value op value`, for one value.
@@ -860,6 +953,125 @@ mod tests {
             ("s", "x".into()),
             ("o", doc(&[("t", array(vec![Document::Int(5)]))])),
         ])
+    }
+
+    /// `Exists` tells a stored null from a missing field, which no
+    /// comparison can (SPEC §45.1); through `[*]` some element must
+    /// have the field.
+    #[test]
+    fn exists_is_true_for_a_stored_null_and_false_for_a_missing_field() {
+        let null = doc(&[("nick", Document::Null)]);
+        let missing = doc(&[("name", "Ada".into())]);
+        let set = doc(&[("nick", "Bob".into())]);
+        let not_an_object = Document::Int(7);
+        let docs = [&null, &missing, &set, &not_an_object];
+        let exists = |field: &str| docs.map(|d| Condition::exists(field).matches(d));
+        assert_eq!(exists("nick"), [true, false, true, false]);
+        let missing_nick = docs.map(|d| Condition::missing("nick").matches(d));
+        assert_eq!(missing_nick, [false, true, false, true]);
+        // `is_null` can't tell the first two apart.
+        let is_null = docs.map(|d| Condition::is_null("nick").matches(d));
+        assert_eq!(is_null, [true, true, false, true]);
+
+        let d = with_arrays();
+        for (path, there) in [
+            ("tags", true),
+            ("s", true),
+            ("o.t", true),
+            ("o.u", false),
+            // `s` is a string: nothing below it.
+            ("s.x", false),
+            ("tags[*]", true),
+            ("items[*].n", true),
+            ("items[*].m", true),
+            ("items[*].k", false),
+            // A scalar has no elements; nor does a missing field.
+            ("s[*]", false),
+            ("nope[*]", false),
+        ] {
+            assert_eq!(Condition::exists(path).matches(&d), there, "{path}");
+        }
+        let empty = doc(&[("tags", Document::Array(vec![]))]);
+        let nulls = doc(&[("tags", Document::Array(vec![Document::Null]))]);
+        assert!(Condition::exists("tags").matches(&empty));
+        assert!(!Condition::exists("tags[*]").matches(&empty));
+        assert!(Condition::exists("tags[*]").matches(&nulls));
+    }
+
+    /// `Size` compares an array's length (SPEC §45.2); without an array
+    /// only `Ne` holds, as `Ne` is `Eq` negated.
+    #[test]
+    fn size_compares_the_length_of_an_array() {
+        let array = |n: usize| doc(&[("tags", Document::Array(vec![Document::Int(1); n]))]);
+        let docs = [
+            array(0),
+            array(1),
+            array(3),
+            doc(&[("tags", "abc".into())]),
+            doc(&[("tags", Document::Null)]),
+            doc(&[]),
+        ];
+        let size = |op: Op, n: usize| {
+            docs.each_ref()
+                .map(|d| Condition::size("tags", op.clone(), n).matches(d))
+        };
+        assert_eq!(size(Op::Eq, 0), [true, false, false, false, false, false]);
+        assert_eq!(size(Op::Eq, 3), [false, false, true, false, false, false]);
+        assert_eq!(size(Op::Ne, 0), [false, true, true, true, true, true]);
+        assert_eq!(size(Op::Gt, 0), [false, true, true, false, false, false]);
+        assert_eq!(size(Op::Gte, 1), [false, true, true, false, false, false]);
+        assert_eq!(size(Op::Lt, 2), [true, true, false, false, false, false]);
+        assert_eq!(size(Op::Lte, 3), [true, true, true, false, false, false]);
+        assert_eq!(size(Op::Contains, 0), [false; 6]);
+
+        // Through `[*]`: any element's array — here `[[2]]`'s one.
+        let d = with_arrays();
+        assert!(Condition::size("tags[*]", Op::Eq, 1).matches(&d));
+        assert!(!Condition::size("tags[*]", Op::Eq, 3).matches(&d));
+        assert!(Condition::size("tags", Op::Eq, 3).matches(&d));
+        assert!(Condition::size("o.t", Op::Eq, 1).matches(&d));
+        assert!(Condition::size("tags[*]", Op::Ne, 3).matches(&d));
+        assert!(!Condition::size("tags[*]", Op::Ne, 1).matches(&d));
+    }
+
+    #[test]
+    fn exists_missing_and_size_build_what_they_say() {
+        let f = Filter::new().exists("a").missing("b").size("c", Op::Gte, 2);
+        let text = format!("{:?}", f.conditions);
+        let want = format!(
+            "{:?}",
+            vec![
+                Condition::Exists { field: "a".into() },
+                Condition::Not(Box::new(Condition::Exists { field: "b".into() })),
+                Condition::Size {
+                    field: "c".into(),
+                    op: Op::Gte,
+                    size: 2
+                },
+            ]
+        );
+        assert_eq!(text, want);
+    }
+
+    /// No index tells whether a field is there, or an array's length
+    /// (SPEC §45.3): alone they scan, next to an indexed comparison they
+    /// check what it finds, and in an OR they make the OR scan.
+    #[test]
+    fn exists_and_size_never_bound_an_index() {
+        let indexes = [index("nick"), index("tags[*]"), sparse(&["team"])];
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        assert_eq!(plan(Filter::new().exists("nick")), None);
+        assert_eq!(plan(Filter::new().missing("nick")), None);
+        assert_eq!(plan(Filter::new().size("tags[*]", Op::Eq, 0)), None);
+        assert_eq!(plan(Filter::new().exists("team")), None);
+        assert_eq!(
+            plan(Filter::new().missing("nick").eq("tags[*]", "rust")).as_deref(),
+            Some("tags[*]")
+        );
+        let or = Filter::new().any_of([Condition::eq("nick", "a"), Condition::exists("team")]);
+        assert_eq!(plan(or), None);
+        let order = Filter::new().exists("team").sort_asc("team").limit(5);
+        assert!(order.index_order(&indexes).is_none());
     }
 
     #[test]

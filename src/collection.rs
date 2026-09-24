@@ -2739,7 +2739,7 @@ mod tests {
         let ops = [Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
         let mut conditions = Vec::new();
         for _ in 0..rng.below(4) {
-            conditions.push(match rng.below(9) {
+            conditions.push(match rng.below(11) {
                 0 | 1 => cond("a", Op::Eq, Document::Int(rng.below(4) as i64)),
                 2 => cond(
                     "a",
@@ -2751,6 +2751,16 @@ mod tests {
                 5 => cond("a", Op::Eq, Document::Null),
                 6 => cond(["a", "b"][rng.below(2)], Op::Ne, Document::Null),
                 7 => cond("b", Op::Eq, Document::Int(rng.below(11) as i64 - 5)),
+                // Shape, not value (SPEC §45): never bounds an index.
+                8 => match rng.below(2) {
+                    0 => Condition::exists(["a", "b"][rng.below(2)]),
+                    _ => Condition::missing(["a", "b"][rng.below(2)]),
+                },
+                9 => Condition::size(
+                    ["a", "b"][rng.below(2)],
+                    [Op::Eq, Op::Ne, Op::Gt][rng.below(3)].clone(),
+                    rng.below(2),
+                ),
                 _ => cond("b", Op::Ne, random_value(rng)),
             });
         }
@@ -3911,6 +3921,84 @@ mod tests {
         let nicks: Vec<_> = members.find(first_nicks).unwrap();
         assert!(nicks.iter().all(|m| m.nick.as_deref() == Some("n0")));
         assert_consistent(&db);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Profile {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nick: Option<String>,
+        team: Option<String>,
+        tags: Vec<String>,
+    }
+
+    /// `exists` and `missing` on typed documents (SPEC §45.1): serde
+    /// writes `None` as null, so the field is there — unless the struct
+    /// skips it, or the document was written before the field existed.
+    /// Next to an indexed comparison, the index finds and they check.
+    #[test]
+    fn exists_tells_skipped_and_older_fields_from_stored_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let profiles = db.collection::<Profile>("profiles");
+        profiles.ensure_index("name").unwrap();
+        let profile = |name: &str, nick: Option<&str>, team: Option<&str>, tags: &[&str]| Profile {
+            name: name.into(),
+            nick: nick.map(str::to_string),
+            team: team.map(str::to_string),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        };
+        profiles
+            .insert(profile("ada", Some("countess"), Some("red"), &["math"]))
+            .unwrap();
+        profiles.insert(profile("bob", None, None, &[])).unwrap();
+        // Written before `team` and `tags` were added to the struct.
+        let untyped = db.collection::<Document>("profiles");
+        untyped
+            .insert(object(vec![
+                ("name", "cy".into()),
+                ("nick", Document::Null),
+            ]))
+            .unwrap();
+
+        let names = |f: Filter| -> Vec<String> {
+            let mut names: Vec<String> = untyped
+                .find(f)
+                .unwrap()
+                .into_iter()
+                .map(|doc| match crate::query::value_or_null(&doc, "name") {
+                    Document::String(name) => name.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        // `None` skipped: missing. A stored null: there.
+        assert_eq!(names(Filter::new().missing("nick")), ["bob"]);
+        assert_eq!(names(Filter::new().exists("nick")), ["ada", "cy"]);
+        assert_eq!(names(Filter::new().is_null("nick")), ["bob", "cy"]);
+        // `None` written as null: there. Older documents: missing.
+        assert_eq!(names(Filter::new().exists("team")), ["ada", "bob"]);
+        assert_eq!(names(Filter::new().missing("team")), ["cy"]);
+        // Sizes: bob's empty list; cy has no list at all.
+        assert_eq!(names(Filter::new().size("tags", Op::Eq, 0)), ["bob"]);
+        assert_eq!(names(Filter::new().size("tags", Op::Ne, 0)), ["ada", "cy"]);
+        assert_eq!(names(Filter::new().size("tags", Op::Gte, 1)), ["ada"]);
+
+        let bob_without_nick = Filter::new().eq("name", "bob").missing("nick");
+        assert_eq!(
+            untyped.explain(&bob_without_nick).unwrap(),
+            QueryPlan::Index {
+                field: "name".into()
+            }
+        );
+        assert_eq!(
+            records_read(|| assert_eq!(names(bob_without_nick), ["bob"])),
+            1
+        );
+        let found = profiles.find(Filter::new().missing("nick")).unwrap();
+        assert_eq!(found, [profile("bob", None, None, &[])]);
     }
 
     /// Asking for an index that exists with other options is refused,

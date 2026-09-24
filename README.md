@@ -15,7 +15,7 @@ scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
 `address.city`, multikey on array elements like `tags[*]`, compound on
 several fields like `(status, created)`, and sparse for fields few documents
 have),
-conditions on array elements, overflow pages for documents larger
+conditions on array elements and on whether a field exists, overflow pages for documents larger
 than a page, export/import as JSON Lines, a checksum on every page so a
 damaged one is an error instead of garbage, compaction that rebuilds the file
 into as few pages as it needs, a page-image write-ahead log making
@@ -131,7 +131,7 @@ trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §45 for the full list and reasoning):
+Done so far (see SPEC.md §46 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -186,8 +186,12 @@ Done so far (see SPEC.md §45 for the full list and reasoning):
     few documents have; used where the filter rules nulls out.
 
     Items 17–18 → 0.8.0.
+19. **`Exists` and array size** (§45): `exists("nick")` tells a stored
+    null from a missing field, `missing("team")` finds documents written
+    before it; `size("tags", Op::Eq, 0)` finds empty arrays. `Op` and
+    `Condition` are now `#[non_exhaustive]`.
 
-What's still open: SPEC.md §45.2.
+What's still open: SPEC.md §46.2.
 
 ## License
 

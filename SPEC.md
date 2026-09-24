@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §45 for the roadmap.
+large-document workload (§5.2) the second; see §46 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1531,7 +1531,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§45.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§46.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1712,7 +1712,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§45.2).
+(§46.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2102,7 +2102,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§45). It's also a backup that can be read and `diff`ed, and a way to
+(§46). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2229,7 +2229,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§45.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§46.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2340,7 +2340,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§45.2);
+- Still one field per index: compound indexes are still open (§46.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2446,6 +2446,8 @@ documented path (§21.2) and already tested.
 
 ### 32.5 Limits
 - No `Exists` operator: "null or missing" is one state for queries.
+  (§45 added one, next to the comparisons, which still don't tell them
+  apart.)
 - A sort still leaves null and missing where they are relative to other
   values (not first or last): `compare` orders only values of one kind.
   (§34.1 fixed that: they sort first.)
@@ -2877,7 +2879,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§45.2).
+- Still no pattern language, no conditions on array elements (§46.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2964,7 +2966,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §45.2).
+  §46.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3300,7 +3302,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§45.2).
+  run on such a file. Repairing is open (§46.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -3640,7 +3642,7 @@ then on 0.6.0 refuses it.
   item with sku A1 *and* qty > 2"). Two conditions on `items[*]` may
   be met by two different items.
 - **No condition on an array's size**, and no way to ask for an empty
-  array.
+  array. (Added in §45.)
 - **Sorting by elements** doesn't sort (§42.3).
 - **A field whose name itself ends in `[*]`** can't be reached, just as
   one with a dot can't (§31.2).
@@ -3985,13 +3987,161 @@ file with either up front (§43.5).
 - **A comparison inside an OR** doesn't make a sparse index usable,
   even when every branch rules out null.
 
-## 45. Roadmap
+## 45. `Exists` and array size (`query.rs`)
+
+Real and tested: two new kinds of condition that look at a field's shape
+rather than its value. One asks whether the field is there at all, and
+the other asks how long the array in it is. Neither changes the file
+format.
+
+```rust
+// Written before `team` existed, or with `None` skipped by serde:
+users.find(Filter::new().missing("team"))?;
+users.find(Filter::new().exists("nick"))?;          // a stored null counts
+posts.find(Filter::new().size("tags", Op::Eq, 0))?; // no tags
+posts.find(Filter::new().size("tags", Op::Gte, 3))?;
+```
+
+### 45.1 `Exists`
+`Condition::Exists { field }` holds if the field is there, even when it
+holds null. `Condition::missing(field)` is `!Condition::exists(field)`,
+and `Filter` has `exists` and `missing` as builders. This separates the
+two states that §32.1 folds into one for comparisons:
+
+| document | `is_null` | `exists` | `missing` |
+|---|---|---|---|
+| `{"nick": null}` | true | true | false |
+| `{}` | true | false | true |
+| `{"nick": "Bob"}` | false | true | false |
+
+Paths work as in comparisons, with a missing field giving nothing
+instead of a null (`present_at`, which shares its walk with
+`values_at`):
+- `address.city` exists if both steps are there. A step into a string
+  or a null finds nothing.
+- `items[*].sku` exists if some element has `sku`.
+- `tags[*]` exists if `tags` is an array with at least one element.
+  `[null]` counts; `[]`, a scalar and a missing `tags` don't.
+
+**Why, if §32.1 decided against telling them apart:** that decision
+still holds for comparisons. `== null` finds both, so the typed path and
+the queries agree. `Exists` is a separate question for the cases where
+the difference matters: documents written before a field was added, and
+fields a struct skips with `#[serde(skip_serializing_if =
+"Option::is_none")]`.
+
+**A catch on the typed path:** serde writes `None` as null. An `Option`
+field without `skip_serializing_if` is therefore always there, and
+`missing` finds only documents written before the field existed. The
+typed test in §45.5 shows both cases.
+
+Rejected: **`Op::Exists`**, as MongoDB spells it with `{$exists: true}`.
+An `Op` compares a field with a value, and `Exists` has no value; its
+`bool` would duplicate what `Not` already does. So it's a variant of
+`Condition` without a value.
+
+### 45.2 Array size
+`Condition::Size { field, op, size }` holds if the field is an array
+whose length `op`-compares true against `size`: `Eq` 0 for an empty
+array, `Gte` 3 for three or more. Every comparison operator works;
+MongoDB's `$size` has only equality.
+
+Without an array there's no length, so only `Ne` holds. `Ne` is `Eq`
+negated everywhere (§42.1), and it stays that way here: `size("tags", Ne,
+0)` holds for a missing `tags`, as `tags != 5` does. The typed test uses
+exactly this: a document written before `tags` existed is "not empty".
+
+Through `[*]`, any element's array counts, as any element's value does
+for a comparison (§42.1). `size("rows[*]", Eq, 0)` holds if some row is
+an empty array. `compare_matches` and `size_matches` share one helper,
+`any_matches`, so `Ne` means "none equal" for both.
+
+Only arrays have a size here, not strings or objects. A string's length
+would be a separate condition, and it would have to decide between
+bytes and characters.
+
+Rejected:
+- **A path suffix** (`"tags.$size"`), which would clash with a field
+  that has that name.
+- **Only `Eq`**, as in MongoDB: "at least one" and "more than two" are
+  the questions actually asked, and supporting them costs nothing.
+
+### 45.3 The planner
+No index holds either answer. A missing field is indexed as null (§32.2)
+and a sparse index leaves out both null and missing (§44.1), so no index
+can tell "there" from "not there". Array lengths aren't indexed at all.
+So both conditions:
+- **alone** scan;
+- **next to an indexed comparison** in the same AND, filter what the
+  index finds (the comparison bounds, as before);
+- **in an OR** make the OR scan, since a branch that can't be bounded
+  makes the union unbounded (§36.3);
+- **don't rule out null** for a sparse index (§44.3). `exists` holds for
+  a stored null, which a sparse index leaves out.
+
+`bounds_for` returns `None` for both, next to `Not`.
+
+### 45.4 `Op` and `Condition` are `#[non_exhaustive]`
+Adding `Exists` and `Size` to `Condition` breaks any code outside the
+crate that matches on it exhaustively, as `Condition` becoming a tree
+did in §36. Both enums are now `#[non_exhaustive]`: a `match` outside
+this crate needs a `_` arm, so the next operator or condition, such as
+`$elemMatch` or a pattern, won't break anything. It works like
+C#'s advice to always write a `default:` case in a `switch` on an enum
+from another library, except that the compiler enforces it. Building
+the values with `Condition::Compare { .. }` still works; only matching
+changes.
+
+This is a breaking change once, for 0.9.0, and it prevents the same
+break later.
+
+### 45.5 Tests
+- `query.rs`:
+  - `Exists` against a stored null, a missing field, a value and a
+    non-object, next to `is_null`, which can't tell the first two
+    apart; eleven paths, including a string's child, `[*]` on a scalar
+    and `[]` against `[null]`.
+  - `Size` with every operator against arrays of lengths 0, 1 and 3, a
+    string, a null and a missing field, and through `[*]`, where it
+    holds for any element's array.
+  - The builders make the trees they name.
+  - Neither condition bounds an index, alone, next to an index, or in an
+    OR, and `exists` doesn't make a sparse index usable for a sort.
+- `collection.rs`:
+  - Typed profiles, with `nick` skipped when `None` and `team` written
+    as null, plus an untyped document from "before" `team` and `tags`
+    existed. It covers `missing`, `exists` and `is_null`, and the sizes
+    of an empty list, a full one and none at all. An index lookup plus
+    `missing` reads 1 document.
+  - The randomized compound test's filters now include `exists`,
+    `missing` and `size` on its fields, so they run beside every index
+    plan, sparse and not, and must still find what a scan finds.
+- Checked by breaking it on purpose, nine ways. Each of these fails a
+  test:
+  - `Exists` reading a missing field as null;
+  - `present_at` walking as `values_at` does;
+  - a step into a non-object giving a null;
+  - `missing` built as `exists`, in `Condition` or in `Filter`;
+  - `Ne` over several values as "any not equal";
+  - lengths counted one too many;
+  - a non-array counted as length 0;
+  - `size` through `[*]` never holding.
+
+### 45.6 Limits
+- **Neither uses an index.** A sparse index could answer `exists` if it
+  kept stored nulls and left out only missing fields. That's the
+  MongoDB variant §44.1 rejected; it can come back as a third index
+  option if the need shows up.
+- **No length of a string or an object.**
+- **Per-element conditions** (`$elemMatch`) are still open (§46.2).
+
+## 46. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 45.1 Done
+### 46.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -4008,16 +4158,15 @@ All of it is done:
 | 0.6.0 | `update_many`; the `trunkdb` command and `Database::check`; page checksums, file format 6 | §38–§40 |
 | 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
+| next | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]` | §45 |
 
-### 45.2 Open
+### 46.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
 **Queries**
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
-- Conditions tied to one array element (`$elemMatch`), and on an
-  array's size (§42.6).
-- An `Exists` operator, to tell a missing field from a null one (§32.5).
+- Conditions tied to one array element (`$elemMatch`, §42.6).
 
 **Indexes**
 - Sorting by several fields, which a compound index could then serve
