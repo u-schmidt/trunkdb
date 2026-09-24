@@ -1,7 +1,9 @@
 mod file;
+mod memory;
 mod slotted;
 
 pub use file::{FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
+pub(crate) use memory::MemoryStore;
 pub use slotted::SlottedPage;
 
 pub type PageId = u64;

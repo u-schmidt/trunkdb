@@ -407,10 +407,53 @@ impl FileStore {
             .map(|(&id, page)| (id, page.as_slice()))
     }
 
-    /// Writes every dirty page to the file, `fsync`s, and ends staging.
-    /// On error the dirty set is kept, still staging, so the caller can
-    /// retry or `rollback` — though by then the file may hold some of the
-    /// pages already (SPEC §19.6's poisoning covers that case).
+    /// Makes `pages` — ids 1 and up, as a `MemoryStore` built them — the
+    /// file's whole content, staged like any other change: the page count
+    /// becomes `page_count`, the free list empty, and `write_back` cuts
+    /// the file to that length (SPEC §41).
+    pub(crate) fn replace_all(
+        &mut self,
+        pages: impl IntoIterator<Item = (PageId, Vec<u8>)>,
+        page_count: u64,
+    ) -> io::Result<()> {
+        assert!(
+            self.staging.is_some(),
+            "FileStore::replace_all without begin"
+        );
+        for (id, page) in pages {
+            assert!(
+                id != HEADER_PAGE && id < page_count,
+                "page {id} out of range"
+            );
+            if page.len() != USABLE_PAGE_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("page {id} is {} bytes, not {USABLE_PAGE_SIZE}", page.len()),
+                ));
+            }
+            self.write_raw(id, &page)?;
+        }
+        self.header.page_count = page_count;
+        self.header.free_list_head = NO_FREE_PAGE;
+        self.write_header()
+    }
+
+    /// Cuts the file to the header's page count, if it's longer — after
+    /// a batch that shrank it (SPEC §41). Nothing past the page count is
+    /// ever read, so the cut loses nothing.
+    fn truncate_to_page_count(&self) -> io::Result<()> {
+        let len = self.header.page_count * PAGE_SIZE as u64;
+        if self.file.metadata()?.len() > len {
+            self.file.set_len(len)?;
+        }
+        Ok(())
+    }
+
+    /// Writes every dirty page to the file, cuts it to the page count,
+    /// `fsync`s, and ends staging. On error the dirty set is kept, still
+    /// staging, so the caller can retry or `rollback` — though by then
+    /// the file may hold some of the pages already (SPEC §19.6's
+    /// poisoning covers that case).
     pub fn write_back(&mut self) -> io::Result<()> {
         let staging = self
             .staging
@@ -432,6 +475,7 @@ impl FileStore {
             }
             write_page_at(&self.file, id, page)?;
         }
+        self.truncate_to_page_count()?;
         self.file.sync_all()?;
         self.staging = None;
         Ok(())
@@ -453,6 +497,9 @@ impl FileStore {
         }
         self.header = read_header(&self.file)?;
         self.header_checked = true;
+        // A crash can come between a shrinking batch's write-back and
+        // its cut.
+        self.truncate_to_page_count()?;
         self.file.sync_all()
     }
 }
@@ -1021,6 +1068,83 @@ mod tests {
         store.restore_pages(&pages).unwrap();
         assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
         assert_eq!(store.read_page(2).unwrap(), vec![9u8; USABLE_PAGE_SIZE]);
+    }
+
+    // ---------- replacing the whole content ----------
+
+    /// Pages 1–5 written, 4 freed: the file before a compaction.
+    fn five_page_file(path: &Path) -> FileStore {
+        let mut store = FileStore::open(path).unwrap();
+        for fill in 1..=5u8 {
+            let id = store.allocate_page().unwrap();
+            store.write_page(id, &[fill; USABLE_PAGE_SIZE]).unwrap();
+        }
+        store.free_page(4).unwrap();
+        store
+    }
+
+    #[test]
+    fn replace_all_makes_the_pages_the_whole_file() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        let pages = [
+            (1, vec![8u8; USABLE_PAGE_SIZE]),
+            (2, vec![9u8; USABLE_PAGE_SIZE]),
+        ];
+        store.replace_all(pages, 3).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            6 * PAGE_SIZE as u64
+        );
+        store.write_back().unwrap();
+        drop(store);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * PAGE_SIZE as u64
+        );
+        let store = FileStore::open(&path).unwrap();
+        assert_eq!(store.page_count(), 3);
+        assert_eq!(store.free_pages().unwrap(), Vec::<PageId>::new());
+        assert_eq!(store.read_page(2).unwrap(), vec![9u8; USABLE_PAGE_SIZE]);
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+    }
+
+    #[test]
+    fn a_rolled_back_replace_all_changes_nothing() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store
+            .replace_all([(1, vec![8u8; USABLE_PAGE_SIZE])], 2)
+            .unwrap();
+        store.rollback();
+        assert_eq!(store.page_count(), 6);
+        assert_eq!(store.free_pages().unwrap(), vec![4]);
+        assert_eq!(store.read_page(1).unwrap(), vec![1u8; USABLE_PAGE_SIZE]);
+    }
+
+    /// A crash between a shrinking batch's write-back and its cut leaves
+    /// the file too long; restoring the batch from the WAL cuts it — here
+    /// by exactly one page.
+    #[test]
+    fn restoring_pages_cuts_the_file_to_its_page_count() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        let pages = (1..5).map(|id| (id, vec![8u8; USABLE_PAGE_SIZE]));
+        store.replace_all(pages, 5).unwrap();
+        let pages: Vec<PageImage> = store
+            .dirty_pages()
+            .map(|(id, page)| (id, page.to_vec()))
+            .collect();
+        store.rollback();
+        store.restore_pages(&pages).unwrap();
+        drop(store);
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, 5 * PAGE_SIZE as u64);
+        assert_eq!(FileStore::open(&path).unwrap().page_count(), 5);
     }
 
     // ---------- staging ----------

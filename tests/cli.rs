@@ -124,6 +124,36 @@ fn check_reports_a_damaged_page_and_fails() {
 }
 
 #[test]
+fn compact_shrinks_a_file_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = path(dir.path(), "db.trunkdb");
+    {
+        let database = trunkdb::Database::open(&db).unwrap();
+        let docs = database.collection::<trunkdb::Document>("docs");
+        for i in 0..300 {
+            docs.insert(trunkdb::Document::String(format!("{i:0>2000}")))
+                .unwrap();
+        }
+        docs.delete_many(trunkdb::query::Filter::new()).unwrap();
+    }
+    let before = std::fs::metadata(&db).unwrap().len();
+
+    let output = trunkdb(&["compact", &db]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(report.starts_with("compacted: "), "{report}");
+    assert!(report.contains(" smaller"), "{report}");
+    let after = std::fs::metadata(&db).unwrap().len();
+    assert!(after * 10 < before, "{before} -> {after}");
+
+    let output = trunkdb(&["compact", &db]);
+    assert!(output.status.success());
+    assert!(stdout(&output).starts_with("already compact: "));
+    assert_eq!(std::fs::metadata(&db).unwrap().len(), after);
+    assert!(trunkdb(&["check", &db]).status.success());
+}
+
+#[test]
 fn a_file_in_use_is_named_as_such() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = path(dir.path(), "db.trunkdb");

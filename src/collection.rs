@@ -1587,10 +1587,33 @@ mod tests {
     }
 
     /// The whole file checks out (SPEC §39): no leaked or doubly used
-    /// page, every index agreeing with the documents.
+    /// page, every index agreeing with the documents. Then it's compacted
+    /// (SPEC §41) — keeping every document, and checking out again — so
+    /// whatever the test does next runs on a rebuilt file.
     fn assert_consistent(db: &Database) {
         let report = db.check().unwrap();
         assert!(report.is_ok(), "{:#?}", report.problems);
+
+        let everything = |db: &Database| {
+            let mut names = db.collections().unwrap();
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    let docs = db.collection::<Document>(&name);
+                    let mut all = docs.find_with_ids(Filter::default()).unwrap();
+                    all.sort_by_key(|(id, _)| *id);
+                    // Debug text: a NaN isn't equal to itself.
+                    format!("{name} {:?} {all:?}", docs.indexes().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = everything(db);
+        let compacted = db.compact().unwrap();
+        assert!(compacted.pages_after <= compacted.pages_before);
+        assert_eq!(everything(db), before);
+        let report = db.check().unwrap();
+        assert!(report.is_ok(), "after compacting: {:#?}", report.problems);
     }
 
     /// Every random filter must find through the index exactly what it

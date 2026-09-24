@@ -14,7 +14,8 @@ scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
 `cursor`), `upsert`, single-field secondary indexes (also unique, and on nested
 paths like `address.city`), overflow pages for documents larger
 than a page, export/import as JSON Lines, a checksum on every page so a
-damaged one is an error instead of garbage, a page-image write-ahead log making
+damaged one is an error instead of garbage, compaction that rebuilds the file
+into as few pages as it needs, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0: secondary
 indexes beyond single fields, a cost-based query planner, and concurrent writers (`Database` is a
@@ -54,7 +55,7 @@ src/
 ├── document.rs        Document enum + DocId — the schema-less value type
 ├── id.rs               IdGenerator trait + UuidV7Generator
 ├── storage/              PageStore + FileStore (page checksums) +
-│                            SlottedPage (real, tested)
+│                            SlottedPage + MemoryStore (real, tested)
 ├── crc32.rs               CRC-32C, in hardware where the CPU has it
 ├── index/                 Index trait + BTreeIndex (real, persisted B-tree,
 │                            primary and secondary indexes) + key encoding +
@@ -69,8 +70,9 @@ src/
 ├── json.rs                          tagged JSON <-> Document, lossless
 ├── export.rs                        Database::export/import (JSON Lines)
 ├── check.rs                         Database::check — consistency check
+├── compact.rs                       Database::compact — rebuild, file shrinks
 ├── bin/trunkdb.rs                   the `trunkdb` command (info, check,
-│                                      export, import)
+│                                      compact, export, import)
 ├── cursor.rs                        Cursor — streaming find
 ├── batch.rs                         Batch — typed atomic multi-op writes
 └── database.rs                      Database — opens the file, recovers from
@@ -113,13 +115,14 @@ cargo test
 cargo install --path .
 trunkdb info app.trunkdb                 # format, pages, collections, indexes
 trunkdb check app.trunkdb                # consistency check; exit code 1 on problems
+trunkdb compact app.trunkdb              # rebuild into as few pages as needed
 trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
 trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 ```
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §41 for the full list and reasoning):
+Done so far (see SPEC.md §42 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -158,8 +161,11 @@ Done so far (see SPEC.md §41 for the full list and reasoning):
     and import.
 
     Items 12–14 → 0.6.0.
+15. **Compaction** (§41): `db.compact()` or `trunkdb compact` rebuilds
+    the file into as few pages as it needs; index leaves now fill when
+    keys come in order.
 
-What's still open: SPEC.md §41.2.
+What's still open: SPEC.md §42.2.
 
 ## License
 

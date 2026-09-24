@@ -211,8 +211,17 @@ fn insert_into_leaf(
         return Ok(InsertOutcome::Done);
     }
 
-    // Doesn't fit: split in place, by bytes (SPEC §28.2).
-    let mid = byte_midpoint(entries.iter().map(|(k, _)| k.len() + 10));
+    // Doesn't fit: split in place, by bytes (SPEC §28.2) — unless the new
+    // key goes past the end of the rightmost leaf. Then only it moves to
+    // the new page, and this one stays full: keys arriving in order (ids
+    // in time order, a compaction's sorted rebuild) would otherwise leave
+    // every leaf half empty, since nothing lands left of them again
+    // (SPEC §41).
+    let appends = pos == entries.len() - 1 && next_page == 0;
+    let mid = match appends {
+        true => pos,
+        false => byte_midpoint(entries.iter().map(|(k, _)| k.len() + 10)),
+    };
     let right_entries = entries.split_off(mid);
     // Smallest key of the right half, copied up (leaves keep it too).
     let separator = right_entries[0].0.clone();
@@ -413,6 +422,55 @@ mod tests {
         let mut store = FileStore::open(dir.path().join("test.trunkdb")).unwrap();
         let root = fresh_index_root(&mut store);
         (dir, store, BTreeIndex::new(root))
+    }
+
+    /// The leaves of `index`, in key order, each with its entry count.
+    fn leaf_sizes(store: &FileStore, index: &BTreeIndex) -> Vec<usize> {
+        let (_id, mut page) = find_leaf(store, index.root, &[]).unwrap();
+        let mut sizes = vec![page.iter_cells().count()];
+        while page.next_page() != 0 {
+            page = SlottedPage::from_bytes(store.read_page(page.next_page()).unwrap()).unwrap();
+            sizes.push(page.iter_cells().count());
+        }
+        sizes
+    }
+
+    /// Keys arriving in order fill every leaf but the last completely
+    /// (SPEC §41): each split leaves the old leaf as it was, full. In
+    /// reverse order they still split in the middle, by bytes.
+    #[test]
+    fn keys_in_order_fill_the_leaves() {
+        let keys: Vec<[u8; 16]> = (0..3000u32)
+            .map(|i| {
+                let mut key = [0u8; 16];
+                key[..4].copy_from_slice(&i.to_be_bytes());
+                key
+            })
+            .collect();
+        let loc = RecordLocation { page: 1, slot: 0 };
+
+        let (_dir, mut store, mut index) = fresh();
+        for key in &keys {
+            index.insert(&mut store, key, loc).unwrap();
+        }
+        let sizes = leaf_sizes(&store, &index);
+        let full = sizes[0];
+        assert!(sizes.len() > 5, "{sizes:?}");
+        assert!(
+            sizes[..sizes.len() - 1].iter().all(|&n| n == full),
+            "{sizes:?}"
+        );
+        assert_eq!(sizes.iter().sum::<usize>(), keys.len());
+
+        let (_dir, mut store, mut index) = fresh();
+        for key in keys.iter().rev() {
+            index.insert(&mut store, key, loc).unwrap();
+        }
+        let sizes = leaf_sizes(&store, &index);
+        assert!(sizes.iter().all(|&n| n < full * 2 / 3), "{sizes:?}");
+        for key in &keys {
+            assert_eq!(index.lookup(&store, key).unwrap(), Some(loc));
+        }
     }
 
     #[test]

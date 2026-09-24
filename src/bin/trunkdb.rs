@@ -1,7 +1,7 @@
 //! The `trunkdb` command (SPEC §39): look into a database file, check it,
-//! export it, import into it.
+//! compact it, export it, import into it.
 //!
-//! Arguments are parsed by hand: four subcommands don't need a parser
+//! Arguments are parsed by hand: five subcommands don't need a parser
 //! crate, and a library's dependencies are compiled for everyone who uses
 //! the library.
 
@@ -18,6 +18,8 @@ commands:
                               document count and indexes
   check  <file>               read the whole file and check that it's
                               consistent; exit code 1 if it isn't
+  compact <file>              rebuild the file into as few pages as it
+                              needs, and cut it to that
   export <file> [out.jsonl]   write the database as JSON Lines, to the
                               given file or to standard output
   import <file> <in.jsonl>    read an export into the database, created if
@@ -30,6 +32,7 @@ fn main() -> ExitCode {
     let result = match args[..] {
         ["info", file] => existing(file).and_then(|db| info(file, &db)),
         ["check", file] => existing(file).and_then(|db| check(&db)),
+        ["compact", file] => existing(file).and_then(|db| compact(&db)),
         ["export", file] => existing(file).and_then(|db| export(&db, None)),
         ["export", file, out] => existing(file).and_then(|db| export(&db, Some(out))),
         ["import", file, input] => open(file).and_then(|db| import(&db, input)),
@@ -133,6 +136,30 @@ fn check(db: &Database) -> Outcome {
     } else {
         println!("{}: {summary}", count(report.problems.len(), "problem"));
         Ok(ExitCode::FAILURE)
+    }
+}
+
+fn compact(db: &Database) -> Outcome {
+    let compacted = db.compact().map_err(|e| e.to_string())?;
+    let (before, after) = (compacted.pages_before, compacted.pages_after);
+    if after == before {
+        println!("already compact: {}", count(after as usize, "page"));
+    } else {
+        let freed = (before - after) * trunkdb::storage::PAGE_SIZE as u64;
+        println!(
+            "compacted: {before} → {after} pages, {} smaller",
+            size(freed)
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `8 KB`, `4.3 MB`.
+fn size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1 << 20 => format!("{} KB", b >> 10),
+        b if b < 1 << 30 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
     }
 }
 
