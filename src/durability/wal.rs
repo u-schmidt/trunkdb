@@ -1,5 +1,6 @@
 use super::Durability;
-use crate::storage::{PAGE_SIZE, PageId, PageImage};
+use crate::crc32::crc32;
+use crate::storage::{PageId, PageImage, USABLE_PAGE_SIZE};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,15 +29,17 @@ pub struct WalDurability {
 
 /// Every non-empty WAL file starts with this: magic, then a `u32` format
 /// version — so a file from another tool, or from an older trunkdb whose
-/// WAL held ops instead of pages, is a clear error rather than a misread.
+/// WAL held ops instead of pages (version 0) or pages of another size
+/// (1, before page checksums: SPEC §40), is a clear error rather than a
+/// misread.
 /// Written together with the first record after a checkpoint, never on
 /// its own.
 const WAL_MAGIC: &[u8; 8] = b"TRUNKWAL";
-const WAL_VERSION: u32 = 1;
+const WAL_VERSION: u32 = 2;
 const WAL_HEADER_LEN: usize = 12;
 
 /// Bytes per page entry in a record body: `[u64 page id][page bytes]`.
-const PAGE_ENTRY_LEN: usize = 8 + PAGE_SIZE;
+const PAGE_ENTRY_LEN: usize = 8 + USABLE_PAGE_SIZE;
 
 fn encode_header() -> [u8; WAL_HEADER_LEN] {
     let mut header = [0u8; WAL_HEADER_LEN];
@@ -47,7 +50,7 @@ fn encode_header() -> [u8; WAL_HEADER_LEN] {
 
 /// `[u32 body_len][u32 crc32(body)][body]`, one record per logged batch.
 /// `body` is `[u32 page_count]` followed by `page_count` ×
-/// `[u64 page id][PAGE_SIZE page bytes]` — fixed-size entries, so a body's
+/// `[u64 page id][USABLE_PAGE_SIZE page bytes]` — fixed-size entries, so a body's
 /// length is fully determined by its count.
 ///
 /// One record per batch is what makes a batch atomic across a crash
@@ -60,7 +63,11 @@ fn encode_record(pages: &[(PageId, &[u8])]) -> Vec<u8> {
     let mut body = Vec::with_capacity(4 + pages.len() * PAGE_ENTRY_LEN);
     body.extend_from_slice(&(pages.len() as u32).to_le_bytes());
     for (id, page) in pages {
-        assert_eq!(page.len(), PAGE_SIZE, "WAL page images are whole pages");
+        assert_eq!(
+            page.len(),
+            USABLE_PAGE_SIZE,
+            "WAL page images are whole pages"
+        );
         body.extend_from_slice(&id.to_le_bytes());
         body.extend_from_slice(page);
     }
@@ -150,21 +157,6 @@ fn corrupt(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-/// CRC-32 (IEEE 802.3, the zlib/PNG one), computed bit by bit. Slow next
-/// to a table-driven version, but it runs once per batch, so it's nowhere
-/// near a bottleneck — and it's small enough not to need a dependency.
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in bytes {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
-
 fn wal_path(db_path: &Path) -> PathBuf {
     let mut os_string = db_path.as_os_str().to_os_string();
     os_string.push(".wal");
@@ -219,7 +211,7 @@ mod tests {
     use super::*;
 
     fn page(fill: u8) -> Vec<u8> {
-        vec![fill; PAGE_SIZE]
+        vec![fill; USABLE_PAGE_SIZE]
     }
 
     fn log(wal: &mut WalDurability, pages: &[(PageId, Vec<u8>)]) {
@@ -238,11 +230,6 @@ mod tests {
 
     fn set_wal_bytes(db_path: &Path, bytes: &[u8]) {
         std::fs::write(wal_path(db_path), bytes).unwrap();
-    }
-
-    #[test]
-    fn crc32_matches_the_standard_check_value() {
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
@@ -315,7 +302,7 @@ mod tests {
         drop(wal);
 
         let bytes = wal_bytes(&db_path);
-        set_wal_bytes(&db_path, &bytes[..bytes.len() - PAGE_SIZE / 2]);
+        set_wal_bytes(&db_path, &bytes[..bytes.len() - USABLE_PAGE_SIZE / 2]);
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
         assert!(recovered.is_empty(), "got a partial batch");

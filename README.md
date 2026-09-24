@@ -13,7 +13,8 @@ and a serde bridge so any `T: Serialize + DeserializeOwned` works),
 scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
 `cursor`), `upsert`, single-field secondary indexes (also unique, and on nested
 paths like `address.city`), overflow pages for documents larger
-than a page, export/import as JSON Lines, a page-image write-ahead log making
+than a page, export/import as JSON Lines, a checksum on every page so a
+damaged one is an error instead of garbage, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0: secondary
 indexes beyond single fields, a cost-based query planner, and concurrent writers (`Database` is a
@@ -52,7 +53,9 @@ src/
 ├── lib.rs           public re-exports, crate-level Error/Result
 ├── document.rs        Document enum + DocId — the schema-less value type
 ├── id.rs               IdGenerator trait + UuidV7Generator
-├── storage/              PageStore + FileStore + SlottedPage (real, tested)
+├── storage/              PageStore + FileStore (page checksums) +
+│                            SlottedPage (real, tested)
+├── crc32.rs               CRC-32C, in hardware where the CPU has it
 ├── index/                 Index trait + BTreeIndex (real, persisted B-tree,
 │                            primary and secondary indexes) + key encoding +
 │                            InMemoryIndex (fake, for tests)
@@ -116,7 +119,7 @@ trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §40 for the full list and reasoning):
+Done so far (see SPEC.md §41 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -150,8 +153,13 @@ Done so far (see SPEC.md §40 for the full list and reasoning):
     `|task| task.status = ...`, in one atomic batch.
 13. **The `trunkdb` command** (§39): `info`, `check`, `export`, `import`;
     `Database::check` finds leaked pages and indexes that disagree.
+14. **Page checksums** (§40): a damaged page is an error, not garbage,
+    and `check` names it; file format 6 — older files move up by export
+    and import.
 
-What's still open: SPEC.md §40.2.
+    Items 12–14 → 0.6.0.
+
+What's still open: SPEC.md §41.2.
 
 ## License
 

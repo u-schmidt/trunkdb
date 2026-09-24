@@ -71,7 +71,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["info", &db]);
     assert!(output.status.success());
     let info = stdout(&output);
-    assert!(info.contains("format 5"), "{info}");
+    assert!(info.contains("format 6"), "{info}");
     assert!(
         info.contains("users: 2 documents, indexes: age, email (unique)"),
         "{info}"
@@ -102,27 +102,25 @@ fn import_info_check_and_export_round_trip() {
 }
 
 #[test]
-fn check_reports_a_leaked_page_and_fails() {
+fn check_reports_a_damaged_page_and_fails() {
     let dir = tempfile::tempdir().unwrap();
     let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
     std::fs::write(&input, EXPORT).unwrap();
     assert!(trunkdb(&["import", &db, &input]).status.success());
 
-    // One more page, counted in the header, owned by nothing.
+    // One changed byte in the last page, as a disk error would leave it.
     let mut bytes = std::fs::read(&db).unwrap();
-    let pages = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-    bytes[12..20].copy_from_slice(&(pages + 1).to_le_bytes());
-    bytes.extend_from_slice(&[0u8; 8192]);
+    let page = bytes.len() / 8192 - 1;
+    bytes[page * 8192 + 100] ^= 0xFF;
     std::fs::write(&db, bytes).unwrap();
 
     let output = trunkdb(&["check", &db]);
     assert_eq!(output.status.code(), Some(1));
     let report = stdout(&output);
     assert!(
-        report.contains(&format!("problem: page {pages} belongs to nothing")),
+        report.contains(&format!("problem: page {page} is damaged")),
         "{report}"
     );
-    assert!(report.contains("1 problem: "), "{report}");
 }
 
 #[test]

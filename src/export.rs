@@ -92,8 +92,9 @@ impl Database {
             summary.collections += 1;
 
             let meta = state.catalog.get(name).expect("a listed collection");
+            let mut records = data::Records::new(&state.store);
             for (_key, loc) in BTreeIndex::new(meta.index_root).scan(&state.store)? {
-                let (id, doc) = data::get_record(&state.store, loc)?;
+                let (id, doc) = records.get(loc)?;
                 write_line(&mut out, &document_line(id, &doc))?;
                 summary.documents += 1;
             }

@@ -1,14 +1,23 @@
 use super::{PageId, PageImage, PageStore, PageType};
+use crate::crc32::Crc32;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-/// Matches LiteDB's page size, partly so numbers stay comparable to it
-/// later, and because a document DB's records (whole JSON-ish objects)
-/// benefit more from fewer, larger pages than a fixed-page-size OS-I/O
-/// alignment argument for 4096 would buy back.
+/// A page's size in the file. Matches LiteDB's page size, partly so
+/// numbers stay comparable to it later, and because a document DB's
+/// records (whole JSON-ish objects) benefit more from fewer, larger pages
+/// than a fixed-page-size OS-I/O alignment argument for 4096 would buy
+/// back.
 pub const PAGE_SIZE: usize = 8192;
+/// Each page's last bytes: a CRC-32 of the page's id and the rest of its
+/// bytes (SPEC §40).
+const CHECKSUM_LEN: usize = 4;
+/// A page's size above this file: what `read_page` returns and
+/// `write_page` takes — `PAGE_SIZE` without the checksum, which only this
+/// file ever sees. The WAL logs pages of this size too.
+pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - CHECKSUM_LEN;
 
 const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// The on-disk format this build reads and writes — bumped whenever a
@@ -18,21 +27,25 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// History: 1 = SPEC §21; 2 = `u32` lengths in documents and overflow
 /// pages (SPEC §26); 3 = catalog cells with a kind byte, and index
 /// entries (SPEC §28); 4 = indexes hold null and missing fields (SPEC §32);
-/// 5 = unique indexes, a new catalog cell kind (SPEC §33).
-const FORMAT_VERSION: u32 = 5;
+/// 5 = unique indexes, a new catalog cell kind (SPEC §33); 6 = a
+/// checksum at the end of every page (SPEC §40).
+const FORMAT_VERSION: u32 = 6;
 /// Older formats this build opens as they are, because such a file *is*
 /// a valid `FORMAT_VERSION` file — one that uses none of what came since
 /// (for 4: unique indexes). Every header write stamps `FORMAT_VERSION`,
 /// and creating anything newer allocates a page, which writes the header
 /// in the same batch — so a file that uses something newer always says
 /// so, and an older build refuses it instead of misreading it (SPEC §33.4).
-const COMPATIBLE_OLDER_FORMATS: [u32; 1] = [4];
+/// Empty since 6: every page of a 4 or 5 file lacks the checksum, and
+/// uses the bytes where it now goes.
+const COMPATIBLE_OLDER_FORMATS: [u32; 0] = [];
 const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
 const NO_FREE_PAGE: PageId = 0;
 
-// Header page layout (rest of the page beyond this is reserved/zeroed):
+// Header page layout (rest of the page beyond this is reserved/zeroed,
+// up to the checksum every page ends with):
 //   [0..8)   magic
 //   [8..12)  page_size: u32
 //   [12..20) page_count: u64
@@ -46,8 +59,8 @@ struct Header {
 }
 
 impl Header {
-    fn encode(&self) -> [u8; PAGE_SIZE] {
-        let mut buf = [0u8; PAGE_SIZE];
+    fn encode(&self) -> [u8; USABLE_PAGE_SIZE] {
+        let mut buf = [0u8; USABLE_PAGE_SIZE];
         buf[0..8].copy_from_slice(MAGIC);
         buf[8..12].copy_from_slice(&self.page_size.to_le_bytes());
         buf[12..20].copy_from_slice(&self.page_count.to_le_bytes());
@@ -77,8 +90,8 @@ impl Header {
                 ),
                 v => format!(
                     "file has format {v}, older than this build's {FORMAT_VERSION}: \
-                     export it with the trunkdb version that wrote it, and import the \
-                     export into a new file with this one"
+                     export it with the trunkdb version that wrote it (`trunkdb export`), \
+                     and import the export into a new file with this one"
                 ),
             };
             return Err(io::Error::new(io::ErrorKind::InvalidData, message));
@@ -124,6 +137,9 @@ impl Header {
 pub struct FileStore {
     file: File,
     header: Header,
+    /// Whether the header's checksum has been checked — not yet between
+    /// `open_before_recovery` and `check_header` (SPEC §40.4).
+    header_checked: bool,
     staging: Option<Staging>,
     /// Test-only fault injection: while non-zero, each `write_back` call
     /// writes `write_back_fails_after` pages, then fails (and decrements
@@ -154,6 +170,18 @@ impl FileStore {
     /// it only stops other trunkdb opens, not arbitrary programs, and it
     /// dies with the process — no stale lock file after a crash.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let mut store = Self::open_before_recovery(path)?;
+        store.check_header()?;
+        Ok(store)
+    }
+
+    /// `open`, but without checking the header's checksum yet — for
+    /// `Database::open`, which recovers from the WAL first. A crash can
+    /// tear the header's write, leaving its fields (in its first bytes)
+    /// new and its checksum (in its last) old; the WAL holds the whole
+    /// page, and `restore_pages` writes it back. `check_header` then
+    /// finds only real damage.
+    pub(crate) fn open_before_recovery(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -209,20 +237,32 @@ impl FileStore {
                 free_list_head: NO_FREE_PAGE,
             }
         } else {
-            let mut buf = [0u8; PAGE_SIZE];
-            read_page_at(&file, HEADER_PAGE, &mut buf)?;
-            Header::decode(&buf)?
+            Header::decode(&read_disk_page(&file, HEADER_PAGE)?[..USABLE_PAGE_SIZE])?
         };
 
         Ok(Self {
             file,
             header,
+            // A fresh file's header isn't on disk yet: nothing to check.
+            header_checked: is_fresh,
             staging: None,
             #[cfg(test)]
             failing_write_backs: 0,
             #[cfg(test)]
             write_back_fails_after: 1,
         })
+    }
+
+    /// Checks the header's checksum, if `open_before_recovery` left it
+    /// unchecked.
+    pub(crate) fn check_header(&mut self) -> io::Result<()> {
+        if !self.header_checked {
+            if !checksum_matches(HEADER_PAGE, &read_disk_page(&self.file, HEADER_PAGE)?) {
+                return Err(damaged(HEADER_PAGE));
+            }
+            self.header_checked = true;
+        }
+        Ok(())
     }
 
     /// How many pages the file has, the header included.
@@ -234,7 +274,7 @@ impl FileStore {
     /// one this build reads as it is (`COMPATIBLE_OLDER_FORMATS`) until
     /// the header is next written.
     pub(crate) fn format_version(&self) -> io::Result<u32> {
-        let mut buf = [0u8; PAGE_SIZE];
+        let mut buf = [0u8; USABLE_PAGE_SIZE];
         self.read_raw(HEADER_PAGE, &mut buf)?;
         Ok(u32::from_le_bytes(buf[28..32].try_into().unwrap()))
     }
@@ -254,7 +294,7 @@ impl FileStore {
             if pages.len() as u64 >= self.header.page_count {
                 return Err(corrupt("it loops".to_string()));
             }
-            let mut buf = [0u8; PAGE_SIZE];
+            let mut buf = [0u8; USABLE_PAGE_SIZE];
             self.read_raw(next, &mut buf)?;
             if buf[0] != PageType::Free as u8 {
                 return Err(corrupt(format!("page {next} isn't tagged free")));
@@ -263,6 +303,19 @@ impl FileStore {
             next = PageId::from_le_bytes(buf[1..9].try_into().unwrap());
         }
         Ok(pages)
+    }
+
+    /// The pages whose checksum doesn't match their bytes on disk, in id
+    /// order — what a disk error or a change from outside trunkdb leaves.
+    /// Reads the file itself, past any staged changes.
+    pub(crate) fn damaged_pages(&self) -> io::Result<Vec<PageId>> {
+        let mut damaged = Vec::new();
+        for id in 0..self.header.page_count {
+            if !checksum_matches(id, &read_disk_page(&self.file, id)?) {
+                damaged.push(id);
+            }
+        }
+        Ok(damaged)
     }
 
     fn write_header(&mut self) -> io::Result<()> {
@@ -398,9 +451,8 @@ impl FileStore {
         for (id, page) in pages {
             write_page_at(&self.file, *id, page)?;
         }
-        let mut buf = [0u8; PAGE_SIZE];
-        read_page_at(&self.file, HEADER_PAGE, &mut buf)?;
-        self.header = Header::decode(&buf)?;
+        self.header = read_header(&self.file)?;
+        self.header_checked = true;
         self.file.sync_all()
     }
 }
@@ -409,7 +461,7 @@ impl PageStore for FileStore {
     fn allocate_page(&mut self) -> io::Result<PageId> {
         let id = if self.header.free_list_head != NO_FREE_PAGE {
             let id = self.header.free_list_head;
-            let mut buf = [0u8; PAGE_SIZE];
+            let mut buf = [0u8; USABLE_PAGE_SIZE];
             self.read_raw(id, &mut buf)?;
             if buf[0] != PageType::Free as u8 {
                 return Err(io::Error::new(
@@ -429,7 +481,7 @@ impl PageStore for FileStore {
             // (or, while staging, so reads of it don't run past the file's
             // end); content is unspecified (see struct doc) until the
             // caller writes it.
-            self.write_raw(id, &[0u8; PAGE_SIZE])?;
+            self.write_raw(id, &[0u8; USABLE_PAGE_SIZE])?;
             id
         };
         self.write_header()?;
@@ -438,7 +490,7 @@ impl PageStore for FileStore {
 
     fn read_page(&self, id: PageId) -> io::Result<Vec<u8>> {
         self.check_bounds(id)?;
-        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         self.read_raw(id, &mut buf)?;
         Ok(buf)
     }
@@ -447,7 +499,7 @@ impl PageStore for FileStore {
         if id >= self.header.page_count {
             return Ok(None);
         }
-        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         self.read_raw(id, &mut buf)?;
         Ok(Some(buf))
     }
@@ -460,11 +512,11 @@ impl PageStore for FileStore {
             ));
         }
         self.check_bounds(id)?;
-        if data.len() != PAGE_SIZE {
+        if data.len() != USABLE_PAGE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "page data must be exactly {PAGE_SIZE} bytes, got {}",
+                    "page data must be exactly {USABLE_PAGE_SIZE} bytes, got {}",
                     data.len()
                 ),
             ));
@@ -481,7 +533,7 @@ impl PageStore for FileStore {
         }
         self.check_bounds(id)?;
 
-        let mut buf = [0u8; PAGE_SIZE];
+        let mut buf = [0u8; USABLE_PAGE_SIZE];
         buf[0] = PageType::Free as u8;
         buf[1..9].copy_from_slice(&self.header.free_list_head.to_le_bytes());
         self.write_raw(id, &buf)?;
@@ -491,13 +543,71 @@ impl PageStore for FileStore {
     }
 }
 
+/// The header, from the file. Magic and format version come before the
+/// checksum: a file of another format may not have one where this
+/// format's goes, and saying "format 5, export it" beats "page 0 is
+/// damaged".
+fn read_header(file: &File) -> io::Result<Header> {
+    let disk = read_disk_page(file, HEADER_PAGE)?;
+    let header = Header::decode(&disk[..USABLE_PAGE_SIZE])?;
+    if !checksum_matches(HEADER_PAGE, &disk) {
+        return Err(damaged(HEADER_PAGE));
+    }
+    Ok(header)
+}
+
+/// The page's id is part of what's summed, so a page written to the
+/// wrong place, or copied onto another, fails the check too.
+fn checksum(id: PageId, usable: &[u8]) -> [u8; CHECKSUM_LEN] {
+    let mut crc = Crc32::new();
+    crc.update(&id.to_le_bytes());
+    crc.update(usable);
+    crc.finish().to_le_bytes()
+}
+
+fn checksum_matches(id: PageId, disk: &[u8; PAGE_SIZE]) -> bool {
+    let (usable, stored) = disk.split_at(USABLE_PAGE_SIZE);
+    checksum(id, usable) == stored
+}
+
+fn damaged(id: PageId) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "page {id} is damaged: its checksum doesn't match its bytes \
+             (a disk error, or a change from outside trunkdb)"
+        ),
+    )
+}
+
+/// A page's bytes above this file, checksum verified and cut off.
+fn read_page_at(file: &File, id: PageId, buf: &mut [u8]) -> io::Result<()> {
+    let disk = read_disk_page(file, id)?;
+    if !checksum_matches(id, &disk) {
+        return Err(damaged(id));
+    }
+    buf.copy_from_slice(&disk[..USABLE_PAGE_SIZE]);
+    Ok(())
+}
+
+/// Writes a page's bytes with their checksum appended.
+fn write_page_at(file: &File, id: PageId, data: &[u8]) -> io::Result<()> {
+    let mut disk = [0u8; PAGE_SIZE];
+    disk[..USABLE_PAGE_SIZE].copy_from_slice(data);
+    disk[USABLE_PAGE_SIZE..].copy_from_slice(&checksum(id, data));
+    write_all_at(file, &disk, id * PAGE_SIZE as u64)
+}
+
+/// A page as it is in the file, checksum included, unchecked.
+fn read_disk_page(file: &File, id: PageId) -> io::Result<[u8; PAGE_SIZE]> {
+    let mut disk = [0u8; PAGE_SIZE];
+    read_exact_at(file, &mut disk, id * PAGE_SIZE as u64)?;
+    Ok(disk)
+}
+
 // Positional I/O (pread/pwrite-style) so reads only ever need `&File` — no
 // shared mutable seek cursor to coordinate, matching `PageStore::read_page`
 // taking `&self`.
-fn read_page_at(file: &File, id: PageId, buf: &mut [u8]) -> io::Result<()> {
-    read_exact_at(file, buf, id * PAGE_SIZE as u64)
-}
-
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
@@ -505,9 +615,9 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn write_page_at(file: &File, id: PageId, data: &[u8]) -> io::Result<()> {
+fn write_all_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
-    file.write_all_at(data, id * PAGE_SIZE as u64)
+    file.write_all_at(data, offset)
 }
 
 #[cfg(windows)]
@@ -529,9 +639,8 @@ fn read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> io::Result<()>
 }
 
 #[cfg(windows)]
-fn write_page_at(file: &File, id: PageId, data: &[u8]) -> io::Result<()> {
+fn write_all_at(file: &File, data: &[u8], mut offset: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
-    let mut offset = id * PAGE_SIZE as u64;
     let mut written = 0;
     while written < data.len() {
         let n = file.seek_write(&data[written..], offset)?;
@@ -573,7 +682,7 @@ mod tests {
         let mut store = FileStore::open(&path).unwrap();
         let id = store.allocate_page().unwrap();
 
-        let mut data = vec![0u8; PAGE_SIZE];
+        let mut data = vec![0u8; USABLE_PAGE_SIZE];
         data[0..5].copy_from_slice(b"hello");
         store.write_page(id, &data).unwrap();
 
@@ -603,7 +712,7 @@ mod tests {
         {
             let mut store = FileStore::open(&path).unwrap();
             let id = store.allocate_page().unwrap();
-            let mut data = vec![0u8; PAGE_SIZE];
+            let mut data = vec![0u8; USABLE_PAGE_SIZE];
             data[0] = 42;
             store.write_page(id, &data).unwrap();
             let extra = store.allocate_page().unwrap();
@@ -623,7 +732,7 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         assert!(store.read_page(99).is_err());
-        assert!(store.write_page(99, &[0u8; PAGE_SIZE]).is_err());
+        assert!(store.write_page(99, &[0u8; USABLE_PAGE_SIZE]).is_err());
     }
 
     #[test]
@@ -638,8 +747,11 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         let id = store.allocate_page().unwrap();
-        store.write_page(id, &[7u8; PAGE_SIZE]).unwrap();
-        assert_eq!(store.try_read_page(id).unwrap(), Some(vec![7u8; PAGE_SIZE]));
+        store.write_page(id, &[7u8; USABLE_PAGE_SIZE]).unwrap();
+        assert_eq!(
+            store.try_read_page(id).unwrap(),
+            Some(vec![7u8; USABLE_PAGE_SIZE])
+        );
     }
 
     #[test]
@@ -654,7 +766,11 @@ mod tests {
     fn header_page_is_protected() {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
-        assert!(store.write_page(HEADER_PAGE, &[0u8; PAGE_SIZE]).is_err());
+        assert!(
+            store
+                .write_page(HEADER_PAGE, &[0u8; USABLE_PAGE_SIZE])
+                .is_err()
+        );
         assert!(store.free_page(HEADER_PAGE).is_err());
     }
 
@@ -672,6 +788,15 @@ mod tests {
         FileStore::open(&path).unwrap();
     }
 
+    /// Writes a file of these pages, as `FileStore` would: each with its
+    /// checksum.
+    fn write_file(path: &Path, pages: &[(PageId, &[u8])]) {
+        let file = File::create(path).unwrap();
+        for (id, page) in pages {
+            write_page_at(&file, *id, page).unwrap();
+        }
+    }
+
     /// Writes a one-page file whose header is valid except for its
     /// format version.
     fn file_with_format_version(path: &Path, version: u32) {
@@ -682,7 +807,7 @@ mod tests {
         }
         .encode();
         header[28..32].copy_from_slice(&version.to_le_bytes());
-        std::fs::write(path, header).unwrap();
+        write_file(path, &[(HEADER_PAGE, &header)]);
     }
 
     #[test]
@@ -726,6 +851,8 @@ mod tests {
         for (version, expected) in [
             (0, "before format versioning"),
             (3, "older than this build"),
+            (4, "older than this build"),
+            (5, "older than this build"),
             (FORMAT_VERSION + 1, "newer than this build"),
         ] {
             file_with_format_version(&path, version);
@@ -769,6 +896,133 @@ mod tests {
         }
     }
 
+    // ---------- checksums ----------
+
+    /// A closed file with pages 1 and 2 written, `[1; …]` and `[2; …]`.
+    fn two_page_file(path: &Path) {
+        let mut store = FileStore::open(path).unwrap();
+        for fill in [1u8, 2] {
+            let id = store.allocate_page().unwrap();
+            store.write_page(id, &[fill; USABLE_PAGE_SIZE]).unwrap();
+        }
+    }
+
+    fn change_file(path: &Path, change: impl FnOnce(&mut Vec<u8>)) {
+        let mut bytes = std::fs::read(path).unwrap();
+        change(&mut bytes);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn assert_damaged(result: io::Result<Vec<u8>>, id: PageId) {
+        let err = result.expect_err("a damaged page must not be read");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(&format!("page {id} is damaged")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_page_ends_with_the_checksum_of_its_id_and_bytes() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 3 * PAGE_SIZE);
+        for (id, page) in bytes.chunks(PAGE_SIZE).enumerate() {
+            let mut crc = Crc32::new();
+            crc.update(&(id as u64).to_le_bytes());
+            crc.update(&page[..USABLE_PAGE_SIZE]);
+            assert_eq!(
+                page[USABLE_PAGE_SIZE..],
+                crc.finish().to_le_bytes(),
+                "page {id}"
+            );
+        }
+    }
+
+    /// A changed bit anywhere in the page — its bytes or its checksum —
+    /// makes that page, and only that page, unreadable.
+    #[test]
+    fn a_changed_bit_makes_the_page_unreadable() {
+        let (_dir, path) = open_temp();
+        for at in [0, 1, USABLE_PAGE_SIZE - 1, USABLE_PAGE_SIZE, PAGE_SIZE - 1] {
+            two_page_file(&path);
+            change_file(&path, |bytes| bytes[PAGE_SIZE + at] ^= 0x10);
+            let store = FileStore::open(&path).unwrap();
+            assert_damaged(store.read_page(1), 1);
+            assert_damaged(store.try_read_page(1).map(Option::unwrap), 1);
+            assert_eq!(store.read_page(2).unwrap(), vec![2u8; USABLE_PAGE_SIZE]);
+            assert_eq!(store.damaged_pages().unwrap(), vec![1], "byte {at}");
+        }
+    }
+
+    /// The id is summed too: a page that is intact but in the wrong place
+    /// — a misdirected write — doesn't pass for the page it replaced.
+    #[test]
+    fn a_page_copied_onto_another_is_damaged() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        change_file(&path, |bytes| {
+            let page_1 = bytes[PAGE_SIZE..2 * PAGE_SIZE].to_vec();
+            bytes[2 * PAGE_SIZE..].copy_from_slice(&page_1);
+        });
+        let store = FileStore::open(&path).unwrap();
+        assert_eq!(store.read_page(1).unwrap(), vec![1u8; USABLE_PAGE_SIZE]);
+        assert_damaged(store.read_page(2), 2);
+    }
+
+    /// What an OS can leave in a file a crash cut short: zeros. Their
+    /// checksum isn't zero.
+    #[test]
+    fn a_zeroed_page_is_damaged() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        change_file(&path, |bytes| bytes[2 * PAGE_SIZE..].fill(0));
+        assert_damaged(FileStore::open(&path).unwrap().read_page(2), 2);
+    }
+
+    #[test]
+    fn a_damaged_header_fails_the_open() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        change_file(&path, |bytes| bytes[100] = 1);
+        let err = FileStore::open(&path).err().expect("must not open");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("page 0 is damaged"), "{err}");
+    }
+
+    /// The header's own checks come before its checksum: an older file's
+    /// header has none, and "format 5, export it" is what helps.
+    #[test]
+    fn an_older_format_is_named_before_the_missing_checksum() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        change_file(&path, |bytes| {
+            bytes[28..32].copy_from_slice(&5u32.to_le_bytes())
+        });
+        let err = FileStore::open(&path).err().expect("must not open");
+        assert!(err.to_string().contains("has format 5"), "{err}");
+    }
+
+    /// Staged pages are checked when they reach the file, not before:
+    /// `damaged_pages` reads the file, so a batch's pages don't count.
+    #[test]
+    fn restored_pages_get_their_checksum() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let mut store = FileStore::open(&path).unwrap();
+        store.begin();
+        store.write_page(2, &[9u8; USABLE_PAGE_SIZE]).unwrap();
+        let pages: Vec<PageImage> = store
+            .dirty_pages()
+            .map(|(id, page)| (id, page.to_vec()))
+            .collect();
+        store.rollback();
+        store.restore_pages(&pages).unwrap();
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+        assert_eq!(store.read_page(2).unwrap(), vec![9u8; USABLE_PAGE_SIZE]);
+    }
+
     // ---------- staging ----------
 
     /// What a second, independent reader of the file sees — i.e. what's
@@ -787,9 +1041,9 @@ mod tests {
 
         store.begin();
         let id = store.allocate_page().unwrap();
-        store.write_page(id, &[7u8; PAGE_SIZE]).unwrap();
+        store.write_page(id, &[7u8; USABLE_PAGE_SIZE]).unwrap();
 
-        assert_eq!(store.read_page(id).unwrap(), vec![7u8; PAGE_SIZE]);
+        assert_eq!(store.read_page(id).unwrap(), vec![7u8; USABLE_PAGE_SIZE]);
         let disk = on_disk(&store);
         assert_eq!(
             disk.header.page_count, 1,
@@ -805,13 +1059,13 @@ mod tests {
 
         store.begin();
         let id = store.allocate_page().unwrap();
-        store.write_page(id, &[9u8; PAGE_SIZE]).unwrap();
+        store.write_page(id, &[9u8; USABLE_PAGE_SIZE]).unwrap();
         store.write_back().unwrap();
 
         assert_eq!(store.dirty_pages().count(), 0, "write_back ends staging");
         let disk = on_disk(&store);
         assert_eq!(disk.header.page_count, 2);
-        assert_eq!(disk.read_page(id).unwrap(), vec![9u8; PAGE_SIZE]);
+        assert_eq!(disk.read_page(id).unwrap(), vec![9u8; USABLE_PAGE_SIZE]);
     }
 
     #[test]
@@ -819,7 +1073,7 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         let a = store.allocate_page().unwrap();
-        store.write_page(a, &[1u8; PAGE_SIZE]).unwrap();
+        store.write_page(a, &[1u8; USABLE_PAGE_SIZE]).unwrap();
         let b = store.allocate_page().unwrap();
         store.free_page(b).unwrap(); // free list: b
 
@@ -830,12 +1084,12 @@ mod tests {
             "pops b off the free list"
         );
         let c = store.allocate_page().unwrap(); // grows the file
-        store.write_page(a, &[2u8; PAGE_SIZE]).unwrap();
+        store.write_page(a, &[2u8; USABLE_PAGE_SIZE]).unwrap();
         store.free_page(a).unwrap();
         store.rollback();
 
         assert_eq!(store.header.page_count, 3, "c's growth undone");
-        assert_eq!(store.read_page(a).unwrap(), vec![1u8; PAGE_SIZE]);
+        assert_eq!(store.read_page(a).unwrap(), vec![1u8; USABLE_PAGE_SIZE]);
         assert!(store.try_read_page(c).unwrap().is_none());
         assert_eq!(
             store.allocate_page().unwrap(),
@@ -857,8 +1111,8 @@ mod tests {
         let mut store = FileStore::open(&path).unwrap();
         let a = store.allocate_page().unwrap();
         let b = store.allocate_page().unwrap();
-        store.write_page(a, &[1u8; PAGE_SIZE]).unwrap();
-        store.write_page(b, &[1u8; PAGE_SIZE]).unwrap();
+        store.write_page(a, &[1u8; USABLE_PAGE_SIZE]).unwrap();
+        store.write_page(b, &[1u8; USABLE_PAGE_SIZE]).unwrap();
 
         store.begin();
         store.free_page(a).unwrap();
@@ -878,8 +1132,8 @@ mod tests {
 
         store.begin();
         assert_eq!(store.dirty_pages().count(), 0);
-        store.write_page(a, &[1u8; PAGE_SIZE]).unwrap();
-        store.write_page(a, &[2u8; PAGE_SIZE]).unwrap();
+        store.write_page(a, &[1u8; USABLE_PAGE_SIZE]).unwrap();
+        store.write_page(a, &[2u8; USABLE_PAGE_SIZE]).unwrap();
         let b = store.allocate_page().unwrap();
 
         let dirty: Vec<(PageId, Vec<u8>)> = store
@@ -892,7 +1146,11 @@ mod tests {
             vec![HEADER_PAGE, a, b],
             "ascending, one entry per page"
         );
-        assert_eq!(dirty[1].1, vec![2u8; PAGE_SIZE], "the last write wins");
+        assert_eq!(
+            dirty[1].1,
+            vec![2u8; USABLE_PAGE_SIZE],
+            "the last write wins"
+        );
         assert_eq!(Header::decode(&dirty[0].1).unwrap().page_count, 3);
     }
 
@@ -901,7 +1159,11 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         store.begin();
-        assert!(store.write_page(HEADER_PAGE, &[0u8; PAGE_SIZE]).is_err());
+        assert!(
+            store
+                .write_page(HEADER_PAGE, &[0u8; USABLE_PAGE_SIZE])
+                .is_err()
+        );
         assert!(store.free_page(HEADER_PAGE).is_err());
     }
 

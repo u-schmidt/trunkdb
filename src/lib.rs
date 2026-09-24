@@ -6,6 +6,7 @@ pub mod batch;
 pub mod catalog;
 pub mod check;
 pub mod collection;
+mod crc32;
 pub mod cursor;
 pub mod data;
 pub mod database;

@@ -1,5 +1,5 @@
 use crate::document::{DocId, Document, decode_document, encode_document};
-use crate::storage::{PAGE_SIZE, PageId, PageStore, PageType, RecordLocation, SlottedPage};
+use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage, USABLE_PAGE_SIZE};
 
 /// Flags byte value for a document stored entirely inside its cell.
 const INLINE: u8 = 0;
@@ -20,7 +20,7 @@ const OVERFLOW_CELL_LEN: usize = CELL_HEADER_LEN + 4 + 8;
 //   [9..)    the next OVERFLOW_CAPACITY bytes of the encoded document;
 //            on the last page, only the remainder, the rest zeroed
 const OVERFLOW_HEADER_LEN: usize = 9;
-const OVERFLOW_CAPACITY: usize = PAGE_SIZE - OVERFLOW_HEADER_LEN;
+const OVERFLOW_CAPACITY: usize = USABLE_PAGE_SIZE - OVERFLOW_HEADER_LEN;
 
 /// The `Data` page cell format: `[u8 flags][16-byte DocId][payload]`, the
 /// payload being the encoded document (`INLINE`) or a pointer to it
@@ -101,17 +101,45 @@ pub fn get_record(
     store: &dyn PageStore,
     loc: RecordLocation,
 ) -> std::io::Result<(DocId, Document)> {
-    #[cfg(test)]
-    RECORDS_READ.with(|n| n.set(n.get() + 1));
-    let page = read_data_page(store, loc.page)?;
-    match Cell::parse(live_cell(&page, loc)?)? {
-        Cell::Inline(id, encoded) => Ok((id, decode(encoded)?)),
-        Cell::Overflow { id, len, first } => {
-            let mut encoded = Vec::with_capacity(len as usize);
-            walk_chain(store, first, len, |_page, bytes| {
-                encoded.extend_from_slice(bytes)
-            })?;
-            Ok((id, decode(&encoded)?))
+    Records::new(store).get(loc)
+}
+
+/// Reads documents one after another, keeping the last data page it read:
+/// a scan's next document is usually on the same page, and reading that
+/// page again — from the file, checksum and all (SPEC §40) — is what a
+/// scan spent most of its time on. Only for reads that change nothing in
+/// between, which the `&dyn PageStore` it borrows makes sure of.
+pub struct Records<'a> {
+    store: &'a dyn PageStore,
+    page: Option<(PageId, SlottedPage)>,
+}
+
+impl<'a> Records<'a> {
+    pub fn new(store: &'a dyn PageStore) -> Self {
+        Records { store, page: None }
+    }
+
+    pub fn get(&mut self, loc: RecordLocation) -> std::io::Result<(DocId, Document)> {
+        #[cfg(test)]
+        RECORDS_READ.with(|n| n.set(n.get() + 1));
+        let page = match &self.page {
+            Some((id, page)) if *id == loc.page => page,
+            _ => {
+                &self
+                    .page
+                    .insert((loc.page, read_data_page(self.store, loc.page)?))
+                    .1
+            }
+        };
+        match Cell::parse(live_cell(page, loc)?)? {
+            Cell::Inline(id, encoded) => Ok((id, decode(encoded)?)),
+            Cell::Overflow { id, len, first } => {
+                let mut encoded = Vec::with_capacity(len as usize);
+                walk_chain(self.store, first, len, |_page, bytes| {
+                    encoded.extend_from_slice(bytes)
+                })?;
+                Ok((id, decode(&encoded)?))
+            }
         }
     }
 }
@@ -286,7 +314,7 @@ fn write_chain(store: &mut dyn PageStore, bytes: &[u8]) -> std::io::Result<PageI
         .collect::<std::io::Result<Vec<PageId>>>()?;
     for (i, chunk) in chunks.iter().enumerate() {
         let next = pages.get(i + 1).copied().unwrap_or(0);
-        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         buf[0] = PageType::Overflow as u8;
         buf[1..OVERFLOW_HEADER_LEN].copy_from_slice(&next.to_le_bytes());
         buf[OVERFLOW_HEADER_LEN..OVERFLOW_HEADER_LEN + chunk.len()].copy_from_slice(chunk);
@@ -417,12 +445,62 @@ mod tests {
     /// Size of a `blob` whose inline cell exactly fills an empty data page.
     fn largest_inline_blob() -> usize {
         let empty = SlottedPage::new(PageType::Data);
-        let largest_cell = (0..PAGE_SIZE)
+        let largest_cell = (0..USABLE_PAGE_SIZE)
             .rev()
             .find(|&n| empty.has_room_for(n))
             .unwrap();
         // flags + id, then the Binary tag and its u32 length.
         largest_cell - CELL_HEADER_LEN - 1 - 4
+    }
+
+    /// A `PageStore` that counts `read_page` calls.
+    struct Counting<'a>(&'a FileStore, std::cell::Cell<usize>);
+
+    impl PageStore for Counting<'_> {
+        fn allocate_page(&mut self) -> std::io::Result<PageId> {
+            unreachable!()
+        }
+        fn read_page(&self, id: PageId) -> std::io::Result<Vec<u8>> {
+            self.1.set(self.1.get() + 1);
+            self.0.read_page(id)
+        }
+        fn try_read_page(&self, _id: PageId) -> std::io::Result<Option<Vec<u8>>> {
+            unreachable!()
+        }
+        fn write_page(&mut self, _id: PageId, _data: &[u8]) -> std::io::Result<()> {
+            unreachable!()
+        }
+        fn free_page(&mut self, _id: PageId) -> std::io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// Documents on the same page, one after another, cost one page read;
+    /// a document on another page is read from that page, and one on the
+    /// first page again from the first page — the right one each time.
+    #[test]
+    fn records_reads_a_page_once_for_the_documents_on_it_in_a_row() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let locs: Vec<RecordLocation> = (0..30u8)
+            .map(|n| insert_record(&mut store, &mut current, id(n), &blob(1000)).unwrap())
+            .collect();
+        let pages: Vec<PageId> = locs.iter().map(|loc| loc.page).collect();
+        assert!(pages[0] == pages[1] && pages[0] != pages[29], "{pages:?}");
+
+        let counting = Counting(&store, std::cell::Cell::new(0));
+        let mut records = Records::new(&counting);
+        for (n, loc) in locs.iter().enumerate() {
+            assert_eq!(records.get(*loc).unwrap(), (id(n as u8), blob(1000)));
+        }
+        let mut distinct = pages.clone();
+        distinct.dedup();
+        assert_eq!(counting.1.get(), distinct.len());
+
+        for n in [0, 29, 1] {
+            assert_eq!(records.get(locs[n]).unwrap().0, id(n as u8));
+        }
+        assert_eq!(counting.1.get(), distinct.len() + 3);
     }
 
     #[test]

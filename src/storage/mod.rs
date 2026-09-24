@@ -1,12 +1,12 @@
 mod file;
 mod slotted;
 
-pub use file::{FileStore, PAGE_SIZE};
+pub use file::{FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
 pub use slotted::SlottedPage;
 
 pub type PageId = u64;
 
-/// A page's id plus its full bytes (`PAGE_SIZE` long) — what the WAL
+/// A page's id plus its full bytes (`USABLE_PAGE_SIZE` long) — what the WAL
 /// records and crash recovery writes back (`FileStore::restore_pages`).
 pub type PageImage = (PageId, Vec<u8>);
 

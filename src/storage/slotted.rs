@@ -1,4 +1,4 @@
-use super::{PAGE_SIZE, PageId, PageType};
+use super::{PageId, PageType, USABLE_PAGE_SIZE};
 
 // Header layout (13 bytes), then the slot directory, then cells packed
 // backward from the end of the page. Shared by Catalog, Data and IndexLeaf
@@ -27,9 +27,9 @@ pub struct SlottedPage {
 impl SlottedPage {
     /// A fresh, empty page of the given type.
     pub fn new(page_type: PageType) -> Self {
-        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         buf[0] = page_type as u8;
-        buf[11..13].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        buf[11..13].copy_from_slice(&(USABLE_PAGE_SIZE as u16).to_le_bytes());
         Self { buf }
     }
 
@@ -38,10 +38,13 @@ impl SlottedPage {
     /// else about a corrupt buffer (bad offsets, overlapping cells) is not
     /// currently detected.
     pub fn from_bytes(buf: Vec<u8>) -> std::io::Result<Self> {
-        if buf.len() != PAGE_SIZE {
+        if buf.len() != USABLE_PAGE_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("page buffer is {} bytes, expected {PAGE_SIZE}", buf.len()),
+                format!(
+                    "page buffer is {} bytes, expected {USABLE_PAGE_SIZE}",
+                    buf.len()
+                ),
             ));
         }
         PageType::from_u8(buf[0])?;
@@ -195,7 +198,7 @@ impl SlottedPage {
     /// dead byte left behind by deleted or shrunk cells.
     fn reclaimable_space(&self) -> usize {
         let live: usize = self.iter_cells().map(|(_slot, cell)| cell.len()).sum();
-        PAGE_SIZE - HEADER_LEN - self.slot_count() as usize * SLOT_LEN - live
+        USABLE_PAGE_SIZE - HEADER_LEN - self.slot_count() as usize * SLOT_LEN - live
     }
 
     /// Repacks the live cells against the end of the page, turning every
@@ -216,7 +219,7 @@ impl SlottedPage {
             .collect();
         let slot_count = live.last().map_or(0, |(slot, _)| slot + 1).max(min_slots);
         self.set_slot_count(slot_count);
-        self.set_data_start(PAGE_SIZE as u16);
+        self.set_data_start(USABLE_PAGE_SIZE as u16);
         for (slot, cell) in &live {
             self.place_cell(*slot, cell);
         }
@@ -399,7 +402,7 @@ mod tests {
         assert_eq!(page.get_cell(a), Some(&grown[..]));
         assert_eq!(page.get_cell(b), Some(&b"world"[..]));
 
-        let too_big = vec![1u8; PAGE_SIZE];
+        let too_big = vec![1u8; USABLE_PAGE_SIZE];
         assert!(!page.update_cell(a, &too_big));
         assert_eq!(
             page.get_cell(a),
@@ -423,7 +426,7 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_bad_type_tag() {
-        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         buf[0] = 200; // not a valid PageType
         assert!(SlottedPage::from_bytes(buf).is_err());
     }

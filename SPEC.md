@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §40 for the roadmap.
+large-document workload (§5.2) the second; see §41 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -914,6 +914,8 @@ bad CRC on the *last* record is treated as a torn tail (ignored); a bad
 CRC with more records after it can't be a crash artifact, so it's a
 hard `InvalidData` error. CRC-32 is implemented inline (bitwise, ~10
 lines) rather than pulled in as a crate — it runs once per batch.
+*Since §40 it's CRC-32C, shared with the page checksums, in hardware
+where the CPU has it.*
 
 Tested at both levels: `a_batch_torn_between_its_ops_recovers_none_of_them`
 (`wal.rs`) and `a_batch_torn_while_being_logged_is_not_partially_recovered`
@@ -1236,7 +1238,7 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§40.2).
+future vacuum (§41.2).
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
@@ -1313,8 +1315,9 @@ format of §20 (packed data pages, flags byte, catalog cells with
 `current_data_page`), `2` since §26 (`u32` document lengths,
 overflow pages), `3` since §28 (catalog cells with a kind byte,
 index entries), `4` since §32 (indexes hold null and missing
-fields), and `5` since §33 (unique indexes; format 4 is still read as
-it is, §33.4). `Header::decode` checks it right after the magic,
+fields), `5` since §33 (unique indexes; format 4 is still read as
+it is, §33.4), and `6` since §40 (a checksum on every page; 4 and 5
+are no longer read). `Header::decode` checks it right after the magic,
 before anything else in the header (another version may lay it out
 differently), and only its own version is accepted. The error says
 which case it is:
@@ -1330,7 +1333,8 @@ the version answers "which layout". The version is bumped whenever a
 page or cell layout changes; a file moves from one version to the next
 by export and import (§30). The WAL keeps its own version (§19.3) — its
 record framing is independent of the page layout inside the images it
-carries.
+carries. (It went to 2 with §40 anyway: its images got 4 bytes shorter,
+and its CRC changed.)
 
 ## 22. Block A addendum: three data-risk fixes (`storage/file.rs`, `collection.rs`, `catalog.rs`, `txn/`)
 
@@ -1387,10 +1391,13 @@ pages holding dozens of entries.
 - **The header is decoded before WAL recovery** (§19.4). It would only
   matter if a power loss tore the header page, and all of the header's
   fields sit in its first 512 bytes, which disks write atomically.
+  *Since §40 the header's checksum sits in its last bytes, so it's
+  checked only after recovery (§40.4).*
 - **`u16` lengths** in the document encoding can't wrap today, since a
   whole document must fit in one page; overflow pages (§26) had to widen
   them, as already planned. *Done in §26.1.*
-- **Bit rot** stays undetected until per-page checksums (§40.2).
+- **Bit rot** stays undetected until per-page checksums. *Closed by
+  §40.*
 
 ## 23. `find_with_ids` (`collection.rs`, `query.rs`)
 
@@ -1520,7 +1527,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§40.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§41.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1701,7 +1708,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§40.2).
+(§41.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2083,7 +2090,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§40). It's also a backup that can be read and `diff`ed, and a way to
+(§41). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2210,7 +2217,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§40.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§41.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2319,7 +2326,7 @@ through export and import anyway, and this can't happen.)
 - A lookup splits the path as it walks — no allocation — so a top-level
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
-- Still one field per index: compound indexes are still open (§40.2);
+- Still one field per index: compound indexes are still open (§41.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2854,7 +2861,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§40.2).
+- Still no pattern language, no conditions on array elements (§41.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2941,7 +2948,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §40.2).
+  §41.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3093,7 +3100,9 @@ no feature so far leaked a page.
 - `tests/cli.rs`, running the real binary: usage and help, a missing
   file refused and not created, import → info → check → export to a file
   and to standard output → import from standard input, identical; a leak
-  made in the file's bytes makes `check` exit with `1` and name the page;
+  made in the file's bytes makes `check` exit with `1` and name the page
+  (since §40 a changed byte instead, since changing the header's page
+  count now breaks its checksum);
   a file held open by another handle is reported as in use.
 - By hand: `info` and `check` on a copy of the sync workload's real
   database: format 4, consistent.
@@ -3104,13 +3113,189 @@ no feature so far leaked a page.
   rebuild a file from its readable documents.
 - The command reads only this build's formats (§39.1).
 
-## 40. Roadmap
+## 40. Page checksums (`storage/file.rs`, `crc32.rs`, `data.rs`, `check.rs`)
+
+Real and tested: every page in the file ends with a checksum of its id
+and its bytes. A page whose bytes don't match it — a disk error, or a
+change made outside trunkdb — is an error when it's read, never
+misread as data, and `check` names it. File format 6.
+
+```text
+$ trunkdb check app.trunkdb
+problem: page 10 is damaged: its checksum doesn't match
+problem: "users": 16 documents can't be read, on damaged page 10
+problem: leaks not checked: not everything could be read
+3 problems: 1 collection, 284 documents, 27 pages
+```
+
+### 40.1 Where the checksum goes
+In each page's last 4 bytes. Only `FileStore` sees them: it appends the
+checksum when it writes a page to the file and verifies and cuts it off
+when it reads one. Everything above it works with pages of
+`USABLE_PAGE_SIZE` (8188) bytes, and the WAL logs pages of that size
+too, so the checksum is computed at write-back and at recovery, from
+exactly the bytes that go to disk. The page's id is part of what's
+summed: a page that is intact but in the wrong place (a misdirected
+write, or one page copied onto another) doesn't pass. Neither does a
+page of zeros, which is what a file extended by a crash can hold.
+
+Rejected:
+- **A checksum field in each page type's own header.** Every layer
+  (slotted pages, overflow pages, the free list, the header) would
+  compute and check its own. In `FileStore` it's done once, for every
+  page type, including ones added later.
+- **Checksums kept elsewhere**, in pages of their own. Pages would keep
+  their layout, and a format-5 file could have been upgraded in place;
+  but every page write also changes a checksum page, and the checksum
+  pages need protecting too.
+- **Pages of 8192 + 4 bytes on disk.** No layer above would notice. But
+  pages would no longer line up with the operating system's 4 KB
+  blocks, so each page read and write would touch three blocks
+  instead of two.
+- **A checksum next to each pointer to a page**, as ZFS and redb do. That
+  also catches a lost write (a page left at an older, intact version,
+  §40.7), but every pointer in every layer would carry one.
+- **Checksums that can be turned off**: two formats to test for
+  something that should always be on.
+
+### 40.2 CRC-32C, in hardware
+The checksum is CRC-32C (Castagnoli), the one iSCSI, ext4 and RocksDB
+use, because x86-64 (SSE 4.2) and ARM64 compute it in hardware: eight
+bytes per instruction. `crc32.rs` checks at run time for the
+instruction, and otherwise uses a table-driven version that takes
+eight bytes per step ("slicing-by-8"). Its tables are built by a
+`const fn` at compile time, so there's nothing to initialize and no
+dependency. The WAL uses the same CRC now, instead of the zlib CRC-32
+it computed bit by bit (§19.3). Its version went to 2, since its page
+images are 4 bytes shorter as well.
+
+Rejected:
+- **The zlib CRC-32**, which the first version used, table-driven.
+  There's no instruction for it. Ten full scans of 50,000 documents
+  took 3.2 s with it, against 0.8 s without checksums; CRC-32C in
+  hardware took 1.5 s.
+- **A crate** (`crc32fast`, `crc32c`): about 100 lines of code, and a
+  library's dependencies are compiled for everyone who uses it (§39.1).
+- **A stronger hash** (xxHash, 64 bits): the checksum catches damage,
+  not an attacker, and 32 bits miss random damage once in four billion.
+
+### 40.3 A scan reads each page once
+That measurement showed where the time went: a scan read a data page
+from the file again for every document on it, about 18 times per page
+in the test. `data::Records` keeps the last data page it read, so
+documents one after another on the same page cost one read. `find`,
+sorting through an index (§34), `export` and `check` read through it.
+It's only used by reads that change nothing in between, which its
+`&dyn PageStore` borrow ensures. Ten full scans take 0.43 s now,
+checksums included, against 0.8 s before §40. A lookup by id still
+reads its page once.
+
+### 40.4 Reading a damaged page
+`read_page` returns an `InvalidData` error: "page 57 is damaged: its
+checksum doesn't match its bytes (a disk error, or a change from
+outside trunkdb)". A query that reads the page fails with it. Nothing
+is decoded from the damaged bytes.
+
+`check` first reads every page and lists each damaged one
+(`FileStore::damaged_pages`). After that come the problems of whatever
+couldn't be read because of them, each said once:
+- The documents on a damaged data page are one problem, "16 documents
+  can't be read, on damaged page 10". They aren't read one by one, and
+  their index entries aren't compared with anything: before this, one
+  damaged page showed up as 34 problems, most of them index entries
+  "that don't match" documents nobody could read.
+- A damaged index or catalog page stops the check of what it belongs
+  to, with the error that stopped it.
+- Leaks aren't checked once anything couldn't be read: whatever that
+  was may own pages, and each of them would look leaked. The report
+  says so instead.
+
+Found by damaging each page of a small file in turn and reading the
+reports.
+
+The header is handled differently, in two ways:
+- **Order of checks.** Its magic, format version and page size are
+  checked before its checksum. A format-5 file has no checksum where
+  format 6 has one, and "format 5: export it with the version that
+  wrote it" helps, where "page 0 is damaged" wouldn't.
+- **When the checksum is checked.** `FileStore::open` reads the header
+  before WAL recovery (§19.4), and a crash can tear the header's write:
+  §22.4 relied on the header's fields sitting in its first 512 bytes,
+  but the checksum sits in its last ones. So `Database::open` checks the
+  header's checksum only after recovery, which rewrites the header from
+  the WAL if a batch was logged. A torn header with no batch in the WAL
+  can't come from a crash, so it's reported as damage.
+
+### 40.5 Format 6, and no reading format 5
+Pages in formats 4 and 5 use the bytes where the checksum now goes:
+slotted pages fill from the end. So this build doesn't read them
+(`COMPATIBLE_OLDER_FORMATS` is empty), and a file moves up by export
+and import (§30): `trunkdb export` of the version that wrote it, then
+`trunkdb import` of this one (§39.1). That's the other reason this came
+now: while few files exist, a format change costs little.
+
+### 40.6 Tests
+- `crc32.rs`: the standard check value; the table version, and the
+  hardware version where the CPU has one, both agree with a bit-by-bit
+  CRC for every length from 0 to 300; a CRC over pieces equals one over
+  the whole.
+- `storage/file.rs`:
+  - every page on disk ends with the CRC of its id and bytes;
+  - a changed bit makes that page unreadable and only that one, wherever
+    the bit is: the page's first or last byte, or its checksum;
+  - a page copied onto another fails, and so does a zeroed page;
+  - a damaged header fails `open`;
+  - a format-5 header is named as format 5, not as damaged;
+  - restored WAL pages get their checksum;
+  - formats 4 and 5 are refused with the export message.
+- `data.rs`: `Records` reads a page once for the documents on it in a
+  row, and still the right page after moving to another and back.
+- `database.rs`: a header torn by a crash mid-write-back, with its batch
+  in the WAL, is recovered. The same tear with an empty WAL fails `open`
+  as damage.
+- `check.rs`: a byte changed on disk in a data page, a collection's
+  current data page, or an index page gives exactly three problems:
+  that page, by id; what couldn't be read because of it; "leaks not
+  checked". With the byte restored, the file checks clean.
+- `tests/cli.rs`: `trunkdb check` on a file with a changed byte exits
+  with `1` and names the page. This replaces the leak test there, which
+  edited the header's page count and now breaks its checksum instead;
+  leaks are still tested in `check.rs`.
+- Checked by breaking it on purpose, twenty ways. Each fails a test:
+  - the id left out of the sum;
+  - every checksum accepted;
+  - reads not verified;
+  - the checksum computed over the wrong bytes;
+  - the header's checksum not checked, or checked before its format;
+  - the header checked before WAL recovery, or not at all;
+  - damaged pages not listed, or not reported by `check`;
+  - the hardware CRC skipping the leftover bytes;
+  - three wrong steps in the tables or the table lookup;
+  - `Records` reusing its page for any location, or never;
+  - `check` reading documents on damaged pages anyway, comparing their
+    index entries, checking leaks regardless, or reading a damaged
+    current page.
+
+  One of the twenty, the wrong bytes, made every page damaged and hung
+  a test instead of failing it.
+
+### 40.7 Limits
+- **A lost write** passes: a page that a write never reached, left
+  intact at an older version, still matches its own checksum. Catching
+  that needs a checksum next to each pointer (§40.1).
+- **Damage in the header or the catalog stops `open`**, so `check` can't
+  run on such a file. Repairing is open (§41.2).
+- **Only bytes read from the file are checked.** A page damaged in
+  memory isn't caught. Neither is a bug that writes wrong bytes, since
+  they get a matching checksum; finding that is `check`'s job (§39.2).
+
+## 41. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 40.1 Done
+### 41.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -3124,9 +3309,9 @@ All of it is done:
 | 0.3.0 | Block C, the large-document workload: overflow pages, a thread-safe `Database`, secondary indexes, `find_one`/`count`/`upsert`/`cursor` | §26–§29 |
 | 0.4.0 | Export/import, nested-field paths, null and missing fields, unique indexes, sorting through an index; file format 5 | §30–§34 |
 | 0.5.0 | A filter builder; OR, NOT and nesting (`Condition` became a tree — breaking); `delete_many` and dropping a collection | §35–§37 |
-| next | `update_many`; the `trunkdb` command and `Database::check` | §38–§39 |
+| 0.6.0 | `update_many`; the `trunkdb` command and `Database::check`; page checksums, file format 6 | §38–§40 |
 
-### 40.2 Open
+### 41.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -3146,8 +3331,6 @@ limit is described.
 **Storage and durability**
 - Compaction/vacuum: half-empty data pages are only refilled by updates
   of their own documents (§20), and the file never shrinks.
-- Per-page checksums, to detect a damaged page instead of misreading it
-  (a format change).
 
 **Concurrency**
 - Readers that don't wait for a write batch: MVCC or pre-batch page

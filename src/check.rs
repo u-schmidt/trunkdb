@@ -54,6 +54,7 @@ impl Database {
     }
 
     /// Reads the whole file and checks that it's consistent (SPEC §39):
+    /// - every page's checksum matches its bytes (SPEC §40);
     /// - every page belongs to exactly one thing — the header, the
     ///   catalog, the free list, or one collection's data, overflow or
     ///   index pages — none to two, none to nothing (a leak);
@@ -71,34 +72,55 @@ impl Database {
             owners: BTreeMap::new(),
             page_count: store.page_count(),
             problems: Vec::new(),
+            incomplete: false,
         };
+        // First, so a damaged page is named as such before whatever
+        // couldn't be read because of it (SPEC §40.4).
+        let damaged: BTreeSet<PageId> = match store.damaged_pages() {
+            Ok(pages) => pages.into_iter().collect(),
+            Err(e) => {
+                check.unreadable(e.to_string());
+                BTreeSet::new()
+            }
+        };
+        for page in &damaged {
+            check.unreadable(format!(
+                "page {page} is damaged: its checksum doesn't match"
+            ));
+        }
         check.claim(0, "the header");
         match Catalog::pages(store) {
             Ok(pages) => pages
                 .into_iter()
                 .for_each(|p| check.claim(p, "the catalog")),
-            Err(e) => check.problem(format!("the catalog: {e}")),
+            Err(e) => check.unreadable(format!("the catalog: {e}")),
         }
         match store.free_pages() {
             Ok(pages) => pages
                 .into_iter()
                 .for_each(|p| check.claim(p, "the free list")),
-            Err(e) => check.problem(e.to_string()),
+            Err(e) => check.unreadable(e.to_string()),
         }
 
         let mut names: Vec<&str> = catalog.names().collect();
         names.sort();
         let mut documents = 0;
         for name in &names {
-            match check_collection(&mut check, catalog, store, name) {
+            match check_collection(&mut check, catalog, store, name, &damaged) {
                 Ok(n) => documents += n,
-                Err(e) => check.problem(format!("collection {name:?}: {e}")),
+                Err(e) => check.unreadable(format!("collection {name:?}: {e}")),
             }
         }
 
-        for page in 0..check.page_count {
-            if !check.owners.contains_key(&page) {
-                check.problem(format!("page {page} belongs to nothing (leaked)"));
+        if check.incomplete {
+            // Whatever couldn't be read may own pages: each would look
+            // leaked.
+            check.problem("leaks not checked: not everything could be read".to_string());
+        } else {
+            for page in 0..check.page_count {
+                if !check.owners.contains_key(&page) {
+                    check.problem(format!("page {page} belongs to nothing (leaked)"));
+                }
             }
         }
         Ok(CheckReport {
@@ -114,11 +136,19 @@ struct Check {
     owners: BTreeMap<PageId, String>,
     page_count: u64,
     problems: Vec<String>,
+    /// Something couldn't be read, so the pages it owns are unknown.
+    incomplete: bool,
 }
 
 impl Check {
     fn problem(&mut self, problem: String) {
         self.problems.push(problem);
+    }
+
+    /// A problem that leaves part of the file unread.
+    fn unreadable(&mut self, problem: String) {
+        self.incomplete = true;
+        self.problem(problem);
     }
 
     fn claim(&mut self, page: PageId, owner: &str) {
@@ -135,12 +165,14 @@ impl Check {
 
 /// Checks one collection, claiming its pages; returns how many documents
 /// it has. An `Err` is a problem that stopped the check of this
-/// collection partway.
+/// collection partway. Documents on `damaged` pages aren't read: one
+/// problem names them all, and their index entries are left alone.
 fn check_collection(
     check: &mut Check,
     catalog: &Catalog,
     store: &FileStore,
     name: &str,
+    damaged: &BTreeSet<PageId>,
 ) -> std::io::Result<usize> {
     let meta = *catalog.get(name).expect("a listed collection");
     let primary = BTreeIndex::new(meta.index_root);
@@ -151,21 +183,48 @@ fn check_collection(
     check_order(check, name, "primary index", &entries);
 
     let mut documents: Vec<(DocId, Document, RecordLocation)> = Vec::new();
+    let mut unreadable = BTreeSet::new();
+    let (mut on_damaged, mut on_damaged_count) = (BTreeSet::new(), 0);
+    let mut records = data::Records::new(store);
     for (key, loc) in &entries {
         let expected = key::doc_id(key);
-        match data::get_record(store, *loc) {
+        if damaged.contains(&loc.page) {
+            unreadable.insert(expected);
+            on_damaged.insert(loc.page);
+            on_damaged_count += 1;
+            continue;
+        }
+        match records.get(*loc) {
             Ok((id, doc)) if id == expected => documents.push((id, doc, *loc)),
             Ok((id, _)) => check.problem(format!(
                 "{name:?}: the primary index files document {expected} at page {} slot {}, \
                  which holds document {id}",
                 loc.page, loc.slot
             )),
-            Err(e) => check.problem(format!("{name:?}: document {expected} can't be read: {e}")),
+            Err(e) => {
+                unreadable.insert(expected);
+                check.unreadable(format!("{name:?}: document {expected} can't be read: {e}"));
+            }
         }
     }
+    if !on_damaged.is_empty() {
+        let pages: Vec<String> = on_damaged.iter().map(PageId::to_string).collect();
+        check.unreadable(format!(
+            "{name:?}: {} can't be read, on damaged {} {}",
+            count(on_damaged_count, "document"),
+            if pages.len() == 1 { "page" } else { "pages" },
+            pages.join(", ")
+        ));
+    }
 
+    // A damaged current page is already reported, and holds nothing
+    // else to find.
+    let current = match damaged.contains(&meta.current_data_page) {
+        true => 0,
+        false => meta.current_data_page,
+    };
     let locs = documents.iter().map(|(_, _, loc)| *loc);
-    let (data_pages, chain_pages) = data::collection_pages(store, meta.current_data_page, locs)?;
+    let (data_pages, chain_pages) = data::collection_pages(store, current, locs)?;
     for page in data_pages {
         check.claim(page, &format!("{name:?}'s documents"));
     }
@@ -174,8 +233,8 @@ fn check_collection(
     }
 
     for index in catalog.indexes(name) {
-        if let Err(e) = check_index(check, store, name, index, &documents) {
-            check.problem(format!("{name:?}'s index on {:?}: {e}", index.field));
+        if let Err(e) = check_index(check, store, name, index, &documents, &unreadable) {
+            check.unreadable(format!("{name:?}'s index on {:?}: {e}", index.field));
         }
     }
     Ok(documents.len())
@@ -183,13 +242,15 @@ fn check_collection(
 
 /// A secondary index against the documents: its pages, its order, one
 /// entry per document with an indexed value and nothing else, and for a
-/// unique one no two equal non-null values.
+/// unique one no two equal non-null values. Entries for `unreadable`
+/// documents are skipped: there's nothing to compare them with.
 fn check_index(
     check: &mut Check,
     store: &FileStore,
     name: &str,
     index: &IndexMeta,
     documents: &[(DocId, Document, RecordLocation)],
+    unreadable: &BTreeSet<DocId>,
 ) -> std::io::Result<()> {
     let what = format!("{name:?}'s index on {:?}", index.field);
     let tree = BTreeIndex::new(index.root);
@@ -206,6 +267,7 @@ fn check_index(
 
     let found: BTreeSet<(Vec<u8>, PageId, u16)> = entries
         .into_iter()
+        .filter(|(key, _)| !unreadable.contains(&key::doc_id(key)))
         .map(|(key, loc)| (key, loc.page, loc.slot))
         .collect();
     let expected: BTreeSet<(Vec<u8>, PageId, u16)> = documents
@@ -253,6 +315,14 @@ fn check_index(
     Ok(())
 }
 
+/// `1 document`, `2 documents`.
+fn count(n: usize, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
+}
+
 /// An index scan must come back in strictly ascending key order.
 fn check_order(check: &mut Check, name: &str, what: &str, entries: &[(Vec<u8>, RecordLocation)]) {
     if let Some(pair) = entries.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
@@ -267,7 +337,7 @@ fn check_order(check: &mut Check, name: &str, what: &str, entries: &[(Vec<u8>, R
 mod tests {
     use super::*;
     use crate::query::Filter;
-    use crate::storage::PageStore;
+    use crate::storage::{PageStore, PageType};
 
     fn object(pairs: &[(&str, Document)]) -> Document {
         Document::Object(
@@ -312,6 +382,65 @@ mod tests {
         );
     }
 
+    /// A byte changed on disk in a data page, a collection's current data
+    /// page, then an index page (the first leaf, a primary index's):
+    /// the damaged page is the first problem, named by id; then what
+    /// couldn't be read because of it — for a data page its documents,
+    /// all in one problem, and no index entries or pages blamed for
+    /// them; leaks aren't checked. With the byte restored, the file
+    /// checks clean.
+    #[test]
+    fn a_damaged_page_is_the_first_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = sample(&dir);
+        let current = db
+            .read()
+            .unwrap()
+            .catalog
+            .get("notes")
+            .unwrap()
+            .current_data_page;
+        drop(db);
+        let clean = std::fs::read(&path).unwrap();
+        let first_of = |kind: PageType| {
+            (1..clean.len() / PAGE_SIZE)
+                .find(|&page| clean[page * PAGE_SIZE] == kind as u8)
+                .unwrap()
+        };
+        let data_page = first_of(PageType::Data);
+        let index_page = first_of(PageType::IndexLeaf);
+
+        for (page, then) in [
+            (data_page, "documents can't be read, on damaged page"),
+            // One `collection_pages` would otherwise read, and fail on.
+            (current as usize, "documents can't be read, on damaged page"),
+            (
+                index_page,
+                "is damaged: its checksum doesn't match its bytes",
+            ),
+        ] {
+            let mut bytes = clean.clone();
+            bytes[page * PAGE_SIZE + 500] ^= 0xFF;
+            std::fs::write(&path, &bytes).unwrap();
+
+            let problems = problems(&Database::open(&path).unwrap());
+            assert_eq!(problems.len(), 3, "{problems:#?}");
+            assert_eq!(
+                problems[0],
+                format!("page {page} is damaged: its checksum doesn't match")
+            );
+            assert!(problems[1].contains(then), "{problems:#?}");
+            assert!(problems[1].contains(&page.to_string()), "{problems:#?}");
+            assert_eq!(
+                problems[2],
+                "leaks not checked: not everything could be read"
+            );
+        }
+        std::fs::write(&path, &clean).unwrap();
+        assert!(problems(&Database::open(&path).unwrap()).is_empty());
+    }
+
     #[test]
     fn a_consistent_file_has_no_problems() {
         let dir = tempfile::tempdir().unwrap();
@@ -320,7 +449,7 @@ mod tests {
         assert_eq!(report.problems, Vec::<String>::new());
         assert_eq!((report.collections, report.documents), (2, 200));
         let info = db.file_info().unwrap();
-        assert_eq!((info.format_version, info.page_size), (5, PAGE_SIZE));
+        assert_eq!((info.format_version, info.page_size), (6, PAGE_SIZE));
         assert_eq!(info.pages, report.pages);
         assert!(info.free_pages > 0, "the deletes freed pages");
 

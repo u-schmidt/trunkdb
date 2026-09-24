@@ -68,11 +68,14 @@ impl Database {
     /// within a process, clone the handle instead of opening it again.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref();
-        let mut store = FileStore::open(path)?;
+        let mut store = FileStore::open_before_recovery(path)?;
         let (mut durability, pending) = WalDurability::open(path)?;
         if !pending.is_empty() {
             store.restore_pages(&pending)?;
         }
+        // After recovery, which rewrites a header a crash tore (SPEC
+        // §40.4); a damaged one without a batch to restore is real damage.
+        store.check_header()?;
         // Always, not just after a restore: a WAL whose only content is a
         // torn tail (a crash mid-`log`) yields nothing pending, but the
         // next batch must not be appended after that garbage.
@@ -615,6 +618,41 @@ mod tests {
         assert!(pages > 1);
 
         assert_two_collection_batch_present(&Database::open(&path).unwrap());
+    }
+
+    /// A crash mid-write of the header page can leave its first bytes new
+    /// and its last ones old: fields and checksum disagree. The batch is
+    /// in the WAL, so that's recovered, not reported as damage (SPEC
+    /// §40.4). The same mismatch with nothing to recover is damage.
+    #[test]
+    fn a_header_torn_by_a_crash_is_recovered_from_the_wal() {
+        use crate::storage::PAGE_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        log_batch_then_crash(
+            &path,
+            &two_collection_batch(),
+            CrashPoint::MidWriteBack { pages_written: 1 },
+        );
+        let last_sector = PAGE_SIZE - 512..PAGE_SIZE;
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_ne!(bytes[last_sector.clone()], before[last_sector.clone()]);
+        bytes[last_sector.clone()].copy_from_slice(&before[last_sector]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = Database::open(&path).unwrap();
+        assert_two_collection_batch_present(&db);
+        assert!(db.check().unwrap().is_ok());
+        drop(db);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[PAGE_SIZE - 100] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let err = Database::open(&path).err().expect("damage, not a crash");
+        assert!(err.to_string().contains("page 0 is damaged"), "{err}");
     }
 
     /// Writing back pages that are already in the main file changes

@@ -16,7 +16,7 @@ use crate::storage::PageId;
 /// the main file can be replayed again harmlessly.
 pub trait Durability {
     /// Durably records one batch's changed pages — `(page id, page bytes)`,
-    /// each exactly `storage::PAGE_SIZE` long — as a single unit: after a
+    /// each exactly `storage::USABLE_PAGE_SIZE` long — as a single unit: after a
     /// crash, recovery sees either all of them or none.
     fn log(&mut self, pages: &[(PageId, &[u8])]) -> std::io::Result<()>;
     /// Marks every batch logged so far as durably reflected in the main

@@ -606,7 +606,8 @@ fn read_in_index_order(
     if sort.order == SortOrder::Desc {
         groups.reverse();
     }
-    let read = |loc: &RecordLocation| data::get_record(store, *loc);
+    let mut records = data::Records::new(store);
+    let mut read = |loc: &RecordLocation| records.get(*loc);
     for group in groups {
         if key::is_exact(key::value_part(&group[0].0)) {
             for (_key, loc) in group {
@@ -668,10 +669,11 @@ fn read_candidates(
     collection: &str,
     filter: &Filter,
 ) -> std::io::Result<Vec<(DocId, Document)>> {
+    let mut records = data::Records::new(store);
     candidate_entries(catalog, store, collection, filter)?
         .into_iter()
         // The id stored in the data cell itself (SPEC §11).
-        .map(|(_key, loc)| data::get_record(store, loc))
+        .map(|(_key, loc)| records.get(loc))
         .collect()
 }
 
@@ -2767,42 +2769,6 @@ mod tests {
         }
         assert_eq!(users.indexes().unwrap(), ["name", "age"]);
         assert_eq!(users.unique_indexes().unwrap(), ["name"]);
-    }
-
-    /// A format-4 file (SPEC §32) is a format-5 file without unique
-    /// indexes: it opens as it is, and the batch that creates its first
-    /// unique index stamps it 5 (SPEC §33.4).
-    #[test]
-    fn a_format_4_file_opens_and_becomes_5_with_its_first_unique_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.trunkdb");
-        let version = || std::fs::read(&path).unwrap()[28..32].to_vec();
-        {
-            let db = Database::open(&path).unwrap();
-            let users = db.collection::<User>("users");
-            users.insert(user("Ada", 36)).unwrap();
-            users.ensure_index("age").unwrap();
-        }
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes[28..32].copy_from_slice(&4u32.to_le_bytes());
-        std::fs::write(&path, bytes).unwrap();
-
-        {
-            let db = Database::open(&path).unwrap();
-            let users = db.collection::<User>("users");
-            assert_eq!(users.find(age_filter(Op::Gte, 0)).unwrap().len(), 1);
-            users.insert(user("Bob", 41)).unwrap();
-        }
-        assert_eq!(version(), 4u32.to_le_bytes(), "no page allocated yet");
-
-        {
-            let db = Database::open(&path).unwrap();
-            db.collection::<User>("users")
-                .ensure_unique_index("name")
-                .unwrap();
-        }
-        // Read with the database closed: on Windows its lock blocks reads.
-        assert_eq!(version(), 5u32.to_le_bytes());
     }
 
     /// Random single-op batches against a unique index on `v`: each must
