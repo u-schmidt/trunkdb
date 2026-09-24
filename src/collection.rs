@@ -2,7 +2,7 @@ use crate::catalog::{Catalog, CollectionMeta, IndexMeta};
 use crate::cursor::Cursor;
 use crate::data;
 use crate::database::Database;
-use crate::document::{DocId, Document};
+use crate::document::{DocId, Document, encode_document};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::query::{Filter, QueryPlan, SortOrder};
@@ -201,6 +201,23 @@ where
         self.as_document().delete(id)
     }
 
+    /// See the untyped `update_many`: `change` gets each match as a `T`.
+    /// A document that doesn't convert to `T` fails the whole batch.
+    /// Whether a document changed is judged after the round trip through
+    /// `T`, so one written before a field was added to `T` counts as
+    /// changed — it gets the field.
+    pub fn update_many(
+        &self,
+        filter: Filter,
+        mut change: impl FnMut(&mut T),
+    ) -> crate::Result<usize> {
+        self.as_document().update_matching(filter, |doc| {
+            let mut value: T = from_document(doc)?;
+            change(&mut value);
+            Ok(crate::serde_bridge::to_document(&value)?)
+        })
+    }
+
     /// See the untyped `delete_many`. No document is converted to `T`.
     pub fn delete_many(&self, filter: Filter) -> crate::Result<usize> {
         self.as_document().delete_many(filter)
@@ -315,6 +332,51 @@ impl Collection<Document> {
     /// `false` if there's no document `id`, as for `update`.
     pub fn delete(&self, id: &DocId) -> crate::Result<bool> {
         found(self.write(WriteOp::Delete(self.name.clone(), *id)))
+    }
+
+    /// Changes the documents `find(filter)` would return — `sort` and
+    /// `limit` included — by calling `change` on each, in that order, and
+    /// writes the ones it changed; returns how many (SPEC §38). One batch
+    /// under one write lock, like `delete_many`: all changes land or none
+    /// — a unique index refusing one (§33) rolls back every one. An `_id`
+    /// can't be changed: whatever `change` puts there, the document keeps
+    /// its own.
+    ///
+    /// `change` runs while the database is locked for writing: it must
+    /// not use this database itself, which would deadlock.
+    pub fn update_many(
+        &self,
+        filter: Filter,
+        mut change: impl FnMut(&mut Document),
+    ) -> crate::Result<usize> {
+        self.update_matching(filter, |mut doc| {
+            change(&mut doc);
+            Ok(doc)
+        })
+    }
+
+    /// `update_many` for both paths: `change` maps each document found to
+    /// its new version, or fails the whole batch.
+    fn update_matching(
+        &self,
+        filter: Filter,
+        mut change: impl FnMut(Document) -> crate::Result<Document>,
+    ) -> crate::Result<usize> {
+        self.db.transact(|catalog, store| {
+            let found = find_in(catalog, store, &self.name, &filter)?;
+            let mut changed = 0;
+            for (id, old) in found {
+                let new = with_id(change(old.clone())?, id);
+                // By encoding, not `==`: a NaN isn't equal to itself, and
+                // a document holding one would never count as unchanged.
+                if encode_document(&new) == encode_document(&old) {
+                    continue; // nothing to write
+                }
+                apply_write_op(catalog, store, &WriteOp::Update(self.name.clone(), id, new))?;
+                changed += 1;
+            }
+            Ok(changed)
+        })
     }
 
     /// Deletes exactly the documents `find(filter)` would return — `sort`
@@ -2387,6 +2449,187 @@ mod tests {
             deleted_any += doomed.len();
         }
         assert!(deleted_any > 100, "only {deleted_any} deleted");
+        assert_index_agrees_with_scan(&docs, &mut rng, "v");
+        assert_nested_filters_agree_with_a_scan(&docs, &mut rng);
+    }
+
+    // --- update_many (SPEC §38) ---
+
+    #[test]
+    fn update_many_changes_what_find_would_return() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Task {
+            name: String,
+            status: String,
+            rank: i64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Task>("tasks");
+        let mut batch = db.batch();
+        for rank in 0..60 {
+            let status = if rank < 40 { "Queued" } else { "Done" }.to_string();
+            let name = format!("task {rank}");
+            batch.insert(&tasks, Task { name, status, rank }).unwrap();
+        }
+        batch.commit().unwrap();
+        tasks.ensure_index("status").unwrap();
+        tasks.ensure_unique_index("name").unwrap();
+        let count = |status: &str| tasks.count(Filter::new().eq("status", status)).unwrap();
+
+        // Sort and limit count, and `change` sees the matches in order.
+        let mut seen = Vec::new();
+        let first_five = Filter::new()
+            .eq("status", "Queued")
+            .sort_asc("rank")
+            .limit(5);
+        let n = tasks
+            .update_many(first_five, |task| {
+                seen.push(task.rank);
+                task.status = "Running".to_string();
+            })
+            .unwrap();
+        assert_eq!((n, seen), (5, vec![0, 1, 2, 3, 4]));
+        // The index moved with them.
+        let running = Filter::new().eq("status", "Running");
+        assert_eq!(
+            tasks.explain(&running).unwrap(),
+            QueryPlan::Index {
+                field: "status".to_string()
+            }
+        );
+        assert_eq!((count("Running"), count("Queued")), (5, 35));
+
+        // Matches left as they were aren't written, nor counted.
+        let done = Filter::new().eq("status", "Done");
+        assert_eq!(
+            tasks
+                .update_many(done, |task| task.status = "Done".to_string())
+                .unwrap(),
+            0
+        );
+
+        // One change a unique index refuses rolls back all of them.
+        let queued = || Filter::new().eq("status", "Queued");
+        let all_same = tasks.update_many(queued(), |task| {
+            task.name = "same".to_string();
+            task.status = "Renamed".to_string();
+        });
+        assert!(
+            matches!(all_same, Err(crate::Error::DuplicateValue { .. })),
+            "{all_same:?}"
+        );
+        assert_eq!((count("Queued"), count("Renamed")), (35, 0));
+
+        // An `_id` stays what it was, whatever `change` does to it.
+        let docs = db.collection::<Document>("tasks");
+        let (id, _) = tasks
+            .find_one_with_id(Filter::new().eq("rank", 7))
+            .unwrap()
+            .unwrap();
+        let n = docs
+            .update_many(Filter::new().eq("rank", 7), |doc| {
+                if let Document::Object(fields) = doc {
+                    fields.insert("_id".to_string(), Document::Id(DocId([0; 16])));
+                    fields.insert("rank".to_string(), Document::Int(700));
+                }
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(tasks.get(&id).unwrap().map(|task| task.rank), Some(700));
+
+        // A match that doesn't convert to `T` fails the whole batch.
+        let odd = [
+            ("name", Document::String("odd".into())),
+            ("status", Document::String("Queued".into())),
+        ];
+        docs.insert(object(odd.to_vec())).unwrap(); // no `rank`
+        let bumped = tasks.update_many(queued(), |task| task.rank += 1000);
+        assert!(
+            matches!(bumped, Err(crate::Error::Document(_))),
+            "{bumped:?}"
+        );
+        assert_eq!(tasks.count(Filter::new().gte("rank", 1000)).unwrap(), 0);
+    }
+
+    /// Random nested filters, sometimes sorted and limited, and a change
+    /// that gives `v` a random new value, or leaves the document alone:
+    /// the count and every document afterwards must match a model, and
+    /// the indexes must still agree with a scan.
+    #[test]
+    fn update_many_matches_a_model_through_random_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("v").unwrap();
+        docs.ensure_index("w").unwrap();
+        let mut rng = XorShift(0x0DDB_A11C_0FFE_E123);
+        // Compared as text: NaN isn't equal to itself.
+        let text = |all: Vec<(DocId, Document)>| {
+            let mut all: Vec<_> = all
+                .into_iter()
+                .map(|(id, doc)| (id, format!("{doc:?}")))
+                .collect();
+            all.sort();
+            all
+        };
+        let mut changed_any = 0;
+        for _ in 0..30 {
+            let ops = (0..15)
+                .map(|_| {
+                    WriteOp::Insert(
+                        "docs".into(),
+                        db.id_gen().generate(),
+                        random_document(&mut rng),
+                    )
+                })
+                .collect();
+            db.write_batch(ops).unwrap();
+
+            let mut f = Filter::new().and(random_condition(&mut rng, 2));
+            if rng.below(2) == 0 {
+                f = f
+                    .sort_by("v", [SortOrder::Asc, SortOrder::Desc][rng.below(2)])
+                    .limit(rng.below(8));
+            }
+            let mut model = docs.find_with_ids(Filter::new()).unwrap();
+            let matched = docs.find_with_ids(f.clone()).unwrap();
+            // What the change will do to each match, decided up front.
+            let new_values: Vec<Option<Document>> = matched
+                .iter()
+                .map(|_| (rng.below(4) != 0).then(|| random_value(&mut rng)))
+                .collect();
+            let mut expected_changes = 0;
+            for ((id, old), new_v) in matched.iter().zip(&new_values) {
+                let Some(new_v) = new_v else { continue };
+                let mut new = old.clone();
+                if let Document::Object(fields) = &mut new {
+                    fields.insert("v".to_string(), new_v.clone());
+                }
+                if encode_document(&new) != encode_document(old) {
+                    expected_changes += 1;
+                    let slot = model.iter_mut().find(|(other, _)| other == id).unwrap();
+                    slot.1 = new;
+                }
+            }
+
+            let mut next = new_values.into_iter();
+            let n = docs
+                .update_many(f.clone(), |doc| {
+                    if let (Some(new_v), Document::Object(fields)) = (next.next().unwrap(), doc) {
+                        fields.insert("v".to_string(), new_v);
+                    }
+                })
+                .unwrap();
+            assert_eq!(n, expected_changes, "{f:?}");
+            assert_eq!(
+                text(docs.find_with_ids(Filter::new()).unwrap()),
+                text(model),
+                "{f:?}"
+            );
+            changed_any += n;
+        }
+        assert!(changed_any > 50, "only {changed_any} changed");
         assert_index_agrees_with_scan(&docs, &mut rng, "v");
         assert_nested_filters_agree_with_a_scan(&docs, &mut rng);
     }

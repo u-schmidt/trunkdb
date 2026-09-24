@@ -103,7 +103,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §38 for the full list and reasoning):
+Done so far (see SPEC.md §39 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -132,7 +132,11 @@ Done so far (see SPEC.md §38 for the full list and reasoning):
 11. **`delete_many` and `drop_collection`** (§37): delete by filter
     (sort and limit included), drop a collection and free its pages.
 
-What's still open: SPEC.md §38.2.
+    Items 9–11 → 0.5.0.
+12. **`update_many`** (§38): change what a filter finds with a closure,
+    `|task| task.status = ...`, in one atomic batch.
+
+What's still open: SPEC.md §39.2.
 
 ## License
 

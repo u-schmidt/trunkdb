@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §38 for the roadmap.
+large-document workload (§5.2) the second; see §39 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1236,7 +1236,7 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§38.2).
+future vacuum (§39.2).
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
@@ -1390,7 +1390,7 @@ pages holding dozens of entries.
 - **`u16` lengths** in the document encoding can't wrap today, since a
   whole document must fit in one page; overflow pages (§26) had to widen
   them, as already planned. *Done in §26.1.*
-- **Bit rot** stays undetected until per-page checksums (§38.2).
+- **Bit rot** stays undetected until per-page checksums (§39.2).
 
 ## 23. `find_with_ids` (`collection.rs`, `query.rs`)
 
@@ -1520,7 +1520,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§38.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§39.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1701,7 +1701,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§38.2).
+(§39.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2083,7 +2083,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§38). It's also a backup that can be read and `diff`ed, and a way to
+(§39). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2210,7 +2210,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§38.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§39.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2319,7 +2319,7 @@ through export and import anyway, and this can't happen.)
 - A lookup splits the path as it walks — no allocation — so a top-level
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
-- Still one field per index: compound indexes are still open (§38.2);
+- Still one field per index: compound indexes are still open (§39.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2854,7 +2854,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§38.2).
+- Still no pattern language, no conditions on array elements (§39.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2941,16 +2941,82 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §38.2).
-- No `update_many` yet.
+  §39.2).
+- No `update_many` yet — it came next (§38).
 
-## 38. Roadmap
+## 38. `update_many` (`collection.rs`)
+
+Real and tested: the documents a filter finds can be changed in one
+call, by a closure.
+
+```rust
+tasks.update_many(Filter::new().eq("status", "Queued"), |task| {
+    task.status = "Running".to_string();
+})?;   // -> how many changed
+
+// Untyped: the closure gets the Document.
+docs.update_many(Filter::new().lt("seen", 0), |doc| { /* ... */ })?;
+```
+
+### 38.1 A closure, not update operators
+The change is a closure: `FnMut(&mut T)` on the typed path, `FnMut(&mut
+Document)` on the untyped one. It's LiteDB's `UpdateMany(x => ...,
+predicate)`, and in Rust it's the obvious shape — the compiler checks
+the field names, and any change the language can express works.
+
+Rejected for now: MongoDB-style operators (`$set`, `$inc`, `$unset`, on
+dotted paths). They'd work without deserializing and read declaratively,
+but they are a small language to design, and for a typed caller strictly
+less than a closure. They can come later, on the untyped path, if a need
+shows up.
+
+### 38.2 What it changes
+Like `delete_many` (§37.1): exactly what `find(filter)` would return —
+sort and limit included — through the same code and plans. `change` is
+called on each match in `find`'s order, so with a sort it sees them
+sorted. Everything happens in one batch under one write lock: all
+changes land or none. A unique index refusing one change (§33) rolls
+back every one; so does a match that doesn't convert to `T`.
+
+It returns how many documents changed — matches `change` left as they
+were aren't written or counted. "Unchanged" is decided by the encoded
+bytes, not `==`: a NaN isn't equal to itself, so a document holding one
+never compared equal — the randomized test found exactly that. On the
+typed path it's decided after the round trip through `T`, so a document
+written before a field was added to `T` counts as changed: it gets the
+field. An `_id` can't change: whatever `change` puts there, the document
+keeps its own.
+
+`change` runs while the database is locked for writing, so it must not
+use this database — that would deadlock. The same rule as for `export`'s
+writer (§30.4).
+
+### 38.3 Tests
+- `update_many_changes_what_find_would_return`: typed tasks — the five
+  lowest-ranked of a status by sort and limit, seen by `change` in that
+  order; the index follows; unchanged matches not counted; a unique
+  index refusing one change rolls back all; `_id` unchangeable
+  (untyped); a match that doesn't convert to `T` fails the batch.
+- `update_many_matches_a_model_through_random_filters`: 30 rounds of
+  inserts and a random nested filter, sometimes sorted and limited; the
+  change gives `v` a random new value or leaves the document alone. The
+  count and every document must match a model; at the end the indexes
+  agree with a scan on every plan. It caught the NaN case above.
+- Checked by breaking it on purpose, four ways: no "unchanged" check,
+  the limit ignored, matches in reverse order, and comparing without the
+  `_id` put back. Each fails a test.
+
+### 38.4 Limits
+- No update operators (§38.1).
+- One big batch, like `delete_many` (§37.4).
+
+## 39. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 38.1 Done
+### 39.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -2963,9 +3029,10 @@ All of it is done:
 | 0.3.0 | Block B, the sync workload: `find_with_ids`, typed batches, `Contains` (planned as 0.2.0, never released on its own) | §23–§25 |
 | 0.3.0 | Block C, the large-document workload: overflow pages, a thread-safe `Database`, secondary indexes, `find_one`/`count`/`upsert`/`cursor` | §26–§29 |
 | 0.4.0 | Export/import, nested-field paths, null and missing fields, unique indexes, sorting through an index; file format 5 | §30–§34 |
-| next | A filter builder; OR, NOT and nesting; `delete_many` and dropping a collection | §35–§37 |
+| 0.5.0 | A filter builder; OR, NOT and nesting (`Condition` became a tree — breaking); `delete_many` and dropping a collection | §35–§37 |
+| next | `update_many` | §38 |
 
-### 38.2 Open
+### 39.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -2994,7 +3061,8 @@ limit is described.
   (§30.6).
 
 **API**
-- Updating by filter (`update_many`), atomic like `delete_many` (§37).
+- Update operators (`$set`, `$inc`, `$unset` on paths) next to
+  `update_many`'s closure (§38.1).
 - A struct with its own id field (`#[serde(rename = "_id")]`, §13.5,
   §18) — `find_with_ids` (§23) covers most needs; unscheduled.
 
