@@ -1,6 +1,6 @@
 [package]
 name = "trunkdb"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.89"
 description = "An embedded, single-file, schema-less document database — a learning-first, from-scratch reimplementation of the LiteDB idea in Rust."

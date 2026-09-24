@@ -185,6 +185,8 @@ Done so far (see SPEC.md §45 for the full list and reasoning):
     sparse: true, .. })` leaves out null and missing values, for fields
     few documents have; used where the filter rules nulls out.
 
+    Items 17–18 → 0.8.0.
+
 What's still open: SPEC.md §45.2.
 
 ## License

@@ -4007,7 +4007,7 @@ All of it is done:
 | 0.5.0 | A filter builder; OR, NOT and nesting (`Condition` became a tree — breaking); `delete_many` and dropping a collection | §35–§37 |
 | 0.6.0 | `update_many`; the `trunkdb` command and `Database::check`; page checksums, file format 6 | §38–§40 |
 | 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
-| next | Compound indexes, sparse indexes, file format 8 | §43–§44 |
+| 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
 
 ### 45.2 Open
 Unordered within each group; each line says where the need or the
