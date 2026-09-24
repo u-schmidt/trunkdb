@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §46 for the roadmap.
+large-document workload (§5.2) the second; see §47 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1531,7 +1531,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§46.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§47.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1712,7 +1712,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§46.2).
+(§47.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2102,7 +2102,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§46). It's also a backup that can be read and `diff`ed, and a way to
+(§47). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2229,7 +2229,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§46.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§47.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2340,7 +2340,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§46.2);
+- Still one field per index: compound indexes are still open (§47.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2879,7 +2879,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§46.2).
+- Still no pattern language, no conditions on array elements (§47.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2966,7 +2966,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §46.2).
+  §47.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3302,7 +3302,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§46.2).
+  run on such a file. Repairing is open (§47.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -3640,7 +3640,7 @@ then on 0.6.0 refuses it.
 ### 42.6 Limits
 - **No conditions tied to one element** (MongoDB's `$elemMatch`: "an
   item with sku A1 *and* qty > 2"). Two conditions on `items[*]` may
-  be met by two different items.
+  be met by two different items. (Added in §46.)
 - **No condition on an array's size**, and no way to ask for an empty
   array. (Added in §45.)
 - **Sorting by elements** doesn't sort (§42.3).
@@ -4133,15 +4133,142 @@ break later.
   MongoDB variant §44.1 rejected; it can come back as a third index
   option if the need shows up.
 - **No length of a string or an object.**
-- **Per-element conditions** (`$elemMatch`) are still open (§46.2).
+- **Per-element conditions** (`$elemMatch`) came next, in §46.
 
-## 46. Roadmap
+## 46. Conditions on one element: `elem_match` (`query.rs`)
+
+Real and tested: a condition that one element of an array must meet as
+a whole. It is MongoDB's `$elemMatch`, with the multikey indexes of §42
+bounding it.
+
+```rust
+// An order with a line of 9 or more of A1 — not an A1 line and some
+// other line of 9:
+orders.find(Filter::new().elem_match(
+    "lines",
+    Condition::eq("sku", "A1") & Condition::gte("qty", 9),
+))?;
+// A score in the 80s — not one above 80 and another below 90:
+students.find(Filter::new().elem_match(
+    "scores",
+    Condition::gte("", 80) & Condition::lt("", 90),
+))?;
+```
+
+### 46.1 What it means
+`Condition::ElemMatch { field, condition }` holds if some element of
+the array at `field` meets `condition`, evaluated with the element as
+its document. The difference from §42's `[*]` paths is that each
+comparison on `lines[*].sku` or `lines[*].qty` may be met by a
+different line (§42.1). `elem_match` needs one line that meets all of
+them.
+
+- **Paths inside start at the element.** On `lines`, `sku` is a line's
+  `sku`, and `address.city` is its `address.city`.
+- **`""` is the element itself**, for arrays of scalars: `gte("", 80)`
+  on a score. A path starting with `[*]` starts there too, so
+  `eq("[*]", 2)` on `rows` means "a row containing 2" when the rows
+  are arrays. `field_value` and `values_at` read the empty path as the
+  document, so any condition works on an element: comparisons,
+  `exists`, `size`, a nested `elem_match`, `Not`, `Any`.
+- **`field` is an ordinary path.** `orders[*].lines` reaches every line
+  of every order, the same as `elem_match("orders", elem_match("lines",
+  …))`.
+- **No array, no element:** a missing field, a scalar or a null never
+  matches, and `!elem_match(…)` always does. Negations inside are
+  about the one element: `elem_match("lines", ne("sku", "A1"))` means
+  "a line that isn't A1", where `ne("lines[*].sku", "A1")` means "no
+  line is A1" (§42.1).
+
+Rejected:
+- **An operator form for scalar elements**, like MongoDB's
+  `{scores: {$elemMatch: {$gte: 80, $lt: 90}}}`, which puts operators
+  where fields would be. The empty path does the same with the
+  conditions that exist, so there's nothing new to learn.
+- **`$` as the element** (`gte("$", 80)`). A field may be named `$`,
+  but not `""` (§31.4 refuses empty path parts for indexes; a key `""`
+  was reachable in a filter before, and now isn't).
+
+### 46.2 API
+- `Condition::elem_match(field, condition)` and
+  `Filter::elem_match(field, condition)`.
+- `Condition` gained the variant `ElemMatch`. It is `#[non_exhaustive]`
+  since §45.4, so that breaks nothing.
+
+### 46.3 The planner
+If an element meets `sku == "A1"`, the document meets `lines[*].sku ==
+"A1"`. So an `ElemMatch` is bounded like its condition with every path
+moved out to the elements (`within`): `sku` becomes `lines[*].sku`,
+`""` becomes `lines[*]`, and `[*]` becomes `lines[*][*]`. An index on
+`lines[*].sku` then reads the orders with an A1 line, and checking each
+one picks those whose A1 line has the quantity.
+
+The rewritten condition is used only for bounds, never for matching,
+because it doesn't mean the same. `ne("sku", "A1")` becomes "no line is
+A1", and a `Not` becomes the negation of an any-element test. Neither
+ever bounds an index (§36.3), and everything that does bound one (an
+`Eq`, a range, an OR whose every branch is bounded) holds for the
+document whenever it holds for one element. So the bounds hold
+everything that matches, as bounds must (§28.3).
+
+Everything else is as for `[*]` paths (§42.3):
+- Two ranges on the same element path aren't intersected, even inside
+  an `ElemMatch`. `gte("", 80) & lt("", 90)` reads one of the two
+  ranges, which is still correct because the check sorts it out.
+- A multikey index is never read in sort order.
+
+Measured by the typed test: 2,000 orders of one to three lines each, 20
+skus. The `elem_match` for a line of A1 with a quantity of 9 or more
+reads 195 orders, the ones with an A1 line, and 38 of them match. The
+two comparisons on `lines[*]` paths would find 78 instead: every order
+with an A1 line and some line of 9.
+
+### 46.4 Tests
+- `query.rs`:
+  - The semantics, against one order-like document: an A1 line and a
+    large line that aren't the same line; scores between bounds with
+    `""`; arrays of arrays with `[*]` and `size`; nested and through a
+    `[*]` path; a missing field, strings and numbers as "arrays", and
+    `Not`, `Ne`, empty `All` and `Any` inside.
+  - The planner: the rewritten paths for a field, for `""` and for
+    `[*]`, with the range read; an OR inside bounded by union; none
+    from a `Ne`, a `Not`, an unindexed field, an OR with an unbounded
+    branch, or an index on another path.
+- `collection.rs`:
+  - The multikey randomized test now also runs 300 random `elem_match`
+    filters, before and after a reopen. They mix `items` with
+    conditions on `n` and `tags` with conditions on the element itself,
+    in ANDs, ORs and NOTs of every comparison, with null and array
+    values and sometimes an indexed comparison beside them. Each must
+    find what a scan finds, and both index plans and a scan must run.
+  - The typed orders test above: the same orders as a scan, the reads
+    equal to the orders with an A1 line, fewer than the loose version
+    finds.
+- Checked by breaking it on purpose, eight ways. Each of these fails a
+  test:
+  - every element having to meet it;
+  - a scalar taken as an array of itself;
+  - an `ElemMatch` never bounding an index;
+  - bounding by the inner condition with its paths unchanged;
+  - `""` rewritten as `lines[*].`;
+  - an OR inside rewritten as an AND;
+  - a path's first empty step read as a field `""`, in `values_at`, or
+    in `field_value`.
+
+### 46.5 Limits
+- **An element condition can't use a compound index.** Compound indexes
+  have no `[*]` fields (§43.1), so "sku and qty of one line" is always
+  bounded by one field and checked for the rest.
+- **No positional result.** MongoDB can return only the matching
+  element (`$`); here a query returns whole documents.
+
+## 47. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 46.1 Done
+### 47.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -4158,15 +4285,14 @@ All of it is done:
 | 0.6.0 | `update_many`; the `trunkdb` command and `Database::check`; page checksums, file format 6 | §38–§40 |
 | 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
-| next | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]` | §45 |
+| next | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match` | §45–§46 |
 
-### 46.2 Open
+### 47.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
 **Queries**
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
-- Conditions tied to one array element (`$elemMatch`, §42.6).
 
 **Indexes**
 - Sorting by several fields, which a compound index could then serve

@@ -42,6 +42,15 @@ pub enum Condition {
     /// `size` (SPEC §45.2) — `Op::Eq` and 0 for an empty one. `Ne` is
     /// `Eq` negated, so it also holds where there's no array at all.
     Size { field: String, op: Op, size: usize },
+    /// Some element of the array at `field` meets `condition` on its own
+    /// (SPEC §46): `items` has an item with `sku == "A1"` *and* `qty >
+    /// 2`, where `items[*].sku == "A1" AND items[*].qty > 2` may be met
+    /// by two different items. Paths in `condition` start at the
+    /// element; `""` is the element itself.
+    ElemMatch {
+        field: String,
+        condition: Box<Condition>,
+    },
     /// Every one of them holds (AND) — true if there are none.
     All(Vec<Condition>),
     /// At least one of them holds (OR) — false if there are none.
@@ -121,6 +130,30 @@ impl Condition {
         }
     }
 
+    /// Some element of the array at `field` meets `condition`, with
+    /// paths relative to the element — `""` for the element itself
+    /// (SPEC §46):
+    ///
+    /// ```
+    /// use trunkdb::query::Condition;
+    ///
+    /// let big_a1 = Condition::elem_match(
+    ///     "items",
+    ///     Condition::eq("sku", "A1") & Condition::gt("qty", 2),
+    /// );
+    /// let in_80s = Condition::elem_match(
+    ///     "scores",
+    ///     Condition::gte("", 80) & Condition::lt("", 90),
+    /// );
+    /// # let _ = (big_a1, in_80s);
+    /// ```
+    pub fn elem_match(field: impl Into<String>, condition: Condition) -> Self {
+        Condition::ElemMatch {
+            field: field.into(),
+            condition: Box::new(condition),
+        }
+    }
+
     /// AND.
     pub fn all(conditions: impl IntoIterator<Item = Condition>) -> Self {
         Condition::All(conditions.into_iter().collect())
@@ -136,6 +169,12 @@ impl Condition {
             Condition::Compare { field, op, value } => compare_matches(field, op, value, doc),
             Condition::Exists { field } => !present_at(doc, field).is_empty(),
             Condition::Size { field, op, size } => size_matches(field, op, *size, doc),
+            Condition::ElemMatch { field, condition } => {
+                values_at(doc, field).into_iter().any(|value| match value {
+                    Document::Array(elements) => elements.iter().any(|e| condition.matches(e)),
+                    _ => false,
+                })
+            }
             Condition::All(conditions) => conditions.iter().all(|c| c.matches(doc)),
             Condition::Any(conditions) => conditions.iter().any(|c| c.matches(doc)),
             Condition::Not(condition) => !condition.matches(doc),
@@ -268,6 +307,12 @@ impl Filter {
     /// missing — matches only `Ne`.
     pub fn size(self, field: impl Into<String>, op: Op, size: usize) -> Self {
         self.and(Condition::size(field, op, size))
+    }
+
+    /// Some element of the array at `field` meets `condition` on its own
+    /// — see `Condition::elem_match` (SPEC §46).
+    pub fn elem_match(self, field: impl Into<String>, condition: Condition) -> Self {
+        self.and(Condition::elem_match(field, condition))
     }
 
     /// Sorts by `field`, smallest first — replacing any earlier sort.
@@ -508,7 +553,8 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
 /// Bounds for one condition: an `All` like the filter's own list, an
 /// `Any` only if every branch can be bounded (the union of theirs), a
 /// `Not` never — nor `Exists` or `Size`, which no index can tell
-/// (SPEC §45.3).
+/// (SPEC §45.3). An `ElemMatch` like its condition moved out to the
+/// array's elements (`within`, SPEC §46.3).
 fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
     match condition {
         Condition::Compare { .. } => bounds_for_all(std::slice::from_ref(condition), indexes),
@@ -524,7 +570,55 @@ fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bou
                 fields: 1,
             })
         }
+        Condition::ElemMatch { field, condition } => bounds_for(&within(field, condition), indexes),
         Condition::Not(_) | Condition::Exists { .. } | Condition::Size { .. } => None,
+    }
+}
+
+/// `condition` about an element of the array at `field`, rewritten as a
+/// condition about the whole document: every path gets `field[*]` in
+/// front — `sku` becomes `items[*].sku`, `""` becomes `items[*]` (SPEC
+/// §46.3). Where an element meets `condition`, the document meets what
+/// comes out for every comparison that can bound an index: an `Eq` or a
+/// range holds for that element, so for some element (§42.1). What it
+/// doesn't imply — a `Ne` (no element equal), anything under a `Not` —
+/// never bounds one, so only bounds are taken from it, never matches.
+fn within(field: &str, condition: &Condition) -> Condition {
+    let path = |inner: &str| match inner.is_empty() || inner.starts_with("[*]") {
+        true => format!("{field}[*]{inner}"),
+        false => format!("{field}[*].{inner}"),
+    };
+    let all = |conditions: &[Condition]| conditions.iter().map(|c| within(field, c)).collect();
+    match condition {
+        Condition::Compare {
+            field: inner,
+            op,
+            value,
+        } => Condition::Compare {
+            field: path(inner),
+            op: op.clone(),
+            value: value.clone(),
+        },
+        Condition::Exists { field: inner } => Condition::Exists { field: path(inner) },
+        Condition::Size {
+            field: inner,
+            op,
+            size,
+        } => Condition::Size {
+            field: path(inner),
+            op: op.clone(),
+            size: *size,
+        },
+        Condition::ElemMatch {
+            field: inner,
+            condition,
+        } => Condition::ElemMatch {
+            field: path(inner),
+            condition: condition.clone(),
+        },
+        Condition::All(conditions) => Condition::All(all(conditions)),
+        Condition::Any(branches) => Condition::Any(all(branches)),
+        Condition::Not(condition) => Condition::Not(Box::new(within(field, condition))),
     }
 }
 
@@ -690,8 +784,12 @@ impl Filter {
 /// joined by dots — `address.city` is the `city` field of the object in
 /// the `address` field. `None` if a step is missing or isn't an object;
 /// arrays aren't walked into. A dot always separates, so a key that
-/// itself contains a dot can't be reached by a path.
+/// itself contains a dot can't be reached by a path. The empty path is
+/// `doc` itself — an element, in `Condition::elem_match` (SPEC §46.1).
 pub(crate) fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Document> {
+    if path.is_empty() {
+        return Some(doc);
+    }
     path.split('.').try_fold(doc, |value, name| match value {
         Document::Object(map) => map.get(name),
         _ => None,
@@ -718,7 +816,9 @@ pub(crate) fn is_multi(path: &str) -> bool {
 ///   without the field gives a null;
 /// - `[*]` on anything but an array gives nothing: a missing, null or
 ///   scalar `tags` has no elements;
-/// - a path without `[*]` gives exactly `value_or_null`.
+/// - a path without `[*]` gives exactly `value_or_null`;
+/// - a path that is empty or starts with `[*]` starts at `doc` itself,
+///   for an element in `Condition::elem_match` (SPEC §46.1).
 pub(crate) fn values_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> {
     walk(doc, path, true)
 }
@@ -734,16 +834,18 @@ fn present_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> {
 fn walk<'a>(doc: &'a Document, path: &str, missing_is_null: bool) -> Vec<&'a Document> {
     let missing = missing_is_null.then_some(&Document::Null);
     let mut values = vec![doc];
-    for step in path.split('.') {
+    for (i, step) in path.split('.').enumerate() {
         let name = step.trim_end_matches("[*]");
         let fan_outs = (step.len() - name.len()) / 3;
-        values = values
-            .into_iter()
-            .filter_map(|value| match value {
-                Document::Object(map) => map.get(name).or(missing),
-                _ => missing,
-            })
-            .collect();
+        if i > 0 || !name.is_empty() {
+            values = values
+                .into_iter()
+                .filter_map(|value| match value {
+                    Document::Object(map) => map.get(name).or(missing),
+                    _ => missing,
+                })
+                .collect();
+        }
         for _ in 0..fan_outs {
             values = values
                 .into_iter()
@@ -1072,6 +1174,149 @@ mod tests {
         assert_eq!(plan(or), None);
         let order = Filter::new().exists("team").sort_asc("team").limit(5);
         assert!(order.index_order(&indexes).is_none());
+    }
+
+    /// `{items: [{sku: "A1", qty: 1}, {sku: "B2", qty: 5}], scores: [72,
+    /// 95], rows: [[1, 2], []], orders: [{lines: [{sku: "C3"}]}]}`.
+    fn order() -> Document {
+        let array = |values: Vec<Document>| Document::Array(values);
+        let item = |sku: &str, qty: i64| doc(&[("sku", sku.into()), ("qty", qty.into())]);
+        doc(&[
+            ("items", array(vec![item("A1", 1), item("B2", 5)])),
+            ("scores", array(vec![72.into(), 95.into()])),
+            (
+                "rows",
+                array(vec![array(vec![1.into(), 2.into()]), array(vec![])]),
+            ),
+            (
+                "orders",
+                array(vec![doc(&[(
+                    "lines",
+                    array(vec![doc(&[("sku", "C3".into())])]),
+                )])]),
+            ),
+        ])
+    }
+
+    /// One element must meet the whole condition (SPEC §46.1) — where
+    /// the same comparisons on `[*]` paths may be met by two elements.
+    #[test]
+    fn elem_match_needs_one_element_to_meet_it_all() {
+        let d = order();
+        let holds = |c: Condition| c.matches(&d);
+        let sku_qty = |sku: &str, qty: i64| Condition::eq("sku", sku) & Condition::gt("qty", qty);
+        // A1 with qty 1, B2 with qty 5: no A1 with qty > 2.
+        assert!(holds(
+            Condition::eq("items[*].sku", "A1") & Condition::gt("items[*].qty", 2)
+        ));
+        assert!(!holds(Condition::elem_match("items", sku_qty("A1", 2))));
+        assert!(holds(Condition::elem_match("items", sku_qty("B2", 2))));
+        // `""` is the element itself: no score in the 80s, one in the 90s.
+        let between = |low: i64, high: i64| {
+            Condition::elem_match("scores", Condition::gte("", low) & Condition::lt("", high))
+        };
+        assert!(holds(
+            Condition::gte("scores[*]", 80) & Condition::lt("scores[*]", 90)
+        ));
+        assert!(!holds(between(80, 90)));
+        assert!(holds(between(90, 100)));
+        // An element that is itself an array: `[*]` and `size` on it.
+        assert!(holds(Condition::elem_match(
+            "rows",
+            Condition::size("", Op::Eq, 0)
+        )));
+        assert!(holds(Condition::elem_match(
+            "rows",
+            Condition::eq("[*]", 2)
+        )));
+        assert!(!holds(Condition::elem_match(
+            "rows",
+            Condition::eq("[*]", 3)
+        )));
+        // Nested, and under a path with `[*]`.
+        let c3 = || Condition::eq("sku", "C3");
+        assert!(holds(Condition::elem_match(
+            "orders",
+            Condition::elem_match("lines", c3())
+        )));
+        assert!(holds(Condition::elem_match("orders[*].lines", c3())));
+        assert!(!holds(Condition::elem_match("orders", c3())));
+        // Not an array, or not there: no element, so it never holds —
+        // and its negation always does.
+        for field in ["missing", "items[*].sku", "scores[*]"] {
+            let any = Condition::elem_match(field, Condition::All(vec![]));
+            assert!(!holds(any.clone()), "{field}");
+            assert!(holds(!any), "{field}");
+        }
+        assert!(holds(Condition::elem_match(
+            "items",
+            Condition::All(vec![])
+        )));
+        assert!(!holds(Condition::elem_match(
+            "items",
+            Condition::Any(vec![])
+        )));
+        // Inside it, `Not` and `Ne` are about the one element.
+        assert!(holds(Condition::elem_match(
+            "items",
+            Condition::ne("sku", "A1")
+        )));
+        assert!(holds(Condition::elem_match(
+            "items",
+            !Condition::eq("sku", "A1")
+        )));
+        assert!(!holds(Condition::ne("items[*].sku", "A1")));
+    }
+
+    /// An `ElemMatch` bounds like its condition on `field[*]` paths
+    /// (SPEC §46.3): an index on `items[*].sku` finds the items, the
+    /// check picks the one that meets it all.
+    #[test]
+    fn elem_match_bounds_through_the_elements_indexes() {
+        let indexes = [
+            index("items[*].sku"),
+            index("scores[*]"),
+            index("rows[*][*]"),
+        ];
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        let f = Filter::new().elem_match(
+            "items",
+            Condition::eq("sku", "A1") & Condition::gt("qty", 2),
+        );
+        assert_eq!(plan(f.clone()).as_deref(), Some("items[*].sku"));
+        let range = &f.index_ranges(&indexes).unwrap()[0].1;
+        let key = |v: &str| key::secondary(&v.into(), crate::DocId([0; 16])).unwrap();
+        assert!(range.contains(&key("A1")) && !range.contains(&key("B2")));
+
+        let in_80s =
+            Filter::new().elem_match("scores", Condition::gte("", 80) & Condition::lt("", 90));
+        assert_eq!(plan(in_80s).as_deref(), Some("scores[*]"));
+        let row = Filter::new().elem_match("rows", Condition::eq("[*]", 2));
+        assert_eq!(plan(row).as_deref(), Some("rows[*][*]"));
+        let either = Filter::new().elem_match(
+            "items",
+            Condition::eq("sku", "A1") | Condition::eq("sku", "B2"),
+        );
+        assert_eq!(plan(either).as_deref(), Some("items[*].sku"));
+        // Nothing to bound by: a `Ne`, a `Not`, a field without an index,
+        // an OR with a branch no index bounds.
+        for inner in [
+            Condition::ne("sku", "A1"),
+            !Condition::eq("sku", "A1"),
+            Condition::gt("qty", 2),
+            Condition::eq("sku", "A1") | Condition::gt("qty", 2),
+        ] {
+            assert_eq!(
+                plan(Filter::new().elem_match("items", inner.clone())),
+                None,
+                "{inner:?}"
+            );
+        }
+        // The path it's on is part of the rewritten one.
+        assert_eq!(
+            plan(Filter::new().elem_match("other", Condition::eq("sku", "A1"))),
+            None
+        );
     }
 
     #[test]

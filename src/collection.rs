@@ -1982,6 +1982,50 @@ mod tests {
         object(fields)
     }
 
+    /// A condition about one element, for `elem_match`: on `n` of an
+    /// `items` element, or on a `tags` element itself (`""`) — ANDs,
+    /// ORs and NOTs of comparisons, any of which may be null.
+    fn random_element_condition(rng: &mut XorShift, path: &str) -> Condition {
+        let ops = [Op::Eq, Op::Ne, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
+        let one = |rng: &mut XorShift| cond(path, ops[rng.below(6)].clone(), random_value(rng));
+        match rng.below(6) {
+            0 | 1 => one(rng),
+            2 | 3 => one(rng) & one(rng),
+            4 => one(rng) | one(rng),
+            _ => !one(rng),
+        }
+    }
+
+    /// Random `elem_match` filters must find what checking every
+    /// document finds (SPEC §46), bounded by the multikey indexes on
+    /// `items[*].n` and `tags[*]` where their condition allows — which
+    /// must happen.
+    fn assert_elem_match_agrees_with_scan(docs: &Collection<Document>, rng: &mut XorShift) {
+        let all = docs.find_with_ids(Filter::default()).unwrap();
+        let mut plans = std::collections::HashSet::new();
+        for _ in 0..300 {
+            let mut f = match rng.below(2) {
+                0 => Filter::new().elem_match("items", random_element_condition(rng, "n")),
+                _ => Filter::new().elem_match("tags", random_element_condition(rng, "")),
+            };
+            if rng.below(3) == 0 {
+                f = f.eq("w", rng.below(3) as i64);
+            }
+            let expected = sorted_ids(f.apply_to(all.clone(), |(_, doc)| doc));
+            let plan = docs.explain(&f).unwrap();
+            let found = sorted_ids(docs.find_with_ids(f.clone()).unwrap());
+            assert_eq!(found, expected, "{f:?} via {plan:?}");
+            plans.insert(format!("{plan:?}"));
+        }
+        for plan in [
+            r#"Index { field: "items[*].n" }"#,
+            r#"Index { field: "tags[*]" }"#,
+            "Scan",
+        ] {
+            assert!(plans.contains(plan), "{plan} never ran: {plans:?}");
+        }
+    }
+
     /// `indexed_finds_match_full_scans_through_every_kind_of_write` for
     /// multikey indexes (SPEC §42.2): a document has as many entries as
     /// elements, and every write must keep exactly those.
@@ -2048,6 +2092,7 @@ mod tests {
                 assert_eq!(docs.explain(&by_value).unwrap(), QueryPlan::Index { field });
                 assert_index_agrees_with_scan(&docs, &mut rng, path);
             }
+            assert_elem_match_agrees_with_scan(&docs, &mut rng);
         }
 
         let db = Database::open(&path).unwrap();
@@ -2056,6 +2101,7 @@ mod tests {
         for path in paths {
             assert_index_agrees_with_scan(&docs, &mut rng, path);
         }
+        assert_elem_match_agrees_with_scan(&docs, &mut rng);
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3999,6 +4045,84 @@ mod tests {
         );
         let found = profiles.find(Filter::new().missing("nick")).unwrap();
         assert_eq!(found, [profile("bob", None, None, &[])]);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Line {
+        sku: String,
+        qty: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Order {
+        number: i64,
+        lines: Vec<Line>,
+    }
+
+    /// What `elem_match` is for (SPEC §46): orders with a line of 9 or
+    /// more of sku A1 — not an A1 line and some other line of 9. The
+    /// index on `lines[*].sku` finds the orders with an A1 line; only
+    /// those are read.
+    #[test]
+    fn orders_with_a_large_line_of_one_sku() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let orders = db.collection::<Order>("orders");
+        orders.ensure_index("lines[*].sku").unwrap();
+        let mut rng = XorShift(0x5851_F42D_4C95_7F2D);
+        let ops = (0..2000)
+            .map(|number| {
+                let lines = (0..1 + rng.below(3))
+                    .map(|_| Line {
+                        sku: format!("A{}", rng.below(20)),
+                        qty: 1 + rng.below(10) as i64,
+                    })
+                    .collect();
+                let order = Order { number, lines };
+                let doc = crate::serde_bridge::to_document(&order).unwrap();
+                WriteOp::Insert("orders".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+
+        let large_a1 = Filter::new().elem_match(
+            "lines",
+            Condition::eq("sku", "A1") & Condition::gte("qty", 9),
+        );
+        let loose = Filter::new()
+            .eq("lines[*].sku", "A1")
+            .gte("lines[*].qty", 9);
+        let all = orders.find(Filter::new()).unwrap();
+        let has = |order: &Order, both: bool| {
+            let a1 = |line: &Line| line.sku == "A1";
+            let large = |line: &Line| line.qty >= 9;
+            match both {
+                true => order.lines.iter().any(|l| a1(l) && large(l)),
+                false => order.lines.iter().any(a1) && order.lines.iter().any(large),
+            }
+        };
+        let numbers = |orders: Vec<Order>| {
+            let mut numbers: Vec<i64> = orders.iter().map(|o| o.number).collect();
+            numbers.sort();
+            numbers
+        };
+        let expected = numbers(all.iter().filter(|o| has(o, true)).cloned().collect());
+        let expected_loose = numbers(all.iter().filter(|o| has(o, false)).cloned().collect());
+        assert!(expected.len() < expected_loose.len(), "{expected:?}");
+        assert!(!expected.is_empty());
+        assert_eq!(
+            orders.explain(&large_a1).unwrap(),
+            QueryPlan::Index {
+                field: "lines[*].sku".into()
+            }
+        );
+        let with_a1 = orders
+            .count(Filter::new().eq("lines[*].sku", "A1"))
+            .unwrap();
+        let reads = records_read(|| assert_eq!(numbers(orders.find(large_a1).unwrap()), expected));
+        assert_eq!(reads, with_a1);
+        assert!(reads < 2000 / 5, "{reads}");
+        assert_eq!(numbers(orders.find(loose).unwrap()), expected_loose);
     }
 
     /// Asking for an index that exists with other options is refused,

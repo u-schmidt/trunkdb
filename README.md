@@ -131,7 +131,7 @@ trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §46 for the full list and reasoning):
+Done so far (see SPEC.md §47 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -190,8 +190,11 @@ Done so far (see SPEC.md §46 for the full list and reasoning):
     null from a missing field, `missing("team")` finds documents written
     before it; `size("tags", Op::Eq, 0)` finds empty arrays. `Op` and
     `Condition` are now `#[non_exhaustive]`.
+20. **Conditions on one element** (§46): `elem_match("lines",
+    Condition::eq("sku", "A1") & Condition::gte("qty", 9))` needs one line
+    to meet both; multikey indexes like `lines[*].sku` bound it.
 
-What's still open: SPEC.md §46.2.
+What's still open: SPEC.md §47.2.
 
 ## License
 
