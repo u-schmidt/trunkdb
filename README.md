@@ -169,6 +169,8 @@ Done so far (see SPEC.md §43 for the full list and reasoning):
     "rust")`, `gt("comments[*].likes", 10)`, `ensure_index("tags[*]")`;
     file format 7, which still opens format 6 as it is.
 
+    Items 15–16 → 0.7.0.
+
 What's still open: SPEC.md §43.2.
 
 ## License
