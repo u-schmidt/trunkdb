@@ -86,7 +86,8 @@ fn rebuild(catalog: &Catalog, store: &FileStore) -> crate::Result<(Catalog, Memo
         }
 
         for (index, mut entries) in indexes.iter().zip(index_entries) {
-            let new_index = rebuilt.create_index(&mut image, name, &index.fields, index.unique)?;
+            let new_index =
+                rebuilt.create_index(&mut image, name, &index.fields, index.options())?;
             entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             if index.unique {
                 refuse_duplicates(&image, name, &new_index, &entries)?;

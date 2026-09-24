@@ -371,7 +371,10 @@ enum BoundKind {
 /// nested group is bounded on its own; a compound index by `Eq` on its
 /// first fields and a range on the next (`compound_bounds`); the best of
 /// all that wins, the first among equals. `Ne` and `Contains` never use
-/// an index, nor does a `Not`.
+/// an index, nor does a `Not`. A sparse index (SPEC §44) has no entry for
+/// a null: it bounds only by comparisons that null fails
+/// (`rules_out_null`), and a compound one only if such a comparison is on
+/// one of its fields.
 fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
     let mut best: Option<Bounds<'a>> = None;
     let mut consider = |candidate: Bounds<'a>| {
@@ -400,7 +403,9 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
                         field: f,
                         op,
                         value,
-                    } if f == field => Some((op, key::range_for(op, value)?)),
+                    } if f == field && (!index.sparse || rules_out_null(op, value)) => {
+                        Some((op, key::range_for(op, value)?))
+                    }
                     _ => None,
                 });
                 let (by_value, mut ranges): (Vec<bool>, Vec<KeyRange>) = on_field
@@ -434,6 +439,9 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
         }
     }
     for index in indexes.iter().filter(|index| index.is_compound()) {
+        if index.sparse && !excludes_null(index, conditions) {
+            continue;
+        }
         if let Some(bounds) = compound_bounds(index, conditions) {
             consider(bounds);
         }
@@ -461,6 +469,26 @@ fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bou
         }
         Condition::Not(_) => None,
     }
+}
+
+/// Whether `field op value` fails for a null or missing field — so a
+/// document it holds for has an entry in a sparse index (SPEC §44). On a
+/// path with `[*]`, for an element: the one that meets it isn't null.
+fn rules_out_null(op: &Op, value: &Document) -> bool {
+    !value_matches(op, &Document::Null, value)
+}
+
+/// Whether `conditions`, all holding, keep out every document a sparse
+/// `index` has no entry for: one of them compares one of its fields in a
+/// way null fails. On one field without `[*]`, that makes its value not
+/// null; on several, not null in all of them.
+fn excludes_null(index: &IndexMeta, conditions: &[Condition]) -> bool {
+    conditions.iter().any(|c| match c {
+        Condition::Compare { field, op, value } => {
+            index.fields.contains(field) && rules_out_null(op, value)
+        }
+        _ => false,
+    })
 }
 
 /// How a compound index bounds conditions that must all hold (SPEC
@@ -553,7 +581,8 @@ impl Filter {
     /// "Queued"`, sorted by `created`, on `(status, created)` — found by
     /// value and in order at once (SPEC §43.3). The more fields fixed, the
     /// better; the first among equals. The sort field's own range
-    /// comparisons narrow the range.
+    /// comparisons narrow the range. A sparse index only where the
+    /// conditions keep out the documents it lacks (SPEC §44).
     pub(crate) fn index_order<'a>(
         &self,
         indexes: &'a [IndexMeta],
@@ -565,6 +594,9 @@ impl Filter {
             // A multikey index holds a document once per element, in
             // element order: no order of documents (SPEC §42.3).
             if index.single().is_some_and(is_multi) {
+                continue;
+            }
+            if index.sparse && !excludes_null(index, &self.conditions) {
                 continue;
             }
             let Some(at) = index.fields.iter().position(|f| *f == sort.field) else {
@@ -903,6 +935,7 @@ mod tests {
             fields: fields.iter().map(|f| f.to_string()).collect(),
             root: 1,
             unique: false,
+            sparse: false,
         }
     }
 
@@ -979,6 +1012,69 @@ mod tests {
         let range = range.unwrap();
         assert!(range.contains(&k("Queued", 6)) && !range.contains(&k("Queued", 4)));
         assert!(!range.contains(&k("Done", 6)));
+    }
+
+    fn sparse(fields: &[&str]) -> IndexMeta {
+        IndexMeta {
+            sparse: true,
+            ..compound(fields)
+        }
+    }
+
+    /// A sparse index has no entry for a null (SPEC §44): it bounds only
+    /// by comparisons null fails, and is read in order only where the
+    /// filter keeps nulls out.
+    #[test]
+    fn a_sparse_index_is_only_used_where_nulls_are_ruled_out() {
+        let indexes = [sparse(&["nick"]), sparse(&["tags[*]"])];
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        assert_eq!(
+            plan(Filter::new().eq("nick", "ada")).as_deref(),
+            Some("nick")
+        );
+        assert_eq!(plan(Filter::new().gt("nick", "m")).as_deref(), Some("nick"));
+        assert_eq!(plan(Filter::new().is_null("nick")), None);
+        assert_eq!(plan(Filter::new().lte("nick", Document::Null)), None);
+        assert_eq!(plan(Filter::new().gte("nick", Document::Null)), None);
+        // An element that is null meets the first, one that is 5 the
+        // second: the range read is the second's.
+        let both = Filter::new().is_null("tags[*]").gt("tags[*]", 3);
+        let ranges = both.index_ranges(&indexes).unwrap();
+        let five = key::secondary(&Document::Int(5), crate::DocId([0; 16])).unwrap();
+        assert!(ranges[0].1.contains(&five), "{:?}", ranges[0].1);
+
+        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|(i, _)| i.name());
+        assert_eq!(order(Filter::new().sort_asc("nick")), None);
+        assert_eq!(
+            order(Filter::new().is_not_null("nick").sort_asc("nick")).as_deref(),
+            Some("nick")
+        );
+        assert_eq!(order(Filter::new().is_null("nick").sort_asc("nick")), None);
+    }
+
+    /// A sparse compound index lacks the documents null in all of its
+    /// fields: a comparison that null fails on any of them keeps those
+    /// out.
+    #[test]
+    fn a_sparse_compound_index_needs_one_field_that_is_not_null() {
+        let indexes = [sparse(&["a", "b"])];
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        assert_eq!(plan(Filter::new().eq("a", 1)).as_deref(), Some("(a, b)"));
+        assert_eq!(plan(Filter::new().is_null("a")), None);
+        assert_eq!(
+            plan(Filter::new().is_null("a").eq("b", 2)).as_deref(),
+            Some("(a, b)")
+        );
+        assert_eq!(
+            plan(Filter::new().is_null("a").is_not_null("b")).as_deref(),
+            Some("(a, b)")
+        );
+        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|(i, _)| i.name());
+        assert_eq!(order(Filter::new().is_null("a").sort_asc("b")), None);
+        assert_eq!(
+            order(Filter::new().is_null("a").gt("b", 0).sort_asc("b")).as_deref(),
+            Some("(a, b)")
+        );
     }
 
     /// `tags[*] > 5 AND tags[*] < 3` holds for `[1, 10]`: one element is
@@ -1556,6 +1652,7 @@ mod tests {
             fields: vec![field.into()],
             root: 1,
             unique: false,
+            sparse: false,
         }
     }
 

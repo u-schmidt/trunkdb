@@ -14,6 +14,7 @@
 //! JSON (`json.rs`). The file is independent of the page layout, so it's
 //! also how data moves from one file format version to the next.
 
+use crate::catalog::IndexOptions;
 use crate::collection::get_or_create_meta;
 use crate::database::Database;
 use crate::id::IdGenerator;
@@ -33,6 +34,7 @@ const INDEXES_KEY: &str = "$indexes";
 const FIELD_KEY: &str = "field";
 const FIELDS_KEY: &str = "fields";
 const UNIQUE_KEY: &str = "unique";
+const SPARSE_KEY: &str = "sparse";
 
 /// An import writes a batch at most this many documents…
 const CHUNK_DOCUMENTS: usize = 1000;
@@ -79,17 +81,23 @@ impl Database {
                 .iter()
                 .map(|index| {
                     let fields = || index.fields.iter().map(|f| f.as_str().into()).collect();
-                    match (index.single(), index.unique) {
-                        (Some(field), false) => Value::String(field.to_string()),
-                        (Some(field), true) => {
-                            object([(FIELD_KEY, field.into()), (UNIQUE_KEY, true.into())])
-                        }
-                        (None, false) => Value::Array(fields()),
-                        (None, true) => object([
-                            (FIELDS_KEY, Value::Array(fields())),
-                            (UNIQUE_KEY, true.into()),
-                        ]),
+                    if index.options() == IndexOptions::default() {
+                        return match index.single() {
+                            Some(field) => Value::String(field.to_string()),
+                            None => Value::Array(fields()),
+                        };
                     }
+                    let mut entry = Map::new();
+                    match index.single() {
+                        Some(field) => entry.insert(FIELD_KEY.into(), field.into()),
+                        None => entry.insert(FIELDS_KEY.into(), Value::Array(fields())),
+                    };
+                    for (key, set) in [(UNIQUE_KEY, index.unique), (SPARSE_KEY, index.sparse)] {
+                        if set {
+                            entry.insert(key.into(), true.into());
+                        }
+                    }
+                    Value::Object(entry)
                 })
                 .collect();
             let header = object([
@@ -216,10 +224,11 @@ impl Chunk {
 }
 
 /// A `{"$collection": ..., "$indexes": [...]}` line. An index is its
-/// field as a string, or `{"field": ..., "unique": true}` (SPEC §33.5).
+/// field as a string, or `{"field": ..., "unique": true}` (SPEC §33.5),
+/// more in `parse_index`.
 struct CollectionHeader {
     name: String,
-    indexes: Vec<(Vec<String>, bool)>,
+    indexes: Vec<(Vec<String>, IndexOptions)>,
 }
 
 impl CollectionHeader {
@@ -257,24 +266,22 @@ impl CollectionHeader {
 
     fn build_indexes(self, db: &Database) -> crate::Result<()> {
         let collection = db.collection::<crate::Document>(&self.name);
-        for (fields, unique) in &self.indexes {
-            match unique {
-                false => collection.ensure_index(fields.as_slice())?,
-                true => collection.ensure_unique_index(fields.as_slice())?,
-            };
+        for (fields, options) in &self.indexes {
+            collection.ensure_index_with(fields.as_slice(), *options)?;
         }
         Ok(())
     }
 }
 
 /// One `$indexes` entry: `"field"`, `["field", ...]` for a compound
-/// index (SPEC §43), or an object with `"field"` or `"fields"` and
-/// `"unique": bool`.
-fn parse_index(index: &Value) -> Result<(Vec<String>, bool), String> {
+/// index (SPEC §43), or an object with `"field"` or `"fields"`, and
+/// `"unique"` and `"sparse"` (SPEC §44) as bools, both optional.
+fn parse_index(index: &Value) -> Result<(Vec<String>, IndexOptions), String> {
     let wrong = || {
         format!(
             "an `{INDEXES_KEY}` entry must be a field name, an array of them, or \
-             {{\"{FIELD_KEY}\" or \"{FIELDS_KEY}\": ..., \"{UNIQUE_KEY}\": true}}, got {index}"
+             {{\"{FIELD_KEY}\" or \"{FIELDS_KEY}\": ..., \"{UNIQUE_KEY}\": true, \
+             \"{SPARSE_KEY}\": true}}, got {index}"
         )
     };
     let names = |value: &Value| match value {
@@ -285,26 +292,28 @@ fn parse_index(index: &Value) -> Result<(Vec<String>, bool), String> {
         _ => None,
     };
     match index {
-        Value::String(field) => Ok((vec![field.clone()], false)),
-        Value::Array(_) => Ok((names(index).ok_or_else(wrong)?, false)),
+        Value::String(field) => Ok((vec![field.clone()], IndexOptions::default())),
+        Value::Array(_) => Ok((names(index).ok_or_else(wrong)?, IndexOptions::default())),
         Value::Object(object) => {
             let fields = match (object.get(FIELD_KEY), object.get(FIELDS_KEY)) {
                 (Some(Value::String(field)), None) => vec![field.clone()],
                 (None, Some(fields)) => names(fields).ok_or_else(wrong)?,
                 _ => return Err(wrong()),
             };
-            let unique = match object.get(UNIQUE_KEY) {
-                None => false,
-                Some(Value::Bool(unique)) => *unique,
-                Some(_) => return Err(wrong()),
+            let flag = |key| match object.get(key) {
+                None => Ok(false),
+                Some(Value::Bool(set)) => Ok(*set),
+                Some(_) => Err(wrong()),
             };
-            if object
-                .keys()
-                .any(|k| k != FIELD_KEY && k != FIELDS_KEY && k != UNIQUE_KEY)
-            {
+            let options = IndexOptions {
+                unique: flag(UNIQUE_KEY)?,
+                sparse: flag(SPARSE_KEY)?,
+            };
+            let known = [FIELD_KEY, FIELDS_KEY, UNIQUE_KEY, SPARSE_KEY];
+            if object.keys().any(|k| !known.contains(&k.as_str())) {
                 return Err(wrong());
             }
-            Ok((fields, unique))
+            Ok((fields, options))
         }
         _ => Err(wrong()),
     }
@@ -389,6 +398,8 @@ mod tests {
                 let mut indexes = collection.indexes().unwrap();
                 let unique = collection.unique_indexes().unwrap();
                 indexes.extend(unique.into_iter().map(|field| format!("unique: {field}")));
+                let sparse = collection.sparse_indexes().unwrap();
+                indexes.extend(sparse.into_iter().map(|field| format!("sparse: {field}")));
                 (name, indexes, docs)
             })
             .collect()
@@ -509,6 +520,20 @@ mod tests {
             .collection::<Document>("indexed")
             .ensure_unique_index("u")
             .unwrap();
+        // Sparse ones (SPEC §44), one of them unique and compound.
+        let sparse = crate::IndexOptions {
+            unique: false,
+            sparse: true,
+        };
+        users.ensure_index_with("x", sparse).unwrap();
+        let both = crate::IndexOptions {
+            unique: true,
+            sparse: true,
+        };
+        source
+            .collection::<Document>("indexed")
+            .ensure_index_with(["p", "q"], both)
+            .unwrap();
 
         let text = export_text(&source);
         let target = open(&dir, "target.trunkdb");
@@ -556,7 +581,7 @@ mod tests {
         let db = open(&dir, "db.trunkdb");
         let text = r#"{"$trunkdb_export": 1}
 
-{"$collection": "people", "$indexes": ["name", {"field": "born", "unique": true}]}
+{"$collection": "people", "$indexes": ["name", {"field": "born", "unique": true}, {"field": "nick", "sparse": true}]}
 {"name": "Ada", "born": 1815, "tags": ["math"]}
 {"name": "Grace", "born": 1906}
 {"$collection": "notes"}
@@ -571,8 +596,9 @@ mod tests {
         );
         assert_eq!(db.collections().unwrap(), ["notes", "people"]);
         let people = db.collection::<Document>("people");
-        assert_eq!(people.indexes().unwrap(), ["name", "born"]);
+        assert_eq!(people.indexes().unwrap(), ["name", "born", "nick"]);
         assert_eq!(people.unique_indexes().unwrap(), ["born"]);
+        assert_eq!(people.sparse_indexes().unwrap(), ["nick"]);
         let found = people
             .find_one(Filter {
                 conditions: vec![Condition::Compare {
@@ -655,6 +681,13 @@ mod tests {
             (
                 format!(
                     "{header}{{\"$collection\":\"c\",\"$indexes\":[{{\"field\":\"a\",\"unique\":1}}]}}\n"
+                ),
+                2,
+                "must be a field name",
+            ),
+            (
+                format!(
+                    "{header}{{\"$collection\":\"c\",\"$indexes\":[{{\"field\":\"a\",\"sparse\":\"yes\"}}]}}\n"
                 ),
                 2,
                 "must be a field name",

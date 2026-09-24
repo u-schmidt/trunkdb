@@ -12,8 +12,9 @@ B-tree primary index, document encoding (both the untyped `Document` path
 and a serde bridge so any `T: Serialize + DeserializeOwned` works),
 scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
 `cursor`), `upsert`, secondary indexes (also unique, on nested paths like
-`address.city`, multikey on array elements like `tags[*]`, and compound on
-several fields like `(status, created)`),
+`address.city`, multikey on array elements like `tags[*]`, compound on
+several fields like `(status, created)`, and sparse for fields few documents
+have),
 conditions on array elements, overflow pages for documents larger
 than a page, export/import as JSON Lines, a checksum on every page so a
 damaged one is an error instead of garbage, compaction that rebuilds the file
@@ -85,7 +86,7 @@ src/
 
 ```rust
 use serde::{Deserialize, Serialize};
-use trunkdb::{Database, query::Filter};
+use trunkdb::{Database, IndexOptions, query::Filter};
 
 #[derive(Serialize, Deserialize)]
 struct User {
@@ -93,6 +94,7 @@ struct User {
     email: String,
     team: String,
     age: i64,
+    nick: Option<String>,
 }
 
 let db = Database::open("app.trunkdb")?;
@@ -100,8 +102,10 @@ let users = db.collection::<User>("users");
 users.ensure_unique_index("email")?; // once at startup; a no-op after
 users.ensure_index("age")?;
 users.ensure_index(["team", "age"])?; // compound: by team, in age order
+let sparse = IndexOptions { sparse: true, ..IndexOptions::default() };
+users.ensure_index_with("nick", sparse)?; // no entries for users without a nick
 
-users.insert(User { name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36 })?;
+users.insert(User { name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36, nick: None })?;
 
 let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
 let youngest_in_core = users.find(Filter::new().eq("team", "core").sort_asc("age").limit(5))?;
@@ -127,7 +131,7 @@ trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §44 for the full list and reasoning):
+Done so far (see SPEC.md §45 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -177,8 +181,11 @@ Done so far (see SPEC.md §44 for the full list and reasoning):
 17. **Compound indexes** (§43): `ensure_index(["status", "created"])`
     finds by status and reads in creation order at once;
     `ensure_unique_index(["tenant", "email"])`; file format 8.
+18. **Sparse indexes** (§44): `ensure_index_with("nick", IndexOptions {
+    sparse: true, .. })` leaves out null and missing values, for fields
+    few documents have; used where the filter rules nulls out.
 
-What's still open: SPEC.md §44.2.
+What's still open: SPEC.md §45.2.
 
 ## License
 

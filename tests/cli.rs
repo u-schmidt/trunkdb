@@ -20,7 +20,7 @@ fn stderr(output: &Output) -> String {
 }
 
 const EXPORT: &str = r#"{"$trunkdb_export":1}
-{"$collection":"users","$indexes":["age",{"field":"email","unique":true}]}
+{"$collection":"users","$indexes":["age",{"field":"email","unique":true},{"field":"nick","sparse":true},{"fields":["team","email"],"unique":true,"sparse":true}]}
 {"name":"Ada","age":36,"email":"a@x"}
 {"name":"Bob","age":41,"email":"b@x"}
 {"$collection":"empty"}
@@ -73,14 +73,17 @@ fn import_info_check_and_export_round_trip() {
     let info = stdout(&output);
     assert!(info.contains("format 8"), "{info}");
     assert!(
-        info.contains("users: 2 documents, indexes: age, email (unique)"),
+        info.contains(
+            "users: 2 documents, indexes: age, email (unique), nick (sparse), \
+             (team, email) (unique, sparse)"
+        ),
         "{info}"
     );
     assert!(info.contains("empty: 0 documents"), "{info}");
 
     let output = trunkdb(&["check", &db]);
     assert!(output.status.success());
-    assert_eq!(stdout(&output), "ok: 2 collections, 2 documents, 7 pages\n");
+    assert_eq!(stdout(&output), "ok: 2 collections, 2 documents, 9 pages\n");
 
     // To a file, and to standard output — the same, and it imports back.
     let output = trunkdb(&["export", &db, &out]);
@@ -89,6 +92,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["export", &db]);
     assert_eq!(stdout(&output), exported);
     assert!(exported.contains(r#"{"field":"email","unique":true}"#));
+    assert!(exported.contains(r#"{"field":"nick","sparse":true}"#));
 
     // `-` reads standard input.
     let copy = path(dir.path(), "copy.trunkdb");

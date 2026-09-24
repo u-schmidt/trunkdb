@@ -1,4 +1,4 @@
-use crate::catalog::{Catalog, CollectionMeta, IndexMeta};
+use crate::catalog::{Catalog, CollectionMeta, IndexMeta, IndexOptions};
 use crate::cursor::Cursor;
 use crate::data;
 use crate::database::Database;
@@ -130,7 +130,7 @@ impl<T> Collection<T> {
     /// An existing unique index on the same fields is an error, not a
     /// match — see `ensure_unique_index`.
     pub fn ensure_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
-        self.ensure(fields.into_fields(), false)
+        self.ensure_index_with(fields, IndexOptions::default())
     }
 
     /// `ensure_index`, plus a constraint (SPEC §33): no two documents may
@@ -147,10 +147,41 @@ impl<T> Collection<T> {
     /// non-unique index on the same fields is an error too: drop it
     /// first, then call this.
     pub fn ensure_unique_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
-        self.ensure(fields.into_fields(), true)
+        let unique = IndexOptions {
+            unique: true,
+            ..IndexOptions::default()
+        };
+        self.ensure_index_with(fields, unique)
     }
 
-    fn ensure(&self, fields: Vec<String>, unique: bool) -> crate::Result<bool> {
+    /// `ensure_index` with `options`: unique (`ensure_unique_index`),
+    /// sparse, or both. A sparse index (SPEC §44) has no entry for a
+    /// null or missing value — on several fields, for a document null in
+    /// all of them — so an index on a field few documents have stays
+    /// small. The price: `find` uses it only where the filter itself
+    /// rules nulls out, with a comparison on one of its fields that null
+    /// fails — `nick == "ada"`, `nick > "m"`, and for a sort by it also
+    /// `nick != null`; never for `nick == null`, nor for a sort alone.
+    ///
+    /// ```
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = trunkdb::Database::open(dir.path().join("db.trunk")).unwrap();
+    /// # let users = db.collection::<trunkdb::Document>("users");
+    /// use trunkdb::IndexOptions;
+    ///
+    /// let sparse = IndexOptions { sparse: true, ..IndexOptions::default() };
+    /// users.ensure_index_with("nick", sparse)?;
+    /// # Ok::<(), trunkdb::Error>(())
+    /// ```
+    ///
+    /// An existing index on the same fields with other options is an
+    /// error: drop it first, then call this.
+    pub fn ensure_index_with(
+        &self,
+        fields: impl IndexFields,
+        options: IndexOptions,
+    ) -> crate::Result<bool> {
+        let fields = fields.into_fields();
         let invalid = |message: &str| {
             crate::Error::from(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -193,7 +224,7 @@ impl<T> Collection<T> {
             }
         }
         self.db
-            .transact(|catalog, store| build_index(catalog, store, &self.name, &fields, unique))
+            .transact(|catalog, store| build_index(catalog, store, &self.name, &fields, options))
     }
 
     /// Drops the secondary index on `fields` and frees its pages: `false`
@@ -219,6 +250,11 @@ impl<T> Collection<T> {
     /// The names of `indexes` whose index is unique (SPEC §33).
     pub fn unique_indexes(&self) -> crate::Result<Vec<String>> {
         self.index_names(|index| index.unique)
+    }
+
+    /// The names of `indexes` whose index is sparse (SPEC §44).
+    pub fn sparse_indexes(&self) -> crate::Result<Vec<String>> {
+        self.index_names(|index| index.sparse)
     }
 
     fn index_names(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
@@ -930,14 +966,24 @@ fn old_document(
 /// field is indexed as null so `field == null` can use the index (§32);
 /// one per element for a path with `[*]`, and none for no elements, a
 /// multikey index (§42.2). On several fields, exactly one key, whatever
-/// they hold: a compound index holds every document (§43.2).
+/// they hold: a compound index holds every document (§43.2). A sparse
+/// index (§44) leaves out the null values — on several fields, the key
+/// of a document null in all of them.
 pub(crate) fn index_keys(doc: &Document, index: &IndexMeta, id: DocId) -> Vec<Vec<u8>> {
+    let kept = |value: &&Document| !(index.sparse && matches!(value, Document::Null));
     let mut keys: Vec<Vec<u8>> = match index.single() {
         Some(field) => crate::query::values_at(doc, field)
             .into_iter()
+            .filter(kept)
             .filter_map(|value| key::secondary(value, id))
             .collect(),
-        None => vec![key::compound(&field_values(doc, index), id)],
+        None => {
+            let values = field_values(doc, index);
+            match values.iter().any(kept) {
+                true => vec![key::compound(&values, id)],
+                false => Vec::new(),
+            }
+        }
     };
     keys.sort();
     keys.dedup();
@@ -1073,42 +1119,41 @@ fn check_unique(
 
 /// Creates the secondary index on `field` and fills it from every
 /// document in the collection — `false` if it already exists as asked.
-/// An existing index that differs in `unique` is an error, not changed:
-/// the caller drops it first (SPEC §33.2). A unique index checks each
+/// An existing index with other options is an error, not changed: the
+/// caller drops it first (SPEC §33.2). A unique index checks each
 /// document as it goes in, so the first duplicate fails the batch.
 fn build_index(
     catalog: &mut Catalog,
     store: &mut dyn PageStore,
     collection: &str,
     fields: &[String],
-    unique: bool,
+    options: IndexOptions,
 ) -> crate::Result<bool> {
     if let Some(existing) = catalog
         .indexes(collection)
         .iter()
         .find(|i| i.fields == fields)
     {
-        if existing.unique == unique {
+        if existing.options() == options {
             return Ok(false);
         }
-        let kind = |unique| if unique { "a unique" } else { "a non-unique" };
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "{collection:?} already has {} index on {:?}, not {}; drop it first",
-                kind(existing.unique),
+                describe(existing.options()),
                 existing.name(),
-                kind(unique)
+                describe(options)
             ),
         )
         .into());
     }
     let meta = get_or_create_meta(catalog, store, collection)?;
-    let index = catalog.create_index(store, collection, fields, unique)?;
+    let index = catalog.create_index(store, collection, fields, options)?;
     let mut tree = BTreeIndex::new(index.root);
     for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
         let (id, doc) = data::get_record(store, loc)?;
-        if unique {
+        if index.unique {
             for (value_part, values) in unique_tuples(&doc, &index) {
                 check_unique(store, collection, &index, id, &value_part, &values)?;
             }
@@ -1118,6 +1163,16 @@ fn build_index(
         }
     }
     Ok(true)
+}
+
+/// "a unique, sparse", "a plain", ... — an index's options in an error.
+fn describe(options: IndexOptions) -> &'static str {
+    match (options.unique, options.sparse) {
+        (false, false) => "a plain",
+        (true, false) => "a unique",
+        (false, true) => "a sparse",
+        (true, true) => "a unique, sparse",
+    }
 }
 
 /// Persists a collection's current data page if `data::insert_record`/
@@ -1819,6 +1874,22 @@ mod tests {
 
     #[test]
     fn indexed_finds_match_full_scans_through_every_kind_of_write() {
+        indexed_finds_match_full_scans(IndexOptions::default());
+    }
+
+    const SPARSE: IndexOptions = IndexOptions {
+        unique: false,
+        sparse: true,
+    };
+
+    /// A sparse index (SPEC §44) lacks the null and missing `v`s, which
+    /// a random filter asks for now and then: it must be left out then.
+    #[test]
+    fn sparse_finds_match_full_scans_through_every_kind_of_write() {
+        indexed_finds_match_full_scans(SPARSE);
+    }
+
+    fn indexed_finds_match_full_scans(options: IndexOptions) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
@@ -1842,7 +1913,7 @@ mod tests {
             };
             // Some documents before the index exists: it's built from them.
             insert(&mut rng, 150);
-            assert!(docs.ensure_index("v").unwrap());
+            assert!(docs.ensure_index_with("v", options).unwrap());
             // ...and some after: inserts maintain it.
             insert(&mut rng, 150);
             for _ in 0..6 {
@@ -1916,6 +1987,16 @@ mod tests {
     /// elements, and every write must keep exactly those.
     #[test]
     fn multikey_finds_match_full_scans_through_every_kind_of_write() {
+        multikey_finds_match_full_scans(IndexOptions::default());
+    }
+
+    /// Sparse, a multikey index leaves out the null elements (SPEC §44).
+    #[test]
+    fn sparse_multikey_finds_match_full_scans_through_every_kind_of_write() {
+        multikey_finds_match_full_scans(SPARSE);
+    }
+
+    fn multikey_finds_match_full_scans(options: IndexOptions) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let mut rng = XorShift(0x6A09_E667_F3BC_C908);
@@ -1938,7 +2019,7 @@ mod tests {
             };
             insert(&mut rng, 150);
             for path in paths {
-                assert!(docs.ensure_index(path).unwrap());
+                assert!(docs.ensure_index_with(path, options).unwrap());
             }
             insert(&mut rng, 150);
             for _ in 0..6 {
@@ -2658,7 +2739,7 @@ mod tests {
         let ops = [Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
         let mut conditions = Vec::new();
         for _ in 0..rng.below(4) {
-            conditions.push(match rng.below(7) {
+            conditions.push(match rng.below(9) {
                 0 | 1 => cond("a", Op::Eq, Document::Int(rng.below(4) as i64)),
                 2 => cond(
                     "a",
@@ -2668,6 +2749,8 @@ mod tests {
                 3 => cond("b", ops[rng.below(5)].clone(), random_value(rng)),
                 4 => cond("c", Op::Eq, Document::Int(rng.below(3) as i64)),
                 5 => cond("a", Op::Eq, Document::Null),
+                6 => cond(["a", "b"][rng.below(2)], Op::Ne, Document::Null),
+                7 => cond("b", Op::Eq, Document::Int(rng.below(11) as i64 - 5)),
                 _ => cond("b", Op::Ne, random_value(rng)),
             });
         }
@@ -2693,6 +2776,42 @@ mod tests {
     /// actually run.
     #[test]
     fn compound_finds_match_full_scans_through_every_kind_of_write() {
+        let plain = IndexOptions::default();
+        compound_finds_match_full_scans(
+            &[(&["a", "b"], plain), (&["a", "b", "c"], plain)],
+            &[
+                r#"Index { field: "(a, b)" }"#,
+                r#"IndexOrder { field: "(a, b)" }"#,
+                r#"IndexOrder { field: "(a, b, c)" }"#,
+            ],
+        );
+    }
+
+    /// Sparse, a compound index leaves out a document null in all of its
+    /// fields, and a one-field index every null (SPEC §44).
+    #[test]
+    fn sparse_compound_finds_match_full_scans_through_every_kind_of_write() {
+        compound_finds_match_full_scans(
+            &[
+                (&["a", "b"], SPARSE),
+                (&["a", "b", "c"], SPARSE),
+                (&["b"], SPARSE),
+            ],
+            &[
+                r#"Index { field: "(a, b)" }"#,
+                r#"IndexOrder { field: "(a, b)" }"#,
+                r#"IndexOrder { field: "(a, b, c)" }"#,
+                r#"Index { field: "b" }"#,
+                r#"IndexOrder { field: "b" }"#,
+                "Scan",
+            ],
+        );
+    }
+
+    fn compound_finds_match_full_scans(
+        indexes: &[(&[&str], IndexOptions)],
+        expected_plans: &[&str],
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let mut rng = XorShift(0xBB67_AE85_84CA_A73B);
@@ -2728,12 +2847,8 @@ mod tests {
                 }
                 plans.insert(format!("{plan:?}"));
             }
-            for plan in [
-                r#"Index { field: "(a, b)" }"#,
-                r#"IndexOrder { field: "(a, b)" }"#,
-                r#"IndexOrder { field: "(a, b, c)" }"#,
-            ] {
-                assert!(plans.contains(plan), "{plan} never ran: {plans:?}");
+            for plan in expected_plans {
+                assert!(plans.contains(*plan), "{plan} never ran: {plans:?}");
             }
         };
         {
@@ -2753,8 +2868,9 @@ mod tests {
                 }
             };
             insert(&mut rng, 150);
-            assert!(docs.ensure_index(["a", "b"]).unwrap());
-            assert!(docs.ensure_index(["a", "b", "c"]).unwrap());
+            for (fields, options) in indexes {
+                assert!(docs.ensure_index_with(*fields, *options).unwrap());
+            }
             insert(&mut rng, 150);
             for _ in 0..6 {
                 let ops = (0..25)
@@ -2780,7 +2896,14 @@ mod tests {
         }
         let db = Database::open(&path).unwrap();
         let docs = db.collection::<Document>("docs");
-        assert_eq!(docs.indexes().unwrap(), ["(a, b)", "(a, b, c)"]);
+        let names: Vec<String> = indexes
+            .iter()
+            .map(|(fields, _)| match fields {
+                [field] => field.to_string(),
+                fields => format!("({})", fields.join(", ")),
+            })
+            .collect();
+        assert_eq!(docs.indexes().unwrap(), names);
         check(&docs, &mut rng);
     }
 
@@ -3713,15 +3836,169 @@ mod tests {
         assert_eq!(users.unique_indexes().unwrap(), ["name"]);
     }
 
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Member {
+        name: String,
+        nick: Option<String>,
+        team: Option<String>,
+    }
+
+    /// Entries in `collection`'s index named `name`.
+    fn entries(db: &Database, collection: &str, name: &str) -> usize {
+        let state = db.read().unwrap();
+        let index = state
+            .catalog
+            .indexes(collection)
+            .iter()
+            .find(|index| index.name() == name)
+            .unwrap()
+            .clone();
+        BTreeIndex::new(index.root)
+            .scan(&state.store)
+            .unwrap()
+            .len()
+    }
+
+    /// What sparse indexes are for (SPEC §44): a field few documents
+    /// have. One document in ten has a nick — the sparse index holds
+    /// those, the plain one every document; both find the same.
+    #[test]
+    fn a_sparse_index_holds_only_the_documents_with_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let members = db.collection::<Member>("members");
+        members.ensure_index_with("nick", SPARSE).unwrap();
+        members.ensure_index_with(["nick", "team"], SPARSE).unwrap();
+        members.ensure_index("team").unwrap();
+        let ops = (0..1000)
+            .map(|i| {
+                let member = Member {
+                    name: format!("m{i}"),
+                    nick: (i % 10 == 0).then(|| format!("n{}", i % 30)),
+                    team: (i % 25 == 0).then(|| "red".to_string()),
+                };
+                let doc = crate::serde_bridge::to_document(&member).unwrap();
+                WriteOp::Insert("members".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        assert_eq!(entries(&db, "members", "nick"), 100);
+        // Null in both only if neither is set: 100 + 40 - 20 with both.
+        assert_eq!(entries(&db, "members", "(nick, team)"), 120);
+        assert_eq!(entries(&db, "members", "team"), 1000);
+        assert_eq!(members.sparse_indexes().unwrap(), ["nick", "(nick, team)"]);
+
+        let by_nick = Filter::new().eq("nick", "n10");
+        assert_eq!(
+            members.explain(&by_nick).unwrap(),
+            QueryPlan::Index {
+                field: "nick".into()
+            }
+        );
+        let reads = records_read(|| assert_eq!(members.count(by_nick).unwrap(), 33));
+        assert_eq!(reads, 33);
+        // Without a nick: not in the index, so a scan finds them.
+        let without = Filter::new().is_null("nick");
+        assert_eq!(members.explain(&without).unwrap(), QueryPlan::Scan);
+        assert_eq!(members.count(without).unwrap(), 900);
+        let first_nicks = Filter::new().is_not_null("nick").sort_asc("nick").limit(3);
+        assert_eq!(
+            members.explain(&first_nicks).unwrap(),
+            QueryPlan::IndexOrder {
+                field: "nick".into()
+            }
+        );
+        let nicks: Vec<_> = members.find(first_nicks).unwrap();
+        assert!(nicks.iter().all(|m| m.nick.as_deref() == Some("n0")));
+        assert_consistent(&db);
+    }
+
+    /// Asking for an index that exists with other options is refused,
+    /// whichever option differs; the same options again are a no-op.
+    #[test]
+    fn an_index_with_other_options_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let members = db.collection::<Member>("members");
+        let both = IndexOptions {
+            unique: true,
+            sparse: true,
+        };
+        assert!(members.ensure_index_with("nick", SPARSE).unwrap());
+        assert!(!members.ensure_index_with("nick", SPARSE).unwrap());
+        assert!(members.ensure_index_with("name", both).unwrap());
+        for result in [
+            members.ensure_index("nick"),
+            members.ensure_unique_index("nick"),
+            members.ensure_index_with("nick", both),
+            members.ensure_unique_index("name"),
+        ] {
+            let Err(crate::Error::Io(err)) = result else {
+                panic!("expected a refusal, got {result:?}");
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("drop it first"), "{err}");
+        }
+        let Err(err) = members.ensure_index("nick") else {
+            unreachable!()
+        };
+        assert!(
+            err.to_string()
+                .contains("already has a sparse index on \"nick\", not a plain"),
+            "{err}"
+        );
+        assert_eq!(members.unique_indexes().unwrap(), ["name"]);
+        assert_eq!(members.sparse_indexes().unwrap(), ["nick", "name"]);
+
+        members
+            .insert(Member {
+                name: "Ada".into(),
+                nick: None,
+                team: None,
+            })
+            .unwrap();
+        members
+            .insert(Member {
+                name: "Bob".into(),
+                nick: None,
+                team: None,
+            })
+            .unwrap();
+        let taken = members.insert(Member {
+            name: "Ada".into(),
+            nick: None,
+            team: None,
+        });
+        assert!(
+            matches!(taken, Err(crate::Error::DuplicateValue { .. })),
+            "{taken:?}"
+        );
+    }
+
     /// Random single-op batches against a unique index on `v`: each must
     /// fail exactly when a scan finds another document with an equal,
     /// non-null `v` — and a failed one must change nothing.
     #[test]
     fn a_unique_index_refuses_exactly_what_a_scan_finds_taken() {
+        a_unique_index_refuses_what_a_scan_finds_taken(false);
+    }
+
+    /// Unique and sparse (SPEC §44): nulls were exempt anyway, now they
+    /// have no entries either.
+    #[test]
+    fn a_unique_sparse_index_refuses_exactly_what_a_scan_finds_taken() {
+        a_unique_index_refuses_what_a_scan_finds_taken(true);
+    }
+
+    fn a_unique_index_refuses_what_a_scan_finds_taken(sparse: bool) {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
-        docs.ensure_unique_index("v").unwrap();
+        let options = IndexOptions {
+            unique: true,
+            sparse,
+        };
+        docs.ensure_index_with("v", options).unwrap();
         let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
         let mut ids: Vec<DocId> = Vec::new();
         let (mut accepted, mut refused) = (0, 0);

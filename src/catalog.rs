@@ -16,9 +16,11 @@ const KIND_COLLECTION: u8 = 0;
 const KIND_INDEX: u8 = 1;
 /// Laid out like `KIND_INDEX` (SPEC §33).
 const KIND_UNIQUE_INDEX: u8 = 2;
-/// An index on several fields (SPEC §43.1), and its unique form.
-const KIND_COMPOUND_INDEX: u8 = 3;
-const KIND_UNIQUE_COMPOUND_INDEX: u8 = 4;
+/// Any other index: on several fields (SPEC §43.1), or sparse (§44),
+/// with a byte of `FLAG_*` bits.
+const KIND_INDEX_WITH_FLAGS: u8 = 3;
+const FLAG_UNIQUE: u8 = 1;
+const FLAG_SPARSE: u8 = 2;
 
 #[derive(Clone, Copy)]
 pub struct CollectionMeta {
@@ -39,6 +41,29 @@ pub struct IndexMeta {
     /// No two documents may have equal non-null values in the field
     /// (SPEC §33) — in all of a compound index's fields at once (§43.4).
     pub unique: bool,
+    /// Null and missing values get no entry (SPEC §44) — on several
+    /// fields, a document null in all of them.
+    pub sparse: bool,
+}
+
+/// How `Collection::ensure_index_with` builds an index: the default is
+/// what `ensure_index` builds.
+///
+/// ```
+/// use trunkdb::IndexOptions;
+///
+/// let options = IndexOptions { sparse: true, ..IndexOptions::default() };
+/// # assert!(options.sparse && !options.unique);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexOptions {
+    /// No two documents may have equal values in it (SPEC §33) —
+    /// `ensure_unique_index`.
+    pub unique: bool,
+    /// Documents with a null or missing value get no entry (SPEC §44):
+    /// smaller for a field few documents have, but only used for
+    /// queries that rule nulls out.
+    pub sparse: bool,
 }
 
 impl IndexMeta {
@@ -60,6 +85,13 @@ impl IndexMeta {
         match self.fields.as_slice() {
             [field] => Some(field),
             _ => None,
+        }
+    }
+
+    pub fn options(&self) -> IndexOptions {
+        IndexOptions {
+            unique: self.unique,
+            sparse: self.sparse,
         }
     }
 }
@@ -201,7 +233,7 @@ impl Catalog {
         store: &mut dyn PageStore,
         collection: &str,
         fields: &[String],
-        unique: bool,
+        options: IndexOptions,
     ) -> Result<IndexMeta> {
         for field in fields {
             check_len("field name", field, MAX_FIELD_NAME_LEN)?;
@@ -211,7 +243,8 @@ impl Catalog {
         let index = IndexMeta {
             fields: fields.to_vec(),
             root: allocate_index_root(store)?,
-            unique,
+            unique: options.unique,
+            sparse: options.sparse,
         };
         append_cell(store, &encode_index(collection, &index))?;
         self.indexes
@@ -399,30 +432,32 @@ fn encode_collection(name: &str, meta: &CollectionMeta) -> Vec<u8> {
 }
 
 /// An index cell: `[u8 kind][u64 root][u8 collection name length]
-/// [collection name]`, then for one field (kind 1, or 2 if unique) the
-/// field name, for several (kind 3, or 4 if unique, SPEC §43.1)
-/// `[u8 count]` and each as `[u8 length][field name]`. Names are at most
-/// 255 bytes, so one length byte does.
+/// [collection name]`, then for a plain one-field index (kind 1, or 2 if
+/// unique) the field name. Any other (kind 3: compound, SPEC §43.1, or
+/// sparse, §44) has `[u8 flags][u8 count]` and each field as `[u8
+/// length][field name]`. Names are at most 255 bytes, so one length
+/// byte does.
 fn encode_index(collection: &str, index: &IndexMeta) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(11 + collection.len() + 256 * index.fields.len());
-    buffer.push(match (index.is_compound(), index.unique) {
-        (false, false) => KIND_INDEX,
-        (false, true) => KIND_UNIQUE_INDEX,
-        (true, false) => KIND_COMPOUND_INDEX,
-        (true, true) => KIND_UNIQUE_COMPOUND_INDEX,
+    let mut buffer = Vec::with_capacity(12 + collection.len() + 256 * index.fields.len());
+    let plain = !index.is_compound() && !index.sparse;
+    buffer.push(match (plain, index.unique) {
+        (true, false) => KIND_INDEX,
+        (true, true) => KIND_UNIQUE_INDEX,
+        (false, _) => KIND_INDEX_WITH_FLAGS,
     });
     buffer.extend_from_slice(&index.root.to_le_bytes());
     buffer.push(collection.len() as u8);
     buffer.extend_from_slice(collection.as_bytes());
-    match index.fields.as_slice() {
-        [field] => buffer.extend_from_slice(field.as_bytes()),
-        fields => {
-            buffer.push(fields.len() as u8);
-            for field in fields {
-                buffer.push(field.len() as u8);
-                buffer.extend_from_slice(field.as_bytes());
-            }
-        }
+    if plain {
+        buffer.extend_from_slice(index.fields[0].as_bytes());
+        return buffer;
+    }
+    let flag = |set: bool, flag: u8| if set { flag } else { 0 };
+    buffer.push(flag(index.unique, FLAG_UNIQUE) | flag(index.sparse, FLAG_SPARSE));
+    buffer.push(index.fields.len() as u8);
+    for field in &index.fields {
+        buffer.push(field.len() as u8);
+        buffer.extend_from_slice(field.as_bytes());
     }
     buffer
 }
@@ -449,13 +484,18 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
                     fields: vec![utf8(field)?],
                     root: u64_at(1),
                     unique: kind == KIND_UNIQUE_INDEX,
+                    sparse: false,
                 },
             ))
         }
-        kind @ (KIND_COMPOUND_INDEX | KIND_UNIQUE_COMPOUND_INDEX) => {
-            let short = || corrupt("compound index cell cut short".into());
+        KIND_INDEX_WITH_FLAGS => {
+            let short = || corrupt("index cell cut short".into());
             let name_len = cell[9] as usize;
             let (collection, rest) = cell[10..].split_at_checked(name_len).ok_or_else(short)?;
+            let (&flags, rest) = rest.split_first().ok_or_else(short)?;
+            if flags & !(FLAG_UNIQUE | FLAG_SPARSE) != 0 {
+                return Err(corrupt(format!("unknown index flags {flags:#04x}")));
+            }
             let (&count, mut rest) = rest.split_first().ok_or_else(short)?;
             let mut fields = Vec::with_capacity(count as usize);
             for _ in 0..count {
@@ -469,7 +509,8 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
                 IndexMeta {
                     fields,
                     root: u64_at(1),
-                    unique: kind == KIND_UNIQUE_COMPOUND_INDEX,
+                    unique: flags & FLAG_UNIQUE != 0,
+                    sparse: flags & FLAG_SPARSE != 0,
                 },
             ))
         }
@@ -590,37 +631,69 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
 
+    const PLAIN: IndexOptions = IndexOptions {
+        unique: false,
+        sparse: false,
+    };
+    const UNIQUE: IndexOptions = IndexOptions {
+        unique: true,
+        sparse: false,
+    };
+    const SPARSE: IndexOptions = IndexOptions {
+        unique: false,
+        sparse: true,
+    };
+    const BOTH: IndexOptions = IndexOptions {
+        unique: true,
+        sparse: true,
+    };
+
     #[test]
     fn indexes_are_created_dropped_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
 
-        let (email, age, tenant_email) = {
+        let (email, age, tenant_email, nick, phone) = {
             let mut store = FileStore::open(&path).unwrap();
             let mut catalog = Catalog::load(&mut store).unwrap();
             catalog.create_collection(&mut store, "users").unwrap();
             catalog.create_collection(&mut store, "posts").unwrap();
             let email = catalog
-                .create_index(&mut store, "users", &fields(&["email"]), true)
+                .create_index(&mut store, "users", &fields(&["email"]), UNIQUE)
                 .unwrap();
             let age = catalog
-                .create_index(&mut store, "users", &fields(&["age"]), false)
+                .create_index(&mut store, "users", &fields(&["age"]), PLAIN)
                 .unwrap();
             let tenant_email = catalog
-                .create_index(&mut store, "users", &fields(&["tenant", "email"]), true)
+                .create_index(&mut store, "users", &fields(&["tenant", "email"]), UNIQUE)
                 .unwrap();
-            // Unique, so dropping them has to find kind-2 and kind-4 cells.
+            let nick = catalog
+                .create_index(&mut store, "users", &fields(&["nick"]), SPARSE)
+                .unwrap();
+            let phone = catalog
+                .create_index(&mut store, "users", &fields(&["phone"]), BOTH)
+                .unwrap();
+            // Unique, so dropping them has to find kind-2 and kind-3 cells.
             catalog
-                .create_index(&mut store, "posts", &fields(&["title"]), true)
+                .create_index(&mut store, "posts", &fields(&["title"]), UNIQUE)
                 .unwrap();
             catalog
-                .create_index(&mut store, "posts", &fields(&["a", "b", "c"]), true)
+                .create_index(&mut store, "posts", &fields(&["a", "b", "c"]), UNIQUE)
                 .unwrap();
             assert_eq!(
                 catalog.indexes("users"),
-                [email.clone(), age.clone(), tenant_email.clone()]
+                [
+                    email.clone(),
+                    age.clone(),
+                    tenant_email.clone(),
+                    nick.clone(),
+                    phone.clone()
+                ]
             );
             assert!(email.unique && !age.unique && tenant_email.unique);
+            assert_eq!(nick.options(), SPARSE);
+            assert_eq!(phone.options(), BOTH);
+            assert!(!email.sparse && !tenant_email.sparse);
             assert_eq!(tenant_email.name(), "(tenant, email)");
 
             for dropped in [&["title"][..], &["a", "b", "c"]] {
@@ -633,15 +706,60 @@ mod tests {
             catalog
                 .set_current_data_page(&mut store, "posts", 7)
                 .unwrap();
-            (email, age, tenant_email)
+            (email, age, tenant_email, nick, phone)
         };
 
         let mut store = FileStore::open(&path).unwrap();
         let catalog = Catalog::load(&mut store).unwrap();
-        assert_eq!(catalog.indexes("users"), [email, age, tenant_email]);
+        assert_eq!(
+            catalog.indexes("users"),
+            [email, age, tenant_email, nick, phone]
+        );
         assert_eq!(catalog.indexes("posts"), []);
         assert_eq!(catalog.indexes("nothing"), []);
         assert_eq!(catalog.get("posts").unwrap().current_data_page, 7);
+    }
+
+    /// A plain one-field index keeps its old cell (kind 1 or 2); any
+    /// other gets kind 3 with flags, and flags this version doesn't know
+    /// are corruption, not ignored.
+    #[test]
+    fn index_cells_carry_their_options_and_refuse_unknown_flags() {
+        for (fields, options, kind) in [
+            (fields(&["a"]), PLAIN, KIND_INDEX),
+            (fields(&["a"]), UNIQUE, KIND_UNIQUE_INDEX),
+            (fields(&["a"]), SPARSE, KIND_INDEX_WITH_FLAGS),
+            (fields(&["a", "b"]), PLAIN, KIND_INDEX_WITH_FLAGS),
+            (fields(&["a", "b"]), BOTH, KIND_INDEX_WITH_FLAGS),
+        ] {
+            let index = IndexMeta {
+                fields,
+                root: 9,
+                unique: options.unique,
+                sparse: options.sparse,
+            };
+            let cell = encode_index("users", &index);
+            assert_eq!(cell[0], kind);
+            let Entry::Index(collection, decoded) = decode_entry(&cell).unwrap() else {
+                panic!("an index cell decodes as an index");
+            };
+            assert_eq!((collection.as_str(), decoded), ("users", index));
+        }
+        let index = IndexMeta {
+            fields: fields(&["a"]),
+            root: 9,
+            unique: false,
+            sparse: true,
+        };
+        let mut cell = encode_index("users", &index);
+        cell[10 + "users".len()] |= 4;
+        let Err(err) = decode_entry(&cell) else {
+            panic!("unknown flags must be refused");
+        };
+        assert!(
+            err.to_string().contains("unknown index flags 0x06"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -657,12 +775,12 @@ mod tests {
                 &mut store,
                 &longest,
                 &["f".repeat(MAX_FIELD_NAME_LEN)],
-                false,
+                PLAIN,
             )
             .unwrap();
         let too_long = "f".repeat(MAX_FIELD_NAME_LEN + 1);
         let Err(crate::Error::Io(err)) =
-            catalog.create_index(&mut store, &longest, &[too_long], false)
+            catalog.create_index(&mut store, &longest, &[too_long], PLAIN)
         else {
             panic!("an overlong field name must be an I/O InvalidInput error");
         };

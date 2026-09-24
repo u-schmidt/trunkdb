@@ -23,6 +23,7 @@ pub mod storage;
 pub mod txn;
 
 pub use batch::Batch;
+pub use catalog::IndexOptions;
 pub use check::{CheckReport, FileInfo};
 pub use collection::{Collection, IndexFields, Upserted};
 pub use compact::Compacted;
