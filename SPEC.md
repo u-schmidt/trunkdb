@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §32 for the roadmap.
+large-document workload (§5.2) the second; see §33 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1234,12 +1234,12 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§32, "Later").
+future vacuum (§33, "Later").
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
 DocId][document]`. `0` means the whole document is in the cell — the
-only kind written today. `1` is reserved for overflow (§32, item 7): the
+only kind written today. `1` is reserved for overflow (§33, item 7): the
 cell will hold `[u32 total length][u64 first Overflow page]` and as much
 of the document as fits. Reading it today is an `InvalidData` error, not
 a misread. The page type tag `Overflow = 6` is reserved alongside it, so
@@ -1309,15 +1309,18 @@ The staging tests in `file.rs` inspect the file through a second
 The header gained `[28..32) format_version: u32`, first `1` — the
 format of §20 (packed data pages, flags byte, catalog cells with
 `current_data_page`), `2` since §26 (`u32` document lengths,
-overflow pages), and `3` since §28 (catalog cells with a kind byte,
-index entries). `Header::decode` checks it right after the magic,
+overflow pages), `3` since §28 (catalog cells with a kind byte,
+index entries), and `4` since §32 (indexes hold null and missing
+fields). `Header::decode` checks it right after the magic,
 before anything else in the header (another version may lay it out
 differently), and only its own version is accepted. The error says
 which case it is:
 - `0` — the bytes every header had before the field existed: trunkdb
   0.1.0, or a development build between 0.1.0 and this change;
 - higher than this build's — open it with a newer trunkdb;
-- lower — an older format with no migration.
+- lower — an older format: export it with the version that wrote it,
+  import it with this one (§30; the message said "no migration" until
+  §32).
 
 The magic stays `TRUNKDB1`: it answers "is this a trunkdb file at all",
 the version answers "which layout". The version is bumped whenever a
@@ -1514,7 +1517,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is in "Later" (§32). A
+A pattern language (regex, `LIKE` wildcards) is in "Later" (§33). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1695,7 +1698,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§32, "Later").
+(§33, "Later").
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -1797,6 +1800,8 @@ comparisons (`query::compare`):
 Everything else (`Null`, arrays, objects, binary, ids, missing fields)
 has no key: no `Eq`/`Lt`/`Lte`/`Gt`/`Gte` condition can match it, so an
 index without those documents answers those conditions correctly.
+(Since §32, `Null` and missing fields do have a key: `== null` matches
+them.)
 
 Rejected: a **typed key** (compare decoded `Document`s in the tree).
 Every comparison would decode, and the B-tree would depend on the
@@ -2073,7 +2078,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§32). It's also a backup that can be read and `diff`ed, and a way to
+(§33). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2163,7 +2168,7 @@ before or entirely after it, and documents in different collections
 that refer to each other agree. Readers go on in parallel; writers wait.
 
 That's the opposite of `cursor` (§29.4), which holds no lock between
-items, and the roadmap's sketch (§32) had planned to export through a
+items, and the roadmap's sketch (§33) had planned to export through a
 cursor.
 Rejected, because an export is a backup: read-committed per document
 would let a batch that updates two collections appear half-applied. The
@@ -2199,7 +2204,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§32,
+  seconds; a snapshot that doesn't block writers needs MVCC (§33,
   "Later").
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
@@ -2269,10 +2274,10 @@ conditions in filters, which don't exist yet either.
 ### 31.4 What `ensure_index` rejects
 A path with an empty part (`a..b`, `.a`, `a.`, the empty string), and
 `_id` or anything below it — `_id` is the primary key, and an id has no
-fields. Both mistakes would otherwise create an index that can never
-hold an entry. Filters don't check paths: `matches` has no error to
-return, and a malformed path simply matches nothing, like a missing
-field.
+fields. Both mistakes would otherwise create an index where every
+document sits under null (a missing field, §32). Filters don't check
+paths: `matches` has no error to return, and a malformed path finds no
+field, so it behaves like a missing one — null (§32).
 
 ### 31.5 Files from 0.3.0
 In 0.3.0, a field name containing a dot meant a top-level key with that
@@ -2283,7 +2288,8 @@ indexed finds can miss documents. Nothing in the file tells the two
 meanings apart. The fix is to rebuild the index — `drop_index` and
 `ensure_index`, or an export and import (§30), which rebuilds every
 index. Indexes on names without a dot, i.e. all normal ones, are
-unaffected.
+unaffected. (Since §32 the format version is 4, so a 0.3.0 file goes
+through export and import anyway, and this can't happen.)
 
 ### 31.6 Tests
 - `nested_path_indexes_match_full_scans_through_every_kind_of_write`:
@@ -2309,9 +2315,115 @@ unaffected.
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
 - Still one field per index: compound and unique indexes remain in
-  "Later" (§32).
+  "Later" (§33).
 
-## 32. Open work / next milestones
+## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
+
+Real and tested: a condition against `Null` finds documents where the
+field holds null *and* documents that don't have the field at all.
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct Member { name: String, nick: Option<String> }   // C#: string? Nick
+
+members.ensure_index("nick")?;
+members.find(Filter { conditions: vec![Condition {
+    field: "nick".into(), op: Op::Eq, value: Document::Null,
+}], ..Filter::default() })?;   // every Member whose nick is None — via the index
+```
+
+Storing null always worked: `Document::Null`, and `Option::None` on the
+typed path. Querying for it didn't: `Null` compared as "not
+comparable", so `nick == null` matched nothing, and `nick != null`
+matched every document that had the field — including the ones where
+it was null.
+
+### 32.1 Missing reads as null
+A condition or a sort that looks at a field the document doesn't have
+sees `Null` (`query::value_or_null`). That includes a path that can't be
+followed (`address.city` when `address` is missing or a string, §31),
+and a document that isn't an object. And `Null` compares equal to
+`Null`. Together:
+
+| condition | matches |
+|---|---|
+| `x == null`, `x <= null`, `x >= null` | `x` is null or missing |
+| `x != null` | `x` is there and not null |
+| `x < null`, `x > null` | nothing |
+| `x == 5`, `x > 5`, `x contains "a"` | as before; never a null or missing `x` |
+| `x != 5` | also a null or missing `x` |
+
+The last row is the one behavior change beyond null itself: `x != 5`
+always matched a *stored* null, but not a missing field. Now both.
+
+Why equate them: on the typed path both come back as the same `None`
+— serde fills a missing `Option` field with `None` — so a query that
+told them apart would disagree with what the app reads back. And a field
+added to a struct later is missing from every older document; if
+`== null` skipped those, the query would silently return too few
+results, the classic schema-less bug. SQL has no "missing" at all, and
+LiteDB (a missing field reads as `BsonValue.Null`) and MongoDB (`{x:
+null}` matches missing) equate them too.
+
+Rejected: keeping them apart. What that buys — telling "cleared" from
+"never set" — is rarely needed, and an `Exists` operator can add it
+later without changing anything here.
+
+### 32.2 Indexes hold null, and missing as null
+`Null` became an indexed type with the lowest tag (`0`), one value,
+and a missing field is indexed as null. So `== null`, `<= null` and
+`>= null` read a range of the index, like any other value (§28.4), and
+the existing range logic needed no change: a tag of its own keeps every
+other type's range free of nulls.
+
+The cost: every document now has an entry in every index — before, a
+document without the field had none. For an index on a field most
+documents lack, that's an entry per document that used to be free.
+MongoDB makes the same trade by default. Rejected for now: *sparse*
+indexes (skip missing fields, as an option). Such an index couldn't
+answer `== null`, so it would need its own planner rule; it's worth
+adding only when an index on a rare field turns out to be too big.
+
+### 32.3 Format version 4
+An index built by format 3 has no entry for a null or missing field, so
+it would silently miss documents for `== null`. That's a change in what
+an index contains, so the format version is now 4 (§21.2), and a
+format-3 file is refused. The error now says how to move it: export
+with the trunkdb version that wrote it, import with this one (§30) —
+which rebuilds every index.
+
+Rejected: upgrading format-3 files in place, by rebuilding their
+indexes on open. It would be trunkdb's first automatic migration — an
+open that writes, plus a header change in the same batch — for files
+that only exist in development so far. Export and import is the
+documented path (§21.2) and already tested.
+
+### 32.4 Tests
+- `a_missing_field_is_null` (`query.rs`): every operator against null
+  and against a value, on a null field, a missing field, a document
+  that isn't an object, and a set field; plus a path whose parent is
+  missing.
+- `null_and_missing_fields_are_found_alike_through_the_index`: typed,
+  with `Option` fields stored as null, left out by
+  `skip_serializing_if`, and missing because the document was written
+  with an older struct. `== null` and `!= null` find the right ones,
+  `== null` through the index, and an update that clears a field moves
+  its entry.
+- The two index-versus-scan tests (§28.7, §31.6) already had null
+  values in their random filters and documents without the field;
+  they now check those through the index too. Checked by breaking it on
+  purpose: with missing fields left out of the index again, both fail,
+  and so does the typed test.
+- Key encoding: null's key, and that `Eq null` covers it while number
+  ranges don't.
+
+### 32.5 Limits
+- No `Exists` operator: "null or missing" is one state for queries.
+- A sort still leaves null and missing where they are relative to other
+  values (not first or last): `compare` orders only values of one kind.
+- Every index grows by one entry per document without the field (§32.2).
+
+## 33. Open work / next milestones
 
 Roadmap from v0 (crate 0.1.0) towards v1, agreed 2026-09-23. Ordered by
 priority: correctness and file format first, then what the sync workload (§5.3)
@@ -2380,10 +2492,12 @@ pure refactor that can happen anytime, independent of trunkdb.
   consistent snapshot. The migration path 1.0.0 needs.
 - **Nested-field paths — done** (§31): `address.city` in conditions,
   sorts and indexes; a dot always separates, arrays aren't entered.
+- **Null and missing fields — done** (§32): `== null` matches both,
+  through indexes too; format version 4.
 
 Unordered: `Filter` OR/nesting and regex; compaction/vacuum;
-per-page checksums; compound and unique indexes, and using an index
-for `sort`; conditions on array elements (and multikey indexes, §31.3); readers that don't wait for a write batch (MVCC
+per-page checksums; compound, unique and sparse indexes, an `Exists`
+operator, and using an index for `sort`; conditions on array elements (and multikey indexes, §31.3); readers that don't wait for a write batch (MVCC
 or pre-batch page snapshots; reader/writer locking is done, §27);
 unique constraints; PyO3 bindings (for Python apps); a CLI for
 inspecting/verifying a file (and running export/import); benchmarks

@@ -18,6 +18,7 @@ pub const MAX_KEY_LEN: usize = 1024;
 // types never compare equal or ordered in `Filter` (`query::compare`), so
 // their relative order here is arbitrary; grouping them by tag is what
 // matters, so a range stays within one type.
+const TAG_NULL: u8 = 0;
 const TAG_BOOL: u8 = 1;
 const TAG_NUMBER: u8 = 2;
 const TAG_STRING: u8 = 3;
@@ -50,16 +51,17 @@ pub fn secondary(value: &Document, id: DocId) -> Option<Vec<u8>> {
 /// that round to one `f64`, strings that share their first ~1000 bytes).
 /// That's fine, since every document an index returns is checked against
 /// the full filter again (SPEC §28.3). Only the types a comparison can
-/// match are indexed — `Bool`, `Int`/`Float`, `String`. Anything else
-/// (`Null`, arrays, objects, binary, ids, `NaN`) is `None`: no `Eq`/`Lt`/
-/// `Lte`/`Gt`/`Gte` condition can match it, so leaving it out of the
-/// index loses nothing.
+/// match are indexed — `Null` (which also stands for a missing field,
+/// SPEC §32), `Bool`, `Int`/`Float`, `String`. Anything else (arrays,
+/// objects, binary, ids, `NaN`) is `None`: no `Eq`/`Lt`/`Lte`/`Gt`/`Gte`
+/// condition can match it, so leaving it out of the index loses nothing.
 ///
 /// The encoding is prefix-free — no encoded value is a proper prefix of
 /// another — so the `DocId` appended after it can't change the order
 /// between two different values.
 pub fn encode_value(value: &Document) -> Option<Vec<u8>> {
     match value {
+        Document::Null => Some(vec![TAG_NULL]),
         Document::Bool(b) => Some(vec![TAG_BOOL, *b as u8]),
         // `as f64`, like `query::compare` does for `Int` vs. `Float`.
         Document::Int(n) => encode_number(*n as f64),
@@ -247,8 +249,8 @@ mod tests {
     #[test]
     fn only_comparable_types_are_indexed() {
         assert!(encode_value(&Document::Bool(true)).is_some());
+        assert_eq!(key(Document::Null), [TAG_NULL]);
         for value in [
-            Document::Null,
             Document::Binary(vec![1]),
             Document::Array(vec![]),
             Document::Id(DocId([1; 16])),
@@ -280,7 +282,12 @@ mod tests {
             range_for(&Op::Contains, &Document::String("a".into())),
             None
         );
-        assert_eq!(range_for(&Op::Eq, &Document::Null), None);
+
+        // Null is a type of its own, with one value.
+        let null = secondary(&Document::Null, id).unwrap();
+        let eq_null = range_for(&Op::Eq, &Document::Null).unwrap();
+        assert!(eq_null.contains(&null) && !eq_null.contains(&boolean));
+        assert!(!lt.contains(&null) && !gt.contains(&null));
     }
 
     #[test]

@@ -80,7 +80,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §32 for the full list and reasoning):
+Done so far (see SPEC.md §33 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -95,8 +95,10 @@ Done so far (see SPEC.md §32 for the full list and reasoning):
    migration path between file format versions.
 5. **Nested-field paths** (§31): `address.city` in filters, sorts and
    `ensure_index`.
+6. **Null and missing fields** (§32): `x == null` finds both, through an
+   index too (file format 4).
 
-Next: an unordered list of further features (§32).
+Next: an unordered list of further features (§33).
 
 ## License
 

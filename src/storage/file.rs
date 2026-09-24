@@ -17,8 +17,8 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// or a development build between 0.1.0 and this field (SPEC §21.2).
 /// History: 1 = SPEC §21; 2 = `u32` lengths in documents and overflow
 /// pages (SPEC §26); 3 = catalog cells with a kind byte, and index
-/// entries (SPEC §28).
-const FORMAT_VERSION: u32 = 3;
+/// entries (SPEC §28); 4 = indexes hold null and missing fields (SPEC §32).
+const FORMAT_VERSION: u32 = 4;
 const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
@@ -69,8 +69,9 @@ impl Header {
                      open it with a newer trunkdb"
                 ),
                 v => format!(
-                    "file has format {v}, older than this build's {FORMAT_VERSION}, \
-                     and there's no migration for it"
+                    "file has format {v}, older than this build's {FORMAT_VERSION}: \
+                     export it with the trunkdb version that wrote it, and import the \
+                     export into a new file with this one"
                 ),
             };
             return Err(io::Error::new(io::ErrorKind::InvalidData, message));

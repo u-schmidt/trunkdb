@@ -78,14 +78,12 @@ impl Filter {
         if let Some(sort) = &self.sort {
             results.sort_by(|a, b| {
                 let (a, b) = (doc_of(a), doc_of(b));
-                let ord = match (field_value(a, &sort.field), field_value(b, &sort.field)) {
-                    (Some(a), Some(b)) => compare(a, b).unwrap_or(std::cmp::Ordering::Equal),
-                    // A document missing the sort field, or a value that
-                    // isn't comparable to the other side's, doesn't error
-                    // out — it just doesn't move relative to what it's
-                    // being compared against.
-                    _ => std::cmp::Ordering::Equal,
-                };
+                let (a, b) = (value_or_null(a, &sort.field), value_or_null(b, &sort.field));
+                // A value that isn't comparable to the other side's
+                // (including a missing field, which is null) doesn't
+                // error out — it just doesn't move relative to what it's
+                // being compared against.
+                let ord = compare(a, b).unwrap_or(std::cmp::Ordering::Equal);
                 match sort.order {
                     SortOrder::Asc => ord,
                     SortOrder::Desc => ord.reverse(),
@@ -156,10 +154,15 @@ pub(crate) fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Docum
     })
 }
 
+/// The value a condition or sort sees at `path`: a missing field reads
+/// as `Null` (SPEC §32), so `x == null` finds documents without `x`, and
+/// every condition treats "missing" and "null" alike.
+pub(crate) fn value_or_null<'a>(doc: &'a Document, path: &str) -> &'a Document {
+    field_value(doc, path).unwrap_or(&Document::Null)
+}
+
 fn condition_matches(cond: &Condition, doc: &Document) -> bool {
-    let Some(field_value) = field_value(doc, &cond.field) else {
-        return false;
-    };
+    let field_value = value_or_null(doc, &cond.field);
     if let Op::Contains = cond.op {
         return match (field_value, &cond.value) {
             (Document::String(haystack), Document::String(needle)) => {
@@ -189,9 +192,13 @@ fn fold_case(s: &str) -> String {
     s.to_lowercase().replace('ß', "ss")
 }
 
+/// Only values of one kind compare; `Null` equals `Null` (SPEC §32), so
+/// `Eq`/`Lte`/`Gte` against null match null and missing fields, `Ne`
+/// everything else, and `Lt`/`Gt` nothing.
 fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> {
     use Document::*;
     match (a, b) {
+        (Null, Null) => Some(std::cmp::Ordering::Equal),
         (Int(x), Int(y)) => x.partial_cmp(y),
         (Float(x), Float(y)) => x.partial_cmp(y),
         (Int(x), Float(y)) => (*x as f64).partial_cmp(y),
@@ -334,18 +341,6 @@ mod tests {
             !city_is("city", "Berlin").matches(&person),
             "no deep search"
         );
-        assert!(
-            !Filter {
-                conditions: vec![Condition {
-                    field: "address.city".into(),
-                    op: Op::Ne,
-                    value: berlin(),
-                }],
-                ..Default::default()
-            }
-            .matches(&doc(&[("address", Document::Null)])),
-            "a missing path matches nothing, not even `Ne` — like a missing field"
-        );
     }
 
     #[test]
@@ -374,6 +369,46 @@ mod tests {
         }
         .apply(vec![at(2), at(3), at(1)]);
         assert_eq!(sorted, vec![at(3), at(2), at(1)]);
+    }
+
+    #[test]
+    fn a_missing_field_is_null() {
+        let when = |op: Op, value: Document| Filter {
+            conditions: vec![Condition {
+                field: "nick".into(),
+                op,
+                value,
+            }],
+            ..Default::default()
+        };
+        let null = doc(&[("nick", Document::Null)]);
+        let missing = doc(&[("name", Document::String("Ada".into()))]);
+        let not_an_object = Document::Int(7);
+        let set = doc(&[("nick", Document::String("Bob".into()))]);
+        let bob = || Document::String("Bob".into());
+
+        for (filter, matching) in [
+            (when(Op::Eq, Document::Null), [true, true, true, false]),
+            (when(Op::Ne, Document::Null), [false, false, false, true]),
+            (when(Op::Lte, Document::Null), [true, true, true, false]),
+            (when(Op::Gte, Document::Null), [true, true, true, false]),
+            (when(Op::Lt, Document::Null), [false; 4]),
+            (when(Op::Gt, Document::Null), [false; 4]),
+            (when(Op::Eq, bob()), [false, false, false, true]),
+            (when(Op::Ne, bob()), [true, true, true, false]),
+            (when(Op::Gt, Document::Int(0)), [false; 4]),
+            (
+                when(Op::Contains, Document::String("".into())),
+                [false, false, false, true],
+            ),
+        ] {
+            let found = [&null, &missing, &not_an_object, &set].map(|d| filter.matches(d));
+            assert_eq!(found, matching, "{:?}", filter.conditions[0]);
+        }
+        // Through a path too: `address` isn't there, so neither is `city`.
+        let mut on_path = when(Op::Eq, Document::Null);
+        on_path.conditions[0].field = "address.city".into();
+        assert!(on_path.matches(&missing) && on_path.matches(&set));
     }
 
     #[test]
@@ -542,7 +577,7 @@ mod tests {
             field_of(&filter(vec![
                 cond("age", Op::Ne, Document::Int(1)),
                 cond("name", Op::Contains, Document::String("a".into())),
-                cond("name", Op::Eq, Document::Null),
+                cond("name", Op::Eq, Document::Array(vec![])),
             ])),
             None
         );

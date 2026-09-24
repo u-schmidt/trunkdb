@@ -539,9 +539,10 @@ fn old_document(
 }
 
 /// A document's key in the secondary index on `field`, if it has one: the
-/// field must exist and hold an indexed type (`key::encode_value`).
+/// field must hold an indexed type (`key::encode_value`). A missing field
+/// is indexed as null, so `field == null` can use the index (SPEC §32).
 fn secondary_key(doc: &Document, field: &str, id: DocId) -> Option<Vec<u8>> {
-    key::secondary(crate::query::field_value(doc, field)?, id)
+    key::secondary(crate::query::value_or_null(doc, field), id)
 }
 
 /// Brings every secondary index from a document's `old` state to its
@@ -1555,6 +1556,81 @@ mod tests {
             people.find(in_berlin).unwrap(),
             [person("Ada", "Berlin", 10115)]
         );
+    }
+
+    /// `None` on the typed path, whether stored as null, left out by serde,
+    /// or never written because the field is newer than the document:
+    /// `== null` finds all three, through the index (SPEC §32).
+    #[test]
+    fn null_and_missing_fields_are_found_alike_through_the_index() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Member {
+            name: String,
+            nick: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            team: Option<String>,
+        }
+        let member = |name: &str, nick: Option<&str>, team: Option<&str>| Member {
+            name: name.to_string(),
+            nick: nick.map(String::from),
+            team: team.map(String::from),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        // Written before `Member` had `nick`: no such key at all.
+        db.collection::<User>("members")
+            .insert(user("Old", 99))
+            .unwrap();
+        let members = db.collection::<Member>("members");
+        members.insert(member("Ada", None, None)).unwrap();
+        members
+            .insert(member("Bob", Some("B"), Some("red")))
+            .unwrap();
+        members.insert(member("Cy", Some("C"), None)).unwrap();
+        assert!(members.ensure_index("nick").unwrap());
+        assert!(members.ensure_index("team").unwrap());
+
+        let names = |field: &str, op: Op| {
+            let f = filter(vec![cond(field, op, Document::Null)]);
+            let mut names: Vec<String> = db
+                .collection::<Document>("members")
+                .find(f)
+                .unwrap()
+                .into_iter()
+                .map(|doc| match crate::query::field_value(&doc, "name") {
+                    Some(Document::String(name)) => name.clone(),
+                    other => panic!("no name: {other:?}"),
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        let nick_is_null = filter(vec![cond("nick", Op::Eq, Document::Null)]);
+        assert_eq!(
+            members.explain(&nick_is_null).unwrap(),
+            QueryPlan::Index {
+                field: "nick".to_string()
+            }
+        );
+        assert_eq!(names("nick", Op::Eq), ["Ada", "Old"]);
+        assert_eq!(names("nick", Op::Ne), ["Bob", "Cy"]);
+        // `team` is never stored as null, only left out.
+        assert_eq!(names("team", Op::Eq), ["Ada", "Cy", "Old"]);
+        assert_eq!(names("team", Op::Ne), ["Bob"]);
+
+        // Setting and clearing a field moves its index entry.
+        let (bob, _) = members
+            .find_with_ids(filter(vec![cond(
+                "team",
+                Op::Eq,
+                Document::String("red".to_string()),
+            )]))
+            .unwrap()
+            .remove(0);
+        members.update(&bob, member("Bob", None, None)).unwrap();
+        assert_eq!(names("nick", Op::Eq), ["Ada", "Bob", "Old"]);
+        assert_eq!(names("team", Op::Eq), ["Ada", "Bob", "Cy", "Old"]);
     }
 
     /// A batch that fails after touching an index leaves no entry behind.
