@@ -1515,7 +1515,11 @@ mod tests {
         two_page_file(&path);
         let store = FileStore::open(&path).unwrap();
         assert_eq!(store.read_page(1).unwrap(), filled(1));
-        change_file(&path, |bytes| bytes[PAGE_SIZE + 100] ^= 1);
+        // Through the store's own handle: Windows' file lock is
+        // mandatory, so another handle couldn't write while it's held.
+        let mut disk = read_disk_page(&store.file, 1).unwrap();
+        disk[100] ^= 1;
+        write_all_at(&store.file, &disk, PAGE_SIZE as u64).unwrap();
         assert_eq!(store.read_page(1).unwrap(), filled(1));
         assert_eq!(store.damaged_pages().unwrap(), [1]);
         drop(store);
