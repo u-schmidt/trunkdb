@@ -428,13 +428,14 @@ mod tests {
         let big = source.collection::<Document>("big");
         big.insert(object(&[("text", Document::String("x".repeat(100_000)))]))
             .unwrap();
-        // A collection that exists but is empty, and one with only an index.
+        // A collection that exists but is empty, and one with only an
+        // index, on a nested path.
         source
             .transact(|c, s| get_or_create_meta(c, s, "empty").map(|_| ()))
             .unwrap();
         source
             .collection::<Document>("indexed")
-            .ensure_index("k")
+            .ensure_index("k.a")
             .unwrap();
 
         let text = export_text(&source);

@@ -11,7 +11,8 @@ collections of documents.
 B-tree primary index, document encoding (both the untyped `Document` path
 and a serde bridge so any `T: Serialize + DeserializeOwned` works),
 scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
-`cursor`), `upsert`, single-field secondary indexes, overflow pages for documents larger
+`cursor`), `upsert`, single-field secondary indexes (also on nested paths like
+`address.city`), overflow pages for documents larger
 than a page, export/import as JSON Lines, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0: secondary
@@ -79,7 +80,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §31 for the full list and reasoning):
+Done so far (see SPEC.md §32 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -92,8 +93,10 @@ Done so far (see SPEC.md §31 for the full list and reasoning):
 
 4. **Export/import** as JSON Lines (§30): a backup you can read, and the
    migration path between file format versions.
+5. **Nested-field paths** (§31): `address.city` in filters, sorts and
+   `ensure_index`.
 
-Next: an unordered list of further features (§31).
+Next: an unordered list of further features (§32).
 
 ## License
 

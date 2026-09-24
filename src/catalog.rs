@@ -24,7 +24,8 @@ pub struct CollectionMeta {
     pub current_data_page: PageId,
 }
 
-/// A secondary index on one top-level field of a collection (SPEC §28).
+/// A secondary index on one field of a collection (SPEC §28) — `field`
+/// may be a dotted path into nested objects (SPEC §31).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexMeta {
     pub field: String,

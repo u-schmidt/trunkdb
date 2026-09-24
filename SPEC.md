@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §31 for the roadmap.
+large-document workload (§5.2) the second; see §32 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1234,12 +1234,12 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§31, "Later").
+future vacuum (§32, "Later").
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
 DocId][document]`. `0` means the whole document is in the cell — the
-only kind written today. `1` is reserved for overflow (§31, item 7): the
+only kind written today. `1` is reserved for overflow (§32, item 7): the
 cell will hold `[u32 total length][u64 first Overflow page]` and as much
 of the document as fits. Reading it today is an `InvalidData` error, not
 a misread. The page type tag `Overflow = 6` is reserved alongside it, so
@@ -1514,7 +1514,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is in "Later" (§31). A
+A pattern language (regex, `LIKE` wildcards) is in "Later" (§32). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1695,7 +1695,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§31, "Later").
+(§32, "Later").
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -1763,8 +1763,8 @@ pings.drop_index("tst")?;     // frees its pages
 atomic batch, and creates the collection if needed, so an app can
 declare its indexes at startup. From then on every insert, update and
 delete keeps each index current, inside the same batch as the document
-change. Indexes persist; there's no index on nested fields (`a.b`) or on
-several fields at once.
+change. Indexes persist. Nested fields (`a.b`) came later (§31); there's
+still no index on several fields at once.
 
 ### 28.1 Keys are byte strings
 The B-tree no longer knows what it indexes. Its keys are byte strings
@@ -1935,7 +1935,8 @@ it, as `free_chain` does (§26.5).
   deletes also read the old document.
 - `ensure_index` on a large collection is one big batch: every index
   page is staged in memory and written to the WAL (§19.9).
-- Only top-level fields; no compound, unique, or sparse/partial
+- One field per index (top-level at first; dotted paths since §31);
+  no compound, unique, or sparse/partial
   options; no index-ordered `sort` (results are still sorted in
   memory). Each is a natural next step, none is needed by the reference workloads yet.
 
@@ -2072,7 +2073,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§31). It's also a backup that can be read and `diff`ed, and a way to
+(§32). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2162,7 +2163,7 @@ before or entirely after it, and documents in different collections
 that refer to each other agree. Readers go on in parallel; writers wait.
 
 That's the opposite of `cursor` (§29.4), which holds no lock between
-items, and the roadmap's sketch (§31) had planned to export through a
+items, and the roadmap's sketch (§32) had planned to export through a
 cursor.
 Rejected, because an export is a backup: read-committed per document
 would let a batch that updates two collections appear half-applied. The
@@ -2198,14 +2199,119 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§31,
+  seconds; a snapshot that doesn't block writers needs MVCC (§32,
   "Later").
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
   can make. A small program using `import`'s format can do it.
 
-## 31. Open work / next milestones
+## 31. Nested-field paths (`query.rs`, `collection.rs`)
+
+Real and tested: a condition, a sort and an index can name a field
+inside nested objects with a dotted path.
+
+```rust
+people.ensure_index("address.city")?;   // like LiteDB's "$.Address.City"
+let in_berlin = Filter {
+    conditions: vec![Condition {
+        field: "address.city".into(),
+        op: Op::Eq,
+        value: Document::String("Berlin".into()),
+    }],
+    sort: Some(Sort { field: "address.zip".into(), order: SortOrder::Asc }),
+    ..Filter::default()
+};
+people.find(in_berlin)?;                 // reads the index, sorts by zip
+```
+
+On the typed path a nested struct serializes to a nested object, so
+`address.city` is simply the `city` field of a `Person`'s `address`.
+
+### 31.1 One lookup for filters, sorts and index keys
+`query::field_value` walks the path, one object per dot. It was already
+the single place where conditions, sorts and index keys read a field;
+now it follows a path instead of reading one key. So a filter and an
+index can't disagree about where a document's value is — which matters
+because every index candidate is rechecked against the filter (§28.3):
+if the two looked in different places, documents would silently go
+missing from indexed finds.
+
+No file-format change: the catalog already stores an index's field as a
+string (§28.5), and a path is just a string with dots in it. The key
+encoding, the key-size cap and "one entry per document per index" stay
+as they are.
+
+### 31.2 A dot always separates
+`a.b` always means "field `b` of the object in field `a`", never a key
+literally named `a.b`. Such keys can still be stored and read back; a
+path just can't reach them. That's MongoDB's rule too.
+
+Rejected: trying the literal key first and falling back to the path. A
+path would then have two possible answers, and which one counts would
+depend on each document — adding an unrelated `"a.b"` key would
+silently change what a document is indexed under. Rejected: an escape
+syntax (`a\.b`). It adds a small language for a case that barely comes
+up: serde field names can't contain dots unless renamed on purpose.
+
+### 31.3 Arrays aren't walked into
+A step that lands on an array stops the walk: `items.name` finds
+nothing in `{"items": [{"name": …}]}`, and neither does `items.0.name`.
+
+Rejected: numeric steps into arrays (`items.0.name`). They're rarely what
+you want, and they'd suggest `items.name` should mean "any element",
+which it doesn't. Deferred: that "any element" meaning (MongoDB's
+multikey indexes). An index would need one entry per element, so one
+document several entries — breaking the "one entry per document per
+index" rule the write path relies on (§28.6). It belongs with array
+conditions in filters, which don't exist yet either.
+
+### 31.4 What `ensure_index` rejects
+A path with an empty part (`a..b`, `.a`, `a.`, the empty string), and
+`_id` or anything below it — `_id` is the primary key, and an id has no
+fields. Both mistakes would otherwise create an index that can never
+hold an entry. Filters don't check paths: `matches` has no error to
+return, and a malformed path simply matches nothing, like a missing
+field.
+
+### 31.5 Files from 0.3.0
+In 0.3.0, a field name containing a dot meant a top-level key with that
+literal name. An index created then on such a name was filled from those
+keys. Now the name is a path, so writes look elsewhere: removing an old
+entry finds nothing to remove (a no-op, §28.6), stale entries stay, and
+indexed finds can miss documents. Nothing in the file tells the two
+meanings apart. The fix is to rebuild the index — `drop_index` and
+`ensure_index`, or an export and import (§30), which rebuilds every
+index. Indexes on names without a dot, i.e. all normal ones, are
+unaffected.
+
+### 31.6 Tests
+- `nested_path_indexes_match_full_scans_through_every_kind_of_write`:
+  an index on `a.b.c` over documents that put the value at that path, one
+  level short, inside an array, under keys with dots (`"a.b.c"`,
+  `"b.c"`), or nowhere. It is built from existing documents, then kept
+  through inserts, updates that move values in and out of the path's
+  reach, and deletes; after all of them and again after a reopen, 300
+  random filters must find through the index exactly what a full scan
+  finds. Checked by breaking it on purpose: index keys read the old
+  way (top-level key only) while filters walk the path — it fails.
+- `typed_nested_fields_are_filtered_indexed_and_sorted_by_path`: nested
+  structs, an index on `address.city`, a sort by `address.zip`, and an
+  update that moves a document to another city and out of the result.
+- Path semantics in `query.rs`: nested matches, missing and non-object
+  steps, no deep search, arrays not entered, dotted keys not reached,
+  malformed paths matching nothing, sort by a nested field.
+- `ensure_index` rejects `_id`, `_id.x` and five malformed paths.
+- The export round trip (§30.5) now includes an index on a nested path.
+
+### 31.7 Cost and limits
+- A lookup splits the path as it walks — no allocation — so a top-level
+  field costs what it did before.
+- No array traversal (§31.3), no escaping of dots (§31.2).
+- Still one field per index: compound and unique indexes remain in
+  "Later" (§32).
+
+## 32. Open work / next milestones
 
 Roadmap from v0 (crate 0.1.0) towards v1, agreed 2026-09-23. Ordered by
 priority: correctness and file format first, then what the sync workload (§5.3)
@@ -2272,10 +2378,12 @@ pure refactor that can happen anytime, independent of trunkdb.
 - **Export/import as JSON Lines — done** (§30): tagged JSON, one file
   per database, ids kept, chunked import, and an export that is a
   consistent snapshot. The migration path 1.0.0 needs.
+- **Nested-field paths — done** (§31): `address.city` in conditions,
+  sorts and indexes; a dot always separates, arrays aren't entered.
 
 Unordered: `Filter` OR/nesting and regex; compaction/vacuum;
-per-page checksums; compound, unique and nested-field indexes, and
-using an index for `sort`; readers that don't wait for a write batch (MVCC
+per-page checksums; compound and unique indexes, and using an index
+for `sort`; conditions on array elements (and multikey indexes, §31.3); readers that don't wait for a write batch (MVCC
 or pre-batch page snapshots; reader/writer locking is done, §27);
 unique constraints; PyO3 bindings (for Python apps); a CLI for
 inspecting/verifying a file (and running export/import); benchmarks

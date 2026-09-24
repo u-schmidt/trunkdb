@@ -61,22 +61,26 @@ impl<T> Collection<T> {
         &self.db
     }
 
-    /// Makes sure there's a secondary index on the top-level field
-    /// `field` (SPEC §28): `true` if it was created now — from every
-    /// document already stored, in one atomic batch — `false` if it
-    /// already existed. Creates the collection if needed, so indexes can
-    /// be declared up front. From then on every write keeps the index up
-    /// to date, and `find` uses it for `Eq`/`Lt`/`Lte`/`Gt`/`Gte`
-    /// conditions on `field`. The index persists; call this at startup.
+    /// Makes sure there's a secondary index on `field` (SPEC §28): `true`
+    /// if it was created now — from every document already stored, in
+    /// one atomic batch — `false` if it already existed. Creates the
+    /// collection if needed, so indexes can be declared up front. From
+    /// then on every write keeps the index up to date, and `find` uses it
+    /// for `Eq`/`Lt`/`Lte`/`Gt`/`Gte` conditions on `field`. The index
+    /// persists; call this at startup.
     ///
-    /// `_id` is always indexed (the primary index) and is rejected here.
+    /// `field` can be a dotted path into nested objects, like
+    /// `address.city` (SPEC §31); a document without that path just has
+    /// no entry. `_id` is always indexed (the primary index) and is
+    /// rejected here, and so are paths below it and paths with an empty
+    /// part (`a..b`, `.a`).
     pub fn ensure_index(&self, field: &str) -> crate::Result<bool> {
-        if field == "_id" {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "`_id` is the primary key; it needs no secondary index",
-            )
-            .into());
+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+        if field.split('.').next() == Some("_id") {
+            return Err(invalid("`_id` is the primary key; it needs no secondary index").into());
+        }
+        if field.split('.').any(str::is_empty) {
+            return Err(invalid("an index path needs a name between every two dots").into());
         }
         self.db
             .transact(|catalog, store| build_index(catalog, store, &self.name, field))
@@ -1228,11 +1232,12 @@ mod tests {
         object(fields)
     }
 
-    fn random_filter(rng: &mut XorShift) -> Filter {
+    /// Conditions on the indexed `path`, sometimes with one on `w`.
+    fn random_filter(rng: &mut XorShift, path: &str) -> Filter {
         let ops = [Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
-        let mut conditions = vec![cond("v", ops[rng.below(5)].clone(), random_value(rng))];
+        let mut conditions = vec![cond(path, ops[rng.below(5)].clone(), random_value(rng))];
         match rng.below(3) {
-            0 => conditions.push(cond("v", ops[rng.below(5)].clone(), random_value(rng))),
+            0 => conditions.push(cond(path, ops[rng.below(5)].clone(), random_value(rng))),
             1 => conditions.push(cond("w", Op::Eq, Document::Int(rng.below(3) as i64))),
             _ => {}
         }
@@ -1247,10 +1252,10 @@ mod tests {
 
     /// Every random filter must find through the index exactly what it
     /// finds by checking every document.
-    fn assert_index_agrees_with_scan(docs: &Collection<Document>, rng: &mut XorShift) {
+    fn assert_index_agrees_with_scan(docs: &Collection<Document>, rng: &mut XorShift, path: &str) {
         let all = docs.find_with_ids(Filter::default()).unwrap();
         for _ in 0..300 {
-            let f = random_filter(rng);
+            let f = random_filter(rng, path);
             let expected = sorted_ids(f.apply_to(all.clone(), |(_, doc)| doc));
             let plan = docs.explain(&f).unwrap();
             let found = sorted_ids(docs.find_with_ids(f.clone()).unwrap());
@@ -1315,13 +1320,13 @@ mod tests {
                     field: "v".to_string()
                 }
             );
-            assert_index_agrees_with_scan(&docs, &mut rng);
+            assert_index_agrees_with_scan(&docs, &mut rng, "v");
         }
 
         let db = Database::open(&path).unwrap();
         let docs = db.collection::<Document>("docs");
         assert_eq!(docs.indexes().unwrap(), vec!["v".to_string()]);
-        assert_index_agrees_with_scan(&docs, &mut rng);
+        assert_index_agrees_with_scan(&docs, &mut rng, "v");
     }
 
     #[test]
@@ -1391,18 +1396,165 @@ mod tests {
     }
 
     #[test]
-    fn id_and_overlong_fields_cannot_be_indexed() {
+    fn id_malformed_and_overlong_paths_cannot_be_indexed() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
 
-        for field in ["_id".to_string(), "f".repeat(256)] {
+        let invalid = ["_id", "_id.x", "", ".", "a.", ".a", "a..b"].map(String::from);
+        for field in invalid.into_iter().chain(["f".repeat(256)]) {
             let Err(crate::Error::Io(err)) = docs.ensure_index(&field) else {
                 panic!("{field:?} must be rejected");
             };
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
         assert!(docs.indexes().unwrap().is_empty());
+    }
+
+    /// A document with a value at `a.b.c`, or at a spot that path must
+    /// not reach: one level short, inside an array, under a key with a
+    /// dot in it — or no `a` at all.
+    fn random_nested_document(rng: &mut XorShift) -> Document {
+        let v = random_value(rng);
+        let a = match rng.below(8) {
+            0..=3 => object(vec![("b", object(vec![("c", v), ("d", Document::Int(1))]))]),
+            4 => object(vec![("b", v)]),
+            5 => object(vec![("b.c", v)]),
+            6 => Document::Array(vec![object(vec![("b", object(vec![("c", v)]))])]),
+            _ => v,
+        };
+        let mut fields = vec![("w", Document::Int(rng.below(3) as i64))];
+        match rng.below(8) {
+            0 => fields.push(("a.b.c", random_value(rng))),
+            1 => {}
+            _ => fields.push(("a", a)),
+        }
+        let pad = [0, 0, 1500, 9000][rng.below(4)];
+        fields.push(("pad", Document::String("y".repeat(pad))));
+        object(fields)
+    }
+
+    #[test]
+    fn nested_path_indexes_match_full_scans_through_every_kind_of_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        {
+            let db = Database::open(&path).unwrap();
+            let docs = db.collection::<Document>("docs");
+            let mut ids = Vec::new();
+            let mut insert = |rng: &mut XorShift| {
+                let ops = (0..25)
+                    .map(|_| {
+                        let id = db.id_gen().generate();
+                        ids.push(id);
+                        WriteOp::Insert("docs".into(), id, random_nested_document(rng))
+                    })
+                    .collect();
+                db.write_batch(ops).unwrap();
+            };
+            (0..4).for_each(|_| insert(&mut rng));
+            assert!(docs.ensure_index("a.b.c").unwrap());
+            (0..4).for_each(|_| insert(&mut rng));
+            // Updates move values into and out of the path's reach.
+            for _ in 0..4 {
+                let ops = (0..25)
+                    .map(|_| {
+                        let id = ids[rng.below(ids.len())];
+                        WriteOp::Update("docs".into(), id, random_nested_document(&mut rng))
+                    })
+                    .collect();
+                db.write_batch(ops).unwrap();
+            }
+            let deleted = (0..30).map(|_| ids.swap_remove(rng.below(ids.len())));
+            let ops = deleted.map(|id| WriteOp::Delete("docs".into(), id));
+            db.write_batch(ops.collect()).unwrap();
+
+            let reachable = docs
+                .find(Filter::default())
+                .unwrap()
+                .iter()
+                .filter(|doc| crate::query::field_value(doc, "a.b.c").is_some())
+                .count();
+            assert!(reachable > 50, "only {reachable} documents have the path");
+            let eq_1 = filter(vec![cond("a.b.c", Op::Eq, Document::Int(1))]);
+            assert_eq!(
+                docs.explain(&eq_1).unwrap(),
+                QueryPlan::Index {
+                    field: "a.b.c".to_string()
+                }
+            );
+            assert_index_agrees_with_scan(&docs, &mut rng, "a.b.c");
+        }
+
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("docs");
+        assert_eq!(docs.indexes().unwrap(), ["a.b.c"]);
+        assert_index_agrees_with_scan(&docs, &mut rng, "a.b.c");
+    }
+
+    /// The typed path: a nested struct is a nested object, so its fields
+    /// are reachable by path — for filters, indexes and sort alike.
+    #[test]
+    fn typed_nested_fields_are_filtered_indexed_and_sorted_by_path() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Address {
+            city: String,
+            zip: i64,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Person {
+            name: String,
+            address: Address,
+        }
+        let person = |name: &str, city: &str, zip| Person {
+            name: name.to_string(),
+            address: Address {
+                city: city.to_string(),
+                zip,
+            },
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let people = db.collection::<Person>("people");
+        people.insert(person("Ada", "Berlin", 10115)).unwrap();
+        people.insert(person("Bob", "Hamburg", 20095)).unwrap();
+        people.insert(person("Cy", "Berlin", 10245)).unwrap();
+        assert!(people.ensure_index("address.city").unwrap());
+
+        let in_berlin = Filter {
+            sort: Some(crate::query::Sort {
+                field: "address.zip".to_string(),
+                order: SortOrder::Desc,
+            }),
+            ..filter(vec![cond(
+                "address.city",
+                Op::Eq,
+                Document::String("Berlin".to_string()),
+            )])
+        };
+        assert_eq!(
+            people.explain(&in_berlin).unwrap(),
+            QueryPlan::Index {
+                field: "address.city".to_string()
+            }
+        );
+        assert_eq!(
+            people.find(in_berlin.clone()).unwrap(),
+            [
+                person("Cy", "Berlin", 10245),
+                person("Ada", "Berlin", 10115)
+            ]
+        );
+
+        // Moving to another city moves the index entry too.
+        let (cy, _) = people.find_with_ids(in_berlin.clone()).unwrap().remove(0);
+        people.update(&cy, person("Cy", "Hamburg", 20095)).unwrap();
+        assert_eq!(
+            people.find(in_berlin).unwrap(),
+            [person("Ada", "Berlin", 10115)]
+        );
     }
 
     /// A batch that fails after touching an index leaves no entry behind.

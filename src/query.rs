@@ -144,11 +144,16 @@ impl Filter {
     }
 }
 
-pub(crate) fn field_value<'a>(doc: &'a Document, field: &str) -> Option<&'a Document> {
-    let Document::Object(map) = doc else {
-        return None;
-    };
-    map.get(field)
+/// The value at `path` in `doc` (SPEC §31): a field name, or several
+/// joined by dots — `address.city` is the `city` field of the object in
+/// the `address` field. `None` if a step is missing or isn't an object;
+/// arrays aren't walked into. A dot always separates, so a key that
+/// itself contains a dot can't be reached by a path.
+pub(crate) fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Document> {
+    path.split('.').try_fold(doc, |value, name| match value {
+        Document::Object(map) => map.get(name),
+        _ => None,
+    })
 }
 
 fn condition_matches(cond: &Condition, doc: &Document) -> bool {
@@ -299,6 +304,76 @@ mod tests {
             ..Default::default()
         };
         assert!(!non_string_needle.matches(&doc(&[("n", Document::String("1".into()))])));
+    }
+
+    fn city_is(path: &str, city: &str) -> Filter {
+        Filter {
+            conditions: vec![Condition {
+                field: path.into(),
+                op: Op::Eq,
+                value: Document::String(city.into()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_dotted_path_walks_into_nested_objects() {
+        let berlin = || Document::String("Berlin".into());
+        let person = doc(&[(
+            "address",
+            doc(&[("city", berlin()), ("geo", doc(&[("zone", berlin())]))]),
+        )]);
+
+        assert!(city_is("address.city", "Berlin").matches(&person));
+        assert!(city_is("address.geo.zone", "Berlin").matches(&person));
+        assert!(!city_is("address.city", "Paris").matches(&person));
+        assert!(!city_is("address.zip", "Berlin").matches(&person));
+        assert!(!city_is("address.city.name", "Berlin").matches(&person));
+        assert!(
+            !city_is("city", "Berlin").matches(&person),
+            "no deep search"
+        );
+        assert!(
+            !Filter {
+                conditions: vec![Condition {
+                    field: "address.city".into(),
+                    op: Op::Ne,
+                    value: berlin(),
+                }],
+                ..Default::default()
+            }
+            .matches(&doc(&[("address", Document::Null)])),
+            "a missing path matches nothing, not even `Ne` — like a missing field"
+        );
+    }
+
+    #[test]
+    fn a_path_never_enters_arrays_or_reaches_dotted_keys() {
+        let berlin = || Document::String("Berlin".into());
+        let in_array = doc(&[("address", Document::Array(vec![doc(&[("city", berlin())])]))]);
+        let dotted_key = doc(&[("address.city", berlin())]);
+
+        assert!(!city_is("address.city", "Berlin").matches(&in_array));
+        assert!(!city_is("address.0.city", "Berlin").matches(&in_array));
+        assert!(!city_is("address.city", "Berlin").matches(&dotted_key));
+        for bad in ["", ".", "address.", ".address.city", "address..city"] {
+            assert!(!city_is(bad, "Berlin").matches(&dotted_key), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sort_by_a_nested_field() {
+        let at = |n| doc(&[("meta", doc(&[("rank", Document::Int(n))]))]);
+        let sorted = Filter {
+            sort: Some(Sort {
+                field: "meta.rank".into(),
+                order: SortOrder::Desc,
+            }),
+            ..Default::default()
+        }
+        .apply(vec![at(2), at(3), at(1)]);
+        assert_eq!(sorted, vec![at(3), at(2), at(1)]);
     }
 
     #[test]
