@@ -109,6 +109,7 @@ users.insert(User { name: "Ada".into(), email: "ada@example.com".into(), team: "
 
 let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
 let youngest_in_core = users.find(Filter::new().eq("team", "core").sort_asc("age").limit(5))?;
+let by_team_then_age = users.find(Filter::new().sort_asc("team").then_asc("age").limit(20))?;
 ```
 
 ## Building
@@ -131,7 +132,7 @@ trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §47 for the full list and reasoning):
+Done so far (see SPEC.md §48 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -193,8 +194,11 @@ Done so far (see SPEC.md §47 for the full list and reasoning):
 20. **Conditions on one element** (§46): `elem_match("lines",
     Condition::eq("sku", "A1") & Condition::gte("qty", 9))` needs one line
     to meet both; multikey indexes like `lines[*].sku` bound it.
+21. **Sorting by several fields** (§47): `sort_asc("status").then_desc("created")`;
+    an index serves the leading keys its fields match, the rest are
+    sorted in memory. `Filter.sort` is now a `Vec<Sort>`.
 
-What's still open: SPEC.md §47.2.
+What's still open: SPEC.md §48.2.
 
 ## License
 

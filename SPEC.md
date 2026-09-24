@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §47 for the roadmap.
+large-document workload (§5.2) the second; see §48 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1531,7 +1531,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§47.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§48.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1712,7 +1712,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§47.2).
+(§48.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2102,7 +2102,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§47). It's also a backup that can be read and `diff`ed, and a way to
+(§48). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2229,7 +2229,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§47.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§48.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2340,7 +2340,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§47.2);
+- Still one field per index: compound indexes are still open (§48.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2879,7 +2879,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§47.2).
+- Still no pattern language, no conditions on array elements (§48.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2966,7 +2966,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §47.2).
+  §48.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3302,7 +3302,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§47.2).
+  run on such a file. Repairing is open (§48.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -3825,7 +3825,7 @@ allocation (§33.4).
 ### 43.7 Limits
 - **No `[*]` in a compound index.**
 - **No sort by several fields** (`sort_by(a).then_by(b)`): `Filter` still
-  sorts by one field.
+  sorts by one field. (Added in §47, which the index serves.)
 - **An OR or a NOT never uses a compound index's second field.** Each
   branch of an OR is bounded by itself (§36.3), so `(a = 1 AND b = 2) OR
   (a = 3)` does use one, branch by branch.
@@ -4262,13 +4262,161 @@ with an A1 line and some line of 9.
 - **No positional result.** MongoDB can return only the matching
   element (`$`); here a query returns whole documents.
 
-## 47. Roadmap
+## 47. Sorting by several fields (`query.rs`, `collection.rs`)
+
+Real and tested: a sort with any number of keys, each ascending or
+descending. It sorts by the first key, breaks ties with the second, and
+so on; documents equal in every key come in id order. An index serves
+as many of the leading keys as its fields allow, and the rest are
+sorted in memory, but only among documents that tie on the keys the
+index already ordered.
+
+```rust
+// By status, and within a status newest first:
+tasks.find(Filter::new().sort_asc("status").then_desc("created").limit(20))?;
+// By status, then oldest first: `(status, created)` gives both.
+tasks.find(Filter::new().sort_asc("status").then_asc("created").limit(20))?;
+// As a literal:
+Filter { sort: vec![Sort::asc("status"), Sort::desc("created")], ..Filter::default() }
+```
+
+### 47.1 API
+- `Filter.sort` changed from `Option<Sort>` to `Vec<Sort>`, most
+  significant key first, where empty means unsorted. This breaks code
+  that builds a `Filter` literal with `sort: Some(…)`. The fix is
+  `sort: vec![Sort::desc("started_at")]`, using the new constructors
+  `Sort::asc` and `Sort::desc`.
+- `then_asc`, `then_desc` and `then_by` add a key after the ones
+  before. `sort_asc`, `sort_desc` and `sort_by` still replace the whole
+  sort, as their documentation always said. This is like LINQ's
+  `OrderBy(…).ThenByDescending(…)`, and SQL's `ORDER BY status,
+  created DESC`.
+- `query::compare_by(keys, a, b)` holds the order: key by key, with
+  `sort_order` (§34.1) for each, until one differs. `apply_to` sorts
+  with it, stably after sorting by id, so full ties stay in id order as
+  before.
+
+Rejected:
+- **`sort_asc` appending when called twice.** A second call used to
+  replace the first, and code that relied on that would silently change
+  meaning. The `then_` methods say what they do.
+- **One sort direction for all keys.** "By status, newest first within
+  it" needs two directions, and it is the case the SPEC's own examples
+  keep coming back to.
+
+### 47.2 Which index, serving how many keys
+`index_order` still starts from the first key, looking for an index
+whose field after its `Eq`-fixed fields is that key (§34.2, §43.3). It
+now counts how many keys that index **serves**: how many of the
+following sort keys are its next fields, in order and in the same
+direction as the first. An index is read in one direction only, so a
+key that goes the other way ends the run. `(status, created)` serves
+two keys for `status asc, created asc` (or both `desc`), and one for
+`status asc, created desc`.
+
+Among the candidates, the one that fixes more fields by `Eq` wins, and
+then the one that serves more keys. Fixed fields narrow what is read;
+served keys only save sorting in memory.
+
+`OrderedRead` tells the sorted read the index, the range, how many
+fields are fixed and how many keys are served.
+
+### 47.3 The sorted read
+`read_in_index_order` groups the entries by the values of the served
+keys, and only those, instead of by the first key alone:
+- **An exact group with nothing left to sort** is read one document at a
+  time until the limit, as before.
+- **A group that needs sorting** is read whole and sorted by every key.
+  That's the case when keys remain after the served ones, or when a
+  value may stand for several (a long string cut to the key's share, a
+  number beyond 2^53). The sort sees the true values, so ties among the
+  served keys are ordered by the remaining keys.
+- **Groups are ordered** value by value, each in the first key's
+  direction, and for a compound index unordered values (`TAG_OTHER`)
+  come last within their position, in both directions, as `sort_order`
+  puts them. Before, the groups were reversed as a whole and the
+  unordered ones moved to the end, which was only right for one key.
+- **A group ends at the first value that may stand for several.** The
+  randomized test found this: three `desc` keys on `(a, b, c)` with `b`
+  a 1,200-byte string, cut to its share of a three-field key (§43.2). Grouped by
+  all three values, the entries sharing a cut `b` were ordered by `c`,
+  though their real `b`s differ past the cut and should decide first.
+  Now such a group runs up to and including the cut value, and is
+  sorted in memory by the real values.
+- **The scan for unordered values** after a one-field index (§34.2) now
+  sorts what it finds by the remaining keys. It still stops at the limit
+  when there's only one key, since id order is their order then.
+
+The cost of a key the index doesn't serve depends on its groups. In the
+typed test, sorting by `created, tenant` through the index on `created`
+reads 15 documents for 12 results: groups of five tasks with equal
+`created`, each sorted by tenant. `status asc, created desc` through
+`(status, created)` reads one whole status (1,000 of 3,000 tasks) for
+20 results. That is still a third of the reads of a full scan, but it
+shows why two directions are worth a separate index where it matters.
+
+### 47.4 Tests
+- `query.rs`:
+  - The in-memory order for two keys in either direction, and for a
+    `Filter` literal.
+  - Which index serves how many keys: two or three keys in one
+    direction, a later key the other way, a key that isn't the index's
+    next field, fixed fields beating served keys, and `sort_desc`
+    starting over after `then_asc`; an index fixing a field against one
+    serving more keys.
+- `collection.rs`:
+  - The randomized compound test now sorts by zero to three of `a`, `b`
+    and `c`, mostly in one direction and sometimes mixed. That covers
+    long strings, huge numbers, nulls, unordered values and every index
+    plan, sparse or not, through every kind of write and a reopen, with
+    the sorted result compared to a sort in memory. It's the test that
+    found the cut-value grouping above.
+  - The nested-filter random test sorts by `v` descending and now
+    sometimes then by `w`, so ties go through the in-memory part of the
+    index read, the unordered scan and the cursor.
+  - Typed tasks with ties in `created`: `status, created` in both
+    directions reads exactly 20; mixed directions read one status; the
+    index on `created` serves `created, tenant` with 15 reads. All
+    compared to sorting everything.
+  - Arrays in the indexed field, found by the scan after the index:
+    sorted among themselves by the next key, the best of them taken,
+    not the first by id.
+- Checked by breaking it on purpose, fourteen ways. Each of these
+  fails a test:
+  - only the first key compared in memory;
+  - an index serving keys whatever their direction, or whatever its
+    fields;
+  - ranking by fixed fields only, or by served keys before fixed ones;
+  - `sort_asc` not starting over;
+  - groups not ended at a cut value;
+  - groups not put in id order when fields follow;
+  - later keys never sorted in memory;
+  - unordered groups not put last, or `Desc` groups not reversed;
+  - the unordered values after the index taken in id order, or the scan
+    for them stopped at the limit despite later keys;
+  - only the first value of a group checked for exactness.
+
+  Three passed at first: ranking by served keys before fixed fields,
+  and the two about the scan after the index. No test had two indexes
+  where the rules disagree, and the random filters rarely got past the
+  index with more unordered matches than the limit. The two targeted
+  tests above catch them now.
+
+### 47.5 Limits
+- **An index serves keys in one direction only.** Mixed directions need
+  memory for the later keys, or a second index. Keys stored in
+  descending order per field (SQL's `CREATE INDEX … (a, b DESC)`) would
+  lift that; it isn't planned.
+- **No sort by array elements** (§42.3), as before.
+- **No sort without a limit through an index** (§34.2), as before.
+
+## 48. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 47.1 Done
+### 48.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -4285,9 +4433,9 @@ All of it is done:
 | 0.6.0 | `update_many`; the `trunkdb` command and `Database::check`; page checksums, file format 6 | §38–§40 |
 | 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
-| next | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match` | §45–§46 |
+| next | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 
-### 47.2 Open
+### 48.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -4295,8 +4443,6 @@ limit is described.
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
 
 **Indexes**
-- Sorting by several fields, which a compound index could then serve
-  in order too (§43.7).
 - A lazy B-tree walk, with backward leaf links for `Desc` (§34.2).
 
 **Storage and durability**

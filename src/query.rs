@@ -188,21 +188,41 @@ pub enum SortOrder {
     Desc,
 }
 
+/// One key of a sort: a field, and which way.
 #[derive(Debug, Clone)]
 pub struct Sort {
     pub field: String,
     pub order: SortOrder,
 }
 
+impl Sort {
+    pub fn asc(field: impl Into<String>) -> Self {
+        Sort {
+            field: field.into(),
+            order: SortOrder::Asc,
+        }
+    }
+
+    pub fn desc(field: impl Into<String>) -> Self {
+        Sort {
+            field: field.into(),
+            order: SortOrder::Desc,
+        }
+    }
+}
+
 /// A query: conditions that must all hold (each may nest ORs, ANDs and
-/// NOTs, SPEC §36), plus an optional sort-by-field and limit. Evaluated
-/// by scanning, or over index ranges when the conditions allow it
-/// (`index_ranges`, SPEC §28.4, §36.3), or by reading the sort field's
-/// index in order (`index_order`, SPEC §34.2).
+/// NOTs, SPEC §36), plus an optional sort and limit. Evaluated by
+/// scanning, or over index ranges when the conditions allow it
+/// (`index_ranges`, SPEC §28.4, §36.3), or by reading an index in sort
+/// order (`index_order`, SPEC §34.2, §47).
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub conditions: Vec<Condition>,
-    pub sort: Option<Sort>,
+    /// Sort keys, most significant first (SPEC §47): by the first field,
+    /// documents equal in it by the second, and so on; equal in all of
+    /// them, by id. Empty: no sort.
+    pub sort: Vec<Sort>,
     pub limit: Option<usize>,
 }
 
@@ -325,8 +345,28 @@ impl Filter {
         self.sort_by(field, SortOrder::Desc)
     }
 
+    /// Sorts by `field` — replacing any earlier sort.
     pub fn sort_by(mut self, field: impl Into<String>, order: SortOrder) -> Self {
-        self.sort = Some(Sort {
+        self.sort = Vec::new();
+        self.then_by(field, order)
+    }
+
+    /// Then by `field`, smallest first, for documents the sort so far
+    /// finds equal (SPEC §47): `.sort_asc("status").then_desc("created")`
+    /// — by status, and within a status newest first.
+    pub fn then_asc(self, field: impl Into<String>) -> Self {
+        self.then_by(field, SortOrder::Asc)
+    }
+
+    /// Then by `field`, largest first.
+    pub fn then_desc(self, field: impl Into<String>) -> Self {
+        self.then_by(field, SortOrder::Desc)
+    }
+
+    /// Adds a sort key after the ones before — the first one if there
+    /// are none.
+    pub fn then_by(mut self, field: impl Into<String>, order: SortOrder) -> Self {
+        self.sort.push(Sort {
             field: field.into(),
             order,
         });
@@ -366,13 +406,9 @@ impl Filter {
             .filter(|item| self.matches(doc_of(item)))
             .collect();
 
-        if let Some(sort) = &self.sort {
-            // Stable: equal values keep the order they came in.
-            results.sort_by(|a, b| {
-                let a = value_or_null(doc_of(a), &sort.field);
-                let b = value_or_null(doc_of(b), &sort.field);
-                sort_order(a, b, sort.order)
-            });
+        if !self.sort.is_empty() {
+            // Stable: equal in every key, they keep the order they came in.
+            results.sort_by(|a, b| compare_by(&self.sort, doc_of(a), doc_of(b)));
         }
 
         if let Some(limit) = self.limit {
@@ -723,8 +759,8 @@ impl Filter {
     }
 
     /// The index `find` reads in sort order (SPEC §34.2) — for a filter
-    /// with a `sort` and a `limit` — and the range of it to read, `None`
-    /// for all of it. An index on the sort field, unless the conditions
+    /// with a `sort` and a `limit` — and how: see `OrderedRead`. An index
+    /// on the first sort field, unless the conditions
     /// find documents by value some other way: an `Eq` on another indexed
     /// field, or an OR of indexed branches (a few documents found by value
     /// beat walking in order). Or a compound index with the sort field
@@ -734,13 +770,16 @@ impl Filter {
     /// better; the first among equals. The sort field's own range
     /// comparisons narrow the range. A sparse index only where the
     /// conditions keep out the documents it lacks (SPEC §44).
-    pub(crate) fn index_order<'a>(
-        &self,
-        indexes: &'a [IndexMeta],
-    ) -> Option<(&'a IndexMeta, Option<KeyRange>)> {
-        let sort = self.sort.as_ref()?;
+    ///
+    /// With several sort keys (SPEC §47), the index gives the order of
+    /// as many as its next fields are, in the same direction as the
+    /// first; among indexes fixing as many fields, the one that serves
+    /// more keys wins. The rest are sorted in memory, among documents
+    /// equal in the served ones.
+    pub(crate) fn index_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
+        let sort = self.sort.first()?;
         self.limit?;
-        let mut best: Option<(&IndexMeta, Vec<u8>, usize)> = None;
+        let mut best: Option<(&IndexMeta, Vec<u8>, usize, usize)> = None;
         for index in indexes {
             // A multikey index holds a document once per element, in
             // element order: no order of documents (SPEC §42.3).
@@ -754,11 +793,22 @@ impl Filter {
                 continue;
             };
             let (prefix, equal) = equal_prefix(index, &self.conditions, at);
-            if equal == at && best.as_ref().is_none_or(|(_, _, fixed)| at > *fixed) {
-                best = Some((index, prefix, at));
+            if equal != at {
+                continue;
+            }
+            let served = self
+                .sort
+                .iter()
+                .zip(&index.fields[at..])
+                .take_while(|(key, field)| key.field == **field && key.order == sort.order)
+                .count();
+            let better =
+                |(_, _, fixed, most): &(_, _, usize, usize)| (at, served) > (*fixed, *most);
+            if best.as_ref().is_none_or(better) {
+                best = Some((index, prefix, at, served));
             }
         }
-        let (index, prefix, fixed) = best?;
+        let (index, prefix, fixed, served) = best?;
         if fixed == 0 {
             let on_sort_field = |c: &&Condition| matches!(c, Condition::Compare { field, .. } if *field == sort.field);
             let others: Vec<Condition> = self
@@ -776,8 +826,27 @@ impl Filter {
             0 => range,
             _ => Some(range.map_or_else(|| KeyRange::prefixed(&prefix), |r| r.under(&prefix))),
         };
-        Some((index, range))
+        Some(OrderedRead {
+            index,
+            range,
+            fixed,
+            served,
+        })
     }
+}
+
+/// How `find` reads an index in sort order (`Filter::index_order`).
+#[derive(Debug)]
+pub(crate) struct OrderedRead<'a> {
+    pub index: &'a IndexMeta,
+    /// The part of it to read — `None` for all of it.
+    pub range: Option<KeyRange>,
+    /// How many of its first fields an `Eq` fixes: the first sort
+    /// field is the one after them.
+    pub fixed: usize,
+    /// How many sort keys, from the first, its fields give the order of
+    /// (SPEC §47) — at least one.
+    pub served: usize,
 }
 
 /// The value at `path` in `doc` (SPEC §31): a field name, or several
@@ -1003,6 +1072,18 @@ pub(crate) fn is_unordered(value: &Document) -> bool {
 /// values nothing orders come after all of them in both directions, as
 /// equals. It is the order of an index's keys, so reading an index gives
 /// what sorting in memory gives.
+/// `a` against `b` by the sort `keys` — by the first, where that's
+/// equal by the second, and so on (SPEC §47).
+pub(crate) fn compare_by(keys: &[Sort], a: &Document, b: &Document) -> std::cmp::Ordering {
+    keys.iter()
+        .map(|key| {
+            let (a, b) = (value_or_null(a, &key.field), value_or_null(b, &key.field));
+            sort_order(a, b, key.order)
+        })
+        .find(|ord| ord.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
 pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::cmp::Ordering {
     let (rank_a, rank_b) = (sort_rank(a), sort_rank(b));
     if rank_a == UNORDERED || rank_b == UNORDERED {
@@ -1443,7 +1524,7 @@ mod tests {
     #[test]
     fn a_compound_index_gives_the_order_after_its_fixed_fields() {
         let indexes = [index("created"), compound(&["status", "created"])];
-        let order = |f: Filter| f.limit(20).index_order(&indexes).map(|(i, _)| i.name());
+        let order = |f: Filter| f.limit(20).index_order(&indexes).map(|o| o.index.name());
         let newest = |f: Filter| f.sort_desc("created");
         assert_eq!(
             order(newest(Filter::new().eq("status", "Queued"))).as_deref(),
@@ -1459,10 +1540,11 @@ mod tests {
             Some("(status, created)")
         );
         // The range read: the fixed value, then the sort field's range.
-        let (_, range) = newest(Filter::new().eq("status", "Queued").gt("created", 5))
+        let range = newest(Filter::new().eq("status", "Queued").gt("created", 5))
             .limit(20)
             .index_order(&indexes)
-            .unwrap();
+            .unwrap()
+            .range;
         let k = |status: &str, created: i64| {
             key::compound(&[&status.into(), &created.into()], crate::DocId([0; 16]))
         };
@@ -1500,7 +1582,7 @@ mod tests {
         let five = key::secondary(&Document::Int(5), crate::DocId([0; 16])).unwrap();
         assert!(ranges[0].1.contains(&five), "{:?}", ranges[0].1);
 
-        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|(i, _)| i.name());
+        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|o| o.index.name());
         assert_eq!(order(Filter::new().sort_asc("nick")), None);
         assert_eq!(
             order(Filter::new().is_not_null("nick").sort_asc("nick")).as_deref(),
@@ -1526,11 +1608,114 @@ mod tests {
             plan(Filter::new().is_null("a").is_not_null("b")).as_deref(),
             Some("(a, b)")
         );
-        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|(i, _)| i.name());
+        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|o| o.index.name());
         assert_eq!(order(Filter::new().is_null("a").sort_asc("b")), None);
         assert_eq!(
             order(Filter::new().is_null("a").gt("b", 0).sort_asc("b")).as_deref(),
             Some("(a, b)")
+        );
+    }
+
+    /// With several sort keys (SPEC §47): an index serves as many as its
+    /// next fields are, in the first key's direction; one that fixes
+    /// more fields wins, then one that serves more keys.
+    #[test]
+    fn an_index_serves_the_sort_keys_its_fields_follow() {
+        let indexes = [
+            index("created"),
+            compound(&["status", "created"]),
+            compound(&["status", "created", "tenant"]),
+        ];
+        let read = |f: Filter| {
+            f.limit(10)
+                .index_order(&indexes)
+                .map(|o| (o.index.name(), o.fixed, o.served))
+        };
+        let status_created = || Filter::new().sort_asc("status").then_asc("created");
+        assert_eq!(
+            read(status_created()),
+            Some(("(status, created)".into(), 0, 2))
+        );
+        assert_eq!(
+            read(status_created().then_asc("tenant")),
+            Some(("(status, created, tenant)".into(), 0, 3))
+        );
+        // The other direction for a later key: the index serves the keys
+        // before it.
+        assert_eq!(
+            read(Filter::new().sort_asc("status").then_desc("created")),
+            Some(("(status, created)".into(), 0, 1))
+        );
+        assert_eq!(
+            read(Filter::new().sort_desc("status").then_desc("created")),
+            Some(("(status, created)".into(), 0, 2))
+        );
+        // Not the index's next field: only the first key.
+        assert_eq!(
+            read(Filter::new().sort_asc("created").then_asc("status")),
+            Some(("created".into(), 0, 1))
+        );
+        // Fixed fields beat served keys.
+        assert_eq!(
+            read(
+                Filter::new()
+                    .eq("status", "Queued")
+                    .sort_asc("created")
+                    .then_asc("tenant")
+            ),
+            Some(("(status, created, tenant)".into(), 1, 2))
+        );
+        assert_eq!(
+            read(Filter::new().eq("status", "Queued").sort_asc("created")),
+            Some(("(status, created)".into(), 1, 1))
+        );
+        // Even against an index that would serve more keys.
+        let fixing_or_serving = [
+            compound(&["created", "tenant"]),
+            compound(&["status", "created"]),
+        ];
+        let f = Filter::new()
+            .eq("status", "Queued")
+            .sort_asc("created")
+            .then_asc("tenant")
+            .limit(10);
+        let o = f.index_order(&fixing_or_serving).unwrap();
+        assert_eq!(
+            (o.index.name(), o.fixed, o.served),
+            ("(status, created)".into(), 1, 1)
+        );
+        // `then_*` adds; `sort_*` starts over.
+        let f = status_created().sort_desc("tenant");
+        assert_eq!(f.sort.len(), 1);
+        assert_eq!(f.sort[0].field, "tenant");
+    }
+
+    #[test]
+    fn several_sort_keys_sort_by_the_first_then_the_next() {
+        let d = |a: i64, b: &str| doc(&[("a", a.into()), ("b", b.into())]);
+        let docs = vec![d(2, "x"), d(1, "y"), d(2, "a"), d(1, "b"), d(1, "y")];
+        let sorted = |f: Filter| {
+            f.apply(docs.clone())
+                .iter()
+                .map(|doc| format!("{:?}{:?}", value_or_null(doc, "a"), value_or_null(doc, "b")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(
+            sorted(Filter::new().sort_asc("a").then_desc("b")),
+            r#"Int(1)String("y") Int(1)String("y") Int(1)String("b") Int(2)String("x") Int(2)String("a")"#
+        );
+        assert_eq!(
+            sorted(Filter::new().sort_desc("b").then_asc("a")),
+            r#"Int(1)String("y") Int(1)String("y") Int(2)String("x") Int(1)String("b") Int(2)String("a")"#
+        );
+        let literal = Filter {
+            sort: vec![Sort::desc("a"), Sort::asc("b")],
+            ..Filter::default()
+        };
+        assert_eq!(
+            sorted(literal),
+            r#"Int(2)String("a") Int(2)String("x") Int(1)String("b") Int(1)String("y") Int(1)String("y")"#
         );
     }
 
@@ -1681,10 +1866,10 @@ mod tests {
                 cond("j", Op::Ne, Document::Null),
                 cond("k", Op::Eq, Document::Array(vec![])),
             ],
-            sort: Some(Sort {
+            sort: vec![Sort {
                 field: "y".into(),
                 order: SortOrder::Desc,
-            }),
+            }],
             limit: Some(5),
         };
         // `Filter` has no `PartialEq` (a `Float` NaN isn't equal to itself).
@@ -1841,10 +2026,10 @@ mod tests {
     fn sort_by_a_nested_field() {
         let at = |n| doc(&[("meta", doc(&[("rank", Document::Int(n))]))]);
         let sorted = Filter {
-            sort: Some(Sort {
+            sort: vec![Sort {
                 field: "meta.rank".into(),
                 order: SortOrder::Desc,
-            }),
+            }],
             ..Default::default()
         }
         .apply(vec![at(2), at(3), at(1)]);
@@ -1899,10 +2084,10 @@ mod tests {
         ];
 
         let asc = Filter {
-            sort: Some(Sort {
+            sort: vec![Sort {
                 field: "age".into(),
                 order: SortOrder::Asc,
-            }),
+            }],
             ..Default::default()
         }
         .apply(docs.clone());
@@ -1916,10 +2101,10 @@ mod tests {
         );
 
         let desc = Filter {
-            sort: Some(Sort {
+            sort: vec![Sort {
                 field: "age".into(),
                 order: SortOrder::Desc,
-            }),
+            }],
             ..Default::default()
         }
         .apply(docs);
@@ -1958,10 +2143,10 @@ mod tests {
         ];
 
         let filter = Filter {
-            sort: Some(Sort {
+            sort: vec![Sort {
                 field: "tst".into(),
                 order: SortOrder::Desc,
-            }),
+            }],
             limit: Some(1),
             ..Default::default()
         };
@@ -2007,10 +2192,10 @@ mod tests {
         let sorted = |order, docs: Vec<Document>| {
             text(
                 Filter {
-                    sort: Some(Sort {
+                    sort: vec![Sort {
                         field: "v".into(),
                         order,
-                    }),
+                    }],
                     ..Default::default()
                 }
                 .apply(docs),
@@ -2080,10 +2265,10 @@ mod tests {
                 op: Op::Gte,
                 value: Document::Int(18),
             }],
-            sort: Some(Sort {
+            sort: vec![Sort {
                 field: "age".into(),
                 order: SortOrder::Asc,
-            }),
+            }],
             limit: Some(2),
         };
 

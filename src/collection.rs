@@ -5,7 +5,7 @@ use crate::database::Database;
 use crate::document::{DocId, Document, encode_document};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
-use crate::query::{Filter, QueryPlan, SortOrder};
+use crate::query::{Filter, OrderedRead, QueryPlan, SortOrder};
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
 use serde::Serialize;
@@ -273,9 +273,9 @@ impl<T> Collection<T> {
     pub fn explain(&self, filter: &Filter) -> crate::Result<QueryPlan> {
         let state = self.db.read()?;
         let indexes = state.catalog.indexes(&self.name);
-        if let Some((index, _range)) = filter.index_order(indexes) {
+        if let Some(order) = filter.index_order(indexes) {
             return Ok(QueryPlan::IndexOrder {
-                field: index.name(),
+                field: order.index.name(),
             });
         }
         Ok(match filter.index_ranges(indexes) {
@@ -587,7 +587,7 @@ impl Collection<Document> {
         filter: Filter,
         convert: fn(Document) -> crate::Result<T>,
     ) -> crate::Result<Cursor<T>> {
-        if filter.sort.is_some() {
+        if !filter.sort.is_empty() {
             let results = self.find_with_ids(filter)?;
             let converted = results
                 .into_iter()
@@ -647,11 +647,11 @@ fn find_in(
     collection: &str,
     filter: &Filter,
 ) -> crate::Result<Vec<(DocId, Document)>> {
-    if let Some((index, range)) = filter.index_order(catalog.indexes(collection)) {
-        return read_in_index_order(catalog, store, collection, filter, index, range);
+    if let Some(order) = filter.index_order(catalog.indexes(collection)) {
+        return read_in_index_order(catalog, store, collection, filter, order);
     }
     let mut candidates = read_candidates(catalog, store, collection, filter)?;
-    if filter.sort.is_some() {
+    if !filter.sort.is_empty() {
         // So equal sort values end up in id order, as they do when read
         // from an index (the sort is stable).
         candidates.sort_unstable_by_key(|(id, _doc)| *id);
@@ -692,82 +692,99 @@ fn candidate_entries(
 }
 
 /// `find` for a filter `Filter::index_order` chose (SPEC §34.2): walks the
-/// index on the sort field in sort order, checks each document against
-/// the whole filter, and stops as soon as `limit` match — the documents
-/// after that are never read. Already filtered, sorted and limited.
+/// index in sort order, checks each document against the whole filter,
+/// and stops as soon as `limit` match — the documents after that are
+/// never read. Already filtered, sorted and limited.
 ///
-/// Entries sharing a key's value part come in id order, which is sort
-/// order when their values are all equal (`key::is_exact`); the rare
-/// group where they may differ (huge numbers, cut strings) is read whole
-/// and sorted. Values no index holds (§34.1: arrays, NaN, ...) sort after
-/// everything: if the index runs out before the limit and no range
-/// condition on the sort field ruled them out, a scan finds them.
+/// Entries are read in groups that share the values of the served sort
+/// keys (`OrderedRead::served`). A group comes in id order, which is sort
+/// order when those values are all equal (`key::part_is_exact`) and no
+/// sort key is left for memory; otherwise the group is read whole and
+/// sorted by every key (SPEC §47) — the rare group whose values may
+/// differ (huge numbers, cut strings), or the documents equal in the
+/// served keys, for the keys after them. Values no one-field index holds
+/// (§34.1: arrays, NaN, ...) sort after everything: if the index runs
+/// out before the limit and no range condition on the sort field ruled
+/// them out, a scan finds them.
 ///
 /// A compound index (SPEC §43.3) is read within the values its first
-/// fields are fixed to, grouped by the sort field's value — by id within
-/// a group, which fields after the sort field would otherwise order. It
-/// holds every document, the unordered values too, under a tag of their
-/// own: those groups go last, whichever the direction.
+/// fields are fixed to — by id within a group, which fields after the
+/// served ones would otherwise order. It holds every document, the
+/// unordered values too, under a tag of their own: those go last in
+/// their group's order, whichever the direction.
 fn read_in_index_order(
     catalog: &Catalog,
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
-    index: &IndexMeta,
-    range: Option<KeyRange>,
+    order: OrderedRead,
 ) -> crate::Result<Vec<(DocId, Document)>> {
-    let (Some(sort), Some(limit)) = (&filter.sort, filter.limit) else {
+    let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
         unreachable!("index_order needs a sort and a limit");
     };
     let mut results = Vec::new();
     if limit == 0 {
         return Ok(results);
     }
-    let unordered_can_match = range.is_none() && !index.is_compound();
-    let entries =
-        BTreeIndex::new(index.root).range(store, &range.unwrap_or_else(KeyRange::everything))?;
+    let index = order.index;
+    let unordered_can_match = order.range.is_none() && !index.is_compound();
+    let entries = BTreeIndex::new(index.root)
+        .range(store, &order.range.unwrap_or_else(KeyRange::everything))?;
     let fields = index.fields.len();
-    let at = index
-        .fields
-        .iter()
-        .position(|f| *f == sort.field)
-        .expect("index_order picks an index with the sort field");
-    // The sort field's value in a key, and everything before it.
-    let sort_value = |key: &[u8]| -> (usize, usize) {
-        let value_part = key::value_part(key);
-        match index.is_compound() {
-            false => (0, value_part.len()),
-            true => {
-                let parts = key::parts(value_part);
-                let start: usize = parts[..at].iter().map(|p| p.len()).sum();
-                (start, start + parts[at].len())
+    let (at, end) = (order.fixed, order.fixed + order.served);
+    // The served sort keys' values in a key: where they start and end.
+    // Up to the first that may stand for several values (a cut string,
+    // a huge number): the keys after it don't order entries it holds,
+    // whose true values may differ — they're sorted in memory instead.
+    let served = |key: &[u8]| -> (usize, usize) {
+        let parts = key::parts(key::value_part(key));
+        let start: usize = parts[..at].iter().map(|p| p.len()).sum();
+        let mut len = 0;
+        for part in &parts[at..end] {
+            len += part.len();
+            if !key::part_is_exact(part, fields) {
+                break;
             }
         }
+        (start, start + len)
     };
     let mut groups: Vec<Vec<(Vec<u8>, RecordLocation)>> = entries
-        .chunk_by(|(a, _), (b, _)| a[..sort_value(a).1] == b[..sort_value(b).1])
+        .chunk_by(|(a, _), (b, _)| a[..served(a).1] == b[..served(b).1])
         .map(<[_]>::to_vec)
         .collect();
-    if at + 1 < fields {
+    if end < fields {
         for group in &mut groups {
             group.sort_by_key(|(key, _)| key::doc_id(key));
         }
     }
-    if sort.order == SortOrder::Desc {
-        groups.reverse();
-    }
-    let part = |key: &[u8]| {
-        let (start, end) = sort_value(key);
-        key[start..end].to_vec()
+    let values = |group: &[(Vec<u8>, RecordLocation)]| {
+        let key = &group[0].0;
+        let (start, end) = served(key);
+        key::parts(&key[start..end])
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>()
     };
-    if index.is_compound() {
-        // Stable: the other groups keep their order among themselves.
-        groups.sort_by_key(|group| key::is_other(&part(&group[0].0)));
-    }
+    // Value by value, as `query::sort_order` compares: the encodings
+    // sort as the values do; unordered ones last, whichever the
+    // direction. Stable, so groups that compare equal keep their order.
+    groups.sort_by_cached_key(|group| {
+        values(group)
+            .into_iter()
+            .map(|part| {
+                let other = key::is_other(&part);
+                (other, Directed(part, first.order))
+            })
+            .collect::<Vec<_>>()
+    });
+    let in_memory = filter.sort.len() > order.served;
     let mut records = data::Records::new(store);
     let mut read = |loc: &RecordLocation| records.get(*loc);
     for group in groups {
-        if key::part_is_exact(&part(&group[0].0), fields) {
+        let exact = values(&group)
+            .iter()
+            .all(|part| key::part_is_exact(part, fields));
+        if exact && !in_memory {
             for (_key, loc) in &group {
                 let (id, doc) = read(loc)?;
                 if filter.matches(&doc) {
@@ -798,19 +815,56 @@ fn read_in_index_order(
         let meta = catalog
             .get(collection)
             .expect("an indexed collection exists");
+        let mut unordered = Vec::new();
         for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
             let (id, doc) = read(&loc)?;
-            let value = crate::query::value_or_null(&doc, &sort.field);
+            let value = crate::query::value_or_null(&doc, &first.field);
             if crate::query::is_unordered(value) && filter.matches(&doc) {
-                results.push((id, doc));
-                if results.len() == limit {
+                unordered.push((id, doc));
+                // Without keys after the first, id order is their order.
+                if !in_memory && results.len() + unordered.len() == limit {
                     break;
                 }
             }
         }
+        let unlimited = Filter {
+            conditions: Vec::new(),
+            limit: None,
+            ..filter.clone()
+        };
+        results.extend(unlimited.apply_to(unordered, |(_id, doc)| doc));
+        results.truncate(limit);
     }
     Ok(results)
 }
+
+/// An encoded value that sorts ascending or descending as its
+/// `SortOrder` says — the key `read_in_index_order` sorts groups by.
+struct Directed(Vec<u8>, SortOrder);
+
+impl Ord for Directed {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let ord = self.0.cmp(&other.0);
+        match self.1 {
+            SortOrder::Asc => ord,
+            SortOrder::Desc => ord.reverse(),
+        }
+    }
+}
+
+impl PartialOrd for Directed {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Directed {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Directed {}
 
 /// `filter` stopping at its first match — what `find_one` asks for, so
 /// a sorted one can stop early too (SPEC §34.2).
@@ -1628,10 +1682,10 @@ mod tests {
         }
 
         let filter = Filter {
-            sort: Some(crate::query::Sort {
+            sort: vec![crate::query::Sort {
                 field: "age".to_string(),
                 order: crate::query::SortOrder::Desc,
-            }),
+            }],
             limit: Some(3),
             ..age_filter(crate::query::Op::Gte, 25)
         };
@@ -2543,10 +2597,10 @@ mod tests {
         assert!(people.ensure_index("address.city").unwrap());
 
         let in_berlin = Filter {
-            sort: Some(crate::query::Sort {
+            sort: vec![crate::query::Sort {
                 field: "address.zip".to_string(),
                 order: SortOrder::Desc,
-            }),
+            }],
             ..filter(vec![cond(
                 "address.city",
                 Op::Eq,
@@ -2682,7 +2736,7 @@ mod tests {
         ];
         Filter {
             conditions,
-            sort: Some(crate::query::Sort { field, order }),
+            sort: vec![crate::query::Sort { field, order }],
             limit: limits[rng.below(limits.len())],
         }
     }
@@ -2810,13 +2864,19 @@ mod tests {
                 _ => cond("b", Op::Ne, random_value(rng)),
             });
         }
-        let sort = match rng.below(4) {
-            0 => None,
-            n => Some(crate::query::Sort {
-                field: ["a", "b", "c"][n - 1].to_string(),
-                order: [SortOrder::Asc, SortOrder::Desc][rng.below(2)],
-            }),
-        };
+        // Up to three sort keys (SPEC §47), each field once, each way;
+        // mostly one direction for all, so an index can serve several.
+        let mut fields = vec!["a", "b", "c"];
+        let order = [SortOrder::Asc, SortOrder::Desc][rng.below(2)];
+        let sort = (0..rng.below(4))
+            .map(|_| crate::query::Sort {
+                field: fields.remove(rng.below(fields.len())).to_string(),
+                order: match rng.below(4) {
+                    0 => [SortOrder::Asc, SortOrder::Desc][rng.below(2)],
+                    _ => order,
+                },
+            })
+            .collect();
         let limits = [None, Some(0), Some(1), Some(3), Some(10), Some(1000)];
         Filter {
             conditions,
@@ -2880,7 +2940,7 @@ mod tests {
                 let f = random_compound_filter(rng);
                 let ids = |found: Vec<(DocId, Document)>| {
                     let mut ids: Vec<DocId> = found.into_iter().map(|(id, _)| id).collect();
-                    if f.sort.is_none() {
+                    if f.sort.is_empty() {
                         ids.sort();
                     }
                     ids
@@ -2888,7 +2948,7 @@ mod tests {
                 let expected = ids(f.apply_to(all.clone(), |(_, doc)| doc));
                 let plan = docs.explain(&f).unwrap();
                 let found = ids(docs.find_with_ids(f.clone()).unwrap());
-                if f.sort.is_none() && f.limit.is_some() {
+                if f.sort.is_empty() && f.limit.is_some() {
                     // Which documents a limit without a sort keeps isn't
                     // promised: any that match, as many as it allows.
                     let unlimited = Filter {
@@ -3055,6 +3115,110 @@ mod tests {
         all_done.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(created, all_done[..5]);
         assert_consistent(&db);
+    }
+
+    /// Values no one-field index holds (arrays here) sort after all the
+    /// others, found by a scan after the index (SPEC §34.2) — and among
+    /// themselves by the next sort key (SPEC §47.3), not in id order:
+    /// the scan reads them all before taking the limit.
+    #[test]
+    fn unordered_values_after_the_index_are_sorted_by_the_next_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("v").unwrap();
+        for w in 0..15i64 {
+            let v = match w < 5 {
+                true => Document::Int(w),
+                false => Document::Array(vec![Document::Int(w)]),
+            };
+            docs.insert(object(vec![("v", v), ("w", Document::Int(w))]))
+                .unwrap();
+        }
+        let f = Filter::new().sort_asc("v").then_desc("w").limit(8);
+        assert_eq!(
+            docs.explain(&f).unwrap(),
+            QueryPlan::IndexOrder { field: "v".into() }
+        );
+        let w = |found: Vec<Document>| -> Vec<Document> {
+            found
+                .iter()
+                .map(|d| crate::query::value_or_null(d, "w").clone())
+                .collect()
+        };
+        let all = docs.find(Filter::new()).unwrap();
+        let expected = w(f.apply(all));
+        assert_eq!(expected, [0, 1, 2, 3, 4, 14, 13, 12].map(Document::Int));
+        assert_eq!(w(docs.find(f).unwrap()), expected);
+    }
+
+    /// Sorting by several fields (SPEC §47) through `(status, created)`:
+    /// both keys in one direction are read in order, 20 documents read
+    /// for 20 results; with the second key the other way, the index gives
+    /// the status order and each status is sorted in memory; the index on
+    /// `created` alone serves a sort by `created, tenant` — ties by
+    /// tenant, in memory. Always what sorting everything finds.
+    #[test]
+    fn tasks_sort_by_status_then_by_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Task>("tasks");
+        let mut batch = db.batch();
+        for n in 0..3000i64 {
+            let task = Task {
+                status: ["Queued", "Running", "Done"][(n * 7 % 3) as usize].into(),
+                // Each value 5 times, so `created` has ties.
+                created: (n * 7919) % 600,
+                tenant: format!("t{}", n * 13 % 5),
+            };
+            batch.insert(&tasks, task).unwrap();
+        }
+        batch.commit().unwrap();
+        tasks.ensure_index(["status", "created"]).unwrap();
+        tasks.ensure_index("created").unwrap();
+        let all: Vec<Document> = tasks
+            .find(Filter::new())
+            .unwrap()
+            .iter()
+            .map(|t| crate::serde_bridge::to_document(t).unwrap())
+            .collect();
+        let check = |f: Filter, plan: &str, max_reads: usize| {
+            assert_eq!(
+                tasks.explain(&f).unwrap(),
+                QueryPlan::IndexOrder { field: plan.into() },
+                "{f:?}"
+            );
+            let mut found = Vec::new();
+            let reads = records_read(|| found = tasks.find(f.clone()).unwrap());
+            assert!(reads <= max_reads, "{f:?}: {reads} reads");
+            let found: Vec<Document> = found
+                .iter()
+                .map(|t| crate::serde_bridge::to_document(t).unwrap())
+                .collect();
+            assert_eq!(found, f.apply(all.clone()), "{f:?}");
+        };
+        let by_both = Filter::new()
+            .sort_asc("status")
+            .then_asc("created")
+            .limit(20);
+        check(by_both, "(status, created)", 20);
+        let by_both_desc = Filter::new()
+            .sort_desc("status")
+            .then_desc("created")
+            .limit(20);
+        check(by_both_desc, "(status, created)", 20);
+        // "Done" first, newest first: the 1000 done tasks are sorted.
+        let newest_per_status = Filter::new()
+            .sort_asc("status")
+            .then_desc("created")
+            .limit(20);
+        check(newest_per_status, "(status, created)", 1000);
+        // Five tasks per `created`: each five sorted by tenant.
+        let by_created_tenant = Filter::new()
+            .sort_asc("created")
+            .then_desc("tenant")
+            .limit(12);
+        check(by_created_tenant, "created", 15);
     }
 
     /// Unique in all its fields at once (SPEC §43.4): an email may repeat
@@ -3390,6 +3554,11 @@ mod tests {
             }
             if rng.below(3) == 0 {
                 f = f.sort_desc("v").limit([1, 5, 50][rng.below(3)]);
+                // Ties in `v` by `w` (SPEC §47): the index on `v` gives
+                // the order of `v` only, `w` is sorted in memory.
+                if rng.below(2) == 0 {
+                    f = f.then_by("w", [SortOrder::Asc, SortOrder::Desc][rng.below(2)]);
+                }
             }
             let ids = |found: Vec<(DocId, Document)>| -> Vec<DocId> {
                 found.into_iter().map(|(id, _)| id).collect()
@@ -3402,7 +3571,7 @@ mod tests {
                 .unwrap()
                 .collect::<crate::Result<Vec<_>>>();
             let mut streamed = ids(streamed.unwrap());
-            if f.sort.is_none() {
+            if f.sort.is_empty() {
                 expected.sort();
                 found.sort();
                 streamed.sort();
@@ -3411,7 +3580,7 @@ mod tests {
             assert_eq!(streamed, expected, "cursor: {f:?} via {plan:?}");
             let counted = docs
                 .count(Filter {
-                    sort: None,
+                    sort: Vec::new(),
                     ..f.clone()
                 })
                 .unwrap();
@@ -4315,10 +4484,10 @@ mod tests {
 
     fn by_age(order: SortOrder) -> Filter {
         Filter {
-            sort: Some(Sort {
+            sort: vec![Sort {
                 field: "age".to_string(),
                 order,
-            }),
+            }],
             ..Filter::default()
         }
     }
