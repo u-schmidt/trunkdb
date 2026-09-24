@@ -121,7 +121,7 @@ mod tests {
 
     fn by_key(key: &str) -> Filter {
         Filter {
-            conditions: vec![Condition {
+            conditions: vec![Condition::Compare {
                 field: "key".to_string(),
                 op: Op::Eq,
                 value: crate::Document::String(key.to_string()),

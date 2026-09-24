@@ -500,7 +500,7 @@ mod tests {
         let target = open(&dir, "target.trunkdb");
         assert_same_contents(&target, &source);
         let filter = Filter {
-            conditions: vec![Condition {
+            conditions: vec![Condition::Compare {
                 field: "age".into(),
                 op: Op::Eq,
                 value: Document::Int(42),
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(people.unique_indexes().unwrap(), ["born"]);
         let found = people
             .find_one(Filter {
-                conditions: vec![Condition {
+                conditions: vec![Condition::Compare {
                     field: "name".into(),
                     op: Op::Eq,
                     value: Document::String("Grace".into()),

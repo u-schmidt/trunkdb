@@ -103,7 +103,7 @@ cargo test
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §36 for the full list and reasoning):
+Done so far (see SPEC.md §37 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -127,8 +127,10 @@ Done so far (see SPEC.md §36 for the full list and reasoning):
 
    Items 4–8 → 0.4.0.
 9. **A filter builder** (§35): `Filter::new().eq("status", "Complete")`.
+10. **OR, NOT and nesting** (§36): `.any_of([...])`, `|`, `&`, `!` —
+    an OR of indexed values reads just those index ranges.
 
-What's still open: SPEC.md §36.2.
+What's still open: SPEC.md §37.2.
 
 ## License
 

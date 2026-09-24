@@ -56,7 +56,7 @@ layer's own implementation is still incomplete in v0).
 | Indexing | `Index` | `BTreeIndex` (persisted B-tree, O(log n), byte-string keys; primary `_id` index §10, secondary indexes §28) + `InMemoryIndex` (fake, tests only) | Yes |
 | Transactions | `TransactionManager` | `GlobalLockTxnManager` (one global lock), wired via `Database::write_batch` (§17); rollback via staged pages (§19.5) | Yes — atomicity and rollback; no isolation |
 | Durability | `Durability` | `WalDurability` (page-image write-ahead log, §19; op-level before that, §16) + `NoopDurability` (fake, tests only) | Yes |
-| Query execution | — (`Filter`) | flat AND of comparisons, built with a builder (§35); a full scan, one secondary index's range (§28.4), or an index read in sort order up to the limit (§34.2), by a fixed rule | No — deliberately minimal |
+| Query execution | — (`Filter`) | comparisons combined by AND, OR and NOT (§36), built with a builder (§35); a full scan, one secondary index's range (§28.4), a union of ranges for an OR (§36.3), or an index read in sort order up to the limit (§34.2), by a fixed rule | No — deliberately minimal |
 | Public API | `Collection<T>`, `Database` | Both `Collection<Document>` (§12) and typed `Collection<T>` (§13.3) real | Yes |
 
 ## 4. Key decisions and rationale
@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §36 for the roadmap.
+large-document workload (§5.2) the second; see §37 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -243,8 +243,8 @@ only.
 **Explicitly out of v0:**
 - A real (cost-based) query planner; secondary indexes were added
   later (§28), with a fixed rule for when to use one
-- OR/nested conditions, joins, aggregates (GROUP BY/COUNT-style — left to
-  application code, per §5.1)
+- Joins, aggregates (GROUP BY/COUNT-style — left to application code,
+  per §5.1); OR/nested conditions were added later (§36)
 - Concurrent multi-process access; concurrent writers (batches are
   serialized, §27)
 - Compaction/vacuum, encryption, schema validation; online backups
@@ -1190,7 +1190,7 @@ Considered and rejected:
   common; see §20.4.
 
 One collection per page, never mixed: a scan of one collection then
-touches only its own pages, and dropping a collection (§36.2) can free
+touches only its own pages, and dropping a collection (§37.2) can free
 whole pages.
 
 ### 20.2 `SlottedPage`: compaction, slot reuse, in-place update
@@ -1236,7 +1236,7 @@ page, which the next insert will use anyway. Known limitation: a partly
 emptied page that isn't current only gets its space back through
 updates of its own documents; inserts don't look there (no free-space
 map, §20.1). Churn-heavy workloads can leave pages half empty until a
-future vacuum (§36.2).
+future vacuum (§37.2).
 
 ### 20.5 Room for overflow pages
 Every data cell now starts with a flags byte: `[u8 flags][16-byte
@@ -1390,7 +1390,7 @@ pages holding dozens of entries.
 - **`u16` lengths** in the document encoding can't wrap today, since a
   whole document must fit in one page; overflow pages (§26) had to widen
   them, as already planned. *Done in §26.1.*
-- **Bit rot** stays undetected until per-page checksums (§36.2).
+- **Bit rot** stays undetected until per-page checksums (§37.2).
 
 ## 23. `find_with_ids` (`collection.rs`, `query.rs`)
 
@@ -1520,7 +1520,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§36.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§37.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1701,7 +1701,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§36.2).
+(§37.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2083,7 +2083,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§36). It's also a backup that can be read and `diff`ed, and a way to
+(§37). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2210,7 +2210,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§36.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§37.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2319,7 +2319,7 @@ through export and import anyway, and this can't happen.)
 - A lookup splits the path as it walks — no allocation — so a top-level
   field costs what it did before.
 - No array traversal (§31.3), no escaping of dots (§31.2).
-- Still one field per index: compound indexes are still open (§36.2);
+- Still one field per index: compound indexes are still open (§37.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2738,19 +2738,131 @@ timestamp struct, an enum — go through `serde_bridge::to_document`.
 - The doc example on `Filter`'s builder `impl` runs as a doc test.
 
 ### 35.4 Limits
-- Still AND only: OR and nesting are still open (§36.2); the builder
-  is where `.or(...)` will go.
+- Still AND only — OR and nesting came next, in §36 (`any_of`, `and`,
+  and `|`, `&`, `!` on `Condition`).
 - No compile-time check of field names — they're strings, as in
   MongoDB's drivers (a closure like LiteDB's `x => x.Name` can't be
   inspected in Rust).
 
-## 36. Roadmap
+## 36. OR, NOT and nesting (`query.rs`, `collection.rs`)
+
+Real and tested: conditions can be combined with OR, AND and NOT, nested
+as deep as needed, and an OR whose branches can use indexes reads just
+those index ranges.
+
+```rust
+runs.find(
+    Filter::new()
+        .any_of([Condition::eq("status", "Queued"), Condition::eq("status", "Running")])
+        .and(!Condition::lt("seen", 30))
+        .sort_desc("started_at"),
+)?;   // explain: IndexUnion { fields: ["status", "status"] }
+
+// The same with operators — `&` binds tighter than `|`, as in Rust:
+let c = (Condition::eq("status", "Queued") | Condition::eq("status", "Running"))
+    & !Condition::lt("seen", 30);
+```
+
+### 36.1 `Condition` is a tree
+```rust
+pub enum Condition {
+    Compare { field: String, op: Op, value: Document },
+    All(Vec<Condition>),     // AND — true if empty
+    Any(Vec<Condition>),     // OR — false if empty
+    Not(Box<Condition>),
+}
+```
+`Filter.conditions` stays a list that must all hold — the top level is
+an AND, as before — but each entry can now be a group. What was the
+struct `Condition { field, op, value }` is the variant
+`Condition::Compare { field, op, value }`: a breaking change for code
+that built conditions by hand, which the builder (§35) mostly replaced.
+
+Rejected: a separate expression type next to a flat `Condition` struct
+(`Filter.conditions: Vec<Expr>`, `Expr::Is(Condition)`). It keeps the
+old struct but adds a wrapper at every use, and two names for "a
+condition". Rejected: SQL's three-valued logic. `NOT` is plain negation
+of "matches": `!(x == 5)` is true where `x` is missing, like `x != 5`
+(§32). A missing field is never "unknown" here, only null.
+
+### 36.2 Building
+`Condition::eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `contains`, `is_null`,
+`is_not_null`, `compare`, and `Condition::any([...])`/`all([...])` for
+groups built from lists. `Filter::and(condition)` adds any condition,
+`Filter::any_of([...])` an OR.
+
+The operators `|`, `&` and `!` build the same trees. A chain flattens —
+`a | b | c` is one OR of three — and Rust's precedence applies (`&`
+before `|`). Rejected: a method `Condition::not(c)`: clippy flags it as
+confusable with `std::ops::Not::not`, and implementing the trait is the
+idiomatic way anyway; `!c` is what a C# or Rust reader expects. Rejected:
+`.or(...)` on `Filter` itself: in a chain like
+`f.eq(a).or(g).eq(b)` the grouping would depend on call order, which
+reads ambiguously. `any_of` says exactly what's grouped.
+
+### 36.3 Indexes: bounds and unions
+Planning is one recursive function, `bounds_for`: for a condition, index
+ranges whose **union** holds every document it can match — or `None` if
+no index can bound it.
+- A comparison on an indexed field: its range (§28.4), with all the
+  comparisons on that field in the same AND intersected.
+- An AND (the filter's list, or a nested `All`): the best bounds of any
+  one part — every match must satisfy that part anyway.
+- An OR: the union of every branch's bounds — but only if **every**
+  branch has some. One branch no index can bound can match documents
+  outside any range, so then there's no bound, and the other conditions
+  or a scan decide.
+- A NOT: none. The complement of a range is two ranges, but the rest of
+  the NOT's semantics (missing fields, values of other kinds) make it
+  more than that; not worth it yet.
+
+Choosing, rule-based like §28.4: an `Eq` beats an OR's union, which
+beats a range — "found by value" first. An OR of `Eq`s is how "status is
+one of these" is written, so it ranks right after a single `Eq`. The
+same rule decides against reading in sort order (§34.2): if the
+conditions *other than those on the sort field* can find documents by
+value — an `Eq` or a union — they're used instead. That rule no longer
+depends on the order conditions were added in.
+
+A union reads each range and keeps each document once — ranges of
+different indexes, or overlapping ones of the same, can hold the same
+document. `explain` says `IndexUnion { fields }`, one field per range.
+An OR of nothing matches nothing and reads no range at all.
+
+### 36.4 Tests
+- `nested_filters_find_what_a_scan_finds_on_every_plan`: 400 random
+  filters, conditions nested three deep — ANDs, ORs (empty ones
+  included), NOTs, every operator, on two indexed fields, an unindexed
+  one and a field no document has — some sorted with a limit. `find`,
+  `cursor` and `count` must each give exactly what checking every
+  document gives, before and after a reopen, and all four plans (scan,
+  index, union, order) must run.
+- `index_ranges_union_the_branches_of_an_or`: every planning rule —
+  unions, ANDs inside branches, nested ORs flattening, an empty OR, an
+  unbounded branch or a NOT falling back, `Eq` over union over range in
+  any order, and reading in order giving way to a union.
+- `an_or_of_indexed_values_reads_just_those`: typed, with the read
+  counter (§34.3): `status` in two of three values reads 200 of 300
+  documents.
+- Matching: OR, AND, NOT, empty groups, nesting, NOT against missing
+  fields; the builder's and the operators' trees, precedence included.
+- Checked by breaking it on purpose, four ways: an OR skipping a branch
+  with no bounds, a NOT using its inner bounds, no de-duplication in a
+  union, a union of the first branch only. Each fails a test.
+
+### 36.5 Limits
+- A NOT never uses an index (§36.3).
+- An AND uses one part's bounds, never the intersection of several
+  indexes' ranges.
+- Still no pattern language, no conditions on array elements (§37.2).
+
+## 37. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 36.1 Done
+### 37.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -2763,15 +2875,13 @@ All of it is done:
 | 0.3.0 | Block B, the sync workload: `find_with_ids`, typed batches, `Contains` (planned as 0.2.0, never released on its own) | §23–§25 |
 | 0.3.0 | Block C, the large-document workload: overflow pages, a thread-safe `Database`, secondary indexes, `find_one`/`count`/`upsert`/`cursor` | §26–§29 |
 | 0.4.0 | Export/import, nested-field paths, null and missing fields, unique indexes, sorting through an index; file format 5 | §30–§34 |
-| next | A filter builder | §35 |
+| next | A filter builder; OR, NOT and nesting | §35–§36 |
 
-### 36.2 Open
+### 37.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
 **Queries**
-- OR and nested conditions in `Filter` — the builder is where `.or(...)`
-  goes (§35.4).
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
 - Conditions on array elements (`tags` contains `x`), with multikey
   indexes (§31.3).

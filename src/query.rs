@@ -19,11 +19,91 @@ pub enum Op {
     Contains,
 }
 
+/// What a document must satisfy (SPEC §36): a comparison of one field, or
+/// several conditions combined — nested as deep as needed.
 #[derive(Debug, Clone)]
-pub struct Condition {
-    pub field: String,
-    pub op: Op,
-    pub value: Document,
+pub enum Condition {
+    /// `field op value`.
+    Compare {
+        field: String,
+        op: Op,
+        value: Document,
+    },
+    /// Every one of them holds (AND) — true if there are none.
+    All(Vec<Condition>),
+    /// At least one of them holds (OR) — false if there are none.
+    Any(Vec<Condition>),
+    /// It doesn't hold (NOT). Plain two-valued logic: `not(x == 5)` is
+    /// true where `x` is missing, like `x != 5` (SPEC §32).
+    Not(Box<Condition>),
+}
+
+/// Building conditions, for `Filter::and` and `Filter::any_of` (SPEC
+/// §36.2). Values convert as in `Filter`'s builder. `|`, `&` and `!`
+/// combine them: `Condition::eq("a", 1) | !Condition::eq("b", 2)`.
+impl Condition {
+    pub fn compare(field: impl Into<String>, op: Op, value: impl Into<Document>) -> Self {
+        Condition::Compare {
+            field: field.into(),
+            op,
+            value: value.into(),
+        }
+    }
+
+    pub fn eq(field: impl Into<String>, value: impl Into<Document>) -> Self {
+        Self::compare(field, Op::Eq, value)
+    }
+
+    pub fn ne(field: impl Into<String>, value: impl Into<Document>) -> Self {
+        Self::compare(field, Op::Ne, value)
+    }
+
+    pub fn lt(field: impl Into<String>, value: impl Into<Document>) -> Self {
+        Self::compare(field, Op::Lt, value)
+    }
+
+    pub fn lte(field: impl Into<String>, value: impl Into<Document>) -> Self {
+        Self::compare(field, Op::Lte, value)
+    }
+
+    pub fn gt(field: impl Into<String>, value: impl Into<Document>) -> Self {
+        Self::compare(field, Op::Gt, value)
+    }
+
+    pub fn gte(field: impl Into<String>, value: impl Into<Document>) -> Self {
+        Self::compare(field, Op::Gte, value)
+    }
+
+    pub fn contains(field: impl Into<String>, needle: impl Into<String>) -> Self {
+        Self::compare(field, Op::Contains, needle.into())
+    }
+
+    pub fn is_null(field: impl Into<String>) -> Self {
+        Self::compare(field, Op::Eq, Document::Null)
+    }
+
+    pub fn is_not_null(field: impl Into<String>) -> Self {
+        Self::compare(field, Op::Ne, Document::Null)
+    }
+
+    /// AND.
+    pub fn all(conditions: impl IntoIterator<Item = Condition>) -> Self {
+        Condition::All(conditions.into_iter().collect())
+    }
+
+    /// OR.
+    pub fn any(conditions: impl IntoIterator<Item = Condition>) -> Self {
+        Condition::Any(conditions.into_iter().collect())
+    }
+
+    pub fn matches(&self, doc: &Document) -> bool {
+        match self {
+            Condition::Compare { field, op, value } => compare_matches(field, op, value, doc),
+            Condition::All(conditions) => conditions.iter().all(|c| c.matches(doc)),
+            Condition::Any(conditions) => conditions.iter().any(|c| c.matches(doc)),
+            Condition::Not(condition) => !condition.matches(doc),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,10 +118,11 @@ pub struct Sort {
     pub order: SortOrder,
 }
 
-/// v0's entire query language: a flat AND of comparisons plus an
-/// optional sort-by-field and limit — still no OR, no nesting. Evaluated
-/// by scanning, or over one secondary index's range when a condition
-/// allows it (`index_range`, SPEC §28.4).
+/// A query: conditions that must all hold (each may nest ORs, ANDs and
+/// NOTs, SPEC §36), plus an optional sort-by-field and limit. Evaluated
+/// by scanning, or over index ranges when the conditions allow it
+/// (`index_ranges`, SPEC §28.4, §36.3), or by reading the sort field's
+/// index in order (`index_order`, SPEC §34.2).
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub conditions: Vec<Condition>,
@@ -74,18 +155,19 @@ impl Filter {
     }
 
     /// Adds a condition: the field `op`-compares true against `value`.
-    pub fn condition(
-        mut self,
-        field: impl Into<String>,
-        op: Op,
-        value: impl Into<Document>,
-    ) -> Self {
-        self.conditions.push(Condition {
-            field: field.into(),
-            op,
-            value: value.into(),
-        });
+    pub fn condition(self, field: impl Into<String>, op: Op, value: impl Into<Document>) -> Self {
+        self.and(Condition::compare(field, op, value))
+    }
+
+    /// Adds any `Condition` — an OR, a NOT, a nested group (SPEC §36).
+    pub fn and(mut self, condition: Condition) -> Self {
+        self.conditions.push(condition);
         self
+    }
+
+    /// Adds an OR: at least one of `conditions` holds.
+    pub fn any_of(self, conditions: impl IntoIterator<Item = Condition>) -> Self {
+        self.and(Condition::any(conditions))
     }
 
     /// `field == value`. Against null, also true for a missing field
@@ -159,7 +241,7 @@ impl Filter {
 
 impl Filter {
     pub fn matches(&self, doc: &Document) -> bool {
-        self.conditions.iter().all(|c| condition_matches(c, doc))
+        self.conditions.iter().all(|c| c.matches(doc))
     }
 
     /// Applies conditions, then sort, then limit — in that order,
@@ -200,6 +282,46 @@ impl Filter {
     }
 }
 
+/// `a | b`: OR. Extends `a` if it's an OR already, so `a | b | c` is one
+/// OR of three.
+impl std::ops::BitOr for Condition {
+    type Output = Condition;
+
+    fn bitor(self, other: Condition) -> Condition {
+        match self {
+            Condition::Any(mut branches) => {
+                branches.push(other);
+                Condition::Any(branches)
+            }
+            first => Condition::Any(vec![first, other]),
+        }
+    }
+}
+
+/// `a & b`: AND, extending `a` if it's an AND already.
+impl std::ops::BitAnd for Condition {
+    type Output = Condition;
+
+    fn bitand(self, other: Condition) -> Condition {
+        match self {
+            Condition::All(mut conditions) => {
+                conditions.push(other);
+                Condition::All(conditions)
+            }
+            first => Condition::All(vec![first, other]),
+        }
+    }
+}
+
+/// `!a`: NOT.
+impl std::ops::Not for Condition {
+    type Output = Condition;
+
+    fn not(self) -> Condition {
+        Condition::Not(Box::new(self))
+    }
+}
+
 /// How `Collection::find` runs a filter — see `Collection::explain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPlan {
@@ -212,47 +334,127 @@ pub enum QueryPlan {
     /// documents are checked one by one until `limit` of them match; the
     /// rest are never read (SPEC §34.2).
     IndexOrder { field: String },
+    /// Several index ranges are read — one per branch of an OR, on the
+    /// indexes on `fields` — each document once, then checked against
+    /// the whole filter (SPEC §36.3).
+    IndexUnion { fields: Vec<String> },
 }
 
-impl Filter {
-    /// Picks the index `find` reads from, and the range of it, among
-    /// `indexes` — `None` for a full scan. Rule-based, not cost-based:
-    /// the first indexed field with an `Eq` condition, else the first
-    /// with any range condition (`Lt`/`Lte`/`Gt`/`Gte`); all of that
-    /// field's range conditions are intersected, so `a >= 10 AND a <= 20`
-    /// reads just that stretch. `Ne` and `Contains` never use an index.
-    /// The range may include documents the filter rejects, never the
-    /// other way around.
-    pub(crate) fn index_range<'a>(
-        &self,
-        indexes: &'a [IndexMeta],
-    ) -> Option<(&'a IndexMeta, KeyRange)> {
-        let usable = |c: &&Condition| {
-            key::range_for(&c.op, &c.value).is_some() && indexes.iter().any(|i| i.field == c.field)
-        };
-        let chosen = self
-            .conditions
-            .iter()
-            .filter(usable)
-            .find(|c| matches!(c.op, Op::Eq))
-            .or_else(|| self.conditions.iter().find(usable))?;
-        let index = indexes.iter().find(|i| i.field == chosen.field)?;
-        let range = self
-            .conditions
-            .iter()
-            .filter(|c| c.field == chosen.field)
-            .filter_map(|c| key::range_for(&c.op, &c.value))
-            .reduce(KeyRange::intersect)?;
-        Some((index, range))
+/// Index ranges whose union holds every document a condition can match
+/// (SPEC §36.3), and how good a choice that is: `ByValue` (one `Eq`) beats
+/// `Union` (an OR) beats `ByRange`.
+struct Bounds<'a> {
+    ranges: Vec<(&'a IndexMeta, KeyRange)>,
+    kind: BoundKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BoundKind {
+    ByValue,
+    Union,
+    ByRange,
+}
+
+/// The best bounds for conditions that must all hold — `None` if no index
+/// can bound any of them. The comparisons on one indexed field are
+/// intersected, so `a >= 10 AND a <= 20` reads just that stretch; a
+/// nested group is bounded on its own; the best of all that wins, the
+/// first among equals. `Ne` and `Contains` never use an index, nor does a
+/// `Not`.
+fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
+    let mut best: Option<Bounds<'a>> = None;
+    let mut consider = |candidate: Bounds<'a>| {
+        if best.as_ref().is_none_or(|b| candidate.kind < b.kind) {
+            best = Some(candidate);
+        }
+    };
+    for (i, condition) in conditions.iter().enumerate() {
+        match condition {
+            Condition::Compare { field, .. } => {
+                let Some(index) = indexes.iter().find(|index| index.field == *field) else {
+                    continue;
+                };
+                // Each field once, at its first comparison.
+                let seen = conditions[..i]
+                    .iter()
+                    .any(|c| matches!(c, Condition::Compare { field: f, .. } if f == field));
+                if seen {
+                    continue;
+                }
+                let on_field = conditions.iter().filter_map(|c| match c {
+                    Condition::Compare {
+                        field: f,
+                        op,
+                        value,
+                    } if f == field => Some((op, key::range_for(op, value)?)),
+                    _ => None,
+                });
+                let (by_value, ranges): (Vec<bool>, Vec<KeyRange>) = on_field
+                    .map(|(op, range)| (matches!(op, Op::Eq), range))
+                    .unzip();
+                if let Some(range) = ranges.into_iter().reduce(KeyRange::intersect) {
+                    let kind = match by_value.contains(&true) {
+                        true => BoundKind::ByValue,
+                        false => BoundKind::ByRange,
+                    };
+                    consider(Bounds {
+                        ranges: vec![(index, range)],
+                        kind,
+                    });
+                }
+            }
+            nested => {
+                if let Some(bounds) = bounds_for(nested, indexes) {
+                    consider(bounds);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Bounds for one condition: an `All` like the filter's own list, an
+/// `Any` only if every branch can be bounded (the union of theirs), a
+/// `Not` never.
+fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
+    match condition {
+        Condition::Compare { .. } => bounds_for_all(std::slice::from_ref(condition), indexes),
+        Condition::All(conditions) => bounds_for_all(conditions, indexes),
+        Condition::Any(branches) => {
+            let mut ranges = Vec::new();
+            for branch in branches {
+                ranges.extend(bounds_for(branch, indexes)?.ranges);
+            }
+            Some(Bounds {
+                ranges,
+                kind: BoundKind::Union,
+            })
+        }
+        Condition::Not(_) => None,
     }
 }
 
 impl Filter {
+    /// The index ranges `find` reads, among `indexes` — `None` for a full
+    /// scan. Rule-based, not cost-based (SPEC §28.4, §36.3): an `Eq` on an
+    /// indexed field, else an OR whose every branch an index can bound,
+    /// else a range on an indexed field. The ranges may hold documents
+    /// the filter rejects, never the other way around; the same document
+    /// may be in several.
+    pub(crate) fn index_ranges<'a>(
+        &self,
+        indexes: &'a [IndexMeta],
+    ) -> Option<Vec<(&'a IndexMeta, KeyRange)>> {
+        bounds_for_all(&self.conditions, indexes).map(|b| b.ranges)
+    }
+
     /// The index `find` reads in sort order (SPEC §34.2) — for a filter
-    /// with a `sort` and a `limit`, on a field with an index, and no `Eq`
-    /// condition another index could answer (a few documents found by
-    /// value beat walking in order). With it, that field's own range
-    /// conditions narrowed to one range, or `None` for the whole index.
+    /// with a `sort` and a `limit`, on a field with an index, unless the
+    /// conditions find documents by value some other way: an `Eq` on
+    /// another indexed field, or an OR of indexed branches (a few
+    /// documents found by value beat walking in order). With it, the sort
+    /// field's own range comparisons narrowed to one range, or `None` for
+    /// the whole index.
     pub(crate) fn index_order<'a>(
         &self,
         indexes: &'a [IndexMeta],
@@ -260,20 +462,26 @@ impl Filter {
         let sort = self.sort.as_ref()?;
         self.limit?;
         let index = indexes.iter().find(|i| i.field == sort.field)?;
-        let eq_elsewhere = self.conditions.iter().any(|c| {
-            matches!(c.op, Op::Eq)
-                && c.field != sort.field
-                && key::range_for(&c.op, &c.value).is_some()
-                && indexes.iter().any(|i| i.field == c.field)
-        });
-        if eq_elsewhere {
+        let on_sort_field =
+            |c: &&Condition| matches!(c, Condition::Compare { field, .. } if *field == sort.field);
+        let others: Vec<Condition> = self
+            .conditions
+            .iter()
+            .filter(|c| !on_sort_field(c))
+            .cloned()
+            .collect();
+        if bounds_for_all(&others, indexes).is_some_and(|b| b.kind != BoundKind::ByRange) {
             return None;
         }
         let range = self
             .conditions
             .iter()
-            .filter(|c| c.field == sort.field)
-            .filter_map(|c| key::range_for(&c.op, &c.value))
+            .filter_map(|c| match c {
+                Condition::Compare { field, op, value } if *field == sort.field => {
+                    key::range_for(op, value)
+                }
+                _ => None,
+            })
             .reduce(KeyRange::intersect);
         Some((index, range))
     }
@@ -298,18 +506,18 @@ pub(crate) fn value_or_null<'a>(doc: &'a Document, path: &str) -> &'a Document {
     field_value(doc, path).unwrap_or(&Document::Null)
 }
 
-fn condition_matches(cond: &Condition, doc: &Document) -> bool {
-    let field_value = value_or_null(doc, &cond.field);
-    if let Op::Contains = cond.op {
-        return match (field_value, &cond.value) {
+fn compare_matches(field: &str, op: &Op, value: &Document, doc: &Document) -> bool {
+    let field_value = value_or_null(doc, field);
+    if let Op::Contains = op {
+        return match (field_value, value) {
             (Document::String(haystack), Document::String(needle)) => {
                 fold_case(haystack).contains(&fold_case(needle))
             }
             _ => false,
         };
     }
-    let ord = compare(field_value, &cond.value);
-    match (&cond.op, ord) {
+    let ord = compare(field_value, value);
+    match (op, ord) {
         (Op::Eq, Some(std::cmp::Ordering::Equal)) => true,
         (Op::Ne, ord) => ord != Some(std::cmp::Ordering::Equal),
         (Op::Lt, Some(std::cmp::Ordering::Less)) => true,
@@ -436,12 +644,12 @@ mod tests {
     fn and_of_comparisons() {
         let filter = Filter {
             conditions: vec![
-                Condition {
+                Condition::Compare {
                     field: "age".into(),
                     op: Op::Gte,
                     value: Document::Int(18),
                 },
-                Condition {
+                Condition::Compare {
                     field: "name".into(),
                     op: Op::Eq,
                     value: Document::String("Udo".into()),
@@ -465,7 +673,7 @@ mod tests {
 
     fn contains(field: &str, needle: &str) -> Filter {
         Filter {
-            conditions: vec![Condition {
+            conditions: vec![Condition::Compare {
                 field: field.into(),
                 op: Op::Contains,
                 value: Document::String(needle.into()),
@@ -513,7 +721,7 @@ mod tests {
         assert!(!filter.matches(&doc(&[("other", Document::String("1".into()))])));
 
         let non_string_needle = Filter {
-            conditions: vec![Condition {
+            conditions: vec![Condition::Compare {
                 field: "n".into(),
                 op: Op::Contains,
                 value: Document::Int(1),
@@ -525,7 +733,7 @@ mod tests {
 
     #[test]
     fn the_builder_builds_what_the_literal_spells_out() {
-        let cond = |field: &str, op, value| Condition {
+        let cond = |field: &str, op, value| Condition::Compare {
             field: field.into(),
             op,
             value,
@@ -572,9 +780,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn or_and_not_nest_as_deep_as_needed() {
+        let ada = doc(&[
+            ("name", Document::String("Ada".into())),
+            ("age", Document::Int(36)),
+            ("role", Document::String("admin".into())),
+        ]);
+        let bob = doc(&[
+            ("name", Document::String("Bob".into())),
+            ("age", Document::Int(17)),
+        ]);
+        let who = |c: Condition| {
+            [("Ada", &ada), ("Bob", &bob)]
+                .into_iter()
+                .filter(|(_, d)| c.matches(d))
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            who(Condition::any([
+                Condition::eq("name", "Ada"),
+                Condition::lt("age", 18)
+            ])),
+            ["Ada", "Bob"]
+        );
+        assert_eq!(
+            who(Condition::all([
+                Condition::eq("name", "Ada"),
+                Condition::lt("age", 18)
+            ])),
+            Vec::<&str>::new()
+        );
+        assert_eq!(who(!Condition::eq("name", "Ada")), ["Bob"]);
+        // NOT of a comparison on a missing field is true (SPEC §32).
+        assert_eq!(who(!Condition::eq("role", "admin")), ["Bob"]);
+        assert_eq!(who(!Condition::is_null("role")), ["Ada"]);
+        // Empty groups: AND of nothing holds, OR of nothing doesn't.
+        assert_eq!(who(Condition::all([])), ["Ada", "Bob"]);
+        assert_eq!(who(Condition::any([])), Vec::<&str>::new());
+        // Nested: (adult AND admin) OR (NOT adult AND name contains "o").
+        let nested = Condition::any([
+            Condition::all([Condition::gte("age", 18), Condition::eq("role", "admin")]),
+            Condition::all([!Condition::gte("age", 18), Condition::contains("name", "O")]),
+        ]);
+        assert_eq!(who(nested.clone()), ["Ada", "Bob"]);
+        assert_eq!(who(!nested), Vec::<&str>::new());
+
+        // Through the builder: each call is ANDed with the rest.
+        let filter = Filter::new()
+            .any_of([Condition::eq("name", "Ada"), Condition::eq("name", "Bob")])
+            .and(!Condition::lt("age", 18));
+        assert!(filter.matches(&ada) && !filter.matches(&bob));
+        assert_eq!(
+            format!("{:?}", filter.conditions),
+            format!(
+                "{:?}",
+                [
+                    Condition::Any(vec![
+                        Condition::eq("name", "Ada"),
+                        Condition::eq("name", "Bob")
+                    ]),
+                    Condition::Not(Box::new(Condition::lt("age", 18))),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn operators_build_the_same_trees_as_the_functions() {
+        let (a, b, c) = (
+            || Condition::eq("a", 1),
+            || Condition::eq("b", 2),
+            || Condition::eq("c", 3),
+        );
+        let same = |x: Condition, y: Condition| assert_eq!(format!("{x:?}"), format!("{y:?}"));
+        // Chains flatten into one group; a group on the right stays one.
+        same(a() | b() | c(), Condition::any([a(), b(), c()]));
+        same(a() & b() & c(), Condition::all([a(), b(), c()]));
+        same(
+            a() | (b() | c()),
+            Condition::any([a(), Condition::any([b(), c()])]),
+        );
+        // `&` binds tighter than `|`, as in Rust.
+        same(
+            a() | b() & c(),
+            Condition::any([a(), Condition::all([b(), c()])]),
+        );
+        same(
+            !(a() | b()),
+            Condition::Not(Box::new(Condition::any([a(), b()]))),
+        );
+        same(
+            !!a(),
+            Condition::Not(Box::new(Condition::Not(Box::new(a())))),
+        );
+    }
+
     fn city_is(path: &str, city: &str) -> Filter {
         Filter {
-            conditions: vec![Condition {
+            conditions: vec![Condition::Compare {
                 field: path.into(),
                 op: Op::Eq,
                 value: Document::String(city.into()),
@@ -633,7 +939,7 @@ mod tests {
     #[test]
     fn a_missing_field_is_null() {
         let when = |op: Op, value: Document| Filter {
-            conditions: vec![Condition {
+            conditions: vec![Condition::Compare {
                 field: "nick".into(),
                 op,
                 value,
@@ -665,8 +971,7 @@ mod tests {
             assert_eq!(found, matching, "{:?}", filter.conditions[0]);
         }
         // Through a path too: `address` isn't there, so neither is `city`.
-        let mut on_path = when(Op::Eq, Document::Null);
-        on_path.conditions[0].field = "address.city".into();
+        let on_path = Filter::new().is_null("address.city");
         assert!(on_path.matches(&missing) && on_path.matches(&set));
     }
 
@@ -855,7 +1160,7 @@ mod tests {
         ];
 
         let filter = Filter {
-            conditions: vec![Condition {
+            conditions: vec![Condition::Compare {
                 field: "age".into(),
                 op: Op::Gte,
                 value: Document::Int(18),
@@ -877,7 +1182,7 @@ mod tests {
     }
 
     fn cond(field: &str, op: Op, value: Document) -> Condition {
-        Condition {
+        Condition::Compare {
             field: field.into(),
             op,
             value,
@@ -899,7 +1204,11 @@ mod tests {
             conditions,
             ..Default::default()
         };
-        let field_of = |f: &Filter| f.index_range(&indexes).map(|(i, _)| i.field.clone());
+        let field_of = |f: &Filter| {
+            let ranges = f.index_ranges(&indexes)?;
+            assert_eq!(ranges.len(), 1, "one range, not a union");
+            Some(ranges[0].0.field.clone())
+        };
 
         // No condition on an indexed field, or only unusable ones.
         assert_eq!(
@@ -925,8 +1234,70 @@ mod tests {
             cond("age", Op::Gte, Document::Int(10)),
             cond("age", Op::Lte, Document::Int(20)),
         ]);
-        let (_, range) = f.index_range(&indexes).unwrap();
+        let (_, range) = f.index_ranges(&indexes).unwrap().remove(0);
         let k = |n| key::secondary(&Document::Int(n), crate::DocId([0; 16])).unwrap();
         assert!(range.contains(&k(15)) && !range.contains(&k(9)) && !range.contains(&k(21)));
+    }
+
+    /// Which index ranges a filter with ORs, ANDs and NOTs reads (SPEC
+    /// §36.3) — `None` for a scan.
+    #[test]
+    fn index_ranges_union_the_branches_of_an_or() {
+        let indexes = [index("age"), index("name")];
+        let fields = |f: Filter| -> Option<Vec<String>> {
+            let ranges = f.index_ranges(&indexes)?;
+            Some(ranges.iter().map(|(i, _)| i.field.clone()).collect())
+        };
+        let ada = || Condition::eq("name", "Ada");
+        let young = || Condition::lt("age", 18);
+        let unindexed = || Condition::eq("city", "Berlin");
+
+        // An OR whose every branch an index can bound: their union.
+        assert_eq!(
+            fields(Filter::new().any_of([ada(), young()])),
+            Some(vec!["name".into(), "age".into()])
+        );
+        // A branch in an AND needs just one bounded condition.
+        let branch = Condition::all([unindexed(), young()]);
+        assert_eq!(
+            fields(Filter::new().any_of([ada(), branch])),
+            Some(vec!["name".into(), "age".into()])
+        );
+        // Nested ORs flatten into one union.
+        let inner = Condition::any([ada(), Condition::eq("name", "Bob")]);
+        assert_eq!(
+            fields(Filter::new().any_of([inner, young()])).map(|f| f.len()),
+            Some(3)
+        );
+        // An OR of nothing matches nothing: no range at all.
+        assert_eq!(fields(Filter::new().any_of([])), Some(vec![]));
+
+        // One branch no index bounds, or a NOT: no union — the other
+        // conditions decide, or a scan.
+        assert_eq!(fields(Filter::new().any_of([ada(), unindexed()])), None);
+        assert_eq!(fields(Filter::new().and(!ada())), None);
+        let f = Filter::new().any_of([ada(), unindexed()]).gt("age", 65);
+        assert_eq!(fields(f), Some(vec!["age".into()]));
+
+        // Eq beats a union, a union beats a range, whatever the order.
+        let f = Filter::new()
+            .gt("age", 65)
+            .any_of([ada(), young()])
+            .eq("name", "Cy");
+        assert_eq!(fields(f), Some(vec!["name".into()]));
+        let f = Filter::new().gt("age", 65).any_of([ada(), young()]);
+        assert_eq!(fields(f).map(|f| f.len()), Some(2));
+        // An AND nested at the top is like more top-level conditions.
+        let f = Filter::new().and(Condition::all([unindexed(), ada()]));
+        assert_eq!(fields(f), Some(vec!["name".into()]));
+
+        // Reading in sort order gives way to an OR found by value.
+        let sorted = |f: Filter| f.sort_desc("age").limit(5).index_order(&indexes).is_some();
+        assert!(sorted(Filter::new().gt("age", 65)));
+        assert!(!sorted(
+            Filter::new().any_of([ada(), Condition::eq("name", "Bob")])
+        ));
+        assert!(!sorted(Filter::new().eq("name", "Ada")));
+        assert!(sorted(Filter::new().any_of([ada(), unindexed()])));
     }
 }

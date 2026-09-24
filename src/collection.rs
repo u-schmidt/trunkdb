@@ -152,11 +152,19 @@ impl<T> Collection<T> {
                 field: index.field.clone(),
             });
         }
-        Ok(match filter.index_range(indexes) {
-            Some((index, _range)) => QueryPlan::Index {
-                field: index.field.clone(),
-            },
+        Ok(match filter.index_ranges(indexes) {
             None => QueryPlan::Scan,
+            Some(ranges) => match &ranges[..] {
+                [(index, _range)] => QueryPlan::Index {
+                    field: index.field.clone(),
+                },
+                _ => QueryPlan::IndexUnion {
+                    fields: ranges
+                        .iter()
+                        .map(|(index, _)| index.field.clone())
+                        .collect(),
+                },
+            },
         })
     }
 }
@@ -438,9 +446,11 @@ impl Collection<Document> {
     }
 }
 
-/// The index entries `find` has to look at for `filter`: one secondary
-/// index's range if a condition allows (SPEC §28.4), otherwise the whole
-/// primary index. Each entry's key ends with its document's id.
+/// The index entries `find` has to look at for `filter`: the secondary
+/// index ranges its conditions allow (SPEC §28.4, §36.3), otherwise the
+/// whole primary index. Each entry's key ends with its document's id, and
+/// each document comes once, even if several ranges hold it (an OR
+/// whose branches overlap).
 fn candidate_entries(
     catalog: &Catalog,
     store: &dyn PageStore,
@@ -450,9 +460,24 @@ fn candidate_entries(
     let Some(meta) = catalog.get(collection) else {
         return Ok(Vec::new());
     };
-    match filter.index_range(catalog.indexes(collection)) {
-        Some((index, range)) => BTreeIndex::new(index.root).range(store, &range),
+    match filter.index_ranges(catalog.indexes(collection)) {
         None => BTreeIndex::new(meta.index_root).scan(store),
+        Some(ranges) if ranges.len() == 1 => {
+            let (index, range) = &ranges[0];
+            BTreeIndex::new(index.root).range(store, range)
+        }
+        Some(ranges) => {
+            let mut seen = std::collections::HashSet::new();
+            let mut entries = Vec::new();
+            for (index, range) in ranges {
+                for entry in BTreeIndex::new(index.root).range(store, &range)? {
+                    if seen.insert(key::doc_id(&entry.0)) {
+                        entries.push(entry);
+                    }
+                }
+            }
+            Ok(entries)
+        }
     }
 }
 
@@ -907,7 +932,7 @@ mod tests {
             .unwrap();
 
         let filter = Filter {
-            conditions: vec![crate::query::Condition {
+            conditions: vec![crate::query::Condition::Compare {
                 field: "age".to_string(),
                 op: crate::query::Op::Gte,
                 value: Document::Int(18),
@@ -1005,7 +1030,7 @@ mod tests {
         users.insert(Document::Object(old)).unwrap();
 
         let filter = Filter {
-            conditions: vec![crate::query::Condition {
+            conditions: vec![crate::query::Condition::Compare {
                 field: "age".to_string(),
                 op: crate::query::Op::Gte,
                 value: Document::Int(18),
@@ -1202,7 +1227,7 @@ mod tests {
 
     fn age_filter(op: crate::query::Op, age: i64) -> Filter {
         Filter {
-            conditions: vec![crate::query::Condition {
+            conditions: vec![crate::query::Condition::Compare {
                 field: "age".to_string(),
                 op,
                 value: Document::Int(age),
@@ -1329,7 +1354,7 @@ mod tests {
         }
 
         let mut filter = age_filter(crate::query::Op::Gt, 18);
-        filter.conditions.push(crate::query::Condition {
+        filter.conditions.push(crate::query::Condition::Compare {
             field: "name".to_string(),
             op: crate::query::Op::Contains,
             value: Document::String("ADA".to_string()),
@@ -1385,7 +1410,7 @@ mod tests {
         assert_eq!(articles.get(&id).unwrap(), Some(expected.clone()));
         let found = articles
             .find(Filter {
-                conditions: vec![crate::query::Condition {
+                conditions: vec![crate::query::Condition::Compare {
                     field: "body".to_string(),
                     op: crate::query::Op::Contains,
                     value: Document::String("STORM BROKE".to_string()),
@@ -1406,7 +1431,7 @@ mod tests {
     }
 
     fn cond(field: &str, op: Op, value: Document) -> Condition {
-        Condition {
+        Condition::Compare {
             field: field.to_string(),
             op,
             value,
@@ -2092,6 +2117,150 @@ mod tests {
                 field: "age".to_string()
             }
         );
+    }
+
+    // --- OR, AND and NOT (SPEC §36) ---
+
+    /// A random condition up to `depth` levels deep: comparisons with
+    /// every operator on the indexed `v` and `w`, the unindexed `pad` and
+    /// a field no document has — combined by ANDs, ORs (empty ones too)
+    /// and NOTs.
+    fn random_condition(rng: &mut XorShift, depth: usize) -> Condition {
+        if depth == 0 || rng.below(3) == 0 {
+            let ops = [
+                Op::Eq,
+                Op::Ne,
+                Op::Lt,
+                Op::Lte,
+                Op::Gt,
+                Op::Gte,
+                Op::Contains,
+            ];
+            let op = ops[rng.below(ops.len())].clone();
+            return match rng.below(6) {
+                0..=2 => cond("v", op, random_value(rng)),
+                3 => cond("w", op, Document::Int(rng.below(4) as i64)),
+                4 => cond("pad", op, Document::String(String::new())),
+                _ => cond("nowhere", op, random_value(rng)),
+            };
+        }
+        let children = (0..rng.below(4))
+            .map(|_| random_condition(rng, depth - 1))
+            .collect::<Vec<_>>();
+        match rng.below(5) {
+            0 => Condition::All(children),
+            1 => !random_condition(rng, depth - 1),
+            _ => Condition::Any(children),
+        }
+    }
+
+    /// Every random nested filter must find, count and stream exactly
+    /// what checking every document finds — whichever plan it runs.
+    fn assert_nested_filters_agree_with_a_scan(docs: &Collection<Document>, rng: &mut XorShift) {
+        let mut all = docs.find_with_ids(Filter::default()).unwrap();
+        all.sort_by_key(|(id, _doc)| *id);
+        let mut plans = std::collections::HashSet::new();
+        for _ in 0..400 {
+            let mut f = Filter::new();
+            for _ in 0..1 + rng.below(2) {
+                f = f.and(random_condition(rng, 3));
+            }
+            if rng.below(3) == 0 {
+                f = f.sort_desc("v").limit([1, 5, 50][rng.below(3)]);
+            }
+            let ids = |found: Vec<(DocId, Document)>| -> Vec<DocId> {
+                found.into_iter().map(|(id, _)| id).collect()
+            };
+            let mut expected = ids(f.apply_to(all.clone(), |(_, doc)| doc));
+            let plan = docs.explain(&f).unwrap();
+            let mut found = ids(docs.find_with_ids(f.clone()).unwrap());
+            let streamed = docs
+                .cursor(f.clone())
+                .unwrap()
+                .collect::<crate::Result<Vec<_>>>();
+            let mut streamed = ids(streamed.unwrap());
+            if f.sort.is_none() {
+                expected.sort();
+                found.sort();
+                streamed.sort();
+            }
+            assert_eq!(found, expected, "{f:?} via {plan:?}");
+            assert_eq!(streamed, expected, "cursor: {f:?} via {plan:?}");
+            let counted = docs
+                .count(Filter {
+                    sort: None,
+                    ..f.clone()
+                })
+                .unwrap();
+            assert_eq!(counted, expected.len(), "count: {f:?} via {plan:?}");
+            plans.insert(std::mem::discriminant(&plan));
+        }
+        assert_eq!(plans.len(), 4, "scan, index, union and order all ran");
+    }
+
+    #[test]
+    fn nested_filters_find_what_a_scan_finds_on_every_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let mut rng = XorShift(0x5151_7A7A_0F0F_3C3C);
+        {
+            let db = Database::open(&path).unwrap();
+            let docs = db.collection::<Document>("docs");
+            docs.ensure_index("v").unwrap();
+            docs.ensure_index("w").unwrap();
+            for _ in 0..10 {
+                let ops = (0..25)
+                    .map(|_| {
+                        let doc = random_document(&mut rng);
+                        WriteOp::Insert("docs".into(), db.id_gen().generate(), doc)
+                    })
+                    .collect();
+                db.write_batch(ops).unwrap();
+            }
+            assert_nested_filters_agree_with_a_scan(&docs, &mut rng);
+        }
+        let db = Database::open(&path).unwrap();
+        assert_nested_filters_agree_with_a_scan(&db.collection("docs"), &mut rng);
+    }
+
+    /// The typed path end to end: `status` is one of two values, read as
+    /// a union of two ranges of its index.
+    #[test]
+    fn an_or_of_indexed_values_reads_just_those() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Run {
+            status: String,
+            seen: i64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let runs = db.collection::<Run>("runs");
+        let mut batch = db.batch();
+        for seen in 0..300 {
+            let status = ["Queued", "Running", "Complete"][(seen % 3) as usize].to_string();
+            batch.insert(&runs, Run { status, seen }).unwrap();
+        }
+        batch.commit().unwrap();
+        runs.ensure_index("status").unwrap();
+
+        let active = Filter::new()
+            .any_of([
+                Condition::eq("status", "Queued"),
+                Condition::eq("status", "Running"),
+            ])
+            .and(!Condition::lt("seen", 30));
+        assert_eq!(
+            runs.explain(&active).unwrap(),
+            QueryPlan::IndexUnion {
+                fields: vec!["status".to_string(), "status".to_string()]
+            }
+        );
+        let mut found = Vec::new();
+        let reads = records_read(|| found = runs.find(active.clone()).unwrap());
+        assert_eq!(reads, 200, "the two ranges, not the Complete ones");
+        assert_eq!(found.len(), 180);
+        assert!(found.iter().all(|r| r.status != "Complete" && r.seen >= 30));
+        assert_eq!(runs.count(active).unwrap(), 180);
     }
 
     // --- Unique indexes (SPEC §33) ---
