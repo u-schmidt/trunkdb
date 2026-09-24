@@ -1894,10 +1894,13 @@ mod tests {
         }
         assert_eq!(version(), 4u32.to_le_bytes(), "no page allocated yet");
 
-        let db = Database::open(&path).unwrap();
-        db.collection::<User>("users")
-            .ensure_unique_index("name")
-            .unwrap();
+        {
+            let db = Database::open(&path).unwrap();
+            db.collection::<User>("users")
+                .ensure_unique_index("name")
+                .unwrap();
+        }
+        // Read with the database closed: on Windows its lock blocks reads.
         assert_eq!(version(), 5u32.to_le_bytes());
     }
 
