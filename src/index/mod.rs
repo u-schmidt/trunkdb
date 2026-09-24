@@ -17,10 +17,9 @@ use crate::storage::{PageStore, RecordLocation};
 /// entirely (it's pure in-memory), kept around for tests that don't want
 /// real file I/O. `BTreeIndex` is the real, disk-backed implementation
 /// `Database` actually uses, for the primary `_id` index and for every
-/// secondary index. `range` returns an eagerly-collected `Vec` rather
-/// than a lazy iterator — a persisted implementation's iteration is
-/// fallible (disk I/O per step), and a lazily-evaluated fallible iterator
-/// isn't worth the complexity at this stage.
+/// secondary index. `range` returns an eagerly-collected `Vec`, which is
+/// what most callers need; reading in sort order walks lazily instead,
+/// with `BTreeIndex::walk` (SPEC §49).
 pub trait Index {
     fn insert(
         &mut self,

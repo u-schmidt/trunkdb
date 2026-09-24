@@ -144,12 +144,14 @@ documents:
 | one commit | 16 ms | 5.3 ms | 5.8 ms | 10 ms |
 | get by id | 32 µs | 18 µs | 2.7 µs | 3.6 µs |
 | 1000 documents by index | 4.7 ms | 1.9 ms | 1.1 ms | 1.9 ms |
-| oldest 20 of a status | 19 ms | 23 µs | 16 µs | 21 µs |
+| oldest 20 of a status | 0.1 ms | 23 µs | 16 µs | 21 µs |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
-Each gap has a known cause (SPEC.md §48): the sorted read collects the
-whole range before stopping at the limit, there's no page cache, and a
-commit flushes three times. Those are the next steps on the roadmap.
+Each gap has a known cause (SPEC.md §48). The first one found, a
+sorted read that collected the whole range before stopping at the
+limit, is fixed: "oldest 20" took 19 ms before the lazy B-tree walk
+(§49). What's left: there's no page cache, and a commit flushes three
+times. Those are the next steps on the roadmap.
 
 ```
 cd bench && cargo run --release
@@ -157,7 +159,7 @@ cd bench && cargo run --release
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §49 for the full list and reasoning):
+Done so far (see SPEC.md §50 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -226,8 +228,10 @@ Done so far (see SPEC.md §49 for the full list and reasoning):
     Items 19–21 → 0.9.0.
 22. **Benchmarks** (§48): `bench/` against SQLite, redb and sled; the
     measured gaps order what comes next.
+23. **A lazy B-tree walk** (§49): reading in sort order stops at the
+    limit, forward or backward — "oldest 20" 150–200× faster.
 
-What's still open: SPEC.md §49.2.
+What's still open: SPEC.md §50.2.
 
 ## License
 

@@ -124,32 +124,178 @@ impl Index for BTreeIndex {
             .map(|(_key, loc)| loc))
     }
 
-    /// Descends to the leaf where `range.start` would be, then walks the
-    /// leaf sibling chain until a key reaches `range.end`. Results come
-    /// back sorted by key: leaves chain left to right in key order, and
-    /// each leaf's cells are sorted.
+    /// Every entry of the walk forward, collected (`walk`).
     fn range(
         &self,
         store: &dyn PageStore,
         range: &KeyRange,
     ) -> std::io::Result<Vec<(Vec<u8>, RecordLocation)>> {
-        let (_page_id, mut page) = find_leaf(store, self.root, &range.start)?;
-        let mut results = Vec::new();
+        self.walk(store, range.clone(), false).collect()
+    }
+}
+
+impl BTreeIndex {
+    /// The entries with keys in `range`, one leaf page read at a time,
+    /// in ascending key order — or descending, `backward` (SPEC §49).
+    /// Stopping early reads no further: "the oldest 20" reads the pages
+    /// those 20 are on.
+    ///
+    /// Forward, it follows the leaves' sibling links from the leaf where
+    /// `range.start` would be. Backward there are none: it keeps the
+    /// branch pages above the current leaf, with the child it's in, and
+    /// steps to the child before — up as far as needed, then down the
+    /// last children to a leaf.
+    pub fn walk<'s>(&self, store: &'s dyn PageStore, range: KeyRange, backward: bool) -> Walk<'s> {
+        Walk {
+            store,
+            root: self.root,
+            range,
+            backward,
+            pending: Vec::new(),
+            started: false,
+            next_leaf: 0,
+            path: Vec::new(),
+            done: false,
+        }
+    }
+}
+
+/// `BTreeIndex::walk`: an iterator of index entries. An I/O error ends
+/// it, after it's been handed out.
+pub struct Walk<'s> {
+    store: &'s dyn PageStore,
+    root: PageId,
+    range: KeyRange,
+    backward: bool,
+    /// The current leaf's entries in the range, still to hand out: the
+    /// next one last, so `pop` hands it out.
+    pending: Vec<(Vec<u8>, RecordLocation)>,
+    /// Whether the first leaf has been read.
+    started: bool,
+    /// Forward: the leaf after the current one, 0 for none.
+    next_leaf: PageId,
+    /// Backward: from the root down, each branch page above the current
+    /// leaf as its children in key order, and which of them the walk is
+    /// in.
+    path: Vec<(Vec<PageId>, usize)>,
+    /// No entry left in the range.
+    done: bool,
+}
+
+impl Walk<'_> {
+    /// Reads the next leaf in the walk's direction into `pending`; sets
+    /// `done` where the range or the tree ends. `pending` may stay empty:
+    /// a leaf can be (all its entries removed, SPEC §10).
+    fn read_next_leaf(&mut self) -> std::io::Result<()> {
+        let leaf = if !self.started {
+            self.started = true;
+            match (self.backward, &self.range.end) {
+                (false, _) => self.descend(self.root, Some(&self.range.start.clone()))?,
+                (true, Some(end)) => self.descend(self.root, Some(&end.clone()))?,
+                (true, None) => self.descend(self.root, None)?,
+            }
+        } else if !self.backward {
+            match self.next_leaf {
+                0 => {
+                    self.done = true;
+                    return Ok(());
+                }
+                next => SlottedPage::from_bytes(self.store.read_page(next)?)?,
+            }
+        } else {
+            // Up to the nearest branch with a child before this one, then
+            // down its last children.
+            loop {
+                match self.path.last_mut() {
+                    None => {
+                        self.done = true;
+                        return Ok(());
+                    }
+                    Some((_, 0)) => {
+                        self.path.pop();
+                    }
+                    Some((children, at)) => {
+                        *at -= 1;
+                        let child = children[*at];
+                        break self.descend(child, None)?;
+                    }
+                }
+            }
+        };
+        self.next_leaf = leaf.next_page();
+        let (start, end) = (self.range.start.as_slice(), self.range.end.as_deref());
+        let mut entries = Vec::new();
+        for (_slot, cell) in leaf.iter_cells() {
+            let (key, loc) = decode_index_entry(cell);
+            if end.is_some_and(|end| key >= end) {
+                // Every later key is past the end too.
+                if !self.backward {
+                    self.done = true;
+                }
+                break;
+            }
+            if key < start {
+                // Every earlier key is before the start too.
+                if self.backward {
+                    self.done = true;
+                }
+                continue;
+            }
+            entries.push((key.to_vec(), loc));
+        }
+        if !self.backward {
+            entries.reverse();
+        }
+        self.pending = entries;
+        Ok(())
+    }
+
+    /// From `page_id` down to a leaf: towards `key`, or along the last
+    /// children for `None` — noting each branch passed in `path`.
+    fn descend(&mut self, mut page_id: PageId, key: Option<&[u8]>) -> std::io::Result<SlottedPage> {
         loop {
-            for (_slot, cell) in page.iter_cells() {
-                let (key, loc) = decode_index_entry(cell);
-                if range.end.as_deref().is_some_and(|end| key >= end) {
-                    return Ok(results);
+            let page = SlottedPage::from_bytes(self.store.read_page(page_id)?)?;
+            match page.page_type() {
+                PageType::IndexLeaf => return Ok(page),
+                PageType::IndexBranch => {
+                    let mut children: Vec<PageId> = page
+                        .iter_cells()
+                        .map(|(_slot, cell)| decode_branch_entry(cell).1)
+                        .collect();
+                    children.push(page.next_page());
+                    let at = match key {
+                        Some(key) => page
+                            .iter_cells()
+                            .position(|(_slot, cell)| decode_branch_entry(cell).0 > key)
+                            .unwrap_or(children.len() - 1),
+                        None => children.len() - 1,
+                    };
+                    page_id = children[at];
+                    if self.backward {
+                        self.path.push((children, at));
+                    }
                 }
-                if key >= range.start.as_slice() {
-                    results.push((key.to_vec(), loc));
-                }
+                other => return Err(corrupt_page_type(page_id, other)),
             }
-            let next = page.next_page();
-            if next == 0 {
-                return Ok(results);
+        }
+    }
+}
+
+impl Iterator for Walk<'_> {
+    type Item = std::io::Result<(Vec<u8>, RecordLocation)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(entry) = self.pending.pop() {
+                return Some(Ok(entry));
             }
-            page = SlottedPage::from_bytes(store.read_page(next)?)?;
+            if self.done {
+                return None;
+            }
+            if let Err(e) = self.read_next_leaf() {
+                self.done = true;
+                return Some(Err(e));
+            }
         }
     }
 }
@@ -438,6 +584,198 @@ mod tests {
     /// Keys arriving in order fill every leaf but the last completely
     /// (SPEC §41): each split leaves the old leaf as it was, full. In
     /// reverse order they still split in the middle, by bytes.
+    /// A read-only view of a store that counts page reads.
+    struct Counting<'a> {
+        store: &'a FileStore,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl PageStore for Counting<'_> {
+        fn allocate_page(&mut self) -> std::io::Result<PageId> {
+            unreachable!("read only")
+        }
+        fn read_page(&self, id: PageId) -> std::io::Result<Vec<u8>> {
+            self.reads.set(self.reads.get() + 1);
+            self.store.read_page(id)
+        }
+        fn try_read_page(&self, id: PageId) -> std::io::Result<Option<Vec<u8>>> {
+            self.reads.set(self.reads.get() + 1);
+            self.store.try_read_page(id)
+        }
+        fn write_page(&mut self, _id: PageId, _data: &[u8]) -> std::io::Result<()> {
+            unreachable!("read only")
+        }
+        fn free_page(&mut self, _id: PageId) -> std::io::Result<()> {
+            unreachable!("read only")
+        }
+    }
+
+    /// Random keys in, a third taken out again — whole leaves of them
+    /// too, so some leaves are empty — then random ranges walked both
+    /// ways: the same entries as a `BTreeMap` has, in its order or the
+    /// reverse (SPEC §49).
+    #[test]
+    fn walks_match_a_btreemap_both_ways() {
+        let (_dir, mut store, mut index) = fresh();
+        let mut rng = XorShift(0x243F_6A88_85A3_08D3);
+        let mut expected = std::collections::BTreeMap::new();
+        for i in 0..6000u32 {
+            let len = 1 + rng.below(40);
+            let key: Vec<u8> = (0..len).map(|_| rng.below(4) as u8 * 60).collect();
+            let key = [key, i.to_be_bytes().to_vec()].concat();
+            let loc = RecordLocation {
+                page: i as u64,
+                slot: 0,
+            };
+            index.insert(&mut store, &key, loc).unwrap();
+            expected.insert(key, loc);
+        }
+        let keys: Vec<Vec<u8>> = expected.keys().cloned().collect();
+        // A stretch of neighbors, emptying the leaves they were on.
+        for key in keys[1000..2500].iter().chain(keys.iter().step_by(3)) {
+            index.remove(&mut store, key).unwrap();
+            expected.remove(key);
+        }
+        let bound = |rng: &mut XorShift| -> Vec<u8> {
+            match rng.below(3) {
+                0 => keys[rng.below(keys.len())].clone(),
+                _ => (0..rng.below(4)).map(|_| rng.below(256) as u8).collect(),
+            }
+        };
+        for _ in 0..300 {
+            let (a, b) = (bound(&mut rng), bound(&mut rng));
+            let range = match rng.below(4) {
+                0 => KeyRange::everything(),
+                1 => KeyRange {
+                    start: a,
+                    end: None,
+                },
+                _ => KeyRange {
+                    start: a.clone().min(b.clone()),
+                    end: Some(a.max(b)),
+                },
+            };
+            let want: Vec<(Vec<u8>, RecordLocation)> = expected
+                .iter()
+                .filter(|(k, _)| **k >= range.start && range.end.as_ref().is_none_or(|e| *k < e))
+                .map(|(k, l)| (k.clone(), *l))
+                .collect();
+            let forward: Vec<_> = index
+                .walk(&store, range.clone(), false)
+                .map(Result::unwrap)
+                .collect();
+            let mut backward: Vec<_> = index
+                .walk(&store, range.clone(), true)
+                .map(Result::unwrap)
+                .collect();
+            backward.reverse();
+            assert_eq!(forward, want, "{range:?}");
+            assert_eq!(backward, want, "{range:?}");
+            assert_eq!(index.range(&store, &range).unwrap(), want);
+        }
+    }
+
+    /// How many pages from the root to a leaf, both counted.
+    fn depth(store: &FileStore, index: &BTreeIndex) -> usize {
+        let mut depth = 1;
+        let mut page = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        while page.page_type() == PageType::IndexBranch {
+            let child = page.next_page();
+            page = SlottedPage::from_bytes(store.read_page(child).unwrap()).unwrap();
+            depth += 1;
+        }
+        depth
+    }
+
+    /// Long keys make a tall tree: a backward walk has to climb more than
+    /// one branch to find the previous leaf (SPEC §49.1).
+    #[test]
+    fn walks_climb_as_far_as_needed_in_a_tall_tree() {
+        let (_dir, mut store, mut index) = fresh();
+        let mut expected = Vec::new();
+        for i in 0..4000u32 {
+            let key = [&i.to_be_bytes()[..], &[b'k'; 600]].concat();
+            let loc = RecordLocation {
+                page: i as u64,
+                slot: 0,
+            };
+            index.insert(&mut store, &key, loc).unwrap();
+            expected.push((key, loc));
+        }
+        assert!(depth(&store, &index) >= 4, "{}", depth(&store, &index));
+        let all: Vec<_> = index
+            .walk(&store, KeyRange::everything(), true)
+            .map(Result::unwrap)
+            .collect();
+        expected.reverse();
+        assert_eq!(all, expected);
+    }
+
+    /// Taking the first few entries reads the pages they're on, not the
+    /// range's: a descent and a leaf or two, either way.
+    #[test]
+    fn a_walk_stopped_early_reads_only_what_it_handed_out() {
+        let (_dir, mut store, mut index) = fresh();
+        for i in 0..20_000u32 {
+            let key = [&i.to_be_bytes()[..], &[7u8; 12]].concat();
+            index
+                .insert(&mut store, &key, RecordLocation { page: 1, slot: 0 })
+                .unwrap();
+        }
+        let counting = Counting {
+            store: &store,
+            reads: std::cell::Cell::new(0),
+        };
+        let depth = depth(&store, &index);
+        assert!(depth >= 2, "{depth}");
+        for backward in [false, true] {
+            counting.reads.set(0);
+            let first: Vec<_> = index
+                .walk(&counting, KeyRange::everything(), backward)
+                .take(20)
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(first.len(), 20);
+            assert!(
+                counting.reads.get() <= depth + 1,
+                "{backward}: {} reads",
+                counting.reads.get()
+            );
+            counting.reads.set(0);
+            let all = index
+                .walk(&counting, KeyRange::everything(), backward)
+                .count();
+            assert_eq!(all, 20_000);
+            let leaves = counting.reads.get();
+            assert!(leaves > 50, "{leaves}");
+            // A thousand keys in the middle: their leaves and a descent,
+            // not the leaves before or after them.
+            let key = |i: u32| [&i.to_be_bytes()[..], &[7u8; 12]].concat();
+            let middle = KeyRange {
+                start: key(9_000),
+                end: Some(key(10_000)),
+            };
+            counting.reads.set(0);
+            assert_eq!(
+                index.walk(&counting, middle.clone(), backward).count(),
+                1000
+            );
+            let most = depth + 2 + 1000 * leaves / 20_000;
+            assert!(
+                counting.reads.get() <= most,
+                "{backward}: {} > {most}",
+                counting.reads.get()
+            );
+            counting.reads.set(0);
+            assert_eq!(index.walk(&counting, middle, backward).take(20).count(), 20);
+            assert!(
+                counting.reads.get() <= depth + 1,
+                "{backward}: {}",
+                counting.reads.get()
+            );
+        }
+    }
+
     #[test]
     fn keys_in_order_fill_the_leaves() {
         let keys: Vec<[u8; 16]> = (0..3000u32)

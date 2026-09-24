@@ -22,6 +22,8 @@ pub trait Store {
     fn in_range(&self, lo: i64, hi: i64) -> usize;
     /// `created` of the oldest `limit` tasks with `status`.
     fn oldest(&self, status: &str, limit: usize) -> Vec<i64>;
+    /// `created` of the newest `limit` tasks with `status`.
+    fn newest(&self, status: &str, limit: usize) -> Vec<i64>;
     /// How many tasks have `tries > n`: no index, every document.
     fn count_tries_above(&self, n: i64) -> usize;
     /// Bytes on disk.
@@ -123,6 +125,19 @@ impl Store for Trunk {
         let f = Filter::new()
             .eq("status", status)
             .sort_asc("created")
+            .limit(limit);
+        self.tasks
+            .find(f)
+            .unwrap()
+            .iter()
+            .map(|t| t.created)
+            .collect()
+    }
+
+    fn newest(&self, status: &str, limit: usize) -> Vec<i64> {
+        let f = Filter::new()
+            .eq("status", status)
+            .sort_desc("created")
             .limit(limit);
         self.tasks
             .find(f)
@@ -275,6 +290,16 @@ impl Store for Sqlite {
         .collect()
     }
 
+    fn newest(&self, status: &str, limit: usize) -> Vec<i64> {
+        self.docs(
+            "SELECT doc FROM tasks WHERE status = ? ORDER BY created DESC LIMIT ?",
+            params![status, limit as i64],
+        )
+        .iter()
+        .map(|t| t.created)
+        .collect()
+    }
+
     fn count_tries_above(&self, n: i64) -> usize {
         // What one would write in SQLite: its own JSON functions.
         self.conn
@@ -405,14 +430,24 @@ impl Redb {
     }
 
     /// The tasks whose keys in index `which` lie in `lo..hi`, in key
-    /// order, at most `limit`.
-    fn through(&self, which: usize, lo: &[u8], hi: &[u8], limit: usize) -> Vec<Task> {
+    /// order or the reverse, at most `limit`.
+    fn through(
+        &self,
+        which: usize,
+        lo: &[u8],
+        hi: &[u8],
+        limit: usize,
+        backward: bool,
+    ) -> Vec<Task> {
         let tx = self.db.begin_read().unwrap();
         let tasks = tx.open_table(TASKS).unwrap();
         let index = tx.open_table(INDEXES[which]).unwrap();
-        index
-            .range(lo..hi)
-            .unwrap()
+        let range = index.range(lo..hi).unwrap();
+        let entries: Box<dyn Iterator<Item = _>> = match backward {
+            true => Box::new(range.rev()),
+            false => Box::new(range),
+        };
+        entries
             .take(limit)
             .map(|entry| {
                 let id = id_of(entry.unwrap().0.value());
@@ -449,17 +484,26 @@ impl Store for Redb {
 
     fn by_tenant(&self, tenant: &str) -> usize {
         let lo = tenant_prefix(tenant);
-        self.through(0, &lo, &prefix_end(&lo), usize::MAX).len()
+        self.through(0, &lo, &prefix_end(&lo), usize::MAX, false)
+            .len()
     }
 
     fn in_range(&self, lo: i64, hi: i64) -> usize {
-        self.through(1, &sortable(lo), &sortable(hi), usize::MAX)
+        self.through(1, &sortable(lo), &sortable(hi), usize::MAX, false)
             .len()
     }
 
     fn oldest(&self, status: &str, limit: usize) -> Vec<i64> {
         let lo = status_prefix(status);
-        self.through(2, &lo, &prefix_end(&lo), limit)
+        self.through(2, &lo, &prefix_end(&lo), limit, false)
+            .iter()
+            .map(|t| t.created)
+            .collect()
+    }
+
+    fn newest(&self, status: &str, limit: usize) -> Vec<i64> {
+        let lo = status_prefix(status);
+        self.through(2, &lo, &prefix_end(&lo), limit, true)
             .iter()
             .map(|t| t.created)
             .collect()
@@ -547,9 +591,20 @@ impl Sled {
         self.db.flush().unwrap();
     }
 
-    fn through(&self, which: usize, lo: &[u8], hi: &[u8], limit: usize) -> Vec<Task> {
-        self.indexes[which]
-            .range(lo..hi)
+    fn through(
+        &self,
+        which: usize,
+        lo: &[u8],
+        hi: &[u8],
+        limit: usize,
+        backward: bool,
+    ) -> Vec<Task> {
+        let range = self.indexes[which].range(lo..hi);
+        let entries: Box<dyn Iterator<Item = _>> = match backward {
+            true => Box::new(range.rev()),
+            false => Box::new(range),
+        };
+        entries
             .take(limit)
             .map(|entry| {
                 let id = id_of(&entry.unwrap().0);
@@ -586,17 +641,26 @@ impl Store for Sled {
 
     fn by_tenant(&self, tenant: &str) -> usize {
         let lo = tenant_prefix(tenant);
-        self.through(0, &lo, &prefix_end(&lo), usize::MAX).len()
+        self.through(0, &lo, &prefix_end(&lo), usize::MAX, false)
+            .len()
     }
 
     fn in_range(&self, lo: i64, hi: i64) -> usize {
-        self.through(1, &sortable(lo), &sortable(hi), usize::MAX)
+        self.through(1, &sortable(lo), &sortable(hi), usize::MAX, false)
             .len()
     }
 
     fn oldest(&self, status: &str, limit: usize) -> Vec<i64> {
         let lo = status_prefix(status);
-        self.through(2, &lo, &prefix_end(&lo), limit)
+        self.through(2, &lo, &prefix_end(&lo), limit, false)
+            .iter()
+            .map(|t| t.created)
+            .collect()
+    }
+
+    fn newest(&self, status: &str, limit: usize) -> Vec<i64> {
+        let lo = status_prefix(status);
+        self.through(2, &lo, &prefix_end(&lo), limit, true)
             .iter()
             .map(|t| t.created)
             .collect()

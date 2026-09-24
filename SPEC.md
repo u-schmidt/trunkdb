@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §49 for the roadmap.
+large-document workload (§5.2) the second; see §50 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1531,7 +1531,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§49.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§50.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1712,7 +1712,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§49.2).
+(§50.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2102,7 +2102,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§49). It's also a backup that can be read and `diff`ed, and a way to
+(§50). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2229,7 +2229,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§49.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§50.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2340,7 +2340,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§49.2);
+- Still one field per index: compound indexes are still open (§50.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2660,6 +2660,7 @@ little next to the reads. Rejected for now: a lazy B-tree walk. `range`
 still collects the range's entries (keys and locations, no documents),
 a few hundred per leaf page — the documents are what's expensive. A
 lazy walk, with backward leaf links for `Desc`, is a later step.
+(§49 added it, without the links, after §48 measured the cost.)
 
 ### 34.3 Tests
 - `sorting_through_an_index_matches_sorting_in_memory`: every kind of
@@ -2879,7 +2880,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§49.2).
+- Still no pattern language, no conditions on array elements (§50.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2966,7 +2967,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §49.2).
+  §50.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3302,7 +3303,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§49.2).
+  run on such a file. Repairing is open (§50.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -4549,7 +4550,7 @@ and by very different factors. Each factor has a cause in the code:
 ### 48.5 What it changes on the roadmap
 Three new items, and one old one moved to the front, in order of
 measured gap and effort:
-1. **The lazy B-tree walk** (§34.2): 1,000× on the one query compound
+1. **The lazy B-tree walk** (§34.2, done in §49): 1,000× on the one query compound
    indexes were built for (§43), and a contained change in `btree.rs`
    and the sorted read.
 2. **A page cache**, which is new: about 10× on lookups and 2.5–4× on
@@ -4570,20 +4571,147 @@ number from this benchmark before and after.
   `fsync` costs differently, and CI runs the benchmark on Linux without
   looking at the times.
 - **One thread.** Nothing measures readers during a write batch, which
-  is where MVCC (§49.2) would show.
+  is where MVCC (§50.2) would show.
 - **Warm caches only**; a cold start (first read after a reboot) isn't
   measured.
 - **JSON for the others**, where a binary format would be faster.
 - **sled 0.34** is the last stable release, and 1.0 has been in alpha
   for years.
 
-## 49. Roadmap
+## 49. A lazy B-tree walk (`index/btree.rs`, `collection.rs`)
+
+Real and measured: reading an index in sort order now reads one leaf
+page at a time and stops at the limit. "The oldest 20 queued tasks"
+reads the pages those 20 are on, not every queued task's entry. In the
+benchmark (§48) that query went from 19 ms to about 0.1 ms with
+100,000 documents, and the descending one is as fast.
+
+### 49.1 `BTreeIndex::walk`
+`walk(store, range, backward)` returns a `Walk`, an iterator of
+`io::Result<(key, location)>` that reads a leaf only when the previous
+one is used up. An I/O error ends it after it's handed out.
+- **Forward**, it descends to the leaf where `range.start` would be and
+  follows the leaves' sibling links (§10) until a key reaches
+  `range.end`.
+- **Backward**, it descends towards `range.end` (or along the last
+  children) and keeps the branch pages above the current leaf in
+  memory: each as its list of children, with the one it's in. The
+  previous leaf is one step left in the lowest branch that has a child
+  to the left, then down the last children. That is one page read per
+  leaf in the common case, and at most the tree's height where it
+  crosses a branch boundary.
+- A leaf left **empty** by removals (§10: leaves aren't merged) is
+  skipped either way.
+- Each leaf's entries in the range are copied out, so a `Walk` borrows
+  only the store and holds no page past its leaf.
+
+`range` is now the forward walk collected, so the eager callers
+(`candidate_entries`, `check`, `compact`, ...) keep their `Vec` and
+behave as before. The `Index` trait keeps `range` only; `InMemoryIndex`
+has no pages to be lazy about.
+
+Rejected:
+- **Backward leaf links**, as the roadmap first said (§34.2). A `prev`
+  pointer in every leaf would change the page layout and the file
+  format, and every split would have to update a third page. The path
+  of branches costs a few `Vec`s of page ids in memory and no format
+  change.
+- **Walking backward by searching again** for the key before the
+  current leaf's first. An empty leaf has no first key to search from.
+- **A walk that holds the read lock itself.** It borrows the store from
+  the caller, which holds the lock for the whole `find` (§27), as
+  before.
+
+### 49.2 The sorted read on top of it
+`read_in_index_order` consumes the walk: entries are grouped as they
+come, by the values of the served sort keys (§47.3), and each finished
+group is read and checked at once. When `limit` documents match, the
+walk is dropped, and the rest of the range is never read. `Desc` walks
+backward; the group sorting of §47.3 is gone.
+
+Two things the old eager version got from sorting whole groups had to
+be kept:
+- **Ties in id order.** A backward walk hands out equal values last id
+  first, so every group is sorted by id before it's read. It usually
+  already is, and it's at most one group.
+- **Unordered values last, in both directions.** In a compound index
+  they carry `TAG_OTHER`, which sorts after every other tag (§43.2), so
+  a forward walk has them last already. A backward walk has them
+  *first* among the groups that share the values before them.
+  `Held` keeps such a group back until the walk leaves those shared
+  values, then hands it out after them, sorted as §47.3 sorted all
+  groups. The stack holds one level per served key that has
+  unordered values, so the innermost level goes first. Unordered
+  values are rare (arrays, objects, NaN in an indexed field), and so
+  are held groups. A one-field index holds no unordered values (§34.1)
+  and never holds a group back.
+
+### 49.3 Measured
+With 100,000 documents, trunkdb alone (§48.3 has the others):
+
+| | before | after, four runs |
+|---|---:|---:|
+| status == x, oldest 20 | 18,465–19,247 µs | 92–126 µs |
+| status == x, newest 20 | — | 93–180 µs |
+
+That's about 150–200× faster. At this size the spread between runs is
+large; the same runs put SQLite, redb and sled at 15–23 µs. Everything
+else stayed within the run-to-run spread, with one outlier: "created in
+a range" once took 6.8 ms, then 4.5 and 4.8 ms again. `range` is now
+the walk collected, so it was worth checking. The benchmark now
+also measures "newest 20", for the backward walk; SQLite, redb and sled
+take 15–23 µs for either. The rest of trunkdb's time is about 25 page
+reads (the index's path and leaf, and 20 data pages), each a `pread`, a
+checksum and an allocation without a page cache (§48.4).
+
+### 49.4 Tests
+- `index/btree.rs`:
+  - 6,000 random keys of varying length, a third of them removed again
+    including a run of 1,500 neighbours, so some leaves are empty. Then
+    300 random ranges (bounded on both, one or no sides), walked
+    forward and backward, must equal a `BTreeMap`'s entries in its
+    order or the reverse; `range` too.
+  - Page reads, counted by a wrapper around the store, on 20,000 keys:
+    - the first 20 of everything, or of a middle range, either way: at
+      most a descent plus one leaf;
+    - a middle range of 1,000 keys walked whole: its leaves plus a
+      descent, not the leaves before or after it;
+    - the whole tree: every leaf.
+- `collection.rs`: every randomized sorted-read test from §34, §43, §44
+  and §47 now runs on the walk, `Desc` included, over arrays, NaN, huge
+  numbers and cut strings in compound keys. They passed unchanged.
+- Checked by breaking it on purpose, eleven ways. Each of these fails
+  a test:
+  - a backward walk starting from the last leaf instead of the one for
+    `range.end` (correct, but reads everything after it);
+  - a backward walk stopping at the first leaf of a branch instead of
+    climbing further;
+  - a walk not stopping at the far end of its range, either way (correct
+    results, too many pages);
+  - a forward walk handing out a leaf backward;
+  - the path of branches not kept;
+  - a `Desc` sort walking forward;
+  - groups not put in id order;
+  - held groups never held, released at once, or held until the end.
+
+  One passed at first: stopping instead of climbing. Every test tree
+  had one level of branches, where the two are the same. A test with
+  600-byte keys builds a tree four levels tall and catches it now.
+
+### 49.5 Limits
+- **Only the sorted read is lazy.** An index range for a filter without
+  a sort is still collected whole (`candidate_entries`), since every
+  document in it is read anyway. A cursor still starts from that list.
+- **Each leaf's entries are copied** before they're handed out, which
+  costs an allocation per key.
+
+## 50. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 49.1 Done
+### 50.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -4601,9 +4729,9 @@ All of it is done:
 | 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
-| next | Benchmarks against SQLite, redb and sled | §48 |
+| next | Benchmarks against SQLite, redb and sled; a lazy B-tree walk | §48–§49 |
 
-### 49.2 Open
+### 50.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -4611,8 +4739,6 @@ limit is described.
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
 
 **Indexes**
-- A lazy B-tree walk, with backward leaf links for `Desc` (§34.2) —
-  measured 1,000× behind on "oldest 20 by status" (§48.4); next.
 
 **Storage and durability**
 - A page cache: lookups 10× behind redb, other reads 2.5–4× (§48.4).

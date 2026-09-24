@@ -692,9 +692,10 @@ fn candidate_entries(
 }
 
 /// `find` for a filter `Filter::index_order` chose (SPEC §34.2): walks the
-/// index in sort order, checks each document against the whole filter,
-/// and stops as soon as `limit` match — the documents after that are
-/// never read. Already filtered, sorted and limited.
+/// index in sort order (`BTreeIndex::walk`, SPEC §49), checks each
+/// document against the whole filter, and stops as soon as `limit`
+/// match — the entries and documents after that are never read. Already
+/// filtered, sorted and limited.
 ///
 /// Entries are read in groups that share the values of the served sort
 /// keys (`OrderedRead::served`). A group comes in id order, which is sort
@@ -710,8 +711,9 @@ fn candidate_entries(
 /// A compound index (SPEC §43.3) is read within the values its first
 /// fields are fixed to — by id within a group, which fields after the
 /// served ones would otherwise order. It holds every document, the
-/// unordered values too, under a tag of their own: those go last in
-/// their group's order, whichever the direction.
+/// unordered values too, under a tag of their own that sorts last:
+/// right for an ascending walk, and a descending one holds those groups
+/// back until it has passed what they must follow (`Held`).
 fn read_in_index_order(
     catalog: &Catalog,
     store: &dyn PageStore,
@@ -728,60 +730,26 @@ fn read_in_index_order(
     }
     let index = order.index;
     let unordered_can_match = order.range.is_none() && !index.is_compound();
-    let entries = BTreeIndex::new(index.root)
-        .range(store, &order.range.unwrap_or_else(KeyRange::everything))?;
+    let backward = first.order == SortOrder::Desc;
+    let mut entries = BTreeIndex::new(index.root).walk(
+        store,
+        order.range.unwrap_or_else(KeyRange::everything),
+        backward,
+    );
     let fields = index.fields.len();
     let (at, end) = (order.fixed, order.fixed + order.served);
-    // The served sort keys' values in a key: where they start and end.
-    // Up to the first that may stand for several values (a cut string,
-    // a huge number): the keys after it don't order entries it holds,
-    // whose true values may differ — they're sorted in memory instead.
-    let served = |key: &[u8]| -> (usize, usize) {
-        let parts = key::parts(key::value_part(key));
-        let start: usize = parts[..at].iter().map(|p| p.len()).sum();
-        let mut len = 0;
-        for part in &parts[at..end] {
-            len += part.len();
-            if !key::part_is_exact(part, fields) {
-                break;
-            }
-        }
-        (start, start + len)
-    };
-    let mut groups: Vec<Vec<(Vec<u8>, RecordLocation)>> = entries
-        .chunk_by(|(a, _), (b, _)| a[..served(a).1] == b[..served(b).1])
-        .map(<[_]>::to_vec)
-        .collect();
-    if end < fields {
-        for group in &mut groups {
-            group.sort_by_key(|(key, _)| key::doc_id(key));
-        }
-    }
-    let values = |group: &[(Vec<u8>, RecordLocation)]| {
-        let key = &group[0].0;
-        let (start, end) = served(key);
-        key::parts(&key[start..end])
-            .into_iter()
-            .map(<[u8]>::to_vec)
-            .collect::<Vec<_>>()
-    };
-    // Value by value, as `query::sort_order` compares: the encodings
-    // sort as the values do; unordered ones last, whichever the
-    // direction. Stable, so groups that compare equal keep their order.
-    groups.sort_by_cached_key(|group| {
-        values(group)
-            .into_iter()
-            .map(|part| {
-                let other = key::is_other(&part);
-                (other, Directed(part, first.order))
-            })
-            .collect::<Vec<_>>()
-    });
+    let spans = Spans { at, end, fields };
     let in_memory = filter.sort.len() > order.served;
     let mut records = data::Records::new(store);
     let mut read = |loc: &RecordLocation| records.get(*loc);
-    for group in groups {
-        let exact = values(&group)
+    // Hands out one group's matching documents; `true` once `limit` are.
+    let mut take = |group: Group, results: &mut Vec<(DocId, Document)>| -> crate::Result<bool> {
+        // Ties in id order: fields after the served ones would order them
+        // otherwise, and a backward walk hands them out last id first.
+        let mut group = group;
+        group.sort_by_key(|(key, _)| key::doc_id(key));
+        let exact = spans
+            .values(&group[0].0)
             .iter()
             .all(|part| key::part_is_exact(part, fields));
         if exact && !in_memory {
@@ -790,7 +758,7 @@ fn read_in_index_order(
                 if filter.matches(&doc) {
                     results.push((id, doc));
                     if results.len() == limit {
-                        return Ok(results);
+                        return Ok(true);
                     }
                 }
             }
@@ -806,11 +774,35 @@ fn read_in_index_order(
             for found in unlimited.apply_to(docs, |(_id, doc)| doc) {
                 results.push(found);
                 if results.len() == limit {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    };
+    let mut held = Held::new(backward && index.is_compound(), spans, first.order);
+    let mut group: Group = Vec::new();
+    loop {
+        let entry = entries.next().transpose()?;
+        let ends_group = match (&entry, group.first()) {
+            (Some((key, _)), Some((first_key, _))) => spans.group(key) != spans.group(first_key),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if ends_group {
+            let next = entry.as_ref().map(|(key, _)| key.as_slice());
+            for ready in held.pass(std::mem::take(&mut group), next) {
+                if take(ready, &mut results)? {
                     return Ok(results);
                 }
             }
         }
+        match entry {
+            Some(entry) => group.push(entry),
+            None => break,
+        }
     }
+    let unordered_after = results.len();
     if unordered_can_match {
         let meta = catalog
             .get(collection)
@@ -822,7 +814,7 @@ fn read_in_index_order(
             if crate::query::is_unordered(value) && filter.matches(&doc) {
                 unordered.push((id, doc));
                 // Without keys after the first, id order is their order.
-                if !in_memory && results.len() + unordered.len() == limit {
+                if !in_memory && unordered_after + unordered.len() == limit {
                     break;
                 }
             }
@@ -836,6 +828,110 @@ fn read_in_index_order(
         results.truncate(limit);
     }
     Ok(results)
+}
+
+/// Index entries sharing the values of the served sort keys.
+type Group = Vec<(Vec<u8>, RecordLocation)>;
+
+/// Where the served sort keys' values are in an index key.
+#[derive(Clone, Copy)]
+struct Spans {
+    /// Fixed fields before them.
+    at: usize,
+    /// Fixed fields and served keys.
+    end: usize,
+    fields: usize,
+}
+
+impl Spans {
+    /// The bytes a group shares: the fixed values and the served ones —
+    /// up to the first that may stand for several values (a cut string,
+    /// a huge number): the keys after it don't order entries it holds,
+    /// whose true values may differ; they're sorted in memory instead.
+    fn group<'k>(&self, key: &'k [u8]) -> &'k [u8] {
+        let parts = key::parts(key::value_part(key));
+        let mut len: usize = parts[..self.at].iter().map(|p| p.len()).sum();
+        for part in &parts[self.at..self.end] {
+            len += part.len();
+            if !key::part_is_exact(part, self.fields) {
+                break;
+            }
+        }
+        &key[..len]
+    }
+
+    /// The served values a group shares, each on its own.
+    fn values<'k>(&self, key: &'k [u8]) -> Vec<&'k [u8]> {
+        let shared = self.group(key);
+        let parts = key::parts(shared);
+        parts[self.at..].to_vec()
+    }
+}
+
+/// A descending walk of a compound index hands out a group whose served
+/// value is unordered (`key::is_other`) before the groups with the same
+/// values up to it, since that tag sorts last — but in a sort, unordered
+/// values go last in both directions (§34.1). So such a group is held
+/// until the walk leaves those values, then handed out after them
+/// (SPEC §49). Unordered values are rare; so are held groups.
+struct Held {
+    active: bool,
+    spans: Spans,
+    order: SortOrder,
+    /// Held groups by the bytes before their first unordered value, the
+    /// innermost last.
+    stack: Vec<(Vec<u8>, Vec<Group>)>,
+}
+
+impl Held {
+    fn new(active: bool, spans: Spans, order: SortOrder) -> Self {
+        Held {
+            active,
+            spans,
+            order,
+            stack: Vec::new(),
+        }
+    }
+
+    /// Takes a finished group, `next` being the walk's next key (`None`
+    /// at the end), and returns the groups to hand out now, in order.
+    fn pass(&mut self, group: Group, next: Option<&[u8]>) -> Vec<Group> {
+        if !self.active {
+            return vec![group];
+        }
+        let mut ready = Vec::new();
+        let key = group[0].0.clone();
+        let values = self.spans.values(&key);
+        match values.iter().position(|part| key::is_other(part)) {
+            Some(i) => {
+                let before: usize = self.spans.group(&key).len()
+                    - values[i..].iter().map(|p| p.len()).sum::<usize>();
+                let prefix = key[..before].to_vec();
+                match self.stack.last_mut() {
+                    Some((top, groups)) if *top == prefix => groups.push(group),
+                    _ => self.stack.push((prefix, vec![group])),
+                }
+            }
+            None => ready.push(group),
+        }
+        while let Some((prefix, _)) = self.stack.last() {
+            if next.is_some_and(|next| next.starts_with(prefix)) {
+                break;
+            }
+            let (_, mut groups) = self.stack.pop().expect("just looked");
+            let order = self.order;
+            let spans = self.spans;
+            groups.sort_by_cached_key(|group| {
+                spans
+                    .values(&group[0].0)
+                    .into_iter()
+                    .map(|part| (key::is_other(part), Directed(part.to_vec(), order)))
+                    .collect::<Vec<_>>()
+            });
+            ready.extend(groups);
+        }
+        ready
+    }
 }
 
 /// An encoded value that sorts ascending or descending as its

@@ -102,6 +102,7 @@ struct Answers {
     by_tenant: usize,
     in_range: usize,
     oldest: Vec<i64>,
+    newest: Vec<i64>,
     scanned: usize,
 }
 
@@ -222,6 +223,19 @@ fn main() {
         answer.oldest = oldest;
         record(
             "status == x, oldest 20",
+            Unit::Micros,
+            micros(statuses.len(), took),
+        );
+        let (took, newest) = time(|| {
+            statuses
+                .iter()
+                .map(|s| store.newest(s, 20))
+                .last()
+                .unwrap_or_default()
+        });
+        answer.newest = newest;
+        record(
+            "status == x, newest 20",
             Unit::Micros,
             micros(statuses.len(), took),
         );
