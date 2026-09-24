@@ -31,6 +31,7 @@ const HEADER_KEY: &str = "$trunkdb_export";
 const COLLECTION_KEY: &str = "$collection";
 const INDEXES_KEY: &str = "$indexes";
 const FIELD_KEY: &str = "field";
+const FIELDS_KEY: &str = "fields";
 const UNIQUE_KEY: &str = "unique";
 
 /// An import writes a batch at most this many documents…
@@ -76,12 +77,19 @@ impl Database {
                 .catalog
                 .indexes(name)
                 .iter()
-                .map(|index| match index.unique {
-                    false => Value::String(index.field.clone()),
-                    true => object([
-                        (FIELD_KEY, index.field.clone().into()),
-                        (UNIQUE_KEY, true.into()),
-                    ]),
+                .map(|index| {
+                    let fields = || index.fields.iter().map(|f| f.as_str().into()).collect();
+                    match (index.single(), index.unique) {
+                        (Some(field), false) => Value::String(field.to_string()),
+                        (Some(field), true) => {
+                            object([(FIELD_KEY, field.into()), (UNIQUE_KEY, true.into())])
+                        }
+                        (None, false) => Value::Array(fields()),
+                        (None, true) => object([
+                            (FIELDS_KEY, Value::Array(fields())),
+                            (UNIQUE_KEY, true.into()),
+                        ]),
+                    }
                 })
                 .collect();
             let header = object([
@@ -211,7 +219,7 @@ impl Chunk {
 /// field as a string, or `{"field": ..., "unique": true}` (SPEC §33.5).
 struct CollectionHeader {
     name: String,
-    indexes: Vec<(String, bool)>,
+    indexes: Vec<(Vec<String>, bool)>,
 }
 
 impl CollectionHeader {
@@ -249,40 +257,54 @@ impl CollectionHeader {
 
     fn build_indexes(self, db: &Database) -> crate::Result<()> {
         let collection = db.collection::<crate::Document>(&self.name);
-        for (field, unique) in &self.indexes {
+        for (fields, unique) in &self.indexes {
             match unique {
-                false => collection.ensure_index(field)?,
-                true => collection.ensure_unique_index(field)?,
+                false => collection.ensure_index(fields.as_slice())?,
+                true => collection.ensure_unique_index(fields.as_slice())?,
             };
         }
         Ok(())
     }
 }
 
-/// One `$indexes` entry: `"field"`, or `{"field": "...", "unique":
-/// bool}`.
-fn parse_index(index: &Value) -> Result<(String, bool), String> {
+/// One `$indexes` entry: `"field"`, `["field", ...]` for a compound
+/// index (SPEC §43), or an object with `"field"` or `"fields"` and
+/// `"unique": bool`.
+fn parse_index(index: &Value) -> Result<(Vec<String>, bool), String> {
     let wrong = || {
         format!(
-            "an `{INDEXES_KEY}` entry must be a field name or \
-             {{\"{FIELD_KEY}\": ..., \"{UNIQUE_KEY}\": true}}, got {index}"
+            "an `{INDEXES_KEY}` entry must be a field name, an array of them, or \
+             {{\"{FIELD_KEY}\" or \"{FIELDS_KEY}\": ..., \"{UNIQUE_KEY}\": true}}, got {index}"
         )
     };
+    let names = |value: &Value| match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect::<Option<Vec<String>>>(),
+        _ => None,
+    };
     match index {
-        Value::String(field) => Ok((field.clone(), false)),
+        Value::String(field) => Ok((vec![field.clone()], false)),
+        Value::Array(_) => Ok((names(index).ok_or_else(wrong)?, false)),
         Value::Object(object) => {
-            let Some(Value::String(field)) = object.get(FIELD_KEY) else {
-                return Err(wrong());
+            let fields = match (object.get(FIELD_KEY), object.get(FIELDS_KEY)) {
+                (Some(Value::String(field)), None) => vec![field.clone()],
+                (None, Some(fields)) => names(fields).ok_or_else(wrong)?,
+                _ => return Err(wrong()),
             };
             let unique = match object.get(UNIQUE_KEY) {
                 None => false,
                 Some(Value::Bool(unique)) => *unique,
                 Some(_) => return Err(wrong()),
             };
-            if object.keys().any(|k| k != FIELD_KEY && k != UNIQUE_KEY) {
+            if object
+                .keys()
+                .any(|k| k != FIELD_KEY && k != FIELDS_KEY && k != UNIQUE_KEY)
+            {
                 return Err(wrong());
             }
-            Ok((field.clone(), unique))
+            Ok((fields, unique))
         }
         _ => Err(wrong()),
     }

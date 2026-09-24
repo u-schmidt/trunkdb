@@ -30,8 +30,9 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// 5 = unique indexes, a new catalog cell kind (SPEC §33); 6 = a
 /// checksum at the end of every page (SPEC §40); 7 = multikey indexes,
 /// on paths with `[*]` (SPEC §42), which a build before them would fill
-/// as if the path named one value.
-const FORMAT_VERSION: u32 = 7;
+/// as if the path named one value; 8 = compound indexes, new catalog
+/// cell kinds (SPEC §43).
+const FORMAT_VERSION: u32 = 8;
 /// Older formats this build opens as they are, because such a file *is*
 /// a valid `FORMAT_VERSION` file — one that uses none of what came since
 /// (for 4: unique indexes). Every header write stamps `FORMAT_VERSION`,
@@ -40,7 +41,7 @@ const FORMAT_VERSION: u32 = 7;
 /// so, and an older build refuses it instead of misreading it (SPEC §33.4).
 /// 4 and 5 aren't: every page of theirs lacks the checksum (6), and uses
 /// the bytes where it now goes.
-const COMPATIBLE_OLDER_FORMATS: [u32; 1] = [6];
+const COMPATIBLE_OLDER_FORMATS: [u32; 2] = [6, 7];
 const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.

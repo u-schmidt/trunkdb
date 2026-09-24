@@ -10,6 +10,55 @@ use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+/// What `ensure_index`, `ensure_unique_index` and `drop_index` take: one
+/// field — `"age"`, `"address.city"`, `"tags[*]"` — or several, for a
+/// compound index (SPEC §43): `["status", "created"]`.
+pub trait IndexFields {
+    fn into_fields(self) -> Vec<String>;
+}
+
+impl IndexFields for &str {
+    fn into_fields(self) -> Vec<String> {
+        vec![self.to_string()]
+    }
+}
+
+impl IndexFields for String {
+    fn into_fields(self) -> Vec<String> {
+        vec![self]
+    }
+}
+
+impl IndexFields for &String {
+    fn into_fields(self) -> Vec<String> {
+        vec![self.clone()]
+    }
+}
+
+impl<const N: usize> IndexFields for [&str; N] {
+    fn into_fields(self) -> Vec<String> {
+        self.iter().map(|field| field.to_string()).collect()
+    }
+}
+
+impl IndexFields for &[&str] {
+    fn into_fields(self) -> Vec<String> {
+        self.iter().map(|field| field.to_string()).collect()
+    }
+}
+
+impl IndexFields for Vec<String> {
+    fn into_fields(self) -> Vec<String> {
+        self
+    }
+}
+
+impl IndexFields for &[String] {
+    fn into_fields(self) -> Vec<String> {
+        self.to_vec()
+    }
+}
 use std::marker::PhantomData;
 
 /// The public-facing API. A `Collection` is a lightweight handle: a clone
@@ -61,66 +110,98 @@ impl<T> Collection<T> {
         &self.db
     }
 
-    /// Makes sure there's a secondary index on `field` (SPEC §28): `true`
+    /// Makes sure there's a secondary index on `fields` (SPEC §28): `true`
     /// if it was created now — from every document already stored, in
     /// one atomic batch — `false` if it already existed. Creates the
     /// collection if needed, so indexes can be declared up front. From
     /// then on every write keeps the index up to date, and `find` uses it
-    /// for `Eq`/`Lt`/`Lte`/`Gt`/`Gte` conditions on `field`. The index
+    /// for `Eq`/`Lt`/`Lte`/`Gt`/`Gte` conditions on its fields. The index
     /// persists; call this at startup.
     ///
-    /// `field` can be a dotted path into nested objects, like
-    /// `address.city` (SPEC §31); a document without that path just has
-    /// no entry. `_id` is always indexed (the primary index) and is
-    /// rejected here, and so are paths below it and paths with an empty
-    /// part (`a..b`, `.a`).
+    /// One field — `"age"`, a dotted path into nested objects like
+    /// `"address.city"` (SPEC §31), or into array elements like
+    /// `"tags[*]"` (SPEC §42) — or several, for a compound index:
+    /// `["status", "created"]` (SPEC §43). A compound index serves `Eq`
+    /// on its first fields and a range or a sort on the next one:
+    /// `status == "Queued"`, sorted by `created`. `_id` is always indexed
+    /// (the primary index) and is rejected here, and so are paths below
+    /// it and paths with an empty part (`a..b`, `.a`).
     ///
-    /// An existing unique index on `field` is an error, not a match —
-    /// see `ensure_unique_index`.
-    pub fn ensure_index(&self, field: &str) -> crate::Result<bool> {
-        self.ensure(field, false)
+    /// An existing unique index on the same fields is an error, not a
+    /// match — see `ensure_unique_index`.
+    pub fn ensure_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
+        self.ensure(fields.into_fields(), false)
     }
 
     /// `ensure_index`, plus a constraint (SPEC §33): no two documents may
-    /// have equal values in `field` — equal as a filter's `Eq` sees it,
+    /// have equal values in the field — equal as a filter's `Eq` sees it,
     /// so `1` and `1.0` count as equal, `"a"` and `"A"` don't. Null and
     /// missing values are exempt: any number of documents may lack the
-    /// field. A write that would break it fails with
-    /// `Error::DuplicateValue`, and its whole batch is rolled back.
+    /// field. On several fields, no two documents may be equal in all of
+    /// them, and a document with a null in any is exempt (SPEC §43.4). A
+    /// write that would break it fails with `Error::DuplicateValue`, and
+    /// its whole batch is rolled back.
     ///
     /// Creating it over documents that already break it fails the same
     /// way, naming two of them, and creates nothing. An existing
-    /// non-unique index on `field` is an error too: drop it first, then
-    /// call this.
-    pub fn ensure_unique_index(&self, field: &str) -> crate::Result<bool> {
-        self.ensure(field, true)
+    /// non-unique index on the same fields is an error too: drop it
+    /// first, then call this.
+    pub fn ensure_unique_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
+        self.ensure(fields.into_fields(), true)
     }
 
-    fn ensure(&self, field: &str, unique: bool) -> crate::Result<bool> {
-        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
-        // Each step a field name, then any number of `[*]` (SPEC §42).
-        let names = field.split('.').map(|step| step.trim_end_matches("[*]"));
-        if names.clone().next() == Some("_id") {
-            return Err(invalid("`_id` is the primary key; it needs no secondary index").into());
+    fn ensure(&self, fields: Vec<String>, unique: bool) -> crate::Result<bool> {
+        let invalid = |message: &str| {
+            crate::Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message.to_string(),
+            ))
+        };
+        if fields.is_empty() {
+            return Err(invalid("an index needs at least one field"));
         }
-        if names.clone().any(str::is_empty) {
-            return Err(invalid("an index path needs a name between every two dots").into());
+        if fields.len() > key::MAX_COMPOUND_FIELDS {
+            return Err(invalid(&format!(
+                "a compound index has at most {} fields",
+                key::MAX_COMPOUND_FIELDS
+            )));
         }
-        if names.clone().any(|name| name.contains(['[', ']'])) {
-            return Err(invalid(
-                "in an index path, only `[*]`, right after a name, may use brackets",
-            )
-            .into());
+        for (i, field) in fields.iter().enumerate() {
+            // Each step a field name, then any number of `[*]` (SPEC §42).
+            let names = field.split('.').map(|step| step.trim_end_matches("[*]"));
+            if names.clone().next() == Some("_id") {
+                return Err(invalid(
+                    "`_id` is the primary key; it needs no secondary index",
+                ));
+            }
+            if names.clone().any(str::is_empty) {
+                return Err(invalid("an index path needs a name between every two dots"));
+            }
+            if names.clone().any(|name| name.contains(['[', ']'])) {
+                return Err(invalid(
+                    "in an index path, only `[*]`, right after a name, may use brackets",
+                ));
+            }
+            if fields.len() > 1 && crate::query::is_multi(field) {
+                return Err(invalid(
+                    "a compound index can't be on array elements (`[*]`): one entry per \
+                     document is what lets it sort (SPEC §43)",
+                ));
+            }
+            if fields[..i].contains(field) {
+                return Err(invalid(&format!("{field:?} is in the index twice")));
+            }
         }
         self.db
-            .transact(|catalog, store| build_index(catalog, store, &self.name, field, unique))
+            .transact(|catalog, store| build_index(catalog, store, &self.name, &fields, unique))
     }
 
-    /// Drops the secondary index on `field` and frees its pages: `false`
+    /// Drops the secondary index on `fields` and frees its pages: `false`
     /// if there was none.
-    pub fn drop_index(&self, field: &str) -> crate::Result<bool> {
+    pub fn drop_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
+        let fields = fields.into_fields();
         self.db.transact(|catalog, store| {
-            let Some(index) = catalog.drop_index(store, &self.name, field)? else {
+            let Some(index) = catalog.drop_index(store, &self.name, &fields)? else {
                 return Ok(false);
             };
             BTreeIndex::new(index.root).free_all(store)?;
@@ -128,25 +209,26 @@ impl<T> Collection<T> {
         })
     }
 
-    /// The fields this collection has secondary indexes on, in creation
-    /// order — unique ones included.
+    /// This collection's secondary indexes, in creation order — unique
+    /// ones included: each by its field, a compound one by its fields in
+    /// parentheses, `(status, created)`.
     pub fn indexes(&self) -> crate::Result<Vec<String>> {
-        self.index_fields(|_| true)
+        self.index_names(|_| true)
     }
 
-    /// The fields of `indexes` whose index is unique (SPEC §33).
+    /// The names of `indexes` whose index is unique (SPEC §33).
     pub fn unique_indexes(&self) -> crate::Result<Vec<String>> {
-        self.index_fields(|index| index.unique)
+        self.index_names(|index| index.unique)
     }
 
-    fn index_fields(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
+    fn index_names(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
         let state = self.db.read()?;
         Ok(state
             .catalog
             .indexes(&self.name)
             .iter()
             .filter(|index| keep(index))
-            .map(|index| index.field.clone())
+            .map(IndexMeta::name)
             .collect())
     }
 
@@ -157,20 +239,17 @@ impl<T> Collection<T> {
         let indexes = state.catalog.indexes(&self.name);
         if let Some((index, _range)) = filter.index_order(indexes) {
             return Ok(QueryPlan::IndexOrder {
-                field: index.field.clone(),
+                field: index.name(),
             });
         }
         Ok(match filter.index_ranges(indexes) {
             None => QueryPlan::Scan,
             Some(ranges) => match &ranges[..] {
                 [(index, _range)] => QueryPlan::Index {
-                    field: index.field.clone(),
+                    field: index.name(),
                 },
                 _ => QueryPlan::IndexUnion {
-                    fields: ranges
-                        .iter()
-                        .map(|(index, _)| index.field.clone())
-                        .collect(),
+                    fields: ranges.iter().map(|(index, _)| index.name()).collect(),
                 },
             },
         })
@@ -587,6 +666,12 @@ fn candidate_entries(
 /// and sorted. Values no index holds (§34.1: arrays, NaN, ...) sort after
 /// everything: if the index runs out before the limit and no range
 /// condition on the sort field ruled them out, a scan finds them.
+///
+/// A compound index (SPEC §43.3) is read within the values its first
+/// fields are fixed to, grouped by the sort field's value — by id within
+/// a group, which fields after the sort field would otherwise order. It
+/// holds every document, the unordered values too, under a tag of their
+/// own: those groups go last, whichever the direction.
 fn read_in_index_order(
     catalog: &Catalog,
     store: &dyn PageStore,
@@ -602,20 +687,52 @@ fn read_in_index_order(
     if limit == 0 {
         return Ok(results);
     }
-    let unordered_can_match = range.is_none();
+    let unordered_can_match = range.is_none() && !index.is_compound();
     let entries =
         BTreeIndex::new(index.root).range(store, &range.unwrap_or_else(KeyRange::everything))?;
-    let mut groups: Vec<_> = entries
-        .chunk_by(|(a, _), (b, _)| key::value_part(a) == key::value_part(b))
+    let fields = index.fields.len();
+    let at = index
+        .fields
+        .iter()
+        .position(|f| *f == sort.field)
+        .expect("index_order picks an index with the sort field");
+    // The sort field's value in a key, and everything before it.
+    let sort_value = |key: &[u8]| -> (usize, usize) {
+        let value_part = key::value_part(key);
+        match index.is_compound() {
+            false => (0, value_part.len()),
+            true => {
+                let parts = key::parts(value_part);
+                let start: usize = parts[..at].iter().map(|p| p.len()).sum();
+                (start, start + parts[at].len())
+            }
+        }
+    };
+    let mut groups: Vec<Vec<(Vec<u8>, RecordLocation)>> = entries
+        .chunk_by(|(a, _), (b, _)| a[..sort_value(a).1] == b[..sort_value(b).1])
+        .map(<[_]>::to_vec)
         .collect();
+    if at + 1 < fields {
+        for group in &mut groups {
+            group.sort_by_key(|(key, _)| key::doc_id(key));
+        }
+    }
     if sort.order == SortOrder::Desc {
         groups.reverse();
+    }
+    let part = |key: &[u8]| {
+        let (start, end) = sort_value(key);
+        key[start..end].to_vec()
+    };
+    if index.is_compound() {
+        // Stable: the other groups keep their order among themselves.
+        groups.sort_by_key(|group| key::is_other(&part(&group[0].0)));
     }
     let mut records = data::Records::new(store);
     let mut read = |loc: &RecordLocation| records.get(*loc);
     for group in groups {
-        if key::is_exact(key::value_part(&group[0].0)) {
-            for (_key, loc) in group {
+        if key::part_is_exact(&part(&group[0].0), fields) {
+            for (_key, loc) in &group {
                 let (id, doc) = read(loc)?;
                 if filter.matches(&doc) {
                     results.push((id, doc));
@@ -807,49 +924,78 @@ fn old_document(
     Ok(Some(data::get_record(store, loc)?.1))
 }
 
-/// A document's keys in the secondary index on `field`, in key order,
-/// each once, with the values it's for: one key per value at the path
-/// that has an indexed type (`key::encode_value`). A plain path has one
-/// value — a missing field is indexed as null, so `field == null` can use
-/// the index (SPEC §32). A path with `[*]` has one per element, and none
-/// for no elements: a multikey index (SPEC §42.2). Several elements can
-/// share a key — equal ones, and different ones a key can't tell apart
-/// (strings cut to the key budget, §28.1) — and a unique index must
-/// check each of them.
-pub(crate) fn secondary_entries<'a>(
-    doc: &'a Document,
-    field: &str,
-    id: DocId,
-) -> Vec<(Vec<u8>, Vec<&'a Document>)> {
-    let mut keyed: Vec<(Vec<u8>, &Document)> = crate::query::values_at(doc, field)
-        .into_iter()
-        .filter_map(|value| Some((key::secondary(value, id)?, value)))
-        .collect();
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut entries: Vec<(Vec<u8>, Vec<&Document>)> = Vec::new();
-    for (key, value) in keyed {
-        match entries.last_mut() {
-            Some((last, values)) if *last == key => values.push(value),
-            _ => entries.push((key, vec![value])),
-        }
-    }
-    entries
+/// A document's keys in `index`, in key order, each once. On one field
+/// (SPEC §28): a key per value at the path that has an indexed type
+/// (`key::encode_value`) — one value for a plain path, where a missing
+/// field is indexed as null so `field == null` can use the index (§32);
+/// one per element for a path with `[*]`, and none for no elements, a
+/// multikey index (§42.2). On several fields, exactly one key, whatever
+/// they hold: a compound index holds every document (§43.2).
+pub(crate) fn index_keys(doc: &Document, index: &IndexMeta, id: DocId) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = match index.single() {
+        Some(field) => crate::query::values_at(doc, field)
+            .into_iter()
+            .filter_map(|value| key::secondary(value, id))
+            .collect(),
+        None => vec![key::compound(&field_values(doc, index), id)],
+    };
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
-/// `secondary_entries` without the values.
-pub(crate) fn secondary_keys(doc: &Document, field: &str, id: DocId) -> Vec<Vec<u8>> {
-    secondary_entries(doc, field, id)
-        .into_iter()
-        .map(|(key, _value)| key)
+/// The values a compound index's key encodes, one per field.
+fn field_values<'a>(doc: &'a Document, index: &IndexMeta) -> Vec<&'a Document> {
+    index
+        .fields
+        .iter()
+        .map(|field| crate::query::value_or_null(doc, field))
         .collect()
+}
+
+/// What a unique `index` compares of a document (SPEC §33): tuples of
+/// values — one per field — each with the value part of the key it's
+/// under. On one field, a 1-tuple per value, per element for `[*]`
+/// (several elements can share a key: equal ones, and long strings a
+/// key can't tell apart, §28.1 — each must be checked). On several
+/// fields, the one tuple of their values (§43.4). Left out, since they
+/// never collide: null values — on several fields, a tuple with a null
+/// in it, as SQL does — and values no comparison finds equal (arrays,
+/// objects, NaN, ...).
+pub(crate) fn unique_tuples<'a>(
+    doc: &'a Document,
+    index: &IndexMeta,
+) -> Vec<(Vec<u8>, Vec<&'a Document>)> {
+    let comparable =
+        |value: &Document| !matches!(value, Document::Null) && key::encode_value(value).is_some();
+    match index.single() {
+        Some(field) => crate::query::values_at(doc, field)
+            .into_iter()
+            .filter(|value| comparable(value))
+            .map(|value| (key::encode_value(value).expect("comparable"), vec![value]))
+            .collect(),
+        None => {
+            let values = field_values(doc, index);
+            match values.iter().all(|value| comparable(value)) {
+                true => vec![(key::encode_values(&values), values)],
+                false => Vec::new(),
+            }
+        }
+    }
+}
+
+/// Two `unique_tuples` tuples collide: every value equal as a filter's
+/// `Eq` sees it.
+pub(crate) fn same_values(a: &[&Document], b: &[&Document]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| crate::query::equal(a, b))
 }
 
 /// Brings every secondary index from a document's `old` state to its
 /// `new` one — each `(document, location)`, `None` for "not there":
 /// insert is `(None, new)`, delete `(old, None)`. Only keys that went
 /// away are removed and only new ones inserted — all of them, if the
-/// document moved. A unique index checks each new key's value before it
-/// goes in, not one that stayed (only the document moved).
+/// document moved. A unique index checks each new key's values before
+/// anything goes in, not one that stayed (only the document moved).
 fn update_secondary_indexes(
     collection: &str,
     indexes: &[IndexMeta],
@@ -860,39 +1006,38 @@ fn update_secondary_indexes(
 ) -> crate::Result<()> {
     let moved = old.map(|(_, loc)| loc) != new.map(|(_, loc)| loc);
     for index in indexes {
-        let before = old.map_or(Vec::new(), |(doc, _)| secondary_keys(doc, &index.field, id));
-        let after = new.map_or(Vec::new(), |(doc, _)| {
-            secondary_entries(doc, &index.field, id)
-        });
+        let before = old.map_or(Vec::new(), |(doc, _)| index_keys(doc, index, id));
+        let after = new.map_or(Vec::new(), |(doc, _)| index_keys(doc, index, id));
         let mut tree = BTreeIndex::new(index.root);
         for key in &before {
-            if moved || !after.iter().any(|(k, _)| k == key) {
+            if moved || !after.contains(key) {
                 tree.remove(store, key)?;
             }
         }
-        let Some((_, loc)) = new else { continue };
-        for (key, values) in &after {
-            let added = !before.contains(key);
-            if !added && !moved {
-                continue;
-            }
-            if index.unique && added {
-                for value in values {
-                    check_unique(store, collection, index, id, value)?;
+        let Some((doc, loc)) = new else { continue };
+        if index.unique {
+            for (value_part, values) in unique_tuples(doc, index) {
+                let key = [value_part.as_slice(), &id.0].concat();
+                if !before.contains(&key) {
+                    check_unique(store, collection, index, id, &value_part, &values)?;
                 }
             }
-            tree.insert(store, key, loc)?;
+        }
+        for key in &after {
+            if moved || !before.contains(key) {
+                tree.insert(store, key, loc)?;
+            }
         }
     }
     Ok(())
 }
 
-/// Before document `id`'s entry for `value` goes into the unique
-/// `index`: `Error::DuplicateValue` if another document has an equal
-/// value in the field (SPEC §33) — in a multikey index, in any of its
-/// elements (SPEC §42.2). Equal means equal to a filter's `Eq` — so
-/// `1` and `1.0` collide, `"a"` and `"A"` don't. Null and missing values
-/// are exempt. Keys can't decide it alone: different values can share a
+/// Before document `id`'s `values` go into the unique `index` under
+/// `value_part`: `Error::DuplicateValue` if another document has equal
+/// values (SPEC §33) — in a multikey index, in any of its elements
+/// (§42.2); in a compound index, in all of its fields (§43.4). Equal
+/// means equal to a filter's `Eq` — so `1` and `1.0` collide, `"a"` and
+/// `"A"` don't. Keys can't decide it alone: different values can share a
 /// key's value part (large ints rounding to one `f64`, strings cut to the
 /// key budget, §28.1), so every document under the same value part is
 /// read and compared — normally none.
@@ -901,26 +1046,23 @@ fn check_unique(
     collection: &str,
     index: &IndexMeta,
     id: DocId,
-    value: &Document,
+    value_part: &[u8],
+    values: &[&Document],
 ) -> crate::Result<()> {
-    if matches!(value, Document::Null) {
-        return Ok(());
-    }
-    let Some(encoded) = key::encode_value(value) else {
-        return Ok(());
-    };
     let tree = BTreeIndex::new(index.root);
-    for (entry, loc) in tree.range(store, &KeyRange::prefixed(&encoded))? {
+    for (entry, loc) in tree.range(store, &KeyRange::prefixed(value_part))? {
         let existing = key::doc_id(&entry);
         if existing == id {
             continue;
         }
         let (_, other) = data::get_record(store, loc)?;
-        let mut others = crate::query::values_at(&other, &index.field).into_iter();
-        if others.any(|other| crate::query::equal(other, value)) {
+        let collides = unique_tuples(&other, index)
+            .iter()
+            .any(|(_, others)| same_values(others, values));
+        if collides {
             return Err(crate::Error::DuplicateValue {
                 collection: collection.to_string(),
-                field: index.field.clone(),
+                field: index.name(),
                 id,
                 existing,
             });
@@ -938,13 +1080,13 @@ fn build_index(
     catalog: &mut Catalog,
     store: &mut dyn PageStore,
     collection: &str,
-    field: &str,
+    fields: &[String],
     unique: bool,
 ) -> crate::Result<bool> {
     if let Some(existing) = catalog
         .indexes(collection)
         .iter()
-        .find(|i| i.field == field)
+        .find(|i| i.fields == fields)
     {
         if existing.unique == unique {
             return Ok(false);
@@ -953,24 +1095,25 @@ fn build_index(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "{collection:?} already has {} index on {field:?}, not {}; drop it first",
+                "{collection:?} already has {} index on {:?}, not {}; drop it first",
                 kind(existing.unique),
+                existing.name(),
                 kind(unique)
             ),
         )
         .into());
     }
     let meta = get_or_create_meta(catalog, store, collection)?;
-    let index = catalog.create_index(store, collection, field, unique)?;
+    let index = catalog.create_index(store, collection, fields, unique)?;
     let mut tree = BTreeIndex::new(index.root);
     for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
         let (id, doc) = data::get_record(store, loc)?;
-        for (key, values) in secondary_entries(&doc, field, id) {
-            if unique {
-                for value in values {
-                    check_unique(store, collection, &index, id, value)?;
-                }
+        if unique {
+            for (value_part, values) in unique_tuples(&doc, &index) {
+                check_unique(store, collection, &index, id, &value_part, &values)?;
             }
+        }
+        for key in index_keys(&doc, &index, id) {
             tree.insert(store, &key, loc)?;
         }
     }
@@ -2490,10 +2633,404 @@ mod tests {
         assert_sorted_finds_agree_with_memory(&db.collection("docs"), &mut rng);
     }
 
+    /// A document for compound indexes (SPEC §43): `a` has few values (or
+    /// is missing, null, or an array), `b` anything `random_value` makes — arrays,
+    /// NaN, huge numbers, long strings included — `c` a small number.
+    fn random_compound_document(rng: &mut XorShift) -> Document {
+        let mut fields = Vec::new();
+        match rng.below(10) {
+            0 => {}
+            1 => fields.push(("a", Document::Null)),
+            // Sorts after everything (§34.1); a compound index holds it.
+            2 => fields.push(("a", Document::Array(vec![Document::Int(1)]))),
+            _ => fields.push(("a", Document::Int(rng.below(3) as i64))),
+        }
+        if rng.below(8) != 0 {
+            fields.push(("b", random_value(rng)));
+        }
+        fields.push(("c", Document::Int(rng.below(3) as i64)));
+        let pad = [0, 0, 1500, 4500][rng.below(4)];
+        fields.push(("pad", Document::String("y".repeat(pad))));
+        object(fields)
+    }
+
+    fn random_compound_filter(rng: &mut XorShift) -> Filter {
+        let ops = [Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
+        let mut conditions = Vec::new();
+        for _ in 0..rng.below(4) {
+            conditions.push(match rng.below(7) {
+                0 | 1 => cond("a", Op::Eq, Document::Int(rng.below(4) as i64)),
+                2 => cond(
+                    "a",
+                    ops[rng.below(5)].clone(),
+                    Document::Int(rng.below(4) as i64),
+                ),
+                3 => cond("b", ops[rng.below(5)].clone(), random_value(rng)),
+                4 => cond("c", Op::Eq, Document::Int(rng.below(3) as i64)),
+                5 => cond("a", Op::Eq, Document::Null),
+                _ => cond("b", Op::Ne, random_value(rng)),
+            });
+        }
+        let sort = match rng.below(4) {
+            0 => None,
+            n => Some(crate::query::Sort {
+                field: ["a", "b", "c"][n - 1].to_string(),
+                order: [SortOrder::Asc, SortOrder::Desc][rng.below(2)],
+            }),
+        };
+        let limits = [None, Some(0), Some(1), Some(3), Some(10), Some(1000)];
+        Filter {
+            conditions,
+            sort,
+            limit: limits[rng.below(limits.len())],
+        }
+    }
+
+    /// Every random filter on compound indexes `(a, b)` and `(a, b, c)`
+    /// must find what sorting a scan in memory finds — same documents,
+    /// and for a sorted filter the same order — through inserts, updates
+    /// that move documents, deletes and a reopen; the compound plans must
+    /// actually run.
+    #[test]
+    fn compound_finds_match_full_scans_through_every_kind_of_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let mut rng = XorShift(0xBB67_AE85_84CA_A73B);
+        let check = |docs: &Collection<Document>, rng: &mut XorShift| {
+            assert_consistent(docs.db());
+            let mut all = docs.find_with_ids(Filter::default()).unwrap();
+            all.sort_by_key(|(id, _)| *id);
+            let mut plans = std::collections::HashSet::new();
+            for _ in 0..400 {
+                let f = random_compound_filter(rng);
+                let ids = |found: Vec<(DocId, Document)>| {
+                    let mut ids: Vec<DocId> = found.into_iter().map(|(id, _)| id).collect();
+                    if f.sort.is_none() {
+                        ids.sort();
+                    }
+                    ids
+                };
+                let expected = ids(f.apply_to(all.clone(), |(_, doc)| doc));
+                let plan = docs.explain(&f).unwrap();
+                let found = ids(docs.find_with_ids(f.clone()).unwrap());
+                if f.sort.is_none() && f.limit.is_some() {
+                    // Which documents a limit without a sort keeps isn't
+                    // promised: any that match, as many as it allows.
+                    let unlimited = Filter {
+                        limit: None,
+                        ..f.clone()
+                    };
+                    let matching = ids(unlimited.apply_to(all.clone(), |(_, doc)| doc));
+                    assert_eq!(found.len(), expected.len(), "{f:?} via {plan:?}");
+                    assert!(found.iter().all(|id| matching.contains(id)), "{f:?}");
+                } else {
+                    assert_eq!(found, expected, "{f:?} via {plan:?}");
+                }
+                plans.insert(format!("{plan:?}"));
+            }
+            for plan in [
+                r#"Index { field: "(a, b)" }"#,
+                r#"IndexOrder { field: "(a, b)" }"#,
+                r#"IndexOrder { field: "(a, b, c)" }"#,
+            ] {
+                assert!(plans.contains(plan), "{plan} never ran: {plans:?}");
+            }
+        };
+        {
+            let db = Database::open(&path).unwrap();
+            let docs = db.collection::<Document>("docs");
+            let mut ids = Vec::new();
+            let mut insert = |rng: &mut XorShift, count| {
+                for _ in 0..count / 25 {
+                    let ops = (0..25)
+                        .map(|_| {
+                            let id = db.id_gen().generate();
+                            ids.push(id);
+                            WriteOp::Insert("docs".into(), id, random_compound_document(rng))
+                        })
+                        .collect();
+                    db.write_batch(ops).unwrap();
+                }
+            };
+            insert(&mut rng, 150);
+            assert!(docs.ensure_index(["a", "b"]).unwrap());
+            assert!(docs.ensure_index(["a", "b", "c"]).unwrap());
+            insert(&mut rng, 150);
+            for _ in 0..6 {
+                let ops = (0..25)
+                    .map(|_| {
+                        let id = ids[rng.below(ids.len())];
+                        let new = match docs.get(&id).unwrap() {
+                            Some(Document::Object(mut fields)) if rng.below(2) == 0 => {
+                                let pad = "z".repeat([0, 4500, 9000][rng.below(3)]);
+                                fields.insert("pad".into(), Document::String(pad));
+                                Document::Object(fields)
+                            }
+                            _ => random_compound_document(&mut rng),
+                        };
+                        WriteOp::Update("docs".into(), id, new)
+                    })
+                    .collect();
+                db.write_batch(ops).unwrap();
+            }
+            let deleted = (0..60).map(|_| ids.swap_remove(rng.below(ids.len())));
+            let ops = deleted.map(|id| WriteOp::Delete("docs".into(), id));
+            db.write_batch(ops.collect()).unwrap();
+            check(&docs, &mut rng);
+        }
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("docs");
+        assert_eq!(docs.indexes().unwrap(), ["(a, b)", "(a, b, c)"]);
+        check(&docs, &mut rng);
+    }
+
     fn records_read(f: impl FnOnce()) -> usize {
         crate::data::RECORDS_READ.with(|n| n.set(0));
         f();
         crate::data::RECORDS_READ.with(|n| n.get())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Task {
+        status: String,
+        created: i64,
+        tenant: String,
+    }
+
+    /// The query compound indexes are for (SPEC §43): the oldest 20
+    /// queued tasks — found by status and read in order of creation at
+    /// once, 20 documents read of 3000.
+    #[test]
+    fn the_oldest_queued_tasks_are_read_through_status_and_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Task>("tasks");
+        let mut batch = db.batch();
+        for n in 0..3000i64 {
+            let status = ["Queued", "Running", "Done"][(n * 7 % 3) as usize];
+            let task = Task {
+                status: status.into(),
+                // Not in insertion order.
+                created: (n * 7919) % 3000,
+                tenant: format!("t{}", n % 5),
+            };
+            batch.insert(&tasks, task).unwrap();
+        }
+        batch.commit().unwrap();
+        let oldest_queued = || {
+            Filter::new()
+                .eq("status", "Queued")
+                .sort_asc("created")
+                .limit(20)
+        };
+        let expected = oldest_queued().apply(
+            tasks
+                .find(Filter::new())
+                .unwrap()
+                .into_iter()
+                .map(|t| crate::serde_bridge::to_document(&t).unwrap()),
+        );
+
+        tasks.ensure_index("status").unwrap();
+        tasks.ensure_index("created").unwrap();
+        let before = records_read(|| {
+            tasks.find(oldest_queued()).unwrap();
+        });
+        assert!(before > 900, "{before}");
+
+        tasks.ensure_index(["status", "created"]).unwrap();
+        assert_eq!(
+            tasks.explain(&oldest_queued()).unwrap(),
+            QueryPlan::IndexOrder {
+                field: "(status, created)".into()
+            }
+        );
+        let mut found = Vec::new();
+        let reads = records_read(|| found = tasks.find(oldest_queued()).unwrap());
+        assert_eq!(reads, 20);
+        let found: Vec<Document> = found
+            .iter()
+            .map(|t| crate::serde_bridge::to_document(t).unwrap())
+            .collect();
+        assert_eq!(found, expected);
+
+        // Newest first, and a range on `created` within the status.
+        let newest = Filter::new()
+            .eq("status", "Done")
+            .lt("created", 100)
+            .sort_desc("created")
+            .limit(5);
+        let created: Vec<i64> = tasks
+            .find(newest)
+            .unwrap()
+            .iter()
+            .map(|t| t.created)
+            .collect();
+        let mut all_done: Vec<i64> = tasks
+            .find(Filter::new().eq("status", "Done"))
+            .unwrap()
+            .iter()
+            .map(|t| t.created)
+            .filter(|c| *c < 100)
+            .collect();
+        all_done.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(created, all_done[..5]);
+        assert_consistent(&db);
+    }
+
+    /// Unique in all its fields at once (SPEC §43.4): an email may repeat
+    /// across tenants, not within one; a null in any field exempts, as in
+    /// SQL.
+    #[test]
+    fn a_unique_compound_index_refuses_only_the_same_values_in_every_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<Document>("users");
+        let user = |tenant: Document, email: &str| {
+            object(vec![("tenant", tenant), ("email", email.into())])
+        };
+        users.ensure_unique_index(["tenant", "email"]).unwrap();
+        let ada = users.insert(user("t1".into(), "ada@x")).unwrap();
+        users.insert(user("t2".into(), "ada@x")).unwrap();
+        users.insert(user("t1".into(), "bob@x")).unwrap();
+        match users.insert(user("t1".into(), "ada@x")) {
+            Err(crate::Error::DuplicateValue {
+                existing, field, ..
+            }) => {
+                assert_eq!((existing, field.as_str()), (ada, "(tenant, email)"));
+            }
+            other => panic!("expected DuplicateValue, got {other:?}"),
+        }
+        // Equal as `Eq` sees it: `1` and `1.0`.
+        users.insert(user(1.into(), "cy@x")).unwrap();
+        assert!(users.insert(user(Document::Float(1.0), "cy@x")).is_err());
+        // A null, or a missing field, in any of them: exempt.
+        for _ in 0..2 {
+            users.insert(user(Document::Null, "ada@x")).unwrap();
+            users
+                .insert(object(vec![("email", "ada@x".into())]))
+                .unwrap();
+        }
+        // Ada moves to t3; then t1's ada@x is free again.
+        assert!(users.update(&ada, user("t3".into(), "ada@x")).unwrap());
+        users.insert(user("t1".into(), "ada@x")).unwrap();
+        assert_consistent(&db);
+
+        // Built over documents that share both values: refused.
+        let other = db.collection::<Document>("other");
+        other.insert(user("t".into(), "e")).unwrap();
+        other.insert(user("t".into(), "e")).unwrap();
+        assert!(matches!(
+            other.ensure_unique_index(["tenant", "email"]),
+            Err(crate::Error::DuplicateValue { .. })
+        ));
+        assert_eq!(other.indexes().unwrap(), Vec::<String>::new());
+    }
+
+    /// Strings longer than a compound key's share for them (501 bytes of
+    /// two fields) are cut in the keys; conditions on them must be cut the
+    /// same way to find them — `Eq`, ranges, and the sorted read.
+    #[test]
+    fn long_strings_in_a_compound_index_are_found_by_every_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let long = |end: &str| Document::String("x".repeat(800) + end);
+        for (a, end) in [(1, "a"), (1, "b"), (1, "c"), (2, "b")] {
+            docs.insert(object(vec![("a", a.into()), ("b", long(end))]))
+                .unwrap();
+        }
+        docs.ensure_index(["a", "b"]).unwrap();
+        let ends = |f: Filter| -> Vec<String> {
+            docs.find(f)
+                .unwrap()
+                .iter()
+                .map(|doc| match crate::query::field_value(doc, "b") {
+                    Some(Document::String(b)) => b[800..].to_string(),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let a1 = || Filter::new().eq("a", 1);
+        assert_eq!(ends(a1().eq("b", long("b"))), ["b"]);
+        assert_eq!(ends(a1().gt("b", long("a")).sort_asc("b")), ["b", "c"]);
+        assert_eq!(ends(a1().gte("b", long("b")).sort_asc("b")), ["b", "c"]);
+        assert_eq!(ends(a1().lt("b", long("c")).sort_asc("b")), ["a", "b"]);
+        assert_eq!(ends(a1().lte("b", long("b")).sort_desc("b")), ["b", "a"]);
+        let newest = a1().sort_desc("b").limit(2);
+        assert_eq!(
+            docs.explain(&newest).unwrap(),
+            QueryPlan::IndexOrder {
+                field: "(a, b)".into()
+            }
+        );
+        assert_eq!(ends(newest), ["c", "b"]);
+        assert_eq!(
+            docs.explain(&a1().gt("b", long("a"))).unwrap(),
+            QueryPlan::Index {
+                field: "(a, b)".into()
+            }
+        );
+    }
+
+    #[test]
+    fn compound_indexes_are_checked_created_dropped_exported_and_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let too_many = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+        for bad in [
+            &[][..],
+            &too_many[..],
+            &["a", "tags[*]"],
+            &["a", "a"],
+            &["a", "_id"],
+            &["a", ""],
+        ] {
+            assert!(docs.ensure_index(bad).is_err(), "{bad:?}");
+        }
+        assert!(docs.ensure_index(&too_many[..8]).unwrap());
+        assert!(docs.ensure_index(["a", "b"]).unwrap());
+        assert!(!docs.ensure_index(["a", "b"]).unwrap());
+        // Another order is another index.
+        assert!(docs.ensure_index(["b", "a"]).unwrap());
+        assert!(docs.ensure_unique_index(["a", "c"]).unwrap());
+        assert!(
+            docs.ensure_unique_index(["a", "b"]).is_err(),
+            "exists, not unique"
+        );
+        docs.insert(object(vec![
+            ("a", 1.into()),
+            ("b", 2.into()),
+            ("c", 3.into()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            docs.indexes().unwrap(),
+            ["(a, b, c, d, e, f, g, h)", "(a, b)", "(b, a)", "(a, c)"]
+        );
+        assert_eq!(docs.unique_indexes().unwrap(), ["(a, c)"]);
+
+        let mut export = Vec::new();
+        db.export(&mut export).unwrap();
+        let text = String::from_utf8(export.clone()).unwrap();
+        assert!(text.contains(r#"["a","b"]"#), "{text}");
+        assert!(
+            text.contains(r#"{"fields":["a","c"],"unique":true}"#),
+            "{text}"
+        );
+        let copy = Database::open(dir.path().join("copy.trunkdb")).unwrap();
+        copy.import(export.as_slice()).unwrap();
+        let copied = copy.collection::<Document>("docs");
+        assert_eq!(copied.indexes().unwrap(), docs.indexes().unwrap());
+        assert_eq!(copied.unique_indexes().unwrap(), ["(a, c)"]);
+        assert_consistent(&copy);
+
+        assert!(docs.drop_index(["b", "a"]).unwrap());
+        assert!(!docs.drop_index(["b", "a"]).unwrap());
+        assert!(!docs.drop_index("b").unwrap(), "no index on b alone");
+        assert_eq!(docs.indexes().unwrap().len(), 3);
+        assert_consistent(&db);
     }
 
     #[test]

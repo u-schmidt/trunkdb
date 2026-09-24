@@ -4,7 +4,7 @@
 //! documents.
 
 use crate::catalog::{Catalog, IndexMeta};
-use crate::collection::{secondary_entries, secondary_keys};
+use crate::collection::{index_keys, same_values, unique_tuples};
 use crate::data;
 use crate::database::Database;
 use crate::document::{DocId, Document};
@@ -234,7 +234,7 @@ fn check_collection(
 
     for index in catalog.indexes(name) {
         if let Err(e) = check_index(check, store, name, index, &documents, &unreadable) {
-            check.unreadable(format!("{name:?}'s index on {:?}: {e}", index.field));
+            check.unreadable(format!("{name:?}'s index on {:?}: {e}", index.name()));
         }
     }
     Ok(documents.len())
@@ -252,7 +252,7 @@ fn check_index(
     documents: &[(DocId, Document, RecordLocation)],
     unreadable: &BTreeSet<DocId>,
 ) -> std::io::Result<()> {
-    let what = format!("{name:?}'s index on {:?}", index.field);
+    let what = format!("{name:?}'s index on {:?}", index.name());
     let tree = BTreeIndex::new(index.root);
     for page in tree.pages(store)? {
         check.claim(page, &what);
@@ -261,7 +261,7 @@ fn check_index(
     check_order(
         check,
         name,
-        &format!("index on {:?}", index.field),
+        &format!("index on {:?}", index.name()),
         &entries,
     );
 
@@ -273,7 +273,7 @@ fn check_index(
     let expected: BTreeSet<(Vec<u8>, PageId, u16)> = documents
         .iter()
         .flat_map(|(id, doc, loc)| {
-            secondary_keys(doc, &index.field, *id)
+            index_keys(doc, index, *id)
                 .into_iter()
                 .map(|key| (key, loc.page, loc.slot))
         })
@@ -292,24 +292,18 @@ fn check_index(
         // Equal values share a key's value part (SPEC §28.1): compare
         // within each group — values of two documents, not two elements
         // of one (SPEC §42.2).
-        let mut groups: BTreeMap<Vec<u8>, Vec<(DocId, &Document)>> = BTreeMap::new();
+        type Group<'a> = Vec<(DocId, Vec<&'a Document>)>;
+        let mut groups: BTreeMap<Vec<u8>, Group> = BTreeMap::new();
         for (id, doc, _) in documents {
-            for (_key, values) in secondary_entries(doc, &index.field, *id) {
-                for value in values {
-                    if matches!(value, Document::Null) {
-                        continue;
-                    }
-                    if let Some(encoded) = key::encode_value(value) {
-                        groups.entry(encoded).or_default().push((*id, value));
-                    }
-                }
+            for (value_part, values) in unique_tuples(doc, index) {
+                groups.entry(value_part).or_default().push((*id, values));
             }
         }
         for group in groups.values() {
-            for (i, (a, a_value)) in group.iter().enumerate() {
+            for (i, (a, a_values)) in group.iter().enumerate() {
                 if let Some((b, _)) = group[i + 1..]
                     .iter()
-                    .find(|(b, b_value)| b != a && crate::query::equal(a_value, b_value))
+                    .find(|(b, b_values)| b != a && same_values(a_values, b_values))
                 {
                     check.problem(format!(
                         "{what} is unique, but documents {a} and {b} share a value"
@@ -455,7 +449,7 @@ mod tests {
         assert_eq!(report.problems, Vec::<String>::new());
         assert_eq!((report.collections, report.documents), (2, 200));
         let info = db.file_info().unwrap();
-        assert_eq!((info.format_version, info.page_size), (7, PAGE_SIZE));
+        assert_eq!((info.format_version, info.page_size), (8, PAGE_SIZE));
         assert_eq!(info.pages, report.pages);
         assert!(info.free_pages > 0, "the deletes freed pages");
 
@@ -486,7 +480,10 @@ mod tests {
         db.transact(|catalog, store| {
             let index = &catalog.indexes("people")[0];
             let mut tree = BTreeIndex::new(index.root);
-            tree.remove(store, &secondary_keys(&doc, "age", id)[0])?;
+            tree.remove(
+                store,
+                &key::secondary(crate::query::value_or_null(&doc, "age"), id).unwrap(),
+            )?;
             // And an entry claiming the document holds 99.
             let loc = BTreeIndex::new(catalog.get("people").unwrap().index_root)
                 .lookup(store, &key::primary(id))?

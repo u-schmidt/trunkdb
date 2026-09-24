@@ -16,6 +16,9 @@ const KIND_COLLECTION: u8 = 0;
 const KIND_INDEX: u8 = 1;
 /// Laid out like `KIND_INDEX` (SPEC §33).
 const KIND_UNIQUE_INDEX: u8 = 2;
+/// An index on several fields (SPEC §43.1), and its unique form.
+const KIND_COMPOUND_INDEX: u8 = 3;
+const KIND_UNIQUE_COMPOUND_INDEX: u8 = 4;
 
 #[derive(Clone, Copy)]
 pub struct CollectionMeta {
@@ -26,15 +29,39 @@ pub struct CollectionMeta {
     pub current_data_page: PageId,
 }
 
-/// A secondary index on one field of a collection (SPEC §28) — `field`
-/// may be a dotted path into nested objects (SPEC §31).
+/// A secondary index of a collection (SPEC §28): on one field — a
+/// dotted path into nested objects (SPEC §31), or into array elements
+/// (SPEC §42) — or on several, a compound index (SPEC §43).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexMeta {
-    pub field: String,
+    pub fields: Vec<String>,
     pub root: PageId,
-    /// No two documents may have equal non-null values in `field`
-    /// (SPEC §33).
+    /// No two documents may have equal non-null values in the field
+    /// (SPEC §33) — in all of a compound index's fields at once (§43.4).
     pub unique: bool,
+}
+
+impl IndexMeta {
+    /// How lists and errors name it: its field, or a compound index's
+    /// fields in parentheses, `(status, created)`.
+    pub fn name(&self) -> String {
+        match self.fields.as_slice() {
+            [field] => field.clone(),
+            fields => format!("({})", fields.join(", ")),
+        }
+    }
+
+    pub fn is_compound(&self) -> bool {
+        self.fields.len() > 1
+    }
+
+    /// The field of a one-field index.
+    pub fn single(&self) -> Option<&str> {
+        match self.fields.as_slice() {
+            [field] => Some(field),
+            _ => None,
+        }
+    }
 }
 
 /// `Clone` so `Database::write_batch` can snapshot it before a batch and
@@ -166,21 +193,23 @@ impl Catalog {
         Ok(meta)
     }
 
-    /// Records a new, empty secondary index on `field` — building it from
-    /// the collection's documents is the caller's job. `collection` must
-    /// exist and not have an index on `field` yet.
+    /// Records a new, empty secondary index on `fields` — building it
+    /// from the collection's documents is the caller's job. `collection`
+    /// must exist and not have an index on `fields` yet.
     pub fn create_index(
         &mut self,
         store: &mut dyn PageStore,
         collection: &str,
-        field: &str,
+        fields: &[String],
         unique: bool,
     ) -> Result<IndexMeta> {
-        check_len("field name", field, MAX_FIELD_NAME_LEN)?;
+        for field in fields {
+            check_len("field name", field, MAX_FIELD_NAME_LEN)?;
+        }
         assert!(self.collections.contains_key(collection));
-        assert!(!self.indexes(collection).iter().any(|i| i.field == field));
+        assert!(!self.indexes(collection).iter().any(|i| i.fields == fields));
         let index = IndexMeta {
-            field: field.to_string(),
+            fields: fields.to_vec(),
             root: allocate_index_root(store)?,
             unique,
         };
@@ -192,24 +221,29 @@ impl Catalog {
         Ok(index)
     }
 
-    /// Removes the index on `field` from the catalog and returns it, so
+    /// Removes the index on `fields` from the catalog and returns it, so
     /// the caller can free its pages; `None` if there's no such index.
     pub fn drop_index(
         &mut self,
         store: &mut dyn PageStore,
         collection: &str,
-        field: &str,
+        fields: &[String],
     ) -> Result<Option<IndexMeta>> {
         let Some(list) = self.indexes.get_mut(collection) else {
             return Ok(None);
         };
-        let Some(pos) = list.iter().position(|i| i.field == field) else {
+        let Some(pos) = list.iter().position(|i| i.fields == fields) else {
             return Ok(None);
         };
         let index = list.remove(pos);
         let cell = encode_index(collection, &index);
-        let (page_id, mut page, slot) = find_cell(store, |c| c == cell.as_slice())?
-            .ok_or_else(|| corrupt(format!("index {collection}.{field} has no catalog entry")))?;
+        let (page_id, mut page, slot) =
+            find_cell(store, |c| c == cell.as_slice())?.ok_or_else(|| {
+                corrupt(format!(
+                    "index {collection}.{} has no catalog entry",
+                    index.name()
+                ))
+            })?;
         page.delete_cell(slot);
         store.write_page(page_id, &page.into_bytes())?;
         Ok(Some(index))
@@ -228,7 +262,7 @@ impl Catalog {
         };
         let indexes = self.indexes(name).to_vec();
         for index in &indexes {
-            self.drop_index(store, name, &index.field)?;
+            self.drop_index(store, name, &index.fields)?;
         }
         let cell = encode_collection(name, &meta);
         let (page_id, mut page, slot) = find_cell(store, |c| c == cell.as_slice())?
@@ -364,20 +398,32 @@ fn encode_collection(name: &str, meta: &CollectionMeta) -> Vec<u8> {
     buffer
 }
 
-/// An index cell: `[u8 kind = 1, or 2 if unique][u64 root][u8
-/// collection name length][collection name][field name]` — a collection
-/// name is at most 255 bytes, so one length byte does.
+/// An index cell: `[u8 kind][u64 root][u8 collection name length]
+/// [collection name]`, then for one field (kind 1, or 2 if unique) the
+/// field name, for several (kind 3, or 4 if unique, SPEC §43.1)
+/// `[u8 count]` and each as `[u8 length][field name]`. Names are at most
+/// 255 bytes, so one length byte does.
 fn encode_index(collection: &str, index: &IndexMeta) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(10 + collection.len() + index.field.len());
-    buffer.push(if index.unique {
-        KIND_UNIQUE_INDEX
-    } else {
-        KIND_INDEX
+    let mut buffer = Vec::with_capacity(11 + collection.len() + 256 * index.fields.len());
+    buffer.push(match (index.is_compound(), index.unique) {
+        (false, false) => KIND_INDEX,
+        (false, true) => KIND_UNIQUE_INDEX,
+        (true, false) => KIND_COMPOUND_INDEX,
+        (true, true) => KIND_UNIQUE_COMPOUND_INDEX,
     });
     buffer.extend_from_slice(&index.root.to_le_bytes());
     buffer.push(collection.len() as u8);
     buffer.extend_from_slice(collection.as_bytes());
-    buffer.extend_from_slice(index.field.as_bytes());
+    match index.fields.as_slice() {
+        [field] => buffer.extend_from_slice(field.as_bytes()),
+        fields => {
+            buffer.push(fields.len() as u8);
+            for field in fields {
+                buffer.push(field.len() as u8);
+                buffer.extend_from_slice(field.as_bytes());
+            }
+        }
+    }
     buffer
 }
 
@@ -400,9 +446,30 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
             Ok(Entry::Index(
                 utf8(collection)?,
                 IndexMeta {
-                    field: utf8(field)?,
+                    fields: vec![utf8(field)?],
                     root: u64_at(1),
                     unique: kind == KIND_UNIQUE_INDEX,
+                },
+            ))
+        }
+        kind @ (KIND_COMPOUND_INDEX | KIND_UNIQUE_COMPOUND_INDEX) => {
+            let short = || corrupt("compound index cell cut short".into());
+            let name_len = cell[9] as usize;
+            let (collection, rest) = cell[10..].split_at_checked(name_len).ok_or_else(short)?;
+            let (&count, mut rest) = rest.split_first().ok_or_else(short)?;
+            let mut fields = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let (&len, after) = rest.split_first().ok_or_else(short)?;
+                let (field, after) = after.split_at_checked(len as usize).ok_or_else(short)?;
+                fields.push(utf8(field)?);
+                rest = after;
+            }
+            Ok(Entry::Index(
+                utf8(collection)?,
+                IndexMeta {
+                    fields,
+                    root: u64_at(1),
+                    unique: kind == KIND_UNIQUE_COMPOUND_INDEX,
                 },
             ))
         }
@@ -519,45 +586,59 @@ mod tests {
         assert_eq!(catalog.get("posts").unwrap().current_data_page, 0);
     }
 
+    fn fields(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
     #[test]
     fn indexes_are_created_dropped_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
 
-        let (email, age) = {
+        let (email, age, tenant_email) = {
             let mut store = FileStore::open(&path).unwrap();
             let mut catalog = Catalog::load(&mut store).unwrap();
             catalog.create_collection(&mut store, "users").unwrap();
             catalog.create_collection(&mut store, "posts").unwrap();
             let email = catalog
-                .create_index(&mut store, "users", "email", true)
+                .create_index(&mut store, "users", &fields(&["email"]), true)
                 .unwrap();
             let age = catalog
-                .create_index(&mut store, "users", "age", false)
+                .create_index(&mut store, "users", &fields(&["age"]), false)
                 .unwrap();
-            // Unique, so dropping it has to find a kind-2 cell.
+            let tenant_email = catalog
+                .create_index(&mut store, "users", &fields(&["tenant", "email"]), true)
+                .unwrap();
+            // Unique, so dropping them has to find kind-2 and kind-4 cells.
             catalog
-                .create_index(&mut store, "posts", "title", true)
+                .create_index(&mut store, "posts", &fields(&["title"]), true)
                 .unwrap();
-            assert_eq!(catalog.indexes("users"), [email.clone(), age.clone()]);
-            assert!(email.unique && !age.unique);
-
-            let dropped = catalog.drop_index(&mut store, "posts", "title").unwrap();
-            assert_eq!(dropped.map(|i| i.field), Some("title".to_string()));
+            catalog
+                .create_index(&mut store, "posts", &fields(&["a", "b", "c"]), true)
+                .unwrap();
             assert_eq!(
-                catalog.drop_index(&mut store, "posts", "title").unwrap(),
-                None
+                catalog.indexes("users"),
+                [email.clone(), age.clone(), tenant_email.clone()]
             );
+            assert!(email.unique && !age.unique && tenant_email.unique);
+            assert_eq!(tenant_email.name(), "(tenant, email)");
+
+            for dropped in [&["title"][..], &["a", "b", "c"]] {
+                let index = catalog.drop_index(&mut store, "posts", &fields(dropped));
+                assert_eq!(index.unwrap().map(|i| i.fields), Some(fields(dropped)));
+                let again = catalog.drop_index(&mut store, "posts", &fields(dropped));
+                assert_eq!(again.unwrap(), None);
+            }
             // Still findable after an index cell came before it.
             catalog
                 .set_current_data_page(&mut store, "posts", 7)
                 .unwrap();
-            (email, age)
+            (email, age, tenant_email)
         };
 
         let mut store = FileStore::open(&path).unwrap();
         let catalog = Catalog::load(&mut store).unwrap();
-        assert_eq!(catalog.indexes("users"), [email, age]);
+        assert_eq!(catalog.indexes("users"), [email, age, tenant_email]);
         assert_eq!(catalog.indexes("posts"), []);
         assert_eq!(catalog.indexes("nothing"), []);
         assert_eq!(catalog.get("posts").unwrap().current_data_page, 7);
@@ -572,11 +653,16 @@ mod tests {
         catalog.create_collection(&mut store, &longest).unwrap();
 
         catalog
-            .create_index(&mut store, &longest, &"f".repeat(MAX_FIELD_NAME_LEN), false)
+            .create_index(
+                &mut store,
+                &longest,
+                &["f".repeat(MAX_FIELD_NAME_LEN)],
+                false,
+            )
             .unwrap();
         let too_long = "f".repeat(MAX_FIELD_NAME_LEN + 1);
         let Err(crate::Error::Io(err)) =
-            catalog.create_index(&mut store, &longest, &too_long, false)
+            catalog.create_index(&mut store, &longest, &[too_long], false)
         else {
             panic!("an overlong field name must be an I/O InvalidInput error");
         };

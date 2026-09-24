@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §43 for the roadmap.
+large-document workload (§5.2) the second; see §44 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1528,7 +1528,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§43.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§44.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1709,7 +1709,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§43.2).
+(§44.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2099,7 +2099,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§43). It's also a backup that can be read and `diff`ed, and a way to
+(§44). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2226,7 +2226,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§43.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§44.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2337,7 +2337,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§43.2);
+- Still one field per index: compound indexes are still open (§44.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2573,6 +2573,7 @@ naming the two, and without that index.
 
 ### 33.7 Limits
 - One field per unique index; no compound uniqueness (`(tenant, email)`).
+  *Done in §43.4.*
 - A value swap inside one batch fails (§33.2).
 - Case-insensitive uniqueness would need a case-folded key; it isn't
   there. An app that wants it stores a folded copy and indexes that.
@@ -2872,7 +2873,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§43.2).
+- Still no pattern language, no conditions on array elements (§44.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2959,7 +2960,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §43.2).
+  §44.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3295,7 +3296,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§43.2).
+  run on such a file. Repairing is open (§44.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -3640,13 +3641,196 @@ then on 0.6.0 refuses it.
 - **A field whose name itself ends in `[*]`** can't be reached, just as
   one with a dot can't (§31.2).
 
-## 43. Roadmap
+## 43. Compound indexes (`index/key.rs`, `catalog.rs`, `query.rs`, `collection.rs`)
+
+Real and tested: an index on several fields at once. It finds documents
+by `Eq` on its first fields and a range on the next one, reads them in
+the order of the field after the fixed ones, and as a unique index
+forbids the same values in all of its fields at once. File format 8.
+
+```rust
+tasks.ensure_index(["status", "created"])?;
+// Found by status and read in order of creation: 20 documents read.
+tasks.find(Filter::new().eq("status", "Queued").sort_asc("created").limit(20))?;
+
+users.ensure_unique_index(["tenant", "email"])?;   // an email once per tenant
+tasks.drop_index(["status", "created"])?;
+```
+
+### 43.1 API and catalog
+`ensure_index`, `ensure_unique_index` and `drop_index` take anything
+that is `IndexFields`: a field (`"age"`, `"address.city"`, `"tags[*]"`),
+or an array or slice of them. A one-field call works as before.
+`indexes()` names a compound index by its fields in parentheses,
+`"(status, created)"`, and so do `explain` and `DuplicateValue`.
+
+`IndexMeta.field` became `fields: Vec<String>`. A one-field index keeps
+its catalog cell (kinds 1 and 2). A compound index gets two new kinds, 3
+and 4 for unique: `[u8 count]`, then each field as `[u8 length][name]`.
+Export writes a compound index as an array of its fields,
+`["status", "created"]`, or as `{"fields": [...], "unique": true}`.
+
+The rules `ensure_index` checks:
+- at most 8 fields;
+- no field twice;
+- each a path as for one field (§31.4);
+- none with `[*]`. A compound index holds one entry per document (§43.2);
+  a multikey one holds one per element. MongoDB, too, allows at most one
+  array per compound index. Here it's none, since the sorted read below
+  needs one entry per document.
+- A different order of the same fields is a different index: `(b, a)`
+  sorts by `b` first.
+
+Rejected:
+- **Methods of their own** (`ensure_compound_index`), and a fourth for
+  unique ones. A trait lets `ensure_index("age")` and
+  `ensure_index(["status", "created"])` be the same call.
+- **Named indexes**, as LiteDB and MongoDB have. The fields are the name
+  here, as they were for one field.
+
+### 43.2 Keys
+A compound key is its values encoded one after another
+(`key::encode_values`), then the document id. The encoding was already
+prefix-free (§28.1), so keys sort by the first value, then the second,
+and so on, whatever the id after them. `key::parts` splits a key back
+into its values, reading each one's length from its tag.
+
+Each value gets an even share of the key: a string is cut to
+`(1024 − 16) / n − 3` bytes, 1005 for one field (as before) and 123 for
+eight. `key::part_is_exact` knows the share, so a cut string is still
+known to be cut (§34.2).
+
+A compound index holds every document, unlike a one-field index, which
+leaves out values no comparison can match (arrays, objects, NaN, ...).
+If it left out a document whose `b` is an array, an `Eq` on `a` through
+the index `(a, b)` would miss that document. Such values get a tag of
+their own, `TAG_OTHER`, sorting after every other type, as they do in a
+sort (§34.1). A missing field is null, as everywhere (§32).
+
+### 43.3 The planner
+- **Finding by value** (`compound_bounds`): an `Eq` on each of the first
+  fields fixes a key prefix, and range comparisons on the next field
+  narrow within it (`KeyRange::under`). Nothing on the first field means
+  no bounds, since keys sort by it first.
+- **Choosing an index:** bounds are ranked by kind as before (by value,
+  then an OR, then a range), and among equal kinds by how many fields
+  they narrow. So `status == "Queued" AND created > x` takes
+  `(status, created)` over an index on `status` alone, while `status ==
+  "Queued"` by itself keeps the one-field index, the first among
+  equals.
+- **Reading in sort order** (`index_order`): a compound index qualifies
+  when the sort field follows fields that an `Eq` each fixes, as in
+  `(status, created)` for `status == "Queued"` sorted by `created`. It's
+  found by value and in order at once. The more fields fixed, the
+  better. With fields fixed, the old rule of preferring another `Eq`
+  index over reading in order doesn't apply: this read is already by
+  value.
+- **The sorted read** groups entries by the values up to the sort field.
+  Within a group they're sorted by id, because fields after the sort
+  field would otherwise order them (ties go in id order, §34.1). Groups
+  whose sort value is `TAG_OTHER` go last in either direction, again as
+  in §34.1. A compound index holds those documents, so the scan that
+  finds them for a one-field index isn't needed, and would find them
+  twice.
+
+Measured by the typed test: "the oldest 20 queued tasks" out of 3,000,
+with indexes on `status` and `created` alone, reads every queued task
+(about a thousand); with `(status, created)` it reads 20.
+
+### 43.4 Unique across all fields
+A unique compound index forbids two documents that are equal (as `Eq`
+sees it) in every one of its fields: `(tenant, email)` lets an email
+repeat across tenants, not within one. A document with a null or
+missing value in any of the fields is exempt, as in SQL. Values no
+comparison finds equal (arrays, NaN, ...) never collide.
+
+Every unique check now works on tuples, one value per field
+(`unique_tuples`): a one-field index has a 1-tuple per value (per
+element, §42.2). So `check_unique`, `check` and `compact` handle both
+kinds of index the same way.
+
+Rejected: **nulls colliding**, as MongoDB does (a second document
+without `email` in a unique `(tenant, email)` is refused there). Here a
+one-field unique index already exempts null (§33.1), and the compound
+one follows it.
+
+### 43.5 File format 8
+A 0.7.0 build would stop at a catalog cell of kind 3 or 4 with "unknown
+catalog entry kind". That's a refusal, not a misreading, but only once
+it reaches the cell. So the format is 8, and 0.7.0 says so up front. A
+format-6 or -7 file opens as it is and is stamped 8 on its next page
+allocation (§33.4).
+
+### 43.6 Tests
+- `index/key.rs`: compound keys sort field by field, whatever the id,
+  and split back into their parts; unordered values share one encoding
+  and sort last; eight long strings still fit a key, each counted as
+  cut; a range under a prefix stays within it.
+- `query.rs`: which index the planner picks — the one-field index as the
+  first among equals, the compound one when it narrows more, none when
+  the first field is free, all three fields of `(a, b, c)`. Which index
+  is read in sort order, and the range read.
+- `collection.rs`:
+  - A randomized test on `(a, b)` and `(a, b, c)` over documents with
+    every kind of `b` and an `a` that is sometimes missing, null or an
+    array. 400 random filters with conditions on all three fields,
+    sorts in both directions and limits must return exactly what
+    sorting a scan in memory returns. That holds through inserts,
+    updates that move documents, deletes and a reopen, and the compound
+    plans must actually run. A limit without a sort only promises some
+    matching documents, as before.
+  - The typed tasks test: 20 documents read instead of about a thousand,
+    the same 20 a scan finds; newest first within a range on `created`.
+  - Unique `(tenant, email)`: the same pair refused, the same email in
+    another tenant fine, `1` and `1.0` colliding, nulls and missing
+    fields exempt, an update freeing a pair, and a build over a
+    duplicate refused.
+  - Strings longer than their share of a key (800 bytes in a two-field
+    key): `Eq`, all four ranges and the sorted read find them. Queries
+    are cut the same way as keys.
+  - The paths `ensure_index` refuses; eight fields; another order being
+    another index; unique against non-unique; drop; export and import.
+- `catalog.rs`: compound cells, unique and not, written, reopened and
+  dropped.
+- Checked by breaking it on purpose, sixteen ways. Each of these fails
+  a test:
+  - bounds ranked by kind alone;
+  - no bounds from `Eq` alone;
+  - fixed fields with a gap between them;
+  - sort order read with a field before the sort field left free;
+  - compound indexes never considered;
+  - a range on a compound index cut with one field's budget;
+  - the scan for unordered values run on a compound index too;
+  - unordered groups left in place when descending;
+  - groups not sorted by id;
+  - grouping by the whole key;
+  - nulls not exempt from uniqueness;
+  - `[*]` or a repeated field allowed;
+  - unordered values dropped from a key;
+  - strings cut with one field's budget;
+  - a unique compound index exported as `field`.
+
+  One passed at first, the range cut with one field's budget. The
+  random filters rarely paired an `Eq` on the first field with a range
+  over a long string. The long-strings test above covers it now.
+
+### 43.7 Limits
+- **No `[*]` in a compound index.**
+- **No sort by several fields** (`sort_by(a).then_by(b)`): `Filter` still
+  sorts by one field.
+- **An OR or a NOT never uses a compound index's second field.** Each
+  branch of an OR is bounded by itself (§36.3), so `(a = 1 AND b = 2) OR
+  (a = 3)` does use one, branch by branch.
+- **Rule-based choice**, as before (§28.4): the more fields narrowed,
+  the better, whatever the data.
+
+## 44. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 43.1 Done
+### 44.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -3662,8 +3846,9 @@ All of it is done:
 | 0.5.0 | A filter builder; OR, NOT and nesting (`Condition` became a tree — breaking); `delete_many` and dropping a collection | §35–§37 |
 | 0.6.0 | `update_many`; the `trunkdb` command and `Database::check`; page checksums, file format 6 | §38–§40 |
 | 0.7.0 | Compaction, and index leaves that fill when keys come in order; array conditions and multikey indexes, file format 7 | §41–§42 |
+| next | Compound indexes, file format 8 | §43 |
 
-### 43.2 Open
+### 44.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -3674,8 +3859,8 @@ limit is described.
 - An `Exists` operator, to tell a missing field from a null one (§32.5).
 
 **Indexes**
-- Compound indexes: several fields in one key, also unique across
-  several (`(tenant, email)`, §33.7).
+- Sorting by several fields, which a compound index could then serve
+  in order too (§43.7).
 - Sparse indexes, skipping missing fields, for fields few documents
   have (§32.2).
 - A lazy B-tree walk, with backward leaf links for `Desc` (§34.2).

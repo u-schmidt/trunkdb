@@ -11,15 +11,16 @@ collections of documents.
 B-tree primary index, document encoding (both the untyped `Document` path
 and a serde bridge so any `T: Serialize + DeserializeOwned` works),
 scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
-`cursor`), `upsert`, single-field secondary indexes (also unique, and on nested
-paths like `address.city`, and multikey on array elements like `tags[*]`),
+`cursor`), `upsert`, secondary indexes (also unique, on nested paths like
+`address.city`, multikey on array elements like `tags[*]`, and compound on
+several fields like `(status, created)`),
 conditions on array elements, overflow pages for documents larger
 than a page, export/import as JSON Lines, a checksum on every page so a
 damaged one is an error instead of garbage, compaction that rebuilds the file
 into as few pages as it needs, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
-(typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0: secondary
-indexes beyond single fields, a cost-based query planner, and concurrent writers (`Database` is a
+(typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
+a cost-based query planner, and concurrent writers (`Database` is a
 cloneable, thread-safe handle; reads run in parallel, writes one at a
 time). See [SPEC.md](SPEC.md)
 for the full design rationale and current progress.
@@ -90,6 +91,7 @@ use trunkdb::{Database, query::Filter};
 struct User {
     name: String,
     email: String,
+    team: String,
     age: i64,
 }
 
@@ -97,10 +99,12 @@ let db = Database::open("app.trunkdb")?;
 let users = db.collection::<User>("users");
 users.ensure_unique_index("email")?; // once at startup; a no-op after
 users.ensure_index("age")?;
+users.ensure_index(["team", "age"])?; // compound: by team, in age order
 
-users.insert(User { name: "Ada".into(), email: "ada@example.com".into(), age: 36 })?;
+users.insert(User { name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36 })?;
 
 let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
+let youngest_in_core = users.find(Filter::new().eq("team", "core").sort_asc("age").limit(5))?;
 ```
 
 ## Building
@@ -123,7 +127,7 @@ trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §43 for the full list and reasoning):
+Done so far (see SPEC.md §44 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -170,8 +174,11 @@ Done so far (see SPEC.md §43 for the full list and reasoning):
     file format 7, which still opens format 6 as it is.
 
     Items 15–16 → 0.7.0.
+17. **Compound indexes** (§43): `ensure_index(["status", "created"])`
+    finds by status and reads in creation order at once;
+    `ensure_unique_index(["tenant", "email"])`; file format 8.
 
-What's still open: SPEC.md §43.2.
+What's still open: SPEC.md §44.2.
 
 ## License
 

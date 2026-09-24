@@ -342,10 +342,19 @@ pub enum QueryPlan {
 
 /// Index ranges whose union holds every document a condition can match
 /// (SPEC §36.3), and how good a choice that is: `ByValue` (one `Eq`) beats
-/// `Union` (an OR) beats `ByRange`.
+/// `Union` (an OR) beats `ByRange`; among equal kinds, bounds on more
+/// fields beat fewer — a compound index narrowed by two conditions
+/// beats one index narrowed by one (SPEC §43.3).
 struct Bounds<'a> {
     ranges: Vec<(&'a IndexMeta, KeyRange)>,
     kind: BoundKind,
+    fields: usize,
+}
+
+impl Bounds<'_> {
+    fn beats(&self, other: &Bounds) -> bool {
+        (self.kind, std::cmp::Reverse(self.fields)) < (other.kind, std::cmp::Reverse(other.fields))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -359,20 +368,24 @@ enum BoundKind {
 /// can bound any of them. The comparisons on one indexed field are
 /// intersected, so `a >= 10 AND a <= 20` reads just that stretch (on a
 /// path with `[*]` only one of them counts, SPEC §42.3); a
-/// nested group is bounded on its own; the best of all that wins, the
-/// first among equals. `Ne` and `Contains` never use an index, nor does a
-/// `Not`.
+/// nested group is bounded on its own; a compound index by `Eq` on its
+/// first fields and a range on the next (`compound_bounds`); the best of
+/// all that wins, the first among equals. `Ne` and `Contains` never use
+/// an index, nor does a `Not`.
 fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
     let mut best: Option<Bounds<'a>> = None;
     let mut consider = |candidate: Bounds<'a>| {
-        if best.as_ref().is_none_or(|b| candidate.kind < b.kind) {
+        if best.as_ref().is_none_or(|b| candidate.beats(b)) {
             best = Some(candidate);
         }
     };
     for (i, condition) in conditions.iter().enumerate() {
         match condition {
             Condition::Compare { field, .. } => {
-                let Some(index) = indexes.iter().find(|index| index.field == *field) else {
+                let Some(index) = indexes
+                    .iter()
+                    .find(|index| index.single() == Some(field.as_str()))
+                else {
                     continue;
                 };
                 // Each field once, at its first comparison.
@@ -409,6 +422,7 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
                     consider(Bounds {
                         ranges: vec![(index, range)],
                         kind,
+                        fields: 1,
                     });
                 }
             }
@@ -417,6 +431,11 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
                     consider(bounds);
                 }
             }
+        }
+    }
+    for index in indexes.iter().filter(|index| index.is_compound()) {
+        if let Some(bounds) = compound_bounds(index, conditions) {
+            consider(bounds);
         }
     }
     best
@@ -437,10 +456,77 @@ fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bou
             Some(Bounds {
                 ranges,
                 kind: BoundKind::Union,
+                fields: 1,
             })
         }
         Condition::Not(_) => None,
     }
+}
+
+/// How a compound index bounds conditions that must all hold (SPEC
+/// §43.3). Its keys sort by the first field, then the second, ...: an
+/// `Eq` on each of its first fields narrows to the keys that begin with
+/// those values, and range comparisons on the field after them narrow
+/// further. Nothing on its first field, no bounds.
+fn compound_bounds<'a>(index: &'a IndexMeta, conditions: &[Condition]) -> Option<Bounds<'a>> {
+    let (prefix, equal) = equal_prefix(index, conditions, index.fields.len());
+    let range = index
+        .fields
+        .get(equal)
+        .and_then(|next| field_range(index, conditions, next));
+    let fields = equal + range.is_some() as usize;
+    let range = match range {
+        Some(range) => range.under(&prefix),
+        None if equal > 0 => KeyRange::prefixed(&prefix),
+        None => return None,
+    };
+    let kind = match equal > 0 {
+        true => BoundKind::ByValue,
+        false => BoundKind::ByRange,
+    };
+    Some(Bounds {
+        ranges: vec![(index, range)],
+        kind,
+        fields,
+    })
+}
+
+/// How many of `index`'s first fields, up to `max`, an `Eq` among
+/// `conditions` fixes — and those values encoded one after another, as
+/// its keys begin.
+fn equal_prefix(index: &IndexMeta, conditions: &[Condition], max: usize) -> (Vec<u8>, usize) {
+    let mut prefix = Vec::new();
+    for (i, field) in index.fields.iter().take(max).enumerate() {
+        let equal = conditions.iter().find_map(|c| match c {
+            Condition::Compare {
+                field: f,
+                op: Op::Eq,
+                value,
+            } if f == field => key::range_for_in(&Op::Eq, value, index.fields.len()),
+            _ => None,
+        });
+        match equal {
+            Some(range) => prefix.extend(range.start),
+            None => return (prefix, i),
+        }
+    }
+    (prefix, max)
+}
+
+/// The comparisons on `field` as one range of `index`'s values for it —
+/// relative to where that value starts in a key.
+fn field_range(index: &IndexMeta, conditions: &[Condition], field: &str) -> Option<KeyRange> {
+    conditions
+        .iter()
+        .filter_map(|c| match c {
+            Condition::Compare {
+                field: f,
+                op,
+                value,
+            } if f == field => key::range_for_in(op, value, index.fields.len()),
+            _ => None,
+        })
+        .reduce(KeyRange::intersect)
 }
 
 impl Filter {
@@ -458,44 +544,55 @@ impl Filter {
     }
 
     /// The index `find` reads in sort order (SPEC §34.2) — for a filter
-    /// with a `sort` and a `limit`, on a field with an index, unless the
-    /// conditions find documents by value some other way: an `Eq` on
-    /// another indexed field, or an OR of indexed branches (a few
-    /// documents found by value beat walking in order). With it, the sort
-    /// field's own range comparisons narrowed to one range, or `None` for
-    /// the whole index.
+    /// with a `sort` and a `limit` — and the range of it to read, `None`
+    /// for all of it. An index on the sort field, unless the conditions
+    /// find documents by value some other way: an `Eq` on another indexed
+    /// field, or an OR of indexed branches (a few documents found by value
+    /// beat walking in order). Or a compound index with the sort field
+    /// after fields every one of which an `Eq` fixes: `status ==
+    /// "Queued"`, sorted by `created`, on `(status, created)` — found by
+    /// value and in order at once (SPEC §43.3). The more fields fixed, the
+    /// better; the first among equals. The sort field's own range
+    /// comparisons narrow the range.
     pub(crate) fn index_order<'a>(
         &self,
         indexes: &'a [IndexMeta],
     ) -> Option<(&'a IndexMeta, Option<KeyRange>)> {
         let sort = self.sort.as_ref()?;
         self.limit?;
-        // A multikey index holds a document once per element, in element
-        // order: no order of documents (SPEC §42.3).
-        let index = indexes
-            .iter()
-            .find(|i| i.field == sort.field && !is_multi(&i.field))?;
-        let on_sort_field =
-            |c: &&Condition| matches!(c, Condition::Compare { field, .. } if *field == sort.field);
-        let others: Vec<Condition> = self
-            .conditions
-            .iter()
-            .filter(|c| !on_sort_field(c))
-            .cloned()
-            .collect();
-        if bounds_for_all(&others, indexes).is_some_and(|b| b.kind != BoundKind::ByRange) {
-            return None;
+        let mut best: Option<(&IndexMeta, Vec<u8>, usize)> = None;
+        for index in indexes {
+            // A multikey index holds a document once per element, in
+            // element order: no order of documents (SPEC §42.3).
+            if index.single().is_some_and(is_multi) {
+                continue;
+            }
+            let Some(at) = index.fields.iter().position(|f| *f == sort.field) else {
+                continue;
+            };
+            let (prefix, equal) = equal_prefix(index, &self.conditions, at);
+            if equal == at && best.as_ref().is_none_or(|(_, _, fixed)| at > *fixed) {
+                best = Some((index, prefix, at));
+            }
         }
-        let range = self
-            .conditions
-            .iter()
-            .filter_map(|c| match c {
-                Condition::Compare { field, op, value } if *field == sort.field => {
-                    key::range_for(op, value)
-                }
-                _ => None,
-            })
-            .reduce(KeyRange::intersect);
+        let (index, prefix, fixed) = best?;
+        if fixed == 0 {
+            let on_sort_field = |c: &&Condition| matches!(c, Condition::Compare { field, .. } if *field == sort.field);
+            let others: Vec<Condition> = self
+                .conditions
+                .iter()
+                .filter(|c| !on_sort_field(c))
+                .cloned()
+                .collect();
+            if bounds_for_all(&others, indexes).is_some_and(|b| b.kind != BoundKind::ByRange) {
+                return None;
+            }
+        }
+        let range = field_range(index, &self.conditions, &sort.field);
+        let range = match fixed {
+            0 => range,
+            _ => Some(range.map_or_else(|| KeyRange::prefixed(&prefix), |r| r.under(&prefix))),
+        };
         Some((index, range))
     }
 }
@@ -798,7 +895,90 @@ mod tests {
             .eq("tags[*]", "a")
             .index_ranges(&indexes)
             .unwrap();
-        assert_eq!(ranges[0].0.field, "tags[*]");
+        assert_eq!(ranges[0].0.name(), "tags[*]");
+    }
+
+    fn compound(fields: &[&str]) -> IndexMeta {
+        IndexMeta {
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+            root: 1,
+            unique: false,
+        }
+    }
+
+    /// `Eq` on a compound index's first fields, then a range on the next:
+    /// the more fields it narrows, the better it is; nothing on its first
+    /// field, no use.
+    #[test]
+    fn a_compound_index_is_chosen_by_how_many_fields_it_narrows() {
+        let indexes = [
+            index("status"),
+            compound(&["status", "created"]),
+            compound(&["a", "b", "c"]),
+        ];
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        let queued = || Filter::new().eq("status", "Queued");
+        // One field narrowed either way: the first among equals.
+        assert_eq!(plan(queued()).as_deref(), Some("status"));
+        assert_eq!(
+            plan(queued().gt("created", 5)).as_deref(),
+            Some("(status, created)")
+        );
+        assert_eq!(
+            plan(queued().eq("created", 5)).as_deref(),
+            Some("(status, created)")
+        );
+        // A range on the first field is a range.
+        assert_eq!(plan(Filter::new().gt("a", 1)).as_deref(), Some("(a, b, c)"));
+        // Not on the first field: nothing to narrow by.
+        assert_eq!(plan(Filter::new().eq("b", 1).eq("c", 2)), None);
+        // `Eq` on all three: all three narrow.
+        assert_eq!(
+            plan(Filter::new().eq("c", 3).eq("a", 1).eq("b", 2)).as_deref(),
+            Some("(a, b, c)")
+        );
+        let ranges = Filter::new()
+            .eq("a", 1)
+            .eq("b", 2)
+            .lt("c", 3)
+            .index_ranges(&indexes)
+            .unwrap();
+        let k = |c: i64| key::compound(&[&1.into(), &2.into(), &c.into()], crate::DocId([0; 16]));
+        assert!(ranges[0].1.contains(&k(2)) && !ranges[0].1.contains(&k(4)));
+    }
+
+    /// Read in sort order when the sort field follows fields an `Eq`
+    /// fixes — the more fixed, the better; not when one before it is
+    /// free.
+    #[test]
+    fn a_compound_index_gives_the_order_after_its_fixed_fields() {
+        let indexes = [index("created"), compound(&["status", "created"])];
+        let order = |f: Filter| f.limit(20).index_order(&indexes).map(|(i, _)| i.name());
+        let newest = |f: Filter| f.sort_desc("created");
+        assert_eq!(
+            order(newest(Filter::new().eq("status", "Queued"))).as_deref(),
+            Some("(status, created)")
+        );
+        assert_eq!(order(newest(Filter::new())).as_deref(), Some("created"));
+        assert_eq!(
+            order(newest(Filter::new().gt("status", "A"))).as_deref(),
+            Some("created")
+        );
+        assert_eq!(
+            order(Filter::new().eq("status", "Queued").sort_asc("status")).as_deref(),
+            Some("(status, created)")
+        );
+        // The range read: the fixed value, then the sort field's range.
+        let (_, range) = newest(Filter::new().eq("status", "Queued").gt("created", 5))
+            .limit(20)
+            .index_order(&indexes)
+            .unwrap();
+        let k = |status: &str, created: i64| {
+            key::compound(&[&status.into(), &created.into()], crate::DocId([0; 16]))
+        };
+        let range = range.unwrap();
+        assert!(range.contains(&k("Queued", 6)) && !range.contains(&k("Queued", 4)));
+        assert!(!range.contains(&k("Done", 6)));
     }
 
     /// `tags[*] > 5 AND tags[*] < 3` holds for `[1, 10]`: one element is
@@ -1373,7 +1553,7 @@ mod tests {
 
     fn index(field: &str) -> IndexMeta {
         IndexMeta {
-            field: field.into(),
+            fields: vec![field.into()],
             root: 1,
             unique: false,
         }
@@ -1389,7 +1569,7 @@ mod tests {
         let field_of = |f: &Filter| {
             let ranges = f.index_ranges(&indexes)?;
             assert_eq!(ranges.len(), 1, "one range, not a union");
-            Some(ranges[0].0.field.clone())
+            Some(ranges[0].0.name())
         };
 
         // No condition on an indexed field, or only unusable ones.
@@ -1428,7 +1608,7 @@ mod tests {
         let indexes = [index("age"), index("name")];
         let fields = |f: Filter| -> Option<Vec<String>> {
             let ranges = f.index_ranges(&indexes)?;
-            Some(ranges.iter().map(|(i, _)| i.field.clone()).collect())
+            Some(ranges.iter().map(|(i, _)| i.name()).collect())
         };
         let ada = || Condition::eq("name", "Ada");
         let young = || Condition::lt("age", 18);

@@ -3,7 +3,7 @@
 //! system.
 
 use crate::catalog::{Catalog, IndexMeta};
-use crate::collection::{secondary_entries, secondary_keys};
+use crate::collection::{index_keys, same_values, unique_tuples};
 use crate::data;
 use crate::database::Database;
 use crate::index::{BTreeIndex, Index, key};
@@ -76,7 +76,7 @@ fn rebuild(catalog: &Catalog, store: &FileStore) -> crate::Result<(Catalog, Memo
             let new_loc = data::insert_record(&mut image, &mut current, id, &doc)?;
             primary.insert(&mut image, &primary_key, new_loc)?;
             for (entries, index) in index_entries.iter_mut().zip(indexes) {
-                for key in secondary_keys(&doc, &index.field, id) {
+                for key in index_keys(&doc, index, id) {
                     entries.push((key, new_loc));
                 }
             }
@@ -86,7 +86,7 @@ fn rebuild(catalog: &Catalog, store: &FileStore) -> crate::Result<(Catalog, Memo
         }
 
         for (index, mut entries) in indexes.iter().zip(index_entries) {
-            let new_index = rebuilt.create_index(&mut image, name, &index.field, index.unique)?;
+            let new_index = rebuilt.create_index(&mut image, name, &index.fields, index.unique)?;
             entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             if index.unique {
                 refuse_duplicates(&image, name, &new_index, &entries)?;
@@ -113,32 +113,28 @@ fn refuse_duplicates(
 ) -> crate::Result<()> {
     let groups = entries.chunk_by(|(a, _), (b, _)| key::value_part(a) == key::value_part(b));
     for group in groups.filter(|group| group.len() > 1) {
-        let mut seen: Vec<(crate::DocId, crate::Document)> = Vec::new();
+        let mut seen: Vec<(crate::DocId, Vec<crate::Document>)> = Vec::new();
         for (key, loc) in group {
             let (id, doc) = data::get_record(image, *loc)?;
-            // The values this entry is for — in a multikey index, some of
-            // the document's elements (SPEC §42.2).
-            let entries = secondary_entries(&doc, &index.field, id);
-            let (_, values) = entries
-                .iter()
-                .find(|(k, _)| k == key)
-                .expect("the entry came from this document");
-            for value in values {
-                if matches!(value, crate::Document::Null) {
-                    continue;
-                }
-                if let Some((existing, _)) = seen
-                    .iter()
-                    .find(|(other_id, other)| *other_id != id && crate::query::equal(other, value))
-                {
+            // The values under this entry's key — in a multikey index,
+            // some of the document's elements (SPEC §42.2), in a compound
+            // one, one per field (§43.4).
+            let tuples = unique_tuples(&doc, index);
+            let under_key = tuples.iter().filter(|(v, _)| v == key::value_part(key));
+            for (_, values) in under_key {
+                let collision = seen.iter().find(|(other_id, others)| {
+                    let others: Vec<&crate::Document> = others.iter().collect();
+                    *other_id != id && same_values(&others, values)
+                });
+                if let Some((existing, _)) = collision {
                     return Err(crate::Error::DuplicateValue {
                         collection: collection.to_string(),
-                        field: index.field.clone(),
+                        field: index.name(),
                         id,
                         existing: *existing,
                     });
                 }
-                seen.push((id, (*value).clone()));
+                seen.push((id, values.iter().map(|v| (*v).clone()).collect()));
             }
         }
     }
