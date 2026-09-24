@@ -130,9 +130,34 @@ trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
 trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 ```
 
+## Performance
+
+Not fast yet, and measured so it can get there. `bench/` runs one
+document workload against trunkdb, SQLite, redb and sled: same
+documents and ids, same three indexes, durable commits everywhere, and
+the same answers checked across all four. On an M1 Pro with 100,000
+documents:
+
+| | trunkdb | SQLite | redb | sled |
+|---|---:|---:|---:|---:|
+| insert, 1000 per commit | 6.3k/s | 41k/s | 41k/s | 29k/s |
+| one commit | 16 ms | 5.3 ms | 5.8 ms | 10 ms |
+| get by id | 32 µs | 18 µs | 2.7 µs | 3.6 µs |
+| 1000 documents by index | 4.7 ms | 1.9 ms | 1.1 ms | 1.9 ms |
+| oldest 20 of a status | 19 ms | 23 µs | 16 µs | 21 µs |
+| file size after compact | 33 MB | 22 MB | 30 MB | — |
+
+Each gap has a known cause (SPEC.md §48): the sorted read collects the
+whole range before stopping at the limit, there's no page cache, and a
+commit flushes three times. Those are the next steps on the roadmap.
+
+```
+cd bench && cargo run --release
+```
+
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §48 for the full list and reasoning):
+Done so far (see SPEC.md §49 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -199,8 +224,10 @@ Done so far (see SPEC.md §48 for the full list and reasoning):
     sorted in memory. `Filter.sort` is now a `Vec<Sort>`.
 
     Items 19–21 → 0.9.0.
+22. **Benchmarks** (§48): `bench/` against SQLite, redb and sled; the
+    measured gaps order what comes next.
 
-What's still open: SPEC.md §48.2.
+What's still open: SPEC.md §49.2.
 
 ## License
 

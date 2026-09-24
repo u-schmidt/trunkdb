@@ -6,6 +6,8 @@ rust-version = "1.89"
 description = "An embedded, single-file, schema-less document database — a learning-first, from-scratch reimplementation of the LiteDB idea in Rust."
 license = "MIT"
 repository = "https://github.com/u-schmidt/trunkdb"
+# The benchmark is its own crate, with its own dependencies (SPEC §48).
+exclude = ["bench/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

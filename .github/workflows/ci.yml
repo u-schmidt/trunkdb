@@ -42,3 +42,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+
+  bench:
+    name: Benchmark (builds, lints, runs small)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench
+      - run: cargo fmt --check --manifest-path bench/Cargo.toml
+      - run: cargo clippy --manifest-path bench/Cargo.toml -- -D warnings
+      # Every store must give the same answers; the times don't matter here.
+      - run: cargo run --release --manifest-path bench/Cargo.toml -- 20000
