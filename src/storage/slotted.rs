@@ -127,6 +127,46 @@ impl SlottedPage {
         Some(slot)
     }
 
+    /// Inserts a cell as slot `slot`, moving the slots from there on up
+    /// by one — for pages whose slot order is their key order, B-tree
+    /// pages, so an insert touches one cell instead of rebuilding the
+    /// page (SPEC §52). Compacts first if the bytes are there but
+    /// scattered; `false`, leaving the page untouched, if they aren't.
+    pub fn insert_cell_at(&mut self, slot: u16, data: &[u8]) -> bool {
+        assert!(
+            slot <= self.slot_count(),
+            "insert at slot {slot} past the end"
+        );
+        if !self.has_room_for(data.len()) {
+            if self.reclaimable_space() < SLOT_LEN + data.len() {
+                return false;
+            }
+            self.compact_keeping(self.slot_count());
+        }
+        let count = self.slot_count();
+        let from = Self::slot_offset(slot);
+        self.buf
+            .copy_within(from..Self::slot_offset(count), from + SLOT_LEN);
+        self.set_slot_count(count + 1);
+        self.place_cell(slot, data);
+        true
+    }
+
+    /// Takes slot `slot` out, moving the slots after it down by one, and
+    /// zeroes its bytes so a removed key doesn't linger on disk; the gap
+    /// is reclaimed by the next compaction.
+    pub fn remove_cell_at(&mut self, slot: u16) {
+        let count = self.slot_count();
+        assert!(slot < count, "remove of slot {slot} past the end");
+        let (offset, length) = self.read_slot(slot);
+        self.buf[offset as usize..(offset + length) as usize].fill(0);
+        let from = Self::slot_offset(slot + 1);
+        self.buf
+            .copy_within(from..Self::slot_offset(count), from - SLOT_LEN);
+        self.buf[Self::slot_offset(count - 1)..Self::slot_offset(count)].fill(0);
+        self.set_slot_count(count - 1);
+    }
+
     /// Tombstones a slot. Does not reclaim its space by itself — plain
     /// `insert_cell` may still reject a cell that would fit after
     /// `compact` (which `insert_cell_reusing_slot`/`update_cell` call
@@ -422,6 +462,89 @@ mod tests {
         let grown = vec![3u8; 6000];
         assert!(page.update_cell(a, &grown));
         assert_eq!(page.get_cell(a), Some(&grown[..]));
+    }
+
+    fn cells(page: &SlottedPage) -> Vec<Vec<u8>> {
+        page.iter_cells()
+            .map(|(_slot, cell)| cell.to_vec())
+            .collect()
+    }
+
+    /// Slot order is key order on a B-tree page: a cell goes in at the
+    /// front, between two others or at the end, and the rest move up.
+    #[test]
+    fn insert_cell_at_keeps_slot_order() {
+        let mut page = SlottedPage::new(PageType::IndexLeaf);
+        assert!(page.insert_cell_at(0, b"c"));
+        assert!(page.insert_cell_at(0, b"a"));
+        assert!(page.insert_cell_at(2, b"d"));
+        assert!(page.insert_cell_at(1, b"bb"));
+        assert_eq!(cells(&page), [&b"a"[..], b"bb", b"c", b"d"]);
+        assert_eq!(page.get_cell(3), Some(&b"d"[..]));
+    }
+
+    /// Room made by removals is used once the page compacts; with no room
+    /// at all, the page is left as it was.
+    #[test]
+    fn insert_cell_at_compacts_or_leaves_the_page_alone() {
+        let mut page = SlottedPage::new(PageType::IndexLeaf);
+        for fill in 1..=4u8 {
+            assert!(page.insert_cell_at(fill as u16 - 1, &[fill; 2000]));
+        }
+        assert!(!page.has_room_for(2000));
+        page.remove_cell_at(1);
+        page.remove_cell_at(1);
+        assert!(!page.has_room_for(2000), "dead, not free, until compaction");
+        assert!(page.insert_cell_at(1, &[9; 2000]));
+        assert!(page.insert_cell_at(1, &[8; 1000]));
+        let before = page.clone().into_bytes();
+        assert!(!page.insert_cell_at(0, &[7; 2000]));
+        assert_eq!(page.clone().into_bytes(), before);
+        assert_eq!(
+            cells(&page),
+            [vec![1; 2000], vec![8; 1000], vec![9; 2000], vec![4; 2000]]
+        );
+    }
+
+    /// A trailing tombstone (left by versions before SPEC §52) keeps its
+    /// slot through the compaction, so the slot the caller counted to —
+    /// the end — is still the end.
+    #[test]
+    fn insert_cell_at_the_end_past_a_trailing_tombstone() {
+        let mut page = SlottedPage::new(PageType::IndexLeaf);
+        for fill in 1..=4u8 {
+            assert!(page.insert_cell_at(fill as u16 - 1, &[fill; 2000]));
+        }
+        page.delete_cell(3);
+        assert!(page.insert_cell_at(4, &[5; 2000]));
+        assert_eq!(page.slot_count(), 5);
+        assert_eq!(page.get_cell(3), None);
+        assert_eq!(page.get_cell(4), Some(&[5; 2000][..]));
+    }
+
+    /// A removed cell's bytes are gone, not just unreachable, and the
+    /// slots after it move down.
+    #[test]
+    fn remove_cell_at_zeroes_the_cell_and_closes_the_gap() {
+        let mut page = SlottedPage::new(PageType::IndexLeaf);
+        for (slot, cell) in [&b"first"[..], b"secret", b"last"].iter().enumerate() {
+            assert!(page.insert_cell_at(slot as u16, cell));
+        }
+        page.remove_cell_at(1);
+        assert_eq!(cells(&page), [&b"first"[..], b"last"]);
+        assert_eq!(page.slot_count(), 2);
+        let bytes = page.clone().into_bytes();
+        assert!(!bytes.windows(6).any(|w| w == b"secret"));
+        // The old last slot entry is cleared too.
+        assert!(
+            bytes[HEADER_LEN + 2 * SLOT_LEN..HEADER_LEN + 3 * SLOT_LEN]
+                .iter()
+                .all(|&b| b == 0)
+        );
+        page.remove_cell_at(1);
+        page.remove_cell_at(0);
+        assert!(page.is_empty());
+        assert_eq!(page.slot_count(), 0);
     }
 
     #[test]

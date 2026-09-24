@@ -109,7 +109,7 @@ impl Index for BTreeIndex {
             .find(|(_slot, cell)| decode_index_entry(cell).0 == key)
             .map(|(slot, _cell)| slot);
         if let Some(slot) = found {
-            page.delete_cell(slot);
+            page.remove_cell_at(slot);
             store.write_page(page_id, &page.into_bytes())?;
         }
         Ok(()) // not found anywhere is a no-op, matching InMemoryIndex
@@ -336,10 +336,22 @@ fn insert_into(
 fn insert_into_leaf(
     store: &mut dyn PageStore,
     page_id: PageId,
-    page: SlottedPage,
+    mut page: SlottedPage,
     key: &[u8],
     loc: RecordLocation,
 ) -> std::io::Result<InsertOutcome> {
+    // In place if it fits: before the first key not below it (SPEC §52).
+    let slot = page
+        .iter_cells()
+        .find(|(_slot, cell)| decode_index_entry(cell).0 >= key)
+        .map_or(page.slot_count(), |(slot, _cell)| slot);
+    if page.insert_cell_at(slot, &encode_index_entry(key, loc)) {
+        store.write_page(page_id, &page.into_bytes())?;
+        return Ok(InsertOutcome::Done);
+    }
+
+    // Full: rebuild it from its entries, which drops any tombstones an
+    // older version left, or split it.
     let mut entries: Vec<(Vec<u8>, RecordLocation)> = page
         .iter_cells()
         .map(|(_slot, c)| {
@@ -387,25 +399,19 @@ fn insert_into_leaf(
 fn insert_into_branch(
     store: &mut dyn PageStore,
     page_id: PageId,
-    page: SlottedPage,
+    mut page: SlottedPage,
     key: &[u8],
     loc: RecordLocation,
 ) -> std::io::Result<InsertOutcome> {
-    let mut entries: Vec<(Vec<u8>, PageId)> = page
+    // The first separator above `key` routes it, as in `find_child`;
+    // `None` is the rightmost child.
+    let (slot, child_id) = page
         .iter_cells()
-        .map(|(_slot, c)| {
-            let (k, child) = decode_branch_entry(c);
-            (k.to_vec(), child)
-        })
-        .collect();
-    let mut rightmost = page.next_page();
-
-    let idx = entries.partition_point(|(k, _)| k.as_slice() <= key);
-    let child_id = if idx < entries.len() {
-        entries[idx].1
-    } else {
-        rightmost
-    };
+        .map(|(slot, cell)| (slot, decode_branch_entry(cell)))
+        .find(|(_slot, (separator, _child))| *separator > key)
+        .map_or((None, page.next_page()), |(slot, (_separator, child))| {
+            (Some(slot), child)
+        });
 
     let outcome = insert_into(store, child_id, key, loc)?;
     let InsertOutcome::Split {
@@ -415,6 +421,42 @@ fn insert_into_branch(
     else {
         return Ok(InsertOutcome::Done); // child absorbed the insert, this page is unchanged
     };
+
+    // In place if it fits (SPEC §52): the separator goes in front of
+    // the child that split, and what routed there now routes to its new
+    // right half.
+    let routing = encode_branch_entry(&separator, child_id);
+    match slot {
+        Some(slot) => {
+            let (next_separator, _child) =
+                decode_branch_entry(page.get_cell(slot).expect("a live slot"));
+            let rerouted = encode_branch_entry(next_separator, new_right);
+            if page.insert_cell_at(slot, &routing) {
+                // The same length, so in place.
+                assert!(page.update_cell(slot + 1, &rerouted));
+                store.write_page(page_id, &page.into_bytes())?;
+                return Ok(InsertOutcome::Done);
+            }
+        }
+        None => {
+            if page.insert_cell_at(page.slot_count(), &routing) {
+                page.set_next_page(new_right);
+                store.write_page(page_id, &page.into_bytes())?;
+                return Ok(InsertOutcome::Done);
+            }
+        }
+    }
+
+    // Full: split it.
+    let mut entries: Vec<(Vec<u8>, PageId)> = page
+        .iter_cells()
+        .map(|(_slot, c)| {
+            let (k, child) = decode_branch_entry(c);
+            (k.to_vec(), child)
+        })
+        .collect();
+    let mut rightmost = page.next_page();
+    let idx = entries.partition_point(|(k, _)| k.as_slice() <= key);
 
     // `child_id` used to own every key routed through position `idx` (or
     // through `rightmost`, if `idx` fell off the end). It just split into
@@ -526,8 +568,7 @@ fn build_branch_page(entries: &[(Vec<u8>, PageId)], rightmost: PageId) -> Option
 /// field, which means something different on a branch page (the child
 /// past the last separator) than it does on a leaf (the next sibling).
 /// Relies on cells being stored in sorted order, which every branch page
-/// is: it's always rebuilt from a sorted `Vec` (see `insert_into_branch`),
-/// never mutated cell-by-cell in place.
+/// is: `insert_into_branch` puts each separator in at its place.
 fn find_child(page: &SlottedPage, target: &[u8]) -> PageId {
     for (_slot, cell) in page.iter_cells() {
         let (key, child) = decode_branch_entry(cell);
@@ -929,6 +970,84 @@ mod tests {
     /// prefixes, inserted and removed in random order: the tree must
     /// always agree with a `BTreeMap` on every range. Long keys make
     /// splits frequent, uneven in entry count, and several levels deep.
+    /// Every page of the tree, as bytes.
+    fn tree_bytes(store: &FileStore, index: &BTreeIndex) -> Vec<Vec<u8>> {
+        index
+            .pages(store)
+            .unwrap()
+            .into_iter()
+            .map(|id| store.read_page(id).unwrap())
+            .collect()
+    }
+
+    /// Keys go in and out of a page in place (SPEC §52): a removed key's
+    /// bytes are zeroed, not left for the next rebuild of its leaf.
+    #[test]
+    fn removed_keys_leave_no_bytes_behind() {
+        let (_dir, mut store, mut index) = fresh();
+        let loc = RecordLocation { page: 1, slot: 0 };
+        let key = |i: u32| format!("key{i:05}-secret{}", i % 7).into_bytes();
+        for i in 0..2000 {
+            index
+                .insert(&mut store, &key(i * 7919 % 2000), loc)
+                .unwrap();
+        }
+        let has = |store: &FileStore, index: &BTreeIndex, needle: &[u8]| {
+            tree_bytes(store, index)
+                .iter()
+                .any(|page| page.windows(needle.len()).any(|w| w == needle))
+        };
+        assert!(has(&store, &index, b"secret3"));
+        for i in (3..2000).step_by(7) {
+            index.remove(&mut store, &key(i)).unwrap();
+        }
+        assert!(!has(&store, &index, b"secret3"));
+        let left: Vec<Vec<u8>> = index
+            .scan(&store)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let expected: Vec<Vec<u8>> = (0..2000).filter(|i| i % 7 != 3).map(key).collect();
+        assert_eq!(left, expected);
+    }
+
+    /// Versions before SPEC §52 left tombstones on a leaf when a key was
+    /// removed; inserts around them keep the keys in order, and a full
+    /// leaf is rebuilt without them before it splits.
+    #[test]
+    fn leaves_with_tombstones_from_older_versions_take_inserts() {
+        let (_dir, mut store, mut index) = fresh();
+        let loc = RecordLocation { page: 1, slot: 0 };
+        let key = |i: u32| format!("{i:04}{}", "x".repeat(60)).into_bytes();
+        for i in (0..100).map(|i| i * 2) {
+            index.insert(&mut store, &key(i), loc).unwrap();
+        }
+        // As a remove used to leave it: every third slot tombstoned.
+        let mut page = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        assert_eq!(page.page_type(), PageType::IndexLeaf);
+        for slot in (0..page.slot_count()).step_by(3) {
+            page.delete_cell(slot);
+        }
+        store.write_page(index.root, &page.into_bytes()).unwrap();
+        let mut expected: std::collections::BTreeSet<Vec<u8>> = (0..100)
+            .filter(|i| i % 3 != 0)
+            .map(|i| key(i * 2))
+            .collect();
+
+        for i in (0..400).map(|i| i * 2 + 1) {
+            index.insert(&mut store, &key(i), loc).unwrap();
+            expected.insert(key(i));
+        }
+        let keys: Vec<Vec<u8>> = index
+            .scan(&store)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, expected.into_iter().collect::<Vec<_>>());
+    }
+
     #[test]
     fn variable_length_keys_match_a_btreemap() {
         let (_dir, mut store, mut index) = fresh();

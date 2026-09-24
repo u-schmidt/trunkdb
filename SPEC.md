@@ -138,7 +138,7 @@ a time, and a reader waits while a batch commits.
 Three workload shapes, taken from real applications, calibrate what
 trunkdb has to do. v0 was built standalone against synthetic data shaped
 like these. The sync workload (§5.3) is the first planned live use, the
-large-document workload (§5.2) the second; see §52 for the roadmap.
+large-document workload (§5.2) the second; see §53 for the roadmap.
 
 ### 5.1 Time-series workload
 A data-shape and query-pattern reference, not a planned integration:
@@ -1538,7 +1538,7 @@ not worth it yet. Folding isn't accent-stripping: `muller` doesn't match
   though skipping the condition is cheaper.
 
 ### 25.4 Deliberately not regex
-A pattern language (regex, `LIKE` wildcards) is still open (§52.2). A
+A pattern language (regex, `LIKE` wildcards) is still open (§53.2). A
 plain substring covers the search boxes, has no syntax to escape user
 input for, and can't be made pathologically slow by a pattern.
 Performance is a scan anyway (§4.3): each candidate's field is folded
@@ -1719,7 +1719,7 @@ costs nothing to take the better of the two, since reads already only
 need `&` access. What this still isn't: readers during a write. A batch
 blocks all readers until it has `fsync`ed twice — tens of milliseconds.
 Truly concurrent readers need MVCC or a snapshot of the pre-batch pages
-(§52.2).
+(§53.2).
 
 `find` drops the lock before filtering and sorting: the candidates are
 owned copies by then. No user code (serde conversion, filter closures)
@@ -2109,7 +2109,7 @@ The whole database becomes one text file that doesn't depend on the page
 layout. That makes it the migration path between file format versions
 (§21.2): export with the old trunkdb, import with the new one, and
 trunkdb never has to read an old format itself — which 1.0.0 needs
-(§52). It's also a backup that can be read and `diff`ed, and a way to
+(§53). It's also a backup that can be read and `diff`ed, and a way to
 bring data in from elsewhere.
 
 ### 30.1 Tagged JSON (`json.rs`)
@@ -2236,7 +2236,7 @@ collection.
 ### 30.6 Limits
 - Not atomic on import (§30.3).
 - Writers wait for the whole export. For a large database that's
-  seconds; a snapshot that doesn't block writers needs MVCC (§52.2).
+  seconds; a snapshot that doesn't block writers needs MVCC (§53.2).
 - Reading `mongoexport` output directly (`$oid` is 12 bytes, not 16;
   `$date`, `$numberLong`) is left out: its `$oid` values aren't
   `DocId`s, so a migration from MongoDB needs decisions only the app
@@ -2347,7 +2347,7 @@ through export and import anyway, and this can't happen.)
   field costs what it did before.
 - No array traversal (§31.3; since §42 with `[*]`), no escaping of
   dots (§31.2).
-- Still one field per index: compound indexes are still open (§52.2);
+- Still one field per index: compound indexes are still open (§53.2);
   unique ones came in §33.
 
 ## 32. Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)
@@ -2887,7 +2887,7 @@ An OR of nothing matches nothing and reads no range at all.
 - A NOT never uses an index (§36.3).
 - An AND uses one part's bounds, never the intersection of several
   indexes' ranges.
-- Still no pattern language, no conditions on array elements (§52.2).
+- Still no pattern language, no conditions on array elements (§53.2).
 
 ## 37. `delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)
 
@@ -2974,7 +2974,7 @@ holds a name, and the next write creates the collection again, empty.
 - A large `delete_many` or drop is one big batch: every changed page is
   staged in memory and written to the WAL (§19.9), like `ensure_index`.
 - Freed pages are reused, but the file doesn't shrink (compaction,
-  §52.2).
+  §53.2).
 - No `update_many` yet — it came next (§38).
 
 ## 38. `update_many` (`collection.rs`)
@@ -3310,7 +3310,7 @@ now: while few files exist, a format change costs little.
   intact at an older version, still matches its own checksum. Catching
   that needs a checksum next to each pointer (§40.1).
 - **Damage in the header or the catalog stops `open`**, so `check` can't
-  run on such a file. Repairing is open (§52.2).
+  run on such a file. Repairing is open (§53.2).
 - **Only bytes read from the file are checked.** A page damaged in
   memory isn't caught. Neither is a bug that writes wrong bytes, since
   they get a matching checksum; finding that is `check`'s job (§39.2).
@@ -4545,10 +4545,12 @@ and by very different factors. Each factor has a cause in the code:
   per document reads its path from the file (again, no cache), and
   every changed page is logged whole (8 KB) to the WAL and written
   back. With `created` in random order, a batch of 1,000 changes
-  hundreds of pages.
+  hundreds of pages. (A profile later found the cost elsewhere: every
+  insert rebuilt its leaf from copies of all its keys. §52 fixed that.)
 - **Compaction, 15–40× slower (7 s).** It rebuilds through ordinary
   B-tree inserts into memory, then logs the whole new image to the WAL
   and writes it back (§41).
+  (Since §52, which made those inserts cheap: 1 s.)
 - **Size:** smaller than redb and sled before compaction, 17% larger
   than SQLite. After compaction it's about redb's size, and SQLite's
   file is a third smaller. Where trunkdb's extra third goes (document
@@ -4578,7 +4580,7 @@ number from this benchmark before and after.
   `fsync` costs differently, and CI runs the benchmark on Linux without
   looking at the times.
 - **One thread.** Nothing measures readers during a write batch, which
-  is where MVCC (§52.2) would show.
+  is where MVCC (§53.2) would show.
 - **Warm caches only**; a cold start (first read after a reboot) isn't
   measured.
 - **JSON for the others**, where a binary format would be faster.
@@ -5024,13 +5026,170 @@ seconds instead of 26, since most of its tests commit.
   - no checkpoint when the last handle goes;
   - an older image of a page kept over a newer one.
 
-## 52. Roadmap
+## 52. B-tree pages changed in place (`storage/slotted.rs`, `index/btree.rs`)
+§48.4 put batched writes 4–7× behind the other stores and blamed page
+work; §51.4 confirmed that flushes weren't it. This section is the
+profile that §53.2 asked for first, and the fix it pointed at.
+
+### 52.1 The profile
+A scratch program inserting documents like the benchmark's, 1,000 per
+batch with its three indexes, under macOS's built-in `sample` (a
+release build with `debug = true`; no Xcode, no install). The rate
+against the number of indexes already located it: 32,000 documents a
+second with none, 15,500 with one, 7,500 with three. Each index
+roughly halved it.
+
+Of 16,765 samples over 300,000 documents:
+- 70% in `insert_into`, the B-tree insert.
+- About 48% of all samples in `malloc` and `free`, and 12% in
+  `memmove`. The fsyncs were 15%.
+- Inside the insert: collecting a page's cells into a `Vec` of owned
+  keys, once in each branch on the way down (2,360 samples) and once in
+  the leaf (2,198), then rebuilding the leaf from them (2,066).
+
+So each insert copied every key on the page into its own allocation
+(about 100 per leaf) and wrote a new page from them. It did that even
+for branches, which change only when a child splits, which is about
+one insert in a hundred.
+
+### 52.2 The fix
+Slot order is key order on a B-tree page, so an insert can move the slot
+directory up by 4 bytes and write one cell:
+- `SlottedPage::insert_cell_at(slot, cell)` compacts first if the bytes
+  are there but scattered. If they aren't there at all, it returns
+  `false` and leaves the page untouched.
+- `SlottedPage::remove_cell_at(slot)` takes the slot out and zeroes
+  the cell's bytes; the gap is reclaimed by the next compaction.
+- **Leaf insert:** find the first key not below the new one, then
+  insert in place. Only a full leaf is rebuilt from its entries, and
+  that code stays as it was: the split by bytes (§28.2) and the
+  in-order append (§41).
+- **Branch insert:** route like `find_child`, without copying
+  anything. If the child split, the separator goes in at the child's
+  slot and the entry after it is rerouted to the new right half. That
+  update is an in-place `update_cell`, since the new entry has the same
+  length. Only a full branch is collected and split.
+- **Leaf remove:** `remove_cell_at` instead of a tombstone.
+
+**No format change.** The pages hold the same cells in the same order;
+only the bytes between them differ. Pages written by older versions can
+still hold tombstones where a key was removed. They stay harmless:
+- `iter_cells` skips them;
+- a compaction before an insert keeps every slot, trailing ones
+  included, so the slot the insert counted to stays valid;
+- a full leaf's rebuild drops them.
+
+**Removed keys no longer linger.** A remove used to tombstone the slot,
+and the key's bytes stayed on disk until the next insert into that leaf
+rebuilt it. Index keys hold field values (§28.1), so zeroing them is
+the same rule `compact` follows for documents (§20).
+
+Rejected:
+- **Binary search for the position.** Scanning about 100 cells with a
+  `memcmp` each no longer shows in the profile; the allocations were
+  the cost, not the comparisons.
+- **A page kept decoded in memory between inserts.** That would be a
+  second representation of every page to keep in step with its bytes,
+  for work that is now a memmove of the slot directory.
+
+### 52.3 Measured
+The scratch program, 100,000 documents:
+
+| indexes | before | after |
+|---|---:|---:|
+| none | 32k/s | 87k/s |
+| one | 15.5k/s | 57k/s |
+| three | 7.5k/s | 22k/s |
+
+The benchmark, trunkdb alone, against the table in §51.5:
+
+| | before | after |
+|---|---:|---:|
+| insert 100000, 1000 per commit | 7,518/s | 23k/s |
+| update 9528, 1000 per commit | 6,187/s | 9,061/s |
+| delete 10000, 1000 per commit | 14k/s | 15k/s |
+| compact | about 7 s | 1.00 s |
+
+Compaction gained the most for its size, because its rebuild is
+ordinary B-tree inserts (§41). Reads are unchanged.
+
+The full run, with the others (a slower run for all four than §51.5's;
+the small figures move between runs):
+
+| | trunkdb | SQLite | redb | sled |
+|---|---:|---:|---:|---:|
+| insert 100000, 1000 per commit | 20k/s | 35k/s | 37k/s | 28k/s |
+| insert 1000, one per commit | 5502 µs | 4660 µs | 4952 µs | 9360 µs |
+| get by id | 5.5 µs | 21.0 µs | 1.9 µs | 2.1 µs |
+| find tenant == x (1000 docs) | 2.25 ms | 2.64 ms | 1.00 ms | 1.78 ms |
+| status == x, oldest 20 | 48.5 µs | 23.8 µs | 16.8 µs | 21.7 µs |
+| scan: tries > 7, unindexed | 156 ms | 49 ms | 49 ms | 71 ms |
+| update 9528, 1000 per commit | 8917/s | 12k/s | 17k/s | 21k/s |
+| delete 10000, 1000 per commit | 15k/s | 18k/s | 23k/s | 35k/s |
+| compact | 1.02 s | 0.20 s | 0.43 s | — |
+
+Batched inserts went from 5× behind SQLite and redb to under 2×.
+
+### 52.4 What's left: the checkpoint
+Profiled again, at 600,000 documents: page work is 29% of the samples,
+the WAL (writing and flushing whole pages) 23%, and the checkpoint 48%.
+A batch of 1,000 documents with `created` in random order changes more
+than 1,000 distinct index leaves once the index is large. That crosses
+`CHECKPOINT_PAGES` (§51) on nearly every commit, so each page is
+written twice and flushed twice. Trying other thresholds in the scratch
+program:
+
+| `CHECKPOINT_PAGES` | 100,000 documents | 300,000 documents |
+|---|---:|---:|
+| 1,000 (now) | 22k/s | 13k/s |
+| 4,000 | 30k/s | 22k/s |
+| 16,000 | 33k/s | 20k/s |
+
+A larger threshold lets a page rewritten by several batches be written
+back once. It costs memory (4,000 pages is 32 MB of unwritten pages),
+a larger WAL, and a longer checkpoint for the commit that crosses the
+threshold. That trade is left open (§53.2) rather than decided with
+this change.
+
+### 52.5 Tests
+- `storage/slotted.rs`:
+  - `insert_cell_at` at the front, in between and at the end keeps
+    slot order.
+  - Room made by removals is used after a compaction. With no room,
+    the page is left byte for byte as it was.
+  - A trailing tombstone keeps its slot through that compaction, so an
+    insert at the end still lands at the end.
+  - `remove_cell_at` closes the gap, zeroes the cell and clears the old
+    last directory entry.
+- `index/btree.rs`:
+  - 2,000 keys inserted out of order, then every seventh removed: none
+    of the removed keys' bytes is on any page of the tree, and the scan
+    holds exactly the rest.
+  - A leaf with every third slot tombstoned, as older versions left it,
+    takes 400 inserts through splits, and the scan is exactly the
+    expected keys in order.
+- The randomized test of §28 (inserts and removes of keys up to
+  `MAX_KEY_LEN` against a `BTreeMap`) runs unchanged. It now covers
+  holes, compaction and splits of pages changed in place.
+- Checked by breaking it on purpose, thirteen ways. Each of these fails
+  a test:
+  - no compaction before an insert, or one that drops trailing
+    tombstones;
+  - a room check without the slot entry;
+  - the slot directory not moved up, or not moved down;
+  - a removed cell not zeroed, or the old last slot not cleared;
+  - removal by tombstone;
+  - a leaf position that is wrong, or at the front instead of the end;
+  - a branch routing equal keys left;
+  - the wrong slot rerouted, or the rightmost child not rerouted.
+
+## 53. Roadmap
 
 "v1" is a milestone name, not a semver promise: 0.x minor versions may
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-### 52.1 Done
+### 53.1 Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and
 the file format first, so real data never needs a migration; then what
 the sync workload (§5.3) needs; then the large-document workload (§5.2).
@@ -5049,9 +5208,9 @@ All of it is done:
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
-| next | One flush per commit (`Database::checkpoint`) | §51 |
+| next | One flush per commit (`Database::checkpoint`); B-tree pages changed in place | §51–§52 |
 
-### 52.2 Open
+### 53.2 Open
 Unordered within each group; each line says where the need or the
 limit is described.
 
@@ -5066,11 +5225,14 @@ limit is described.
 - A free-space map, so inserts refill half-empty data pages between
   compactions (§20.1, §41.5).
 - Compaction without holding the whole new file in memory: a streamed
-  WAL record (§41.5). And faster: leaves built from sorted entries, not
-  inserted one by one (§48.4).
-- Batched writes, 5× behind: page work, not flushes — a staged page
-  copied whole on every write and read, a leaf rebuilt for every insert
-  (§48.4, §51.4). Profile first.
+  WAL record (§41.5). Leaves built from sorted entries instead of
+  inserted one by one would make it faster still (§48.4), though 1 s for
+  100,000 documents (§52.3) makes that less pressing.
+- Batched writes, still about 2× behind: nearly every batch of 1,000
+  crosses the checkpoint threshold once the indexes are large. A larger
+  `CHECKPOINT_PAGES`, or one set in `OpenOptions`, trades memory and WAL
+  size for it (§52.4). A staged page is also still copied whole on every
+  read and write.
 
 **Concurrency**
 - Readers that don't wait for a write batch: MVCC or pre-batch page

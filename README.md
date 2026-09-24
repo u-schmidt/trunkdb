@@ -140,18 +140,20 @@ documents:
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 7.5k/s | 39k/s | 43k/s | 30k/s |
+| insert, 1000 per commit | 20k/s | 35k/s | 37k/s | 28k/s |
 | one commit | 4.6 ms | 4.6 ms | 4.8 ms | 9.5 ms |
 | get by id | 3.9 µs | 4.4 µs | 1.8 µs | 2.2 µs |
 | 1000 documents by index | 2.4 ms | 1.7 ms | 1.0 ms | 2.4 ms |
 | oldest 20 of a status | 47 µs | 23 µs | 22 µs | 20 µs |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
-Each gap has a known cause (SPEC.md §48), and the first three are
+Each gap has a known cause (SPEC.md §48), and the first four are
 fixed: "oldest 20" took 19 ms before the lazy B-tree walk (§49), a
 lookup by id 32 µs before the page cache (§50), a commit 16 ms before it
-flushed once instead of three times (§51). What's left: page work in
-batched writes, decoding in scans, and a copy per page read.
+flushed once instead of three times (§51), and batched inserts ran at
+7.5k/s before index pages were changed in place (§52). What's left:
+checkpoints in large batches, decoding in scans, and a copy per page
+read.
 
 ```
 cd bench && cargo run --release
@@ -159,7 +161,7 @@ cd bench && cargo run --release
 
 ## Roadmap (short version)
 
-Done so far (see SPEC.md §52 for the full list and reasoning):
+Done so far (see SPEC.md §53 for the full list and reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format
@@ -237,8 +239,11 @@ Done so far (see SPEC.md §52 for the full list and reasoning):
 25. **One flush per commit** (§51): pages are written back at a
     checkpoint every 8 MB, not every commit; a commit takes 4.6 ms
     instead of 16. `db.checkpoint()` makes the file complete on its own.
+26. **B-tree pages changed in place** (§52): an index insert writes one
+    cell instead of rebuilding its page; batched inserts 3× faster,
+    compaction 7×.
 
-What's still open: SPEC.md §52.2.
+What's still open: SPEC.md §53.2.
 
 ## License
 
