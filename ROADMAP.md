@@ -29,7 +29,7 @@ All of it is done:
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
-| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels | §55–§56 |
+| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred | §55–§57 |
 
 ## Open
 Unordered within each group; each line says where the need or the
@@ -42,7 +42,9 @@ limit is described.
 - Scan resistance for the page cache, and shared pages instead of a
   copy per read (§50.7).
 - A free-space map, so inserts refill half-empty data pages between
-  compactions (§20.1, §41.5).
+  compactions (§20.1, §41.5). It must keep the storage rules of §57.3:
+  above all, space freed by a commit isn't reused while a reader could
+  still need it.
 - Compaction without holding the whole new file in memory: a streamed
   WAL record (§41.5). Leaves built from sorted entries instead of
   inserted one by one would make it faster still (§48.4), though 1 s for
@@ -55,9 +57,13 @@ limit is described.
   page is also still copied whole on every read and write.
 
 **Concurrency**
-- Readers that don't wait for a write batch: MVCC or pre-batch page
-  snapshots (§27). It would also stop an export from blocking writers
-  (§30.6).
+- Measure how long readers wait while a writer commits, in `bench/`:
+  one commit a second, and batches (§57.2). The number that would reopen
+  the next two.
+- Writers that stage and flush beside the readers, taking the lock only
+  to publish (§57.2, option B). Not scheduled.
+- Snapshot reads (MVCC): deferred, not rejected (§57). They would also
+  stop an export from blocking writers (§30.6).
 
 **API**
 - Update operators (`$set`, `$inc`, `$unset` on paths) next to

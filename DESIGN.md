@@ -273,9 +273,16 @@ behind one `RwLock`:
 
 The page cache is behind its own mutex inside the store, so parallel
 readers take turns only for the cache lookup itself [§50](spec/50-a-page-cache.md). There is
-one writer at a time, and one process per file. Readers that don't
-wait for writers would need MVCC or snapshots of the pages before a
-batch; that's open (ROADMAP.md).
+one writer at a time, and one process per file.
+
+**Snapshot reads are deferred, not rejected** [§57](spec/57-concurrency.md). Readers that
+don't wait for writers (as in SQLite's WAL mode, LiteDB 5 or redb) aren't
+needed by anything measured yet, and they'd live below `PageStore`, so
+features above it don't make them harder. To keep them possible, the
+storage layer follows six rules. The one to know first: **a freed page
+isn't reused while a reader could still need its old contents**. It
+costs nothing today, since no reader overlaps a commit, but a
+free-space map or any other change to allocation must keep it.
 
 ## 10. The API
 

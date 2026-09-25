@@ -683,6 +683,12 @@ impl FileStore {
 }
 
 impl PageStore for FileStore {
+    /// Takes the free list's first page, or grows the file. A page freed
+    /// by a commit may come back from here at once — harmless while no
+    /// reader overlaps a commit. Snapshot reads (SPEC §57, deferred)
+    /// would need a freed page kept until every reader that might still
+    /// read its old contents is done: rule 1 of §57.3, which a free-space
+    /// map has to keep too.
     fn allocate_page(&mut self) -> io::Result<PageId> {
         let id = if self.header.free_list_head != NO_FREE_PAGE {
             let id = self.header.free_list_head;
@@ -755,6 +761,8 @@ impl PageStore for FileStore {
         self.write_raw(id, data)
     }
 
+    /// Puts `id` on the free list, where the next allocation takes it
+    /// (see `allocate_page`, and SPEC §57.3 before changing when).
     fn free_page(&mut self, id: PageId) -> io::Result<()> {
         if id == HEADER_PAGE {
             return Err(io::Error::new(

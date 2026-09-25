@@ -67,3 +67,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 54. [Checking a page when it is read (`storage/slotted.rs`)](54-checking-a-page-when-it-is-read.md)
 55. [Fuzzing (`fuzz/`, `decode.rs`, and every decoder it found)](55-fuzzing.md)
 56. [A limit on nesting (`document.rs`, `collection.rs`)](56-a-limit-on-nesting.md)
+57. [Concurrency: one writer, and snapshots kept possible](57-concurrency.md)
