@@ -5,7 +5,8 @@
 //!
 //! `cargo run --release -- [documents]` from `bench/` (default 100000);
 //! `BENCH_ONLY=trunkdb,redb` runs only those; `BENCH_TRUNKDB_CACHE_MB=256`
-//! gives trunkdb a cache of that size instead of its default.
+//! gives trunkdb a cache of that size instead of its default, and
+//! `BENCH_TRUNKDB_CHECKPOINT_PAGES=4000` a checkpoint threshold.
 
 mod stores;
 

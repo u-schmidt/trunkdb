@@ -45,6 +45,7 @@ pub(crate) struct State {
     /// main file, even on retry — see `write_batch`. From then on every
     /// call fails with `Error::Poisoned` until the database is reopened.
     poisoned: bool,
+    checkpoint_pages: usize,
 }
 
 /// How `Database::open_with` opens a database. `#[non_exhaustive]`: made
@@ -57,12 +58,20 @@ pub struct OpenOptions {
     /// §50); 0 keeps none. Default: `storage::DEFAULT_CACHE_SIZE`, 256 MiB.
     /// It fills only as pages are read.
     pub cache_size: usize,
+    /// Once this many committed pages wait, a commit writes them back to
+    /// the file (SPEC §51, §53); 0 or 1 writes them back after every
+    /// commit. More: fewer writes, but more memory (8 KB a page) and a
+    /// WAL that grows with every commit, not with this number, which the
+    /// next open after a crash reads back whole (§53.3). Default:
+    /// `DEFAULT_CHECKPOINT_PAGES`, 1,000.
+    pub checkpoint_pages: usize,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
         OpenOptions {
             cache_size: crate::storage::DEFAULT_CACHE_SIZE,
+            checkpoint_pages: DEFAULT_CHECKPOINT_PAGES,
         }
     }
 }
@@ -72,12 +81,17 @@ impl OpenOptions {
         self.cache_size = bytes;
         self
     }
+
+    pub fn checkpoint_pages(mut self, pages: usize) -> Self {
+        self.checkpoint_pages = pages;
+        self
+    }
 }
 
 /// How many committed pages may wait in memory, logged but not written
 /// back, before a commit writes them back (SPEC §51): 1,000 pages, 8 MB —
 /// SQLite's default for its WAL mode too.
-const CHECKPOINT_PAGES: usize = 1000;
+const DEFAULT_CHECKPOINT_PAGES: usize = 1000;
 
 impl State {
     /// `Database::checkpoint`: the pages to the file, then the WAL
@@ -182,6 +196,7 @@ impl Database {
                     catalog,
                     durability,
                     poisoned: false,
+                    checkpoint_pages: options.checkpoint_pages,
                 }),
                 id_gen: UuidV7Generator,
                 txn: GlobalLockTxnManager::default(),
@@ -296,8 +311,9 @@ impl Database {
     ///    the one flush a commit waits for (SPEC §51).
     /// 4. **commit** — the pages become the newest committed ones, read
     ///    from memory; the main file isn't touched.
-    /// 5. **checkpoint**, once `CHECKPOINT_PAGES` or more are waiting:
-    ///    write them back to the main file, `fsync`, truncate the WAL.
+    /// 5. **checkpoint**, once `OpenOptions::checkpoint_pages` or more are
+    ///    waiting (default 1,000): write them back to the main file,
+    ///    `fsync`, truncate the WAL.
     ///
     /// A crash before 3 completes leaves the state before; a crash after
     /// it leaves complete WAL records that `open` writes back, giving the
@@ -349,7 +365,7 @@ impl Database {
 
         // The batch is durable from here on: the WAL holds all its pages.
         state.store.commit();
-        if state.store.unwritten_pages() >= CHECKPOINT_PAGES {
+        if state.store.unwritten_pages() >= state.checkpoint_pages {
             // Not an error for this batch if it fails: it's durable, and
             // reads find its pages in memory. The next one tries again.
             let _ = state.checkpoint();
@@ -905,6 +921,41 @@ mod tests {
         assert_two_collection_batch_present(&db);
     }
 
+    /// How many committed pages wait for a checkpoint after one small
+    /// commit, in a database opened with `options`.
+    fn pages_waiting_after_one_commit(options: OpenOptions) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with(dir.path().join("test.trunkdb"), options).unwrap();
+        let doc = Document::String("x".into());
+        db.write_batch(vec![WriteOp::Insert("docs".into(), DocId([1; 16]), doc)])
+            .unwrap();
+        db.state().store.unwritten_pages()
+    }
+
+    /// `OpenOptions::checkpoint_pages` decides when a commit writes its
+    /// pages back: at 0 or 1 right away, at the default only once 1,000
+    /// wait — which one small commit doesn't reach — and exactly when
+    /// as many as it says are waiting.
+    #[test]
+    fn checkpoint_pages_sets_when_a_commit_writes_back() {
+        let options = OpenOptions::default();
+        assert_eq!(
+            pages_waiting_after_one_commit(options.checkpoint_pages(0)),
+            0
+        );
+        assert_eq!(
+            pages_waiting_after_one_commit(options.checkpoint_pages(1)),
+            0
+        );
+        let waiting = pages_waiting_after_one_commit(options);
+        assert!(waiting > 1);
+
+        let just_enough = options.checkpoint_pages(waiting);
+        assert_eq!(pages_waiting_after_one_commit(just_enough), 0);
+        let one_short = options.checkpoint_pages(waiting + 1);
+        assert_eq!(pages_waiting_after_one_commit(one_short), waiting);
+    }
+
     /// Enough waiting pages, and the commit writes them back itself.
     #[test]
     fn a_commit_checkpoints_once_enough_pages_wait() {
@@ -912,6 +963,7 @@ mod tests {
         let path = dir.path().join("test.trunkdb");
         let db = Database::open(&path).unwrap();
         let big = Document::String("x".repeat(6000));
+        let checkpoint_pages = DEFAULT_CHECKPOINT_PAGES;
         let mut waiting = 0;
         for commit in 0..100u8 {
             let ops = (0..50u8)
@@ -925,7 +977,7 @@ mod tests {
             if now < waiting {
                 // This commit's pages brought it over the line.
                 assert_eq!(now, 0);
-                assert!(waiting < CHECKPOINT_PAGES, "{waiting}");
+                assert!(waiting < checkpoint_pages, "{waiting}");
                 assert!(commit > 5, "{commit}");
                 assert_eq!(wal_len(&path), 0);
                 return;

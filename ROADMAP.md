@@ -27,7 +27,7 @@ All of it is done:
 | 0.8.0 | Compound indexes, sparse indexes, file format 8 | §43–§44 |
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
-| next | One flush per commit (`Database::checkpoint`); B-tree pages changed in place | §51–§52 |
+| next | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`) | §51–§53 |
 
 ## Open
 Unordered within each group; each line says where the need or the
@@ -46,10 +46,11 @@ limit is described.
   inserted one by one would make it faster still (§48.4), though 1 s for
   100,000 documents (§52.3) makes that less pressing.
 - Batched writes, still about 2× behind: nearly every batch of 1,000
-  crosses the checkpoint threshold once the indexes are large. A larger
-  `CHECKPOINT_PAGES`, or one set in `OpenOptions`, trades memory and WAL
-  size for it (§52.4). A staged page is also still copied whole on every
-  read and write.
+  crosses the default checkpoint threshold once the indexes are large.
+  `OpenOptions::checkpoint_pages` can raise it (§53), but the WAL then
+  grows with every commit, not with the threshold: a second trigger, on
+  the WAL's size, would make a large value reasonable (§53.3). A staged
+  page is also still copied whole on every read and write.
 
 **Concurrency**
 - Readers that don't wait for a write batch: MVCC or pre-batch page

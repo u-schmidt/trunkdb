@@ -70,6 +70,11 @@ impl Trunk {
         if let Ok(mb) = std::env::var("BENCH_TRUNKDB_CACHE_MB") {
             options = options.cache_size(mb.parse::<usize>().unwrap() << 20);
         }
+        // And the default checkpoint threshold unless
+        // `BENCH_TRUNKDB_CHECKPOINT_PAGES` says.
+        if let Ok(pages) = std::env::var("BENCH_TRUNKDB_CHECKPOINT_PAGES") {
+            options = options.checkpoint_pages(pages.parse().unwrap());
+        }
         let db = Database::open_with(&path, options).unwrap();
         let tasks = db.collection::<Task>("tasks");
         tasks.ensure_index("tenant").unwrap();
