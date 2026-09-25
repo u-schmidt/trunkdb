@@ -8,7 +8,8 @@ decision needs to be checked against the original intent.
 One file per section, numbered in the order the work happened. The
 numbers are stable: code comments and the other sections refer to
 them as `SPEC §N` or `§N`, and a new section gets the next number.
-What is done and what is open is in [ROADMAP.md](../ROADMAP.md).
+How the parts fit together today is in [DESIGN.md](../DESIGN.md); what
+is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 
 1. [Motivation](01-motivation.md)
 2. [Feasibility read](02-feasibility-read.md)

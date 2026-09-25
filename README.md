@@ -23,8 +23,8 @@ every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
 cloneable, thread-safe handle; reads run in parallel, writes one at a
-time). See [the spec](spec/README.md)
-for the full design rationale, and [ROADMAP.md](ROADMAP.md) for progress.
+time). See [DESIGN.md](DESIGN.md) for how it works,
+[the spec](spec/README.md) for why, and [ROADMAP.md](ROADMAP.md) for progress.
 
 ## Why
 
@@ -53,33 +53,53 @@ and (b) actually learn how a database is built, from the page layer up.
 ## Project layout
 
 ```
+DESIGN.md              how it works today, one subsystem at a time
+spec/                  why: one numbered section per step (SPEC §N)
+ROADMAP.md             what's done, what's open
 src/
-├── lib.rs           public re-exports, crate-level Error/Result
-├── document.rs        Document enum + DocId — the schema-less value type
-├── id.rs               IdGenerator trait + UuidV7Generator
-├── storage/              PageStore + FileStore (page checksums) +
-│                            SlottedPage + MemoryStore (real, tested)
-├── crc32.rs               CRC-32C, in hardware where the CPU has it
-├── index/                 Index trait + BTreeIndex (real, persisted B-tree,
-│                            primary and secondary indexes) + key encoding +
-│                            InMemoryIndex (fake, for tests)
-├── txn/                     TransactionManager trait + GlobalLockTxnManager,
-│                              wired via Database::write_batch
-├── durability/                Durability trait + WalDurability (real WAL) +
-│                                NoopDurability (fake, for tests)
-├── query.rs                     Filter/Condition/Sort — scan-based matching,
-│                                  comparisons + case-insensitive Contains
-├── collection.rs                  Collection<T> — public CRUD API (real)
-├── json.rs                          tagged JSON <-> Document, lossless
-├── export.rs                        Database::export/import (JSON Lines)
-├── check.rs                         Database::check — consistency check
-├── compact.rs                       Database::compact — rebuild, file shrinks
-├── bin/trunkdb.rs                   the `trunkdb` command (info, check,
-│                                      compact, export, import)
-├── cursor.rs                        Cursor — streaming find
-├── batch.rs                         Batch — typed atomic multi-op writes
-└── database.rs                      Database — opens the file, recovers from
-                                       the WAL, wires layers, write_batch
+├── lib.rs             public re-exports, the crate's Error type
+├── database.rs        Database: open, recovery, the commit protocol,
+│                        checkpoints, OpenOptions
+├── collection.rs      Collection<T>: CRUD, find, indexes, update_many
+├── batch.rs           Batch: typed atomic multi-op writes
+├── cursor.rs          Cursor: streaming find
+├── query.rs           Filter, Condition, Sort; the planner
+├── document.rs        Document and DocId: the schema-less value type
+├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document
+├── json.rs            tagged JSON <-> Document, lossless
+├── id.rs              IdGenerator + UuidV7Generator
+├── catalog.rs         collections and their indexes (page 1)
+├── data.rs            documents on data pages, overflow chains
+├── storage/
+│   ├── mod.rs         PageStore, page types
+│   ├── file.rs        FileStore: the file, checksums, staged and
+│   │                    committed pages, the file lock
+│   ├── slotted.rs     SlottedPage: slot directory + cells
+│   ├── cache.rs       PageCache: CLOCK eviction
+│   └── memory.rs      MemoryStore: pages in memory (compaction, tests)
+├── index/
+│   ├── mod.rs         Index trait
+│   ├── btree.rs       BTreeIndex: every index, primary and secondary
+│   ├── key.rs         index key encoding, KeyRange
+│   ├── leaf.rs        leaf entry encoding
+│   ├── branch.rs      branch entry encoding
+│   └── in_memory.rs   InMemoryIndex: a fake, for tests
+├── durability/
+│   ├── mod.rs         Durability trait
+│   ├── wal.rs         WalDurability: the page-image write-ahead log
+│   └── noop.rs        NoopDurability: a fake, for tests
+├── txn/
+│   ├── mod.rs         TransactionManager trait, WriteOp
+│   └── global_lock.rs GlobalLockTxnManager: one batch at a time
+├── crc32.rs           CRC-32C, in hardware where the CPU has it
+├── export.rs          Database::export/import (JSON Lines)
+├── check.rs           Database::check: consistency check
+├── compact.rs         Database::compact: rebuild, file shrinks
+└── bin/trunkdb.rs     the `trunkdb` command (info, check, compact,
+                         export, import)
+tests/                 the command line, and a time-series-shaped
+                         workload through the public API
+bench/                 against SQLite, redb and sled (its own crate)
 ```
 
 ## Usage
