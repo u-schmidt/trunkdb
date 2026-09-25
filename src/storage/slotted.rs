@@ -13,6 +13,15 @@ use super::{PageId, PageType, USABLE_PAGE_SIZE};
 const HEADER_LEN: usize = 13;
 const SLOT_LEN: usize = 4;
 
+impl PageType {
+    pub fn is_slotted(&self) -> bool {
+        matches!(
+            self,
+            PageType::Catalog | PageType::Data | PageType::IndexBranch | PageType::IndexLeaf
+        )
+    }
+}
+
 /// A page interpreted as a slot directory (growing forward from the
 /// header) plus variable-length cells (packed backward from the end of the
 /// page) — the standard layout PostgreSQL heap pages and SQLite B-tree
@@ -34,9 +43,9 @@ impl SlottedPage {
     }
 
     /// Interprets an existing page buffer (as read from a `PageStore`) as a
-    /// slotted page. Fails only if the type tag is unrecognized — anything
-    /// else about a corrupt buffer (bad offsets, overlapping cells) is not
-    /// currently detected.
+    /// slotted page. Fails if the type byte is unknown or not a slotted page
+    /// type, if the slot directory runs into the cells, or if a cell lies
+    /// outside the page. Overlapping cells are not detected (SPEC §54).
     pub fn from_bytes(buf: Vec<u8>) -> std::io::Result<Self> {
         if buf.len() != USABLE_PAGE_SIZE {
             return Err(std::io::Error::new(
@@ -47,8 +56,49 @@ impl SlottedPage {
                 ),
             ));
         }
-        PageType::from_u8(buf[0])?;
-        Ok(Self { buf })
+
+        let page_type = PageType::from_u8(buf[0])?;
+        if !page_type.is_slotted() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("page buffer contains invalid file type {page_type:?}"),
+            ));
+        }
+
+        let page = Self { buf }; // build it first, so you can call its methods
+
+        // The directory: slot_count and data_start are u16, so convert to usize.
+        let directory_end = HEADER_LEN + page.slot_count() as usize * SLOT_LEN;
+        if (page.data_start() as usize) < directory_end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "slot directory ends at {directory_end}, past the cells at {}",
+                    page.data_start()
+                ),
+            ));
+        }
+
+        let data_start = page.data_start() as usize;
+
+        // Every slot:
+        for slot in 0..page.slot_count() {
+            let (offset, length) = page.read_slot(slot);
+            let (offset, length) = (offset as usize, length as usize); // usize, no overflow
+            if length == 0 {
+                continue; // a tombstone has no cell to check
+            }
+            if offset < data_start || offset + length > USABLE_PAGE_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "slot {slot} points outside the page: offset {offset}, length {length}"
+                    ),
+                ));
+            }
+        }
+
+        Ok(page)
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
@@ -552,5 +602,96 @@ mod tests {
         let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         buf[0] = 200; // not a valid PageType
         assert!(SlottedPage::from_bytes(buf).is_err());
+    }
+
+    /// A page with one slot, `(offset, length)`, and otherwise empty.
+    fn page_bytes_with_slot(offset: u16, length: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
+        buf[0] = PageType::Data as u8;
+        buf[9..11].copy_from_slice(&1u16.to_le_bytes());
+        buf[11..13].copy_from_slice(&offset.to_le_bytes());
+        buf[13..15].copy_from_slice(&offset.to_le_bytes());
+        buf[15..17].copy_from_slice(&length.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn from_bytes_rejects_offsets_past_page_end() {
+        let buf = page_bytes_with_slot(60000, 500);
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("a slot past the page end must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("slot 0"), "wrong error: {error}");
+    }
+
+    #[test]
+    fn from_bytes_rejects_offsets_slightly_above_end() {
+        let buf = page_bytes_with_slot(8000, 200);
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("a slot past the page end must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("slot 0"), "wrong error: {error}");
+    }
+
+    #[test]
+    fn from_bytes_accepts_offsets_barely_within_bounds() {
+        let buf = page_bytes_with_slot(8000, 100);
+        let page = SlottedPage::from_bytes(buf).expect("a slot within bounds has to fit the page");
+
+        let slots = page.slot_count();
+        assert_eq!(slots, 1, "page should contain 1 slot but contains {slots}");
+    }
+
+    #[test]
+    fn from_bytes_rejects_data_reaching_into_directory() {
+        let buf = page_bytes_with_slot(12, 200);
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("a slot reaching into the directory must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn from_bytes_rejects_wrong_page_format() {
+        let mut buf = page_bytes_with_slot(12, 200);
+        buf[0] = PageType::Header as u8;
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("a page with an not slotted page type must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("Header"));
+    }
+
+    /// A page with a tombstone in it loads: the dead slot stays in the
+    /// directory and is skipped, and the live one is still readable.
+    #[test]
+    fn from_bytes_accepts_a_page_with_a_tombstone() {
+        let mut page = SlottedPage::new(PageType::Data);
+        page.insert_cell(b"first").unwrap();
+        page.insert_cell(b"second").unwrap();
+        page.delete_cell(0);
+
+        let page =
+            SlottedPage::from_bytes(page.into_bytes()).expect("a page with a tombstone must load");
+
+        assert_eq!(page.slot_count(), 2, "a delete keeps the slot");
+        assert_eq!(page.get_cell(0), None);
+        assert_eq!(page.get_cell(1), Some(&b"second"[..]));
+    }
+
+    /// `data_start` is legal here and the cell ends inside the page, so
+    /// only the check that a cell starts at or after `data_start` can
+    /// reject it.
+    #[test]
+    fn from_bytes_rejects_a_cell_starting_before_data_start() {
+        let mut buf = page_bytes_with_slot(7000, 100); // the cell: bytes 7000..7100
+        buf[11..13].copy_from_slice(&8000u16.to_le_bytes()); // but the cells "begin" at 8000
+
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("a cell before data_start must be rejected");
+        assert!(error.to_string().contains("slot 0"), "wrong error: {error}");
     }
 }
