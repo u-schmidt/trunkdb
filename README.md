@@ -263,6 +263,13 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 26. **B-tree pages changed in place** (§52): an index insert writes one
     cell instead of rebuilding its page; batched inserts 3× faster,
     compaction 7×.
+27. **A configurable checkpoint threshold** (§53):
+    `OpenOptions::checkpoint_pages` trades memory and WAL size for
+    fewer write-backs in large batches.
+28. **Pages checked when read** (§54): a page whose slots don't fit its
+    layout is an error saying what is wrong, not a panic in the host app.
+
+    Items 25–28 → 0.11.0.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

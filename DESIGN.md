@@ -90,7 +90,7 @@ anything that points at it changing. On data pages a slot is an
 identity and a deleted one is reused; on B-tree pages slot order is key
 order, and a cell is inserted or removed in place by moving the
 directory [§52](spec/52-b-tree-pages-changed-in-place.md). A page's layout is checked when it's read: a slot
-outside the cell area is an error naming the page, not a panic [§54](spec/54-checking-a-page-when-it-is-read.md).
+outside the cell area is an error saying what is wrong, not a panic [§54](spec/54-checking-a-page-when-it-is-read.md).
 
 **Freed pages** go onto a free list threaded through the pages
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
