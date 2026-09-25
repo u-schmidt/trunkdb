@@ -118,7 +118,8 @@ Rejected:
   safe without touching any.
 - **Fallible key helpers.** Twenty callers, for damage that can only
   change how much a query reads. Finding it is `check`'s job (§39).
-- **A cap on document nesting when decoding** — see 55.6.
+- **A cap on document nesting when decoding**, here: it also limits
+  what may be written, so it got its own section (§56).
 
 ## 55.4 What it costs
 The same machine, the same day, `bench` (§48) against the commit before:
@@ -176,7 +177,8 @@ document decoding), batched inserts 22–23k/s against 24k/s.
   does encoding one. A damaged overflow document could claim tens of
   thousands of levels and overflow the stack. The fuzzer can't reach it
   (its edits stay within a page), and a cap would also refuse inserting
-  such a document, which is an API decision. Open (ROADMAP.md).
+  such a document, which is an API decision: made in §56, a limit of 64
+  levels.
 - **Overlapping cells** (§54.2) and other damage to what cells mean — a
   B-tree page with its keys out of order, a key whose id part changed —
   aren't found on read. They give errors or wrong answers, not panics;

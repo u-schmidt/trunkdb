@@ -21,6 +21,43 @@ pub enum Document {
     Id(DocId),
 }
 
+/// How deeply a document may nest (SPEC §56), counted as MongoDB counts
+/// (its limit is 100): the document is the first level, and every object
+/// or array inside adds one. Far deeper than real data goes, even with
+/// serde's wrapper around each enum variant, and it keeps a damaged
+/// document from recursing the decoder off the end of the stack.
+pub const MAX_NESTING: usize = 64;
+
+impl Document {
+    /// Whether `self`, as the whole document, nests deeper than
+    /// `MAX_NESTING`: what a write refuses. An object whose only key,
+    /// besides `_id`, is an export tag (`$id`, `$object`, ...) counts
+    /// twice, since an export writes it inside `{"$object": ...}` (SPEC
+    /// §30.1): every export then stays well inside what an import reads.
+    /// Stops at the limit, so even a document too deep for the stack
+    /// can't overflow it here.
+    pub fn nests_too_deep(&self) -> bool {
+        fn within(doc: &Document, levels: usize) -> bool {
+            match doc {
+                Document::Array(items) => {
+                    levels >= 1 && items.iter().all(|item| within(item, levels - 1))
+                }
+                Document::Object(map) => {
+                    let mut others = map.keys().filter(|key| *key != "_id");
+                    let tag_like = matches!(
+                        (others.next(), others.next()),
+                        (Some(key), None) if crate::json::is_tag(key)
+                    );
+                    let cost = if tag_like { 2 } else { 1 };
+                    levels >= cost && map.values().all(|value| within(value, levels - cost))
+                }
+                _ => true,
+            }
+        }
+        !within(self, MAX_NESTING)
+    }
+}
+
 /// A document's primary key: 16 bytes, generated as a UUIDv7 by default
 /// (see `id.rs`) so ids created in sequence sort close together — good
 /// insert locality once a real B-tree index replaces `LinearIndex`.
@@ -163,11 +200,14 @@ fn write_len_prefixed(bytes: &[u8], buffer: &mut Vec<u8>) {
 /// and a length or count in them may be wrong (SPEC §55).
 pub fn decode_document(bytes: &[u8]) -> std::io::Result<(Document, &[u8])> {
     let mut rest = bytes;
-    let doc = decode_value(&mut rest)?;
+    let doc = decode_value(&mut rest, MAX_NESTING)?;
     Ok((doc, rest))
 }
 
-fn decode_value(bytes: &mut &[u8]) -> std::io::Result<Document> {
+/// `levels`: how many more objects or arrays may open, this one included
+/// (SPEC §56). A document nested deeper was never written by a trunkdb
+/// with the limit, and decoding it could overflow the stack.
+fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
     Ok(match take_u8(bytes, "a document's type tag")? {
         TAG_NULL => Document::Null,
         TAG_BOOL => Document::Bool(take_u8(bytes, "a bool")? != 0),
@@ -175,13 +215,18 @@ fn decode_value(bytes: &mut &[u8]) -> std::io::Result<Document> {
         TAG_FLOAT => Document::Float(f64::from_le_bytes(take_array(bytes, "a float")?)),
         TAG_STRING => Document::String(decode_string(bytes, "a string")?),
         TAG_BINARY => Document::Binary(take_len_prefixed(bytes, "binary")?.to_vec()),
+        TAG_ARRAY | TAG_OBJECT if levels == 0 => {
+            return Err(corrupt(format_args!(
+                "a document nests deeper than {MAX_NESTING} levels"
+            )));
+        }
         TAG_ARRAY => {
             let count = take_u32(bytes, "an array's length")? as usize;
             // Each item is at least a byte: a count past what's left is
             // damage, and must not size the allocation.
             let mut items = Vec::with_capacity(count.min(bytes.len()));
             for _ in 0..count {
-                items.push(decode_value(bytes)?);
+                items.push(decode_value(bytes, levels - 1)?);
             }
             Document::Array(items)
         }
@@ -190,7 +235,7 @@ fn decode_value(bytes: &mut &[u8]) -> std::io::Result<Document> {
             let mut entries = IndexMap::with_capacity(count.min(bytes.len()));
             for _ in 0..count {
                 let key = decode_string(bytes, "a key")?;
-                entries.insert(key, decode_value(bytes)?);
+                entries.insert(key, decode_value(bytes, levels - 1)?);
             }
             Document::Object(entries)
         }
@@ -324,6 +369,78 @@ mod tests {
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{len}");
         }
         assert_eq!(decode_document(&bytes).unwrap().0, doc);
+    }
+
+    /// `levels` objects or arrays, each inside the one before, the
+    /// innermost holding `leaf`.
+    fn nested(levels: usize, leaf: Document) -> Document {
+        (0..levels).fold(leaf, |inner, i| match i % 2 {
+            0 => Document::Array(vec![inner]),
+            _ => Document::Object([("x".to_string(), inner)].into_iter().collect()),
+        })
+    }
+
+    /// SPEC §56: 64 levels are written and read; 65 are refused on
+    /// write, and a damaged cell claiming them is an error on read.
+    #[test]
+    fn documents_nest_at_most_64_levels() {
+        let deepest = nested(MAX_NESTING, Document::Int(1));
+        assert!(!deepest.nests_too_deep());
+        let bytes = encode_document(&deepest);
+        assert_eq!(decode_document(&bytes).unwrap().0, deepest);
+
+        let too_deep = nested(MAX_NESTING + 1, Document::Int(1));
+        assert!(too_deep.nests_too_deep());
+        let err = decode_document(&encode_document(&too_deep)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("deeper than 64"), "{err}");
+    }
+
+    /// An object whose only key besides `_id` is an export tag counts
+    /// twice: an export wraps it in `{"$object": ...}`.
+    #[test]
+    fn tag_like_objects_count_twice() {
+        let tagged =
+            |inner: Document| Document::Object([("$id".to_string(), inner)].into_iter().collect());
+        let half = (0..MAX_NESTING / 2).fold(Document::Null, |inner, _| tagged(inner));
+        assert!(!half.nests_too_deep());
+        assert!(tagged(half).nests_too_deep());
+        let with_id = |inner: Document| {
+            Document::Object(
+                [
+                    ("_id".to_string(), Document::Null),
+                    ("$object".to_string(), inner),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        // 31 tag-like levels around an array: 63. At the top, next to an
+        // `_id`, one more tag-like object is two levels, so 65.
+        let inner =
+            (0..MAX_NESTING / 2 - 1).fold(Document::Array(vec![]), |inner, _| tagged(inner));
+        assert!(!inner.nests_too_deep());
+        assert!(
+            with_id(inner).nests_too_deep(),
+            "`_id` doesn't count as a field"
+        );
+    }
+
+    /// The check stops at the limit: a document far too deep for the
+    /// stack to walk whole is still just refused.
+    #[test]
+    fn a_document_too_deep_for_the_stack_is_refused_not_walked() {
+        // Built and dropped on a thread with room for it; the check itself
+        // needs only 65 levels of that.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let abyss = nested(100_000, Document::Null);
+                assert!(abyss.nests_too_deep());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// A count or length near `u32::MAX` with nothing behind it is an

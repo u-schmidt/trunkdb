@@ -157,6 +157,11 @@ fn tagged(tag: &str, value: Value) -> Value {
     Value::Object(object)
 }
 
+/// Whether `key` is one of the tags an export writes (SPEC §30.1).
+pub(crate) fn is_tag(key: &str) -> bool {
+    TAGS.contains(&key)
+}
+
 fn looks_like_tag(object: &Map<String, Value>) -> bool {
     object.len() == 1 && object.keys().all(|k| TAGS.contains(&k.as_str()))
 }

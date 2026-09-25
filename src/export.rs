@@ -350,7 +350,7 @@ fn write_line(out: &mut impl Write, value: &Value) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{DocId, Document};
+    use crate::document::{DocId, Document, MAX_NESTING};
     use crate::query::{Condition, Filter, Op};
     use crate::testing::XorShift;
 
@@ -470,6 +470,32 @@ mod tests {
                 object(&fields)
             }
         }
+    }
+
+    /// SPEC §56: a document as deep as a write allows, in the shapes that
+    /// add the most JSON levels (an id at the bottom; every object
+    /// tag-like, so wrapped), exports to lines an import reads back. The
+    /// JSON parser refuses more than 127 levels.
+    #[test]
+    fn the_deepest_documents_survive_export_and_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = open(&dir, "source.trunkdb");
+        let id = Document::Id(DocId([7; 16]));
+        let plain = (0..MAX_NESTING - 1).fold(id.clone(), |inner, i| match i % 2 {
+            0 => Document::Array(vec![inner]),
+            _ => object(&[("x", inner)]),
+        });
+        let tag_like = (0..MAX_NESTING / 2 - 1).fold(id, |inner, _| object(&[("$object", inner)]));
+        let docs = source.collection::<Document>("deep");
+        for doc in [object(&[("p", plain)]), object(&[("$object", tag_like)])] {
+            assert!(!doc.nests_too_deep());
+            docs.insert(doc).unwrap();
+        }
+        let text = export_text(&source);
+
+        let target = open(&dir, "target.trunkdb");
+        import_text(&target, &text).unwrap();
+        assert_eq!(export_text(&target), text);
     }
 
     #[test]

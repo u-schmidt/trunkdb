@@ -276,6 +276,8 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 29. **Fuzzing** (§55): `fuzz/` feeds trunkdb damaged databases, WALs and
     exports; fourteen ways one crashed or hung it are fixed, each with a
     test.
+30. **A limit on nesting** (§56): documents nest at most 64 levels, so a
+    damaged one can't overflow the stack, and every export imports again.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

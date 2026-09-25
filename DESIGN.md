@@ -159,6 +159,11 @@ field, so an untyped read reports it [§18](spec/18-merging-id-into-the-untyped-
 the field, and `find_with_ids` returns each id next to its document
 [§13.5](spec/13-the-serde-bridge.md) [§23](spec/23-find-with-ids.md).
 
+**Nesting** is limited to 64 levels, counted as MongoDB counts (the
+document is the first, each object or array inside adds one): deeper
+writes are refused, so a damaged document can't take the decoder off
+the end of the stack, and every export imports again [§56](spec/56-a-limit-on-nesting.md).
+
 **Ids** are UUIDv7 by default: 16 bytes, starting with a timestamp, so
 ids made in sequence land at the end of the primary index instead of
 all over it [§4.2](spec/04-key-decisions-and-rationale.md).

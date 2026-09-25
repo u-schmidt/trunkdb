@@ -1018,6 +1018,22 @@ pub(crate) fn get_or_create_meta(
 /// fails the whole batch (SPEC §22.2). These used to be silent no-ops,
 /// once load-bearing for op replay (§16.1), which page-image recovery
 /// (§19.4) no longer needs.
+/// A document nested deeper than `MAX_NESTING` is refused like a name
+/// too long (SPEC §56): an `InvalidInput` error, and the batch rolls back.
+fn refuse_too_deep(collection: &str, id: &DocId, doc: &Document) -> crate::Result<()> {
+    if doc.nests_too_deep() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "document {id} for collection {collection:?} nests deeper than the limit of {} levels",
+                crate::document::MAX_NESTING
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_write_op(
     catalog: &mut Catalog,
     store: &mut dyn PageStore,
@@ -1034,6 +1050,7 @@ pub(crate) fn apply_write_op(
                 });
             }
             let doc = with_id(doc.clone(), *id);
+            refuse_too_deep(collection, id, &doc)?;
             let mut current = meta.current_data_page;
             let loc = data::insert_record(store, &mut current, *id, &doc)?;
             index.insert(store, &key::primary(*id), loc)?;
@@ -1045,6 +1062,7 @@ pub(crate) fn apply_write_op(
             let (meta, loc) = locate(catalog, store, collection, id)?;
             let mut index = BTreeIndex::new(meta.index_root);
             let doc = with_id(doc.clone(), *id);
+            refuse_too_deep(collection, id, &doc)?;
             let secondary = catalog.indexes(collection);
             let old = old_document(secondary, store, loc)?;
             let mut current = meta.current_data_page;
@@ -4329,6 +4347,55 @@ mod tests {
     /// more of sku A1 — not an A1 line and some other line of 9. The
     /// index on `lines[*].sku` finds the orders with an A1 line; only
     /// those are read.
+    /// SPEC §56: an insert or update nested deeper than the limit is
+    /// refused like a name too long, and its batch rolls back whole.
+    #[test]
+    fn writes_nested_too_deep_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let nest = |levels: usize| {
+            (0..levels).fold(Document::Int(1), |inner, _| Document::Array(vec![inner]))
+        };
+        let wrap =
+            |inner: Document| Document::Object([("a".to_string(), inner)].into_iter().collect());
+        // The document is the first level, its field's arrays the rest.
+        let id = docs
+            .insert(wrap(nest(crate::document::MAX_NESTING - 1)))
+            .unwrap();
+
+        let refused = |e: crate::Error| match e {
+            crate::Error::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(e.to_string().contains("deeper than the limit of 64"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        };
+        refused(
+            docs.insert(wrap(nest(crate::document::MAX_NESTING)))
+                .unwrap_err(),
+        );
+        refused(
+            docs.update(&id, wrap(nest(crate::document::MAX_NESTING)))
+                .unwrap_err(),
+        );
+        let ops = [wrap(Document::Int(2)), wrap(nest(100))]
+            .into_iter()
+            .enumerate()
+            .map(|(n, doc)| WriteOp::Insert("docs".into(), DocId([n as u8 + 1; 16]), doc))
+            .collect();
+        refused(db.write_batch(ops).unwrap_err());
+        assert_eq!(
+            docs.count(Filter::new()).unwrap(),
+            1,
+            "the batch rolled back whole"
+        );
+        let Some(Document::Object(stored)) = docs.get(&id).unwrap() else {
+            panic!("the first insert is there");
+        };
+        assert_eq!(stored["a"], nest(crate::document::MAX_NESTING - 1));
+    }
+
     /// Found by fuzzing (SPEC §55): a damaged compound key with fewer
     /// values than the index has fields groups by the ones it has, and
     /// a key too short for even its id by none.
