@@ -29,6 +29,7 @@ All of it is done:
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
+| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed | §55 |
 
 ## Open
 Unordered within each group; each line says where the need or the
@@ -67,6 +68,11 @@ limit is described.
 **Tooling and reach**
 - Repairing what `check` finds, beyond export and import (§39.5).
 - `check` finding overlapping cells on a page (§54.2).
+- A limit on how deeply documents nest, so a damaged one can't
+  overflow the stack when it's decoded; it would also refuse inserting
+  one that deep (§55.6).
+- Longer fuzzing runs, with AddressSanitizer too, and short ones in CI
+  on nightly (§55.6).
 - PyO3 bindings, for Python apps.
 
 Not planned: a cost-based query planner, joins, aggregates, multiple

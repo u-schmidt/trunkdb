@@ -35,7 +35,7 @@ them are real now; the fakes remain for tests.
 | Layer | Trait | Implementation | Code |
 |---|---|---|---|
 | Pages | `PageStore` | `FileStore`: the file, checksums, the page cache, staged and committed pages | `storage/` |
-| Documents | — | the `Document` enum, its byte encoding, the serde bridge, tagged JSON | `document.rs`, `serde_bridge.rs`, `json.rs` |
+| Documents | — | the `Document` enum, its byte encoding, the serde bridge, tagged JSON | `document.rs`, `serde_bridge.rs`, `json.rs`, `decode.rs` |
 | Ids | `IdGenerator` | `UuidV7Generator` | `id.rs` |
 | Indexes | `Index` | `BTreeIndex`, for the primary index and every secondary one | `index/` |
 | Transactions | `TransactionManager` | `GlobalLockTxnManager`: one batch at a time, all or nothing | `txn/` |
@@ -91,6 +91,11 @@ identity and a deleted one is reused; on B-tree pages slot order is key
 order, and a cell is inserted or removed in place by moving the
 directory [§52](spec/52-b-tree-pages-changed-in-place.md). A page's layout is checked when it's read: a slot
 outside the cell area is an error saying what is wrong, not a panic [§54](spec/54-checking-a-page-when-it-is-read.md).
+The same holds for everything decoded from a page: bytes that run out,
+a count past what's left, a link back to a page already seen or past
+the file's end are `InvalidData` errors. Decoders read through
+`decode.rs`, and B-tree pages through one function that checks every
+cell is long enough for its entry [§55](spec/55-fuzzing.md).
 
 **Freed pages** go onto a free list threaded through the pages
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
@@ -124,7 +129,9 @@ A write batch goes through five steps under the write lock
 A crash before step 3 finishes leaves the state before the batch; a
 crash after it leaves a complete WAL record, which the next `open`
 writes back before anything reads the file. Page images are
-idempotent, so writing one back twice is harmless [§19](spec/19-durability-take-two-a-page-image-wal.md). A checkpoint
+idempotent, so writing one back twice is harmless [§19](spec/19-durability-take-two-a-page-image-wal.md). A WAL page
+past the file's end, as the header before it has it, is refused before
+anything is written [§55](spec/55-fuzzing.md). A checkpoint
 that fails keeps its pages waiting, and the next one tries again.
 
 Only if the WAL can't be written *and* can't be truncated is the
@@ -323,8 +330,11 @@ Still behind: full scans (decoding), a copy per page read, and whole
   the WAL, the write-back or the checkpoint, and check that the next
   open has the state before or after the batch, and nothing in between
   [§19](spec/19-durability-take-two-a-page-image-wal.md) [§51](spec/51-one-flush-per-commit.md).
+- **Fuzzing** (`fuzz/`): damaged databases, WALs and exports, millions
+  of them, where anything but a panic or a hang is a correct answer. Each
+  crash it found became a test in the library [§55](spec/55-fuzzing.md).
 - **Mutation checks:** each section breaks its own code on purpose in a
   handful of ways and lists them; every one has to fail a test.
 - **CI** runs the tests on Linux, macOS and Windows, clippy with
-  warnings as errors, fmt, the minimum Rust version (1.89) and a short
-  benchmark run.
+  warnings as errors, fmt, the minimum Rust version (1.89), a short
+  benchmark run, and keeps the fuzz crate compiling (it doesn't fuzz).

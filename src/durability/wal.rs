@@ -41,7 +41,7 @@ const WAL_HEADER_LEN: usize = 12;
 /// Bytes per page entry in a record body: `[u64 page id][page bytes]`.
 const PAGE_ENTRY_LEN: usize = 8 + USABLE_PAGE_SIZE;
 
-fn encode_header() -> [u8; WAL_HEADER_LEN] {
+pub(crate) fn encode_header() -> [u8; WAL_HEADER_LEN] {
     let mut header = [0u8; WAL_HEADER_LEN];
     header[0..8].copy_from_slice(WAL_MAGIC);
     header[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
@@ -59,7 +59,7 @@ fn encode_header() -> [u8; WAL_HEADER_LEN] {
 /// The length prefix catches a record cut short; the CRC catches one that
 /// is length-complete but whose bytes didn't all make it to disk (a
 /// partially persisted sector).
-fn encode_record(pages: &[(PageId, &[u8])]) -> Vec<u8> {
+pub(crate) fn encode_record(pages: &[(PageId, &[u8])]) -> Vec<u8> {
     let mut body = Vec::with_capacity(4 + pages.len() * PAGE_ENTRY_LEN);
     body.extend_from_slice(&(pages.len() as u32).to_le_bytes());
     for (id, page) in pages {
@@ -196,13 +196,13 @@ impl Durability for WalDurability {
         }
         bytes.extend_from_slice(&encode_record(pages));
         self.file.write_all(&bytes)?;
-        self.file.sync_all()
+        crate::storage::sync(&self.file)
     }
 
     fn checkpoint(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.sync_all()
+        crate::storage::sync(&self.file)
     }
 }
 

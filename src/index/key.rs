@@ -46,15 +46,26 @@ pub fn primary(id: DocId) -> Vec<u8> {
     id.0.to_vec()
 }
 
+// The functions below take keys apart that were read from the file. A
+// damaged one gets a cautious answer from them, never a panic (SPEC §55):
+// a key too short for its id, a number cut short or a string without its
+// terminator. Finding the damage is `Database::check`'s job; every document
+// is checked against the filter anyway, so a wrong answer here changes
+// how much is read, not what matches.
+
 /// The document id a key ends with — the whole key for the primary
-/// index, the last 16 bytes for a secondary one.
+/// index, the last 16 bytes for a secondary one. A damaged key shorter
+/// than an id is zero-padded in front.
 pub fn doc_id(key: &[u8]) -> DocId {
-    DocId(key[key.len() - 16..].try_into().unwrap())
+    let tail = &key[key.len().saturating_sub(16)..];
+    let mut id = [0u8; 16];
+    id[16 - tail.len()..].copy_from_slice(tail);
+    DocId(id)
 }
 
 /// A secondary key without its trailing `DocId`: the encoded value.
 pub fn value_part(key: &[u8]) -> &[u8] {
-    &key[..key.len() - 16]
+    &key[..key.len().saturating_sub(16)]
 }
 
 /// Whether every value encoded as `value_part` is equal to every other
@@ -69,9 +80,15 @@ pub fn is_exact(value_part: &[u8]) -> bool {
 /// `is_exact` for one value of a key of `fields` values (`parts`).
 pub fn part_is_exact(part: &[u8], fields: usize) -> bool {
     let value_part = part;
-    match value_part[0] {
+    let Some(&tag) = value_part.first() else {
+        return false;
+    };
+    match tag {
         TAG_NUMBER => {
-            let sortable = u64::from_be_bytes(value_part[1..9].try_into().unwrap());
+            let Some(Ok(bytes)) = value_part.get(1..9).map(<[u8; 8]>::try_from) else {
+                return false;
+            };
+            let sortable = u64::from_be_bytes(bytes);
             // `encode_number` backwards.
             let bits = if sortable >> 63 == 1 {
                 sortable & !(1 << 63)
@@ -83,7 +100,10 @@ pub fn part_is_exact(part: &[u8], fields: usize) -> bool {
         // Tag, escaped bytes, two-byte terminator: a cut string used at
         // least `string_budget - 1` bytes, since the next byte (up to two
         // escaped) didn't fit.
-        TAG_STRING => value_part.len() - 3 < string_budget(fields) - 1,
+        TAG_STRING => value_part
+            .len()
+            .checked_sub(3)
+            .is_some_and(|len| len < string_budget(fields) - 1),
         TAG_OTHER => false,
         _ => true,
     }
@@ -92,33 +112,40 @@ pub fn part_is_exact(part: &[u8], fields: usize) -> bool {
 /// Whether one value of a compound key is `TAG_OTHER`: a value that
 /// sorts after everything, whichever the direction (§34.1).
 pub fn is_other(part: &[u8]) -> bool {
-    part[0] == TAG_OTHER
+    part.first() == Some(&TAG_OTHER)
 }
 
-/// A compound key's value part, split into its values' encodings.
+/// A compound key's value part, split into its values' encodings. In a
+/// damaged key, whatever is left when a value runs past the end is one
+/// last part.
 pub fn parts(value_part: &[u8]) -> Vec<&[u8]> {
     let mut parts = Vec::new();
     let mut rest = value_part;
-    while !rest.is_empty() {
-        let len = match rest[0] {
+    while let Some(&tag) = rest.first() {
+        let len = match tag {
             TAG_NULL | TAG_OTHER => 1,
             TAG_BOOL => 2,
             TAG_NUMBER => 9,
-            _ => {
-                // Up to and including the `0x00 0x00` terminator; an
-                // escaped zero is `0x00 0xFF`.
-                let mut at = 1;
-                while rest[at] != 0 || rest[at + 1] != 0 {
-                    at += if rest[at] == 0 { 2 } else { 1 };
-                }
-                at + 2
-            }
+            _ => string_len(rest).unwrap_or(rest.len()),
         };
-        let (part, after) = rest.split_at(len);
+        let (part, after) = rest.split_at(len.min(rest.len()));
         parts.push(part);
         rest = after;
     }
     parts
+}
+
+/// An encoded string's length, tag through the `0x00 0x00` terminator (an
+/// escaped zero is `0x00 0xFF`); `None` if the terminator is missing.
+fn string_len(encoded: &[u8]) -> Option<usize> {
+    let mut at = 1;
+    loop {
+        match (*encoded.get(at)?, *encoded.get(at + 1)?) {
+            (0, 0) => return Some(at + 2),
+            (0, _) => at += 2,
+            _ => at += 1,
+        }
+    }
 }
 
 /// A compound index's key for a document with these values in its
@@ -543,5 +570,48 @@ mod tests {
         assert_eq!(prefix_end(&[1, 2]), Some(vec![1, 3]));
         assert_eq!(prefix_end(&[1, 0xFF]), Some(vec![2]));
         assert_eq!(prefix_end(&[0xFF, 0xFF]), None);
+    }
+
+    /// Found by fuzzing (SPEC §55): a key cut short anywhere, or shorter
+    /// than an id, gets an answer from every helper, not a panic; a cut
+    /// value is never called exact.
+    #[test]
+    fn damaged_keys_get_cautious_answers() {
+        let values = [
+            Document::String("with\0zero".into()),
+            Document::Int(42),
+            Document::Null,
+            Document::Bool(true),
+            Document::Array(vec![]),
+        ];
+        let refs: Vec<&Document> = values.iter().collect();
+        let key = compound(&refs, DocId([7; 16]));
+        let whole = value_part(&key);
+        assert_eq!(parts(whole).len(), values.len());
+        assert_eq!(doc_id(&key), DocId([7; 16]));
+        for len in 0..key.len() {
+            let cut = &key[..len];
+            let _ = doc_id(cut);
+            let value = value_part(cut);
+            let split = parts(value);
+            assert_eq!(split.concat(), value, "{len}: parts cover the bytes");
+            for part in &split {
+                let _ = is_other(part);
+                let _ = part_is_exact(part, values.len());
+            }
+        }
+        assert_eq!(
+            doc_id(&[1, 2]),
+            DocId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2])
+        );
+        assert_eq!(value_part(&[1, 2]), &[] as &[u8]);
+        assert!(!part_is_exact(&[], 1));
+        assert!(!part_is_exact(&[TAG_NUMBER, 1, 2], 1), "a number cut short");
+        assert!(
+            !part_is_exact(&[TAG_STRING, b'a'], 1),
+            "a string without its end"
+        );
+        assert!(!is_other(&[]));
+        assert_eq!(parts(&[TAG_STRING, b'a', 0]), [&[TAG_STRING, b'a', 0][..]]);
     }
 }

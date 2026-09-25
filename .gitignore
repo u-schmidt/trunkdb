@@ -1,2 +1,3 @@
 /target
 /bench/target
+/fuzz/target

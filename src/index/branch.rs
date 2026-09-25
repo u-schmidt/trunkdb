@@ -10,6 +10,11 @@ pub(super) fn encode_branch_entry(key: &[u8], child: PageId) -> Vec<u8> {
     buffer
 }
 
+/// The shortest branch cell: an empty key and the child.
+pub(super) const MIN_BRANCH_ENTRY_LEN: usize = 8;
+
+/// Trusts `bytes` to be at least `MIN_BRANCH_ENTRY_LEN` long, which
+/// `btree::read_node` checks for every cell of a page it reads.
 pub(super) fn decode_branch_entry(bytes: &[u8]) -> (&[u8], PageId) {
     let (key, child) = bytes.split_at(bytes.len() - 8);
     (key, PageId::from_le_bytes(child.try_into().unwrap()))

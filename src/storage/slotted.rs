@@ -98,6 +98,16 @@ impl SlottedPage {
             }
         }
 
+        // The cells start inside the page. Found by fuzzing (SPEC §55):
+        // with no live slot, the loop above has no cell to catch a
+        // data_start past the end, and the next insert wrote there.
+        if data_start > USABLE_PAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cells start at {data_start}, past the page's end at {USABLE_PAGE_SIZE}"),
+            ));
+        }
+
         Ok(page)
     }
 
@@ -693,5 +703,23 @@ mod tests {
             .err()
             .expect("a cell before data_start must be rejected");
         assert!(error.to_string().contains("slot 0"), "wrong error: {error}");
+    }
+
+    /// Found by fuzzing (SPEC §55): with no live slot, nothing else
+    /// catches cells that "start" past the page's end.
+    #[test]
+    fn from_bytes_rejects_cells_starting_past_the_page_end() {
+        let mut buf = page_bytes_with_slot(8000, 100);
+        buf[9..11].copy_from_slice(&0u16.to_le_bytes()); // no slots
+        buf[11..13].copy_from_slice(&16539u16.to_le_bytes());
+
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("cells past the page's end must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("past the page's end"),
+            "wrong error: {error}"
+        );
     }
 }

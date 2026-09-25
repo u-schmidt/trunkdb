@@ -91,6 +91,7 @@ src/
 ├── txn/
 │   ├── mod.rs         TransactionManager trait, WriteOp
 │   └── global_lock.rs GlobalLockTxnManager: one batch at a time
+├── decode.rs          reading bytes from disk: running out is an error
 ├── crc32.rs           CRC-32C, in hardware where the CPU has it
 ├── export.rs          Database::export/import (JSON Lines)
 ├── check.rs           Database::check: consistency check
@@ -100,6 +101,8 @@ src/
 tests/                 the command line, and a time-series-shaped
                          workload through the public API
 bench/                 against SQLite, redb and sled (its own crate)
+fuzz/                  fuzz targets: damaged files, WALs and exports
+                         (its own crate, nightly)
 ```
 
 ## Usage
@@ -270,6 +273,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     layout is an error saying what is wrong, not a panic in the host app.
 
     Items 25–28 → 0.11.0.
+29. **Fuzzing** (§55): `fuzz/` feeds trunkdb damaged databases, WALs and
+    exports; fourteen ways one crashed or hung it are fixed, each with a
+    test.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

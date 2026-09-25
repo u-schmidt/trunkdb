@@ -3,11 +3,24 @@ mod file;
 mod memory;
 mod slotted;
 
+#[cfg(feature = "fuzzing")]
+pub(crate) use file::checksum;
 pub use file::{DEFAULT_CACHE_SIZE, FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
 pub(crate) use memory::MemoryStore;
 pub use slotted::SlottedPage;
 
 pub type PageId = u64;
+
+/// `file.sync_all()`, the flush every durability promise rests on —
+/// except in a `fuzzing` build (SPEC §55), which tests decoding, not
+/// durability, and where a flush of several milliseconds per commit
+/// would slow the fuzzer down a hundredfold.
+pub(crate) fn sync(file: &std::fs::File) -> std::io::Result<()> {
+    if cfg!(feature = "fuzzing") {
+        return Ok(());
+    }
+    file.sync_all()
+}
 
 /// A page's id plus its full bytes (`USABLE_PAGE_SIZE` long) — what the WAL
 /// records and crash recovery writes back (`FileStore::restore_pages`).

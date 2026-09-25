@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::decode::{take, take_u8, take_u64};
 use crate::storage::{PageId, PageStore, PageType, SlottedPage};
 use std::collections::HashMap;
 
@@ -117,8 +118,16 @@ impl Catalog {
         let mut collections = HashMap::new();
         let mut indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
         let mut page_id = CATALOG_PAGE_ID;
+        // Catalog pages link to the next; one seen twice is a loop, which
+        // would otherwise be followed forever (SPEC §55).
+        let mut seen = std::collections::HashSet::new();
 
         loop {
+            if !seen.insert(page_id) {
+                return Err(corrupt(format!(
+                    "catalog page {page_id} comes twice in the chain: it goes round in a loop"
+                )));
+            }
             let bytes = match store.try_read_page(page_id)? {
                 Some(bytes) => bytes,
                 None if page_id == CATALOG_PAGE_ID => {
@@ -324,8 +333,9 @@ impl Catalog {
         meta.current_data_page = page;
         let entry_bytes = encode_collection(name, meta);
 
-        let is_this_collection =
-            |c: &[u8]| c[0] == KIND_COLLECTION && c[COLLECTION_NAME_AT..] == *name.as_bytes();
+        let is_this_collection = |c: &[u8]| {
+            c[0] == KIND_COLLECTION && c.get(COLLECTION_NAME_AT..) == Some(name.as_bytes())
+        };
         let (page_id, mut page, slot) = find_cell(store, is_this_collection)?.ok_or_else(|| {
             corrupt(format!(
                 "collection {name:?} is cached but has no catalog entry"
@@ -462,53 +472,56 @@ fn encode_index(collection: &str, index: &IndexMeta) -> Vec<u8> {
     buffer
 }
 
+/// A cell too short for its kind is damage, not a panic (SPEC §55).
 fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
     let utf8 = |bytes: &[u8]| {
         String::from_utf8(bytes.to_vec()).map_err(|_| corrupt("bad utf8 in catalog".into()))
     };
-    let u64_at = |at: usize| PageId::from_le_bytes(cell[at..at + 8].try_into().unwrap());
-    match cell[0] {
-        KIND_COLLECTION => Ok(Entry::Collection(
-            utf8(&cell[COLLECTION_NAME_AT..])?,
-            CollectionMeta {
-                index_root: u64_at(1),
-                current_data_page: u64_at(9),
-            },
-        )),
+    let mut rest = cell;
+    let kind = take_u8(&mut rest, "a catalog entry's kind")?;
+    let root = take_u64(&mut rest, "a catalog entry's root")?;
+    match kind {
+        KIND_COLLECTION => {
+            let current_data_page = take_u64(&mut rest, "a collection's current data page")?;
+            Ok(Entry::Collection(
+                utf8(rest)?,
+                CollectionMeta {
+                    index_root: root,
+                    current_data_page,
+                },
+            ))
+        }
         kind @ (KIND_INDEX | KIND_UNIQUE_INDEX) => {
-            let name_len = cell[9] as usize;
-            let (collection, field) = cell[10..].split_at(name_len);
+            let name_len = take_u8(&mut rest, "an index's collection name")? as usize;
+            let collection = take(&mut rest, name_len, "an index's collection name")?;
             Ok(Entry::Index(
                 utf8(collection)?,
                 IndexMeta {
-                    fields: vec![utf8(field)?],
-                    root: u64_at(1),
+                    fields: vec![utf8(rest)?],
+                    root,
                     unique: kind == KIND_UNIQUE_INDEX,
                     sparse: false,
                 },
             ))
         }
         KIND_INDEX_WITH_FLAGS => {
-            let short = || corrupt("index cell cut short".into());
-            let name_len = cell[9] as usize;
-            let (collection, rest) = cell[10..].split_at_checked(name_len).ok_or_else(short)?;
-            let (&flags, rest) = rest.split_first().ok_or_else(short)?;
+            let name_len = take_u8(&mut rest, "an index's collection name")? as usize;
+            let collection = take(&mut rest, name_len, "an index's collection name")?;
+            let flags = take_u8(&mut rest, "an index's flags")?;
             if flags & !(FLAG_UNIQUE | FLAG_SPARSE) != 0 {
                 return Err(corrupt(format!("unknown index flags {flags:#04x}")));
             }
-            let (&count, mut rest) = rest.split_first().ok_or_else(short)?;
+            let count = take_u8(&mut rest, "an index's field count")?;
             let mut fields = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                let (&len, after) = rest.split_first().ok_or_else(short)?;
-                let (field, after) = after.split_at_checked(len as usize).ok_or_else(short)?;
-                fields.push(utf8(field)?);
-                rest = after;
+                let len = take_u8(&mut rest, "an index's field")? as usize;
+                fields.push(utf8(take(&mut rest, len, "an index's field")?)?);
             }
             Ok(Entry::Index(
                 utf8(collection)?,
                 IndexMeta {
                     fields,
-                    root: u64_at(1),
+                    root,
                     unique: flags & FLAG_UNIQUE != 0,
                     sparse: flags & FLAG_SPARSE != 0,
                 },
@@ -760,6 +773,74 @@ mod tests {
             err.to_string().contains("unknown index flags 0x06"),
             "{err}"
         );
+    }
+
+    /// Found by fuzzing (SPEC §55): a catalog page linking back to one
+    /// before it is an error at load, not a load that never ends.
+    #[test]
+    fn a_catalog_chain_that_loops_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileStore::open(dir.path().join("test.trunkdb")).unwrap();
+        let mut catalog = Catalog::load(&mut store).unwrap();
+        catalog.create_collection(&mut store, "users").unwrap();
+        let mut page = SlottedPage::from_bytes(store.read_page(CATALOG_PAGE_ID).unwrap()).unwrap();
+        page.set_next_page(CATALOG_PAGE_ID);
+        store
+            .write_page(CATALOG_PAGE_ID, &page.into_bytes())
+            .unwrap();
+
+        let Err(err) = Catalog::load(&mut store) else {
+            panic!("a looping catalog loaded");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("comes twice"), "{err}");
+    }
+
+    /// Found by fuzzing (SPEC §55): a catalog cell cut short anywhere
+    /// decodes or is an `InvalidData` error, never a panic; cut within its
+    /// fixed part, it's always the error.
+    #[test]
+    fn truncated_catalog_cells_are_errors() {
+        let meta = CollectionMeta {
+            index_root: 3,
+            current_data_page: 4,
+        };
+        let cells = [
+            (encode_collection("users", &meta), COLLECTION_NAME_AT),
+            (
+                encode_index(
+                    "users",
+                    &IndexMeta {
+                        fields: fields(&["a"]),
+                        root: 9,
+                        unique: false,
+                        sparse: false,
+                    },
+                ),
+                10 + "users".len(),
+            ),
+            (
+                encode_index(
+                    "users",
+                    &IndexMeta {
+                        fields: fields(&["a", "b"]),
+                        root: 9,
+                        unique: true,
+                        sparse: true,
+                    },
+                ),
+                10 + "users".len() + 2,
+            ),
+        ];
+        for (cell, fixed) in cells {
+            assert!(decode_entry(&cell).is_ok());
+            for len in 0..cell.len() {
+                match decode_entry(&cell[..len]) {
+                    Ok(_) => assert!(len >= fixed, "{len} of {cell:?} decoded"),
+                    Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+                }
+            }
+        }
     }
 
     #[test]

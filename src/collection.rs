@@ -848,10 +848,12 @@ impl Spans {
     /// up to the first that may stand for several values (a cut string,
     /// a huge number): the keys after it don't order entries it holds,
     /// whose true values may differ; they're sorted in memory instead.
+    /// A damaged key with fewer values than the index has fields groups
+    /// by the ones it has (SPEC §55).
     fn group<'k>(&self, key: &'k [u8]) -> &'k [u8] {
         let parts = key::parts(key::value_part(key));
-        let mut len: usize = parts[..self.at].iter().map(|p| p.len()).sum();
-        for part in &parts[self.at..self.end] {
+        let mut len: usize = parts.iter().take(self.at).map(|p| p.len()).sum();
+        for part in parts.iter().take(self.end).skip(self.at) {
             len += part.len();
             if !key::part_is_exact(part, self.fields) {
                 break;
@@ -863,8 +865,7 @@ impl Spans {
     /// The served values a group shares, each on its own.
     fn values<'k>(&self, key: &'k [u8]) -> Vec<&'k [u8]> {
         let shared = self.group(key);
-        let parts = key::parts(shared);
-        parts[self.at..].to_vec()
+        key::parts(shared).into_iter().skip(self.at).collect()
     }
 }
 
@@ -4328,6 +4329,27 @@ mod tests {
     /// more of sku A1 — not an A1 line and some other line of 9. The
     /// index on `lines[*].sku` finds the orders with an A1 line; only
     /// those are read.
+    /// Found by fuzzing (SPEC §55): a damaged compound key with fewer
+    /// values than the index has fields groups by the ones it has, and
+    /// a key too short for even its id by none.
+    #[test]
+    fn groups_of_keys_with_values_missing() {
+        let spans = Spans {
+            at: 1,
+            end: 3,
+            fields: 3,
+        };
+        let queued = Document::String("Queued".into());
+        let one = key::compound(&[&queued], DocId([1; 16]));
+        let group = spans.group(&one);
+        assert_eq!(group, key::value_part(&one));
+        assert!(spans.values(&one).is_empty());
+        for short in [&[][..], &[1, 2, 3][..]] {
+            assert_eq!(spans.group(short), &[] as &[u8]);
+            assert!(spans.values(short).is_empty());
+        }
+    }
+
     #[test]
     fn orders_with_a_large_line_of_one_sku() {
         let dir = tempfile::tempdir().unwrap();

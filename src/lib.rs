@@ -11,9 +11,13 @@ mod crc32;
 pub mod cursor;
 pub mod data;
 pub mod database;
+mod decode;
 pub mod document;
 pub mod durability;
 pub mod export;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod id;
 pub mod index;
 pub mod json;

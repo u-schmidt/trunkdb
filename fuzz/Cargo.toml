@@ -1,0 +1,47 @@
+[package]
+name = "trunkdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+indexmap = "2"
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+trunkdb = { path = "..", features = ["fuzzing"] }
+
+# Its own workspace, like `bench/`.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "open_file"
+path = "fuzz_targets/open_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_raw"
+path = "fuzz_targets/open_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recover_wal"
+path = "fuzz_targets/recover_wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import"
+path = "fuzz_targets/import.rs"
+test = false
+doc = false
+bench = false

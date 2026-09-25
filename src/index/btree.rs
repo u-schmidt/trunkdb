@@ -1,7 +1,7 @@
 use super::Index;
-use super::branch::{decode_branch_entry, encode_branch_entry};
+use super::branch::{MIN_BRANCH_ENTRY_LEN, decode_branch_entry, encode_branch_entry};
 use super::key::{KeyRange, MAX_KEY_LEN};
-use super::leaf::{decode_index_entry, encode_index_entry};
+use super::leaf::{MIN_INDEX_ENTRY_LEN, decode_index_entry, encode_index_entry};
 use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage};
 
 /// The real, disk-backed `Index` implementation — a B-tree with linked
@@ -51,7 +51,7 @@ impl BTreeIndex {
                     format!("index page {page_id} is reached twice — file may be corrupt"),
                 ));
             }
-            let page = SlottedPage::from_bytes(store.read_page(page_id)?)?;
+            let page = read_node(store, page_id)?;
             match page.page_type() {
                 PageType::IndexLeaf => {}
                 PageType::IndexBranch => {
@@ -93,7 +93,7 @@ impl Index for BTreeIndex {
                 ),
             ));
         }
-        match insert_into(store, self.root, key, loc)? {
+        match insert_into(store, self.root, key, loc, 0)? {
             InsertOutcome::Done => Ok(()),
             InsertOutcome::Split {
                 separator,
@@ -156,6 +156,7 @@ impl BTreeIndex {
             next_leaf: 0,
             path: Vec::new(),
             done: false,
+            seen: std::collections::HashSet::new(),
         }
     }
 }
@@ -180,6 +181,9 @@ pub struct Walk<'s> {
     path: Vec<(Vec<PageId>, usize)>,
     /// No entry left in the range.
     done: bool,
+    /// Forward: every leaf read, so sibling links that go round a loop
+    /// are damage, not a walk that never ends (SPEC §55).
+    seen: std::collections::HashSet<PageId>,
 }
 
 impl Walk<'_> {
@@ -200,7 +204,15 @@ impl Walk<'_> {
                     self.done = true;
                     return Ok(());
                 }
-                next => SlottedPage::from_bytes(self.store.read_page(next)?)?,
+                next if !self.seen.insert(next) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "index leaf {next} comes twice along the leaves: their links go round in a loop — file may be corrupt"
+                        ),
+                    ));
+                }
+                next => read_node(self.store, next)?,
             }
         } else {
             // Up to the nearest branch with a child before this one, then
@@ -253,8 +265,9 @@ impl Walk<'_> {
     /// From `page_id` down to a leaf: towards `key`, or along the last
     /// children for `None` — noting each branch passed in `path`.
     fn descend(&mut self, mut page_id: PageId, key: Option<&[u8]>) -> std::io::Result<SlottedPage> {
-        loop {
-            let page = SlottedPage::from_bytes(self.store.read_page(page_id)?)?;
+        // Backward, the path above counts too.
+        for _ in self.path.len()..=MAX_DEPTH {
+            let page = read_node(self.store, page_id)?;
             match page.page_type() {
                 PageType::IndexLeaf => return Ok(page),
                 PageType::IndexBranch => {
@@ -278,6 +291,7 @@ impl Walk<'_> {
                 other => return Err(corrupt_page_type(page_id, other)),
             }
         }
+        Err(too_deep(page_id))
     }
 }
 
@@ -300,6 +314,45 @@ impl Iterator for Walk<'_> {
     }
 }
 
+/// Deeper than any tree can be: every page holds at least four entries
+/// (`MAX_KEY_LEN`), so each level multiplies the leaves by five or more,
+/// and 28 levels would already hold more pages than a file can have. A
+/// descent past this has gone round a loop of damaged child pointers
+/// (SPEC §55).
+const MAX_DEPTH: usize = 64;
+
+fn too_deep(page_id: PageId) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "index page {page_id} is more than {MAX_DEPTH} levels down: its child pointers go round in a loop — file may be corrupt"
+        ),
+    )
+}
+
+/// Reads B-tree page `page_id`, which must be a leaf or a branch whose
+/// cells are all long enough for their entries (SPEC §55): the entry
+/// decoders trust that, so a damaged page is an error here rather than a
+/// panic there.
+fn read_node(store: &dyn PageStore, page_id: PageId) -> std::io::Result<SlottedPage> {
+    let page = SlottedPage::from_bytes(store.read_page(page_id)?)?;
+    let min = match page.page_type() {
+        PageType::IndexLeaf => MIN_INDEX_ENTRY_LEN,
+        PageType::IndexBranch => MIN_BRANCH_ENTRY_LEN,
+        other => return Err(corrupt_page_type(page_id, other)),
+    };
+    if let Some((slot, cell)) = page.iter_cells().find(|(_slot, cell)| cell.len() < min) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "index page {page_id} slot {slot} is {} bytes, shorter than any entry — file may be corrupt",
+                cell.len()
+            ),
+        ));
+    }
+    Ok(page)
+}
+
 /// Descends from `root` to the leaf that holds (or would hold) `key`.
 fn find_leaf(
     store: &dyn PageStore,
@@ -307,14 +360,15 @@ fn find_leaf(
     key: &[u8],
 ) -> std::io::Result<(PageId, SlottedPage)> {
     let mut page_id = root;
-    loop {
-        let page = SlottedPage::from_bytes(store.read_page(page_id)?)?;
+    for _ in 0..=MAX_DEPTH {
+        let page = read_node(store, page_id)?;
         match page.page_type() {
             PageType::IndexLeaf => return Ok((page_id, page)),
             PageType::IndexBranch => page_id = find_child(&page, key),
             other => return Err(corrupt_page_type(page_id, other)),
         }
     }
+    Err(too_deep(page_id))
 }
 
 /// Reads `page_id` and dispatches to the leaf or branch insert logic —
@@ -324,11 +378,15 @@ fn insert_into(
     page_id: PageId,
     key: &[u8],
     loc: RecordLocation,
+    depth: usize,
 ) -> std::io::Result<InsertOutcome> {
-    let page = SlottedPage::from_bytes(store.read_page(page_id)?)?;
+    if depth > MAX_DEPTH {
+        return Err(too_deep(page_id));
+    }
+    let page = read_node(store, page_id)?;
     match page.page_type() {
         PageType::IndexLeaf => insert_into_leaf(store, page_id, page, key, loc),
-        PageType::IndexBranch => insert_into_branch(store, page_id, page, key, loc),
+        PageType::IndexBranch => insert_into_branch(store, page_id, page, key, loc, depth),
         other => Err(corrupt_page_type(page_id, other)),
     }
 }
@@ -402,6 +460,7 @@ fn insert_into_branch(
     mut page: SlottedPage,
     key: &[u8],
     loc: RecordLocation,
+    depth: usize,
 ) -> std::io::Result<InsertOutcome> {
     // The first separator above `key` routes it, as in `find_child`;
     // `None` is the rightmost child.
@@ -413,7 +472,7 @@ fn insert_into_branch(
             (Some(slot), child)
         });
 
-    let outcome = insert_into(store, child_id, key, loc)?;
+    let outcome = insert_into(store, child_id, key, loc, depth + 1)?;
     let InsertOutcome::Split {
         separator,
         new_right,
@@ -978,6 +1037,101 @@ mod tests {
             .into_iter()
             .map(|id| store.read_page(id).unwrap())
             .collect()
+    }
+
+    /// Found by fuzzing (SPEC §55): a leaf or branch cell too short for
+    /// its entry is an error from every path that reads the page, not a
+    /// panic in the decoder.
+    #[test]
+    fn a_cell_too_short_for_its_entry_is_an_error() {
+        let loc = RecordLocation { page: 1, slot: 0 };
+        for leaf in [true, false] {
+            let (_dir, mut store, mut index) = fresh();
+            for i in 0..400u16 {
+                index.insert(&mut store, &id_from(i), loc).unwrap();
+            }
+            let root = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+            assert_eq!(root.page_type(), PageType::IndexBranch);
+            let target = match leaf {
+                true => decode_branch_entry(root.get_cell(0).unwrap()).1,
+                false => index.root,
+            };
+            let mut page = SlottedPage::from_bytes(store.read_page(target).unwrap()).unwrap();
+            page.remove_cell_at(0);
+            assert!(page.insert_cell_at(0, &[1, 2, 3]));
+            store.write_page(target, &page.into_bytes()).unwrap();
+
+            let invalid = |e: std::io::Error| {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+                assert!(e.to_string().contains("shorter than any entry"), "{e}");
+            };
+            invalid(index.lookup(&store, &id_from(0)).unwrap_err());
+            invalid(index.scan(&store).unwrap_err());
+            invalid(index.insert(&mut store, &id_from(0), loc).unwrap_err());
+            invalid(index.pages(&store).unwrap_err());
+            let walked: std::io::Result<Vec<_>> = index
+                .walk(
+                    &store,
+                    KeyRange {
+                        start: Vec::new(),
+                        end: None,
+                    },
+                    true,
+                )
+                .collect();
+            invalid(walked.unwrap_err());
+        }
+    }
+
+    /// Found by fuzzing (SPEC §55): a child pointer back to the root, or
+    /// a leaf linked back to an earlier one, is an error from every path
+    /// that follows it, not a loop that never ends.
+    #[test]
+    fn pointers_that_go_round_in_a_loop_are_errors() {
+        let loc = RecordLocation { page: 1, slot: 0 };
+        let everything = || KeyRange {
+            start: Vec::new(),
+            end: None,
+        };
+        let invalid = |e: std::io::Error, says: &str| {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+            assert!(e.to_string().contains(says), "{e}");
+        };
+
+        // The root's last child is the root itself.
+        let (_dir, mut store, mut index) = fresh();
+        for i in 0..400u16 {
+            index.insert(&mut store, &id_from(i), loc).unwrap();
+        }
+        let mut root = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        assert_eq!(root.page_type(), PageType::IndexBranch);
+        root.set_next_page(index.root);
+        store.write_page(index.root, &root.into_bytes()).unwrap();
+        invalid(
+            index.lookup(&store, &[0xFF; 16]).unwrap_err(),
+            "levels down",
+        );
+        invalid(
+            index.insert(&mut store, &[0xFF; 16], loc).unwrap_err(),
+            "levels down",
+        );
+        // Backward starts down the last child; forward starts at the
+        // first leaf and goes along the leaves, never through it.
+        let walked: std::io::Result<Vec<_>> = index.walk(&store, everything(), true).collect();
+        invalid(walked.unwrap_err(), "levels down");
+
+        // The last leaf links back to the first.
+        let (_dir, mut store, mut index) = fresh();
+        for i in 0..400u16 {
+            index.insert(&mut store, &id_from(i), loc).unwrap();
+        }
+        let (first, _) = find_leaf(&store, index.root, &[]).unwrap();
+        let (last, mut page) = find_leaf(&store, index.root, &[0xFF; 16]).unwrap();
+        assert_ne!(first, last);
+        page.set_next_page(first);
+        store.write_page(last, &page.into_bytes()).unwrap();
+        let walked: std::io::Result<Vec<_>> = index.walk(&store, everything(), false).collect();
+        invalid(walked.unwrap_err(), "comes twice along the leaves");
     }
 
     /// Keys go in and out of a page in place (SPEC §52): a removed key's

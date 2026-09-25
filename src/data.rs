@@ -1,3 +1,4 @@
+use crate::decode::{take_array, take_u8, take_u32, take_u64};
 use crate::document::{DocId, Document, decode_document, encode_document};
 use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage, USABLE_PAGE_SIZE};
 
@@ -37,16 +38,17 @@ enum Cell<'a> {
 }
 
 impl<'a> Cell<'a> {
+    /// A cell too short for its kind is damage, not a panic (SPEC §55).
     fn parse(bytes: &'a [u8]) -> std::io::Result<Self> {
-        let (&flags, rest) = bytes.split_first().expect("cells are never empty");
-        let (id_bytes, rest) = rest.split_at(16);
-        let id = DocId(id_bytes.try_into().unwrap());
+        let mut rest = bytes;
+        let flags = take_u8(&mut rest, "a record's flags")?;
+        let id = DocId(take_array(&mut rest, "a record's id")?);
         match flags {
             INLINE => Ok(Cell::Inline(id, rest)),
             OVERFLOW => Ok(Cell::Overflow {
                 id,
-                len: u32::from_le_bytes(rest[0..4].try_into().unwrap()),
-                first: PageId::from_le_bytes(rest[4..12].try_into().unwrap()),
+                len: take_u32(&mut rest, "an overflow record's length")?,
+                first: take_u64(&mut rest, "an overflow record's first page")?,
             }),
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -134,7 +136,9 @@ impl<'a> Records<'a> {
         match Cell::parse(live_cell(page, loc)?)? {
             Cell::Inline(id, encoded) => Ok((id, decode(encoded)?)),
             Cell::Overflow { id, len, first } => {
-                let mut encoded = Vec::with_capacity(len as usize);
+                // `len` is from the file: the chain has to back it up
+                // before it sizes anything (SPEC §55).
+                let mut encoded = Vec::with_capacity((len as usize).min(1 << 20));
                 walk_chain(self.store, first, len, |_page, bytes| {
                     encoded.extend_from_slice(bytes)
                 })?;
@@ -342,7 +346,13 @@ fn walk_chain(
     };
     let mut page_id = first;
     let mut remaining = len as usize;
+    // A chain's pages are all different. One seen twice is a loop, which
+    // a damaged length could otherwise follow half a million times.
+    let mut seen = std::collections::HashSet::new();
     loop {
+        if !seen.insert(page_id) {
+            return Err(corrupt(format!("page {page_id} comes twice")));
+        }
         let buf = store.read_page(page_id)?;
         if buf[0] != PageType::Overflow as u8 {
             return Err(corrupt(format!("page {page_id} isn't an overflow page")));
@@ -759,6 +769,59 @@ mod tests {
             std::io::ErrorKind::InvalidData,
             "a delete must not free pages of a chain it can't follow"
         );
+    }
+
+    /// A chain that loops back is reported at the first page seen twice,
+    /// even with a length big enough to go round it half a million times.
+    #[test]
+    fn a_chain_that_loops_is_a_corruption_error() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let loc = insert_record(&mut store, &mut current, id(1), &blob(20_000)).unwrap();
+        let mut page = read_data_page(&store, loc.page).unwrap();
+        let (_len, first) = Cell::parse(page.get_cell(loc.slot).unwrap())
+            .unwrap()
+            .chain()
+            .unwrap();
+        let mut first_page = store.read_page(first).unwrap();
+        first_page[1..9].copy_from_slice(&first.to_le_bytes());
+        store.write_page(first, &first_page).unwrap();
+        let mut cell = page.get_cell(loc.slot).unwrap().to_vec();
+        cell[CELL_HEADER_LEN..CELL_HEADER_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(page.update_cell(loc.slot, &cell));
+        store.write_page(loc.page, &page.into_bytes()).unwrap();
+
+        let err = get_record(&store, loc).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("comes twice"), "{err}");
+    }
+
+    /// Found by fuzzing (SPEC §55): a cell cut short, inline or overflow,
+    /// is an error, not a panic.
+    #[test]
+    fn every_truncated_cell_is_an_error() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        for doc in [Document::Int(5), blob(20_000)] {
+            let loc = insert_record(&mut store, &mut current, id(1), &doc).unwrap();
+            let page = read_data_page(&store, loc.page).unwrap();
+            let cell = page.get_cell(loc.slot).unwrap().to_vec();
+            let shortest = match doc {
+                // The id is all an inline cell needs; the document after
+                // it is `decode_document`'s to check.
+                Document::Int(_) => CELL_HEADER_LEN,
+                _ => OVERFLOW_CELL_LEN,
+            };
+            for len in 0..shortest {
+                let err = Cell::parse(&cell[..len]).err();
+                assert_eq!(
+                    err.map(|e| e.kind()),
+                    Some(std::io::ErrorKind::InvalidData),
+                    "{len}"
+                );
+            }
+            assert!(Cell::parse(&cell).is_ok());
+        }
     }
 
     #[test]

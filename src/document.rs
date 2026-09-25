@@ -1,3 +1,4 @@
+use crate::decode::{corrupt, take, take_array, take_u8, take_u32};
 use indexmap::IndexMap;
 
 /// The schema-less value every document is made of — this DB's equivalent
@@ -157,88 +158,56 @@ fn write_len_prefixed(bytes: &[u8], buffer: &mut Vec<u8>) {
 /// nested call has to report back where it stopped, so the next
 /// element/entry can be decoded starting there.
 ///
-/// Only fails on an unrecognized type tag (real corruption) or invalid
-/// UTF-8 in a string/key — a truncated buffer panics via out-of-bounds
-/// slicing instead of a graceful error, the same trust level the rest of
-/// this crate's cell decoders use: nothing reads a cell's bytes except
-/// code that wrote them.
+/// Fails, with `InvalidData`, on an unknown type tag, invalid UTF-8, or
+/// bytes that run out before the document does: cells come from the file,
+/// and a length or count in them may be wrong (SPEC §55).
 pub fn decode_document(bytes: &[u8]) -> std::io::Result<(Document, &[u8])> {
-    let (&tag, rest) = bytes.split_first().expect("cell bytes must be non-empty");
-    match tag {
-        TAG_NULL => Ok((Document::Null, rest)),
-        TAG_BOOL => {
-            let (&value, rest) = rest.split_first().unwrap();
-            Ok((Document::Bool(value != 0), rest))
-        }
-        TAG_INT => {
-            let (value, rest) = rest.split_at(8);
-            Ok((
-                Document::Int(i64::from_le_bytes(value.try_into().unwrap())),
-                rest,
-            ))
-        }
-        TAG_FLOAT => {
-            let (value, rest) = rest.split_at(8);
-            Ok((
-                Document::Float(f64::from_le_bytes(value.try_into().unwrap())),
-                rest,
-            ))
-        }
-        TAG_STRING => {
-            let (bytes, rest) = read_len_prefixed(rest);
-            let value = String::from_utf8(bytes.to_vec()).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad utf8 in document string",
-                )
-            })?;
-            Ok((Document::String(value), rest))
-        }
-        TAG_BINARY => {
-            let (bytes, rest) = read_len_prefixed(rest);
-            Ok((Document::Binary(bytes.to_vec()), rest))
-        }
-        TAG_ARRAY => {
-            let (count_bytes, mut rest) = rest.split_at(4);
-            let count = u32::from_le_bytes(count_bytes.try_into().unwrap());
-            let mut items = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let (item, remaining) = decode_document(rest)?;
-                items.push(item);
-                rest = remaining;
-            }
-            Ok((Document::Array(items), rest))
-        }
-        TAG_OBJECT => {
-            let (count_bytes, mut rest) = rest.split_at(4);
-            let count = u32::from_le_bytes(count_bytes.try_into().unwrap());
-            let mut entries = IndexMap::with_capacity(count as usize);
-            for _ in 0..count {
-                let (key_bytes, r) = read_len_prefixed(rest);
-                let key = String::from_utf8(key_bytes.to_vec()).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "bad utf8 in document key")
-                })?;
-                let (value, r) = decode_document(r)?;
-                entries.insert(key, value);
-                rest = r;
-            }
-            Ok((Document::Object(entries), rest))
-        }
-        TAG_ID => {
-            let (id_bytes, rest) = rest.split_at(16);
-            Ok((Document::Id(DocId(id_bytes.try_into().unwrap())), rest))
-        }
-        other => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unknown document type tag {other} — file may be corrupt"),
-        )),
-    }
+    let mut rest = bytes;
+    let doc = decode_value(&mut rest)?;
+    Ok((doc, rest))
 }
 
-fn read_len_prefixed(bytes: &[u8]) -> (&[u8], &[u8]) {
-    let (len_bytes, rest) = bytes.split_at(4);
-    let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-    rest.split_at(len)
+fn decode_value(bytes: &mut &[u8]) -> std::io::Result<Document> {
+    Ok(match take_u8(bytes, "a document's type tag")? {
+        TAG_NULL => Document::Null,
+        TAG_BOOL => Document::Bool(take_u8(bytes, "a bool")? != 0),
+        TAG_INT => Document::Int(i64::from_le_bytes(take_array(bytes, "an int")?)),
+        TAG_FLOAT => Document::Float(f64::from_le_bytes(take_array(bytes, "a float")?)),
+        TAG_STRING => Document::String(decode_string(bytes, "a string")?),
+        TAG_BINARY => Document::Binary(take_len_prefixed(bytes, "binary")?.to_vec()),
+        TAG_ARRAY => {
+            let count = take_u32(bytes, "an array's length")? as usize;
+            // Each item is at least a byte: a count past what's left is
+            // damage, and must not size the allocation.
+            let mut items = Vec::with_capacity(count.min(bytes.len()));
+            for _ in 0..count {
+                items.push(decode_value(bytes)?);
+            }
+            Document::Array(items)
+        }
+        TAG_OBJECT => {
+            let count = take_u32(bytes, "an object's length")? as usize;
+            let mut entries = IndexMap::with_capacity(count.min(bytes.len()));
+            for _ in 0..count {
+                let key = decode_string(bytes, "a key")?;
+                entries.insert(key, decode_value(bytes)?);
+            }
+            Document::Object(entries)
+        }
+        TAG_ID => Document::Id(DocId(take_array(bytes, "an id")?)),
+        other => return Err(corrupt(format_args!("unknown document type tag {other}"))),
+    })
+}
+
+/// `[u32 length][bytes]`.
+fn take_len_prefixed<'a>(bytes: &mut &'a [u8], what: &str) -> std::io::Result<&'a [u8]> {
+    let len = take_u32(bytes, what)? as usize;
+    take(bytes, len, what)
+}
+
+fn decode_string(bytes: &mut &[u8], what: &str) -> std::io::Result<String> {
+    let raw = take_len_prefixed(bytes, what)?;
+    String::from_utf8(raw.to_vec()).map_err(|_| corrupt(format_args!("bad UTF-8 in {what}")))
 }
 
 #[cfg(test)]
@@ -330,5 +299,42 @@ mod tests {
     fn decode_rejects_unknown_tag() {
         let bytes = [200u8]; // not a valid tag
         assert!(decode_document(&bytes).is_err());
+    }
+
+    /// Found by fuzzing (SPEC §55): a document cut short anywhere is an
+    /// `InvalidData` error, not a panic.
+    #[test]
+    fn every_truncated_document_is_an_error() {
+        let doc = Document::Object(
+            [
+                ("n".to_string(), Document::Int(7)),
+                ("f".to_string(), Document::Float(0.5)),
+                ("b".to_string(), Document::Bool(true)),
+                ("s".to_string(), Document::String("text".into())),
+                ("x".to_string(), Document::Binary(vec![1, 2, 3])),
+                ("i".to_string(), Document::Id(DocId([9; 16]))),
+                ("a".to_string(), Document::Array(vec![Document::Null])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let bytes = encode_document(&doc);
+        for len in 0..bytes.len() {
+            let err = decode_document(&bytes[..len]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{len}");
+        }
+        assert_eq!(decode_document(&bytes).unwrap().0, doc);
+    }
+
+    /// A count or length near `u32::MAX` with nothing behind it is an
+    /// error, and never sizes an allocation first.
+    #[test]
+    fn huge_counts_and_lengths_are_errors() {
+        for tag in [TAG_ARRAY, TAG_OBJECT, TAG_STRING, TAG_BINARY] {
+            let mut bytes = vec![tag];
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+            bytes.push(TAG_NULL);
+            assert!(decode_document(&bytes).is_err(), "{tag}");
+        }
     }
 }

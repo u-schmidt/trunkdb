@@ -13,6 +13,11 @@ pub(super) fn encode_index_entry(key: &[u8], location: RecordLocation) -> Vec<u8
     buffer
 }
 
+/// The shortest leaf cell: an empty key and the location.
+pub(super) const MIN_INDEX_ENTRY_LEN: usize = 10;
+
+/// Trusts `bytes` to be at least `MIN_INDEX_ENTRY_LEN` long, which
+/// `btree::read_node` checks for every cell of a page it reads.
 pub(super) fn decode_index_entry(bytes: &[u8]) -> (&[u8], RecordLocation) {
     let (key, loc) = bytes.split_at(bytes.len() - 10);
     let page = u64::from_le_bytes(loc[0..8].try_into().unwrap());

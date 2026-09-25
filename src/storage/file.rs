@@ -115,6 +115,23 @@ impl Header {
         }
         let page_count = u64::from_le_bytes(buf[12..20].try_into().unwrap());
         let free_list_head = u64::from_le_bytes(buf[20..28].try_into().unwrap());
+        // The header counts itself, every page's offset fits in a `u64`,
+        // and the free list starts inside the file (SPEC §55): a count of
+        // 0 would hand out page 0, the header, as the next new page.
+        if page_count == 0 || page_count > u64::MAX / PAGE_SIZE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("header counts {page_count} pages — file may be corrupt"),
+            ));
+        }
+        if free_list_head >= page_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "free list starts at page {free_list_head}, past the {page_count} pages — file may be corrupt"
+                ),
+            ));
+        }
         Ok(Header {
             page_size,
             page_count,
@@ -464,7 +481,7 @@ impl FileStore {
     /// every dirty page for this file regardless of how many separate
     /// writes produced them.
     pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_all()
+        super::sync(&self.file)
     }
 
     /// Starts staging: from here until `write_back` or `rollback`, no page
@@ -574,7 +591,7 @@ impl FileStore {
         }
         self.write_unwritten_pages()?;
         self.truncate_to_page_count()?;
-        self.file.sync_all()?;
+        super::sync(&self.file)?;
         let written = std::mem::take(&mut self.unwritten);
         let page_count = self.header.page_count;
         let mut cache = self.cache();
@@ -624,6 +641,23 @@ impl FileStore {
             self.staging.is_none() && self.unwritten.is_empty(),
             "FileStore::restore_pages while staging, or with pages to write back"
         );
+        // A page past the end of the file, as the header before it has
+        // it, is damage (SPEC §55): a batch that grows the file logs its
+        // header too, and first, as page 0. Checked before anything is
+        // written, so a damaged WAL leaves the file as it was.
+        let mut page_count = read_header(&self.file).ok().map(|h| h.page_count);
+        for (id, page) in pages {
+            if *id == HEADER_PAGE {
+                page_count = Some(Header::decode(page)?.page_count);
+            } else if page_count.is_none_or(|count| *id >= count) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the WAL holds page {id}, past the end of the file — it may be corrupt"
+                    ),
+                ));
+            }
+        }
         // Pages are about to change under it.
         self.cache().clear();
         for (id, page) in pages {
@@ -634,7 +668,7 @@ impl FileStore {
         // A crash can come between a shrinking batch's write-back and
         // its cut.
         self.truncate_to_page_count()?;
-        self.file.sync_all()
+        super::sync(&self.file)
     }
 }
 
@@ -653,6 +687,16 @@ impl PageStore for FileStore {
                 ));
             }
             let next = PageId::from_le_bytes(buf[1..9].try_into().unwrap());
+            // The link is from the file: the header's own was checked at
+            // open, each one after it is checked here (SPEC §55).
+            if next >= self.header.page_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "free page {id} links to page {next}, past the end — file may be corrupt"
+                    ),
+                ));
+            }
             self.header.free_list_head = next;
             id
         } else {
@@ -735,7 +779,7 @@ fn read_header(file: &File) -> io::Result<Header> {
 
 /// The page's id is part of what's summed, so a page written to the
 /// wrong place, or copied onto another, fails the check too.
-fn checksum(id: PageId, usable: &[u8]) -> [u8; CHECKSUM_LEN] {
+pub(crate) fn checksum(id: PageId, usable: &[u8]) -> [u8; CHECKSUM_LEN] {
     let mut crc = Crc32::new();
     crc.update(&id.to_le_bytes());
     crc.update(usable);
@@ -1198,6 +1242,84 @@ mod tests {
         store.restore_pages(&pages).unwrap();
         assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
         assert_eq!(store.read_page(2).unwrap(), vec![9u8; USABLE_PAGE_SIZE]);
+    }
+
+    /// Found by fuzzing (SPEC §55): a header whose page count is 0 or
+    /// overflows an offset, or whose free list starts past the end, is
+    /// refused at open.
+    #[test]
+    fn a_header_that_cannot_be_right_is_refused() {
+        for (page_count, free_list_head, says) in [
+            (0, NO_FREE_PAGE, "counts 0 pages"),
+            (u64::MAX / 2, NO_FREE_PAGE, "pages — file may be corrupt"),
+            (3, 3, "free list starts at page 3"),
+        ] {
+            let (_dir, path) = open_temp();
+            let header = Header {
+                page_size: PAGE_SIZE as u32,
+                page_count,
+                free_list_head,
+            }
+            .encode();
+            write_file(&path, &[(HEADER_PAGE, &header)]);
+            let Err(err) = FileStore::open(&path) else {
+                panic!("{page_count} pages, free list at {free_list_head}: opened");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains(says), "{err}");
+        }
+    }
+
+    /// Found by fuzzing (SPEC §55): a free page linking past the end is
+    /// an error when allocation follows the link, not a read there.
+    #[test]
+    fn a_free_list_link_past_the_end_is_an_error() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let mut store = FileStore::open(&path).unwrap();
+        store.free_page(2).unwrap();
+        let mut free = store.read_page(2).unwrap();
+        free[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
+        store.write_raw(2, &free).unwrap();
+
+        let err = store.allocate_page().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("links to page"), "{err}");
+    }
+
+    /// A WAL page past the end of the file, as the header before it in
+    /// the WAL (or the file's own) has it, is refused before anything is
+    /// written; one the WAL's header makes room for is restored.
+    #[test]
+    fn restored_pages_must_lie_inside_the_file() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let mut store = FileStore::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let page = vec![7u8; USABLE_PAGE_SIZE];
+        let header = |page_count| {
+            let header = Header {
+                page_size: PAGE_SIZE as u32,
+                page_count,
+                free_list_head: NO_FREE_PAGE,
+            };
+            header.encode().to_vec()
+        };
+
+        let past = store.restore_pages(&[(3, page.clone())]).unwrap_err();
+        assert!(past.to_string().contains("page 3, past the end"), "{past}");
+        let shrunk = [(HEADER_PAGE, header(2)), (2, page.clone())];
+        assert!(
+            store.restore_pages(&shrunk).is_err(),
+            "the header shrank the file first"
+        );
+        assert!(store.restore_pages(&[(u64::MAX, page.clone())]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+
+        store
+            .restore_pages(&[(HEADER_PAGE, header(5)), (4, page.clone())])
+            .unwrap();
+        assert_eq!(store.read_page(4).unwrap(), page);
     }
 
     // ---------- replacing the whole content ----------
