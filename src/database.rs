@@ -45,26 +45,19 @@ pub(crate) struct State {
     /// main file, even on retry — see `write_batch`. From then on every
     /// call fails with `Error::Poisoned` until the database is reopened.
     poisoned: bool,
+    /// `OpenOptions::checkpoint_pages`, as of `open_with`: how many
+    /// committed pages may wait before a commit writes them back.
     checkpoint_pages: usize,
 }
 
-/// How `Database::open_with` opens a database. `#[non_exhaustive]`: made
-/// with `OpenOptions::default()` and its setters, so a new option breaks
-/// nobody.
+/// How `Database::open_with` opens a database. Made with
+/// `OpenOptions::default()` and its setters; the fields are private and the
+/// type `#[non_exhaustive]`, so a new option breaks nobody.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OpenOptions {
-    /// At most this many bytes of the file's pages kept in memory (SPEC
-    /// §50); 0 keeps none. Default: `storage::DEFAULT_CACHE_SIZE`, 256 MiB.
-    /// It fills only as pages are read.
-    pub cache_size: usize,
-    /// Once this many committed pages wait, a commit writes them back to
-    /// the file (SPEC §51, §53); 0 or 1 writes them back after every
-    /// commit. More: fewer writes, but more memory (8 KB a page) and a
-    /// WAL that grows with every commit, not with this number, which the
-    /// next open after a crash reads back whole (§53.3). Default:
-    /// `DEFAULT_CHECKPOINT_PAGES`, 1,000.
-    pub checkpoint_pages: usize,
+    cache_size: usize,
+    checkpoint_pages: usize,
 }
 
 impl Default for OpenOptions {
@@ -77,11 +70,19 @@ impl Default for OpenOptions {
 }
 
 impl OpenOptions {
+    /// At most this many bytes of the file's pages kept in memory (SPEC
+    /// §50); 0 keeps none. Default: `storage::DEFAULT_CACHE_SIZE`, 256 MiB.
+    /// It fills only as pages are read.
     pub fn cache_size(mut self, bytes: usize) -> Self {
         self.cache_size = bytes;
         self
     }
 
+    /// Once this many committed pages wait, a commit writes them back to
+    /// the file (SPEC §51, §53); 0 or 1 writes them back after every
+    /// commit. More: fewer writes, but more memory (8 KB a page) and a
+    /// WAL that grows with every commit, not with this number, which the
+    /// next open after a crash reads back whole (§53.3). Default: 1,000.
     pub fn checkpoint_pages(mut self, pages: usize) -> Self {
         self.checkpoint_pages = pages;
         self
@@ -89,7 +90,7 @@ impl OpenOptions {
 }
 
 /// How many committed pages may wait in memory, logged but not written
-/// back, before a commit writes them back (SPEC §51): 1,000 pages, 8 MB —
+/// back, before a commit writes them back (SPEC §51): 1,000 pages of 8 KB each —
 /// SQLite's default for its WAL mode too.
 const DEFAULT_CHECKPOINT_PAGES: usize = 1000;
 
