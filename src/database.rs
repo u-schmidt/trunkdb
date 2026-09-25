@@ -909,15 +909,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let db = Database::open(&path).unwrap();
-        let empty = std::fs::read(&path).unwrap();
+        // Through the store's handle: Windows won't let a second one read
+        // a locked file.
+        let file = || db.state().store.file_bytes();
+        let empty = file();
 
         db.write_batch(two_collection_batch()).unwrap();
         assert_two_collection_batch_present(&db);
-        assert_eq!(std::fs::read(&path).unwrap(), empty, "the main file waits");
+        assert_eq!(file(), empty, "the main file waits");
         assert!(wal_len(&path) > 0);
 
         db.checkpoint().unwrap();
-        assert_ne!(std::fs::read(&path).unwrap(), empty);
+        assert_ne!(file(), empty);
         assert_eq!(wal_len(&path), 0);
         assert_two_collection_batch_present(&db);
     }

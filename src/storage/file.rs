@@ -446,6 +446,16 @@ impl FileStore {
         self.cache().capacity()
     }
 
+    /// The whole file as it is on disk, read through the store's own
+    /// handle: on Windows the file lock (§21.1) is mandatory, and a second
+    /// handle can't read the file while this one holds it.
+    #[cfg(test)]
+    pub(crate) fn file_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0u8; self.file.metadata().unwrap().len() as usize];
+        read_exact_at(&self.file, &mut bytes, 0).unwrap();
+        bytes
+    }
+
     /// Hits and misses so far.
     #[cfg(test)]
     pub(crate) fn cache_stats(&self) -> (usize, usize) {
@@ -1295,7 +1305,7 @@ mod tests {
         let (_dir, path) = open_temp();
         two_page_file(&path);
         let mut store = FileStore::open(&path).unwrap();
-        let before = std::fs::read(&path).unwrap();
+        let before = store.file_bytes();
         let page = vec![7u8; USABLE_PAGE_SIZE];
         let header = |page_count| {
             let header = Header {
@@ -1314,7 +1324,7 @@ mod tests {
             "the header shrank the file first"
         );
         assert!(store.restore_pages(&[(u64::MAX, page.clone())]).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+        assert_eq!(store.file_bytes(), before, "nothing written");
 
         store
             .restore_pages(&[(HEADER_PAGE, header(5)), (4, page.clone())])
