@@ -1345,7 +1345,7 @@ fn save_current_data_page(
 /// documents always report their own id when read back — LiteDB/Mongo
 /// convention — even though the physical primary key lives outside the
 /// document content as far as `data.rs`/`BTreeIndex` are concerned (see
-/// SPEC.md §13.5). Overwrites any existing `_id` key rather than trusting
+/// SPEC §13.5). Overwrites any existing `_id` key rather than trusting
 /// one the caller supplied, since the real id is always the one `insert`/
 /// `update` were actually called with. Non-`Object` documents (a bare
 /// `Document::Int`, a top-level `String`, ...) have no field to attach an

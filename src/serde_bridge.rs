@@ -427,7 +427,7 @@ impl<'de> Deserializer<'de> for Document {
             Document::Binary(v) => visitor.visit_byte_buf(v),
             // Not a distinct wire type of its own for arbitrary T — a
             // stored _id round-trips through a typed field as its string
-            // form (see SPEC.md for why this isn't given special
+            // form (see SPEC §13.5 for why this isn't given special
             // treatment here).
             Document::Id(id) => visitor.visit_string(id.to_string()),
             Document::Array(items) => visitor.visit_seq(SeqDeserializer::new(items.into_iter())),

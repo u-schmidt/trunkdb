@@ -23,8 +23,8 @@ every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
 cloneable, thread-safe handle; reads run in parallel, writes one at a
-time). See [SPEC.md](SPEC.md)
-for the full design rationale and current progress.
+time). See [the spec](spec/README.md)
+for the full design rationale, and [ROADMAP.md](ROADMAP.md) for progress.
 
 ## Why
 
@@ -44,7 +44,7 @@ and (b) actually learn how a database is built, from the page layer up.
   implementation can later drop into without changes rippling upward.
 - **Feature-poor is fine; unclear boundaries are not.** v0 intentionally
   skips a real query planner and concurrent writers —
-  see [SPEC.md](SPEC.md) for the full list and why each one is deferred
+  see [the spec](spec/README.md) for the full list and why each one is deferred
   rather than missing.
 - **Own decisions, not a translation.** LiteDB (and the Rust embedded DBs
   `sled`, `redb`, `PoloDB`) are references for calibration, not code to
@@ -147,7 +147,7 @@ documents:
 | oldest 20 of a status | 47 µs | 23 µs | 22 µs | 20 µs |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
-Each gap has a known cause (SPEC.md §48), and the first four are
+Each gap has a known cause (SPEC §48, in [spec/](spec/README.md)), and the first four are
 fixed: "oldest 20" took 19 ms before the lazy B-tree walk (§49), a
 lookup by id 32 µs before the page cache (§50), a commit 16 ms before it
 flushed once instead of three times (§51), and batched inserts ran at
@@ -161,8 +161,8 @@ cd bench && cargo run --release
 
 ## Roadmap (short version)
 
-Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and SPEC.md
-for the reasoning):
+Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
+[spec/](spec/README.md) for the reasoning):
 
 1. **Correctness and file format**: a page-image WAL (SPEC §19),
    several documents per data page (§20), a file lock and format

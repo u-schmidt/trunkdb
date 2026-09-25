@@ -1,0 +1,66 @@
+# trunkdb — design spec
+
+The spec captures the reasoning behind trunkdb, not just its current
+state: why it exists, what was decided and why, and what was deliberately
+left out of v0. Treat it as the record to come back to when a later
+decision needs to be checked against the original intent.
+
+One file per section, numbered in the order the work happened. The
+numbers are stable: code comments and the other sections refer to
+them as `SPEC §N` or `§N`, and a new section gets the next number.
+What is done and what is open is in [ROADMAP.md](../ROADMAP.md).
+
+1. [Motivation](01-motivation.md)
+2. [Feasibility read](02-feasibility-read.md)
+3. [Architecture: layers and what's real vs. fakeable](03-architecture-layers-and-whats-real-vs-fakeable.md)
+4. [Key decisions and rationale](04-key-decisions-and-rationale.md)
+5. [Reference workloads](05-reference-workloads.md)
+6. [v0 feature set](06-v0-feature-set.md)
+7. [Page layout (`storage/`)](07-page-layout.md)
+8. [Ownership: one `RefCell` boundary, not one per component](08-ownership-one-refcell-boundary-not-one-per-component.md)
+9. [Catalog (`catalog.rs`)](09-catalog.md)
+10. [Index (`index/btree.rs`, `index/branch.rs`, `index/leaf.rs`, `index/in_memory.rs`)](10-index.md)
+11. [Document encoding (`document.rs`, `data.rs`)](11-document-encoding.md)
+12. [Wiring `Collection<Document>` (`collection.rs`)](12-wiring-collection-document.md)
+13. [The serde bridge (`serde_bridge.rs`)](13-the-serde-bridge.md)
+14. [Query: sort and limit (`query.rs`)](14-query-sort-and-limit.md)
+15. [Synthetic time-series data (`tests/timeseries_shape.rs`)](15-synthetic-time-series-data.md)
+16. [Durability: a real write-ahead log (`durability/wal.rs`, `txn.rs`)](16-durability-a-real-write-ahead-log.md)
+17. [Batch writes: wiring `TransactionManager` (`database.rs`, `txn.rs`)](17-batch-writes-wiring-transactionmanager.md)
+18. [Merging `_id` into the untyped path (`collection.rs`)](18-merging-id-into-the-untyped-path.md)
+19. [Durability, take two: a page-image WAL (`storage/file.rs`, `durability/wal.rs`, `database.rs`)](19-durability-take-two-a-page-image-wal.md)
+20. [Several documents per data page (`data.rs`, `storage/slotted.rs`, `catalog.rs`)](20-several-documents-per-data-page.md)
+21. [An exclusive file lock and a format version (`storage/file.rs`, `database.rs`)](21-an-exclusive-file-lock-and-a-format-version.md)
+22. [Block A addendum: three data-risk fixes (`storage/file.rs`, `collection.rs`, `catalog.rs`, `txn/`)](22-block-a-addendum-three-data-risk-fixes.md)
+23. [`find_with_ids` (`collection.rs`, `query.rs`)](23-find-with-ids.md)
+24. [Typed batches (`batch.rs`)](24-typed-batches.md)
+25. [`Op::Contains`: case-insensitive substring match (`query.rs`)](25-op-contains-case-insensitive-substring-match.md)
+26. [Overflow pages and `u32` lengths (`data.rs`, `document.rs`)](26-overflow-pages-and-u32-lengths.md)
+27. [A thread-safe, cloneable `Database` handle (`database.rs`, `collection.rs`, `batch.rs`)](27-a-thread-safe-cloneable-database-handle.md)
+28. [Secondary indexes (`index/`, `catalog.rs`, `collection.rs`, `query.rs`)](28-secondary-indexes.md)
+29. [API rounding-out: `find_one`, `count`, `upsert`, `cursor` (`collection.rs`, `cursor.rs`)](29-api-rounding-out-find-one-count-upsert-cursor.md)
+30. [Export and import as JSON Lines (`json.rs`, `export.rs`)](30-export-and-import-as-json-lines.md)
+31. [Nested-field paths (`query.rs`, `collection.rs`)](31-nested-field-paths.md)
+32. [Null and missing fields (`query.rs`, `index/key.rs`, `collection.rs`)](32-null-and-missing-fields.md)
+33. [Unique indexes (`collection.rs`, `catalog.rs`, `storage/file.rs`, `export.rs`)](33-unique-indexes.md)
+34. [Sorting through an index (`query.rs`, `collection.rs`, `index/key.rs`)](34-sorting-through-an-index.md)
+35. [A filter builder (`query.rs`, `document.rs`)](35-a-filter-builder.md)
+36. [OR, NOT and nesting (`query.rs`, `collection.rs`)](36-or-not-and-nesting.md)
+37. [`delete_many` and dropping a collection (`collection.rs`, `database.rs`, `catalog.rs`, `data.rs`)](37-delete-many-and-dropping-a-collection.md)
+38. [`update_many` (`collection.rs`)](38-update-many.md)
+39. [The `trunkdb` command and `Database::check` (`src/bin/trunkdb.rs`, `check.rs`)](39-the-trunkdb-command-and-database-check.md)
+40. [Page checksums (`storage/file.rs`, `crc32.rs`, `data.rs`, `check.rs`)](40-page-checksums.md)
+41. [Compaction (`compact.rs`, `storage/memory.rs`, `storage/file.rs`, `index/btree.rs`)](41-compaction.md)
+42. [Array conditions and multikey indexes (`query.rs`, `collection.rs`, `check.rs`, `compact.rs`)](42-array-conditions-and-multikey-indexes.md)
+43. [Compound indexes (`index/key.rs`, `catalog.rs`, `query.rs`, `collection.rs`)](43-compound-indexes.md)
+44. [Sparse indexes (`catalog.rs`, `collection.rs`, `query.rs`, `export.rs`)](44-sparse-indexes.md)
+45. [`Exists` and array size (`query.rs`)](45-exists-and-array-size.md)
+46. [Conditions on one element: `elem_match` (`query.rs`)](46-conditions-on-one-element-elem-match.md)
+47. [Sorting by several fields (`query.rs`, `collection.rs`)](47-sorting-by-several-fields.md)
+48. [Benchmarks against SQLite, redb and sled (`bench/`)](48-benchmarks-against-sqlite-redb-and-sled.md)
+49. [A lazy B-tree walk (`index/btree.rs`, `collection.rs`)](49-a-lazy-b-tree-walk.md)
+50. [A page cache (`storage/cache.rs`, `storage/file.rs`, `database.rs`)](50-a-page-cache.md)
+51. [One flush per commit (`database.rs`, `storage/file.rs`)](51-one-flush-per-commit.md)
+52. [B-tree pages changed in place (`storage/slotted.rs`, `index/btree.rs`)](52-b-tree-pages-changed-in-place.md)
+53. [A configurable checkpoint threshold (`database.rs`)](53-a-configurable-checkpoint-threshold.md)
+54. [Checking a page when it is read (`storage/slotted.rs`)](54-checking-a-page-when-it-is-read.md)

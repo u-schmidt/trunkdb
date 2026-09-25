@@ -5,8 +5,8 @@ use super::leaf::{decode_index_entry, encode_index_entry};
 use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage};
 
 /// The real, disk-backed `Index` implementation — a B-tree with linked
-/// leaves (leaves double as a sorted linked list via `next_page`; see §10
-/// in SPEC.md for why branch pages reuse the same field for something
+/// leaves (leaves double as a sorted linked list via `next_page`; see SPEC
+/// §10 for why branch pages reuse the same field for something
 /// else entirely).
 ///
 /// Keys are byte strings of up to `MAX_KEY_LEN` bytes, compared byte by

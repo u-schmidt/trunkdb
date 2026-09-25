@@ -4,9 +4,10 @@
 still break API and file format. 1.0.0 is reserved for a stable format
 with a migration path — export/import (§30) is that path.
 
-Section numbers (§) refer to [SPEC.md](SPEC.md), which records why
-each step was taken. New work goes in a new SPEC section at the end;
-this file only lists it.
+Section numbers (§) refer to the spec, one file per section in
+[spec/](spec/README.md), which records why each step was taken. New
+work gets a new spec section with the next number; this file only
+lists it.
 
 ## Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and

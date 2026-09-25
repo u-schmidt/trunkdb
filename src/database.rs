@@ -283,7 +283,7 @@ impl Database {
 
     /// Applies every op in `ops` as one atomic, durable unit. Ops may name
     /// different collections (each `WriteOp` carries its own) — that's the
-    /// actual point: a multi-entity update (SPEC.md §4.4) needs exactly
+    /// actual point: a multi-entity update (SPEC §4.4) needs exactly
     /// this, which a sequence of separate `Collection::insert`/`update`/
     /// `delete` calls can't give you, since each of those is its own batch.
     pub fn write_batch(&self, ops: Vec<WriteOp>) -> crate::Result<()> {

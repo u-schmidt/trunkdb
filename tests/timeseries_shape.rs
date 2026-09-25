@@ -1,4 +1,4 @@
-//! Synthetic data shaped like the time-series workload (SPEC.md §5.1), exercised through trunkdb's public API only (this is an
+//! Synthetic data shaped like the time-series workload (SPEC §5.1), exercised through trunkdb's public API only (this is an
 //! integration test, not a unit test — no access to crate internals).
 //!
 //! Covers the workload's query patterns, per §5.1:
