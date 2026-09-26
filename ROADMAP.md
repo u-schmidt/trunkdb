@@ -119,6 +119,22 @@ limit is described.
 - An index key for ids, so a filter on a reference (a `DocId` field)
   uses an index instead of a scan. Indexes built before it lack entries
   for id values: a format bump, or a rebuild at open (§59.6).
+- `eq("_id", id)` through the primary index, as `get` does, instead of a
+  scan (§59.6).
+- A filter for a document's id that doesn't need `"_id"` spelled out:
+  `Filter::new().id(some_id)`, or a public `ID_FIELD` constant. Filters
+  see stored names, after serde's `rename`, so `eq("id", ...)` on a
+  struct's id field finds nothing, silently (§59).
+- Maybe later, as sugar: `#[trunkdb::document]` on a struct and `#[id]`
+  on its id field, so a consumer says "this is a document, that is its
+  id" and needn't know about `_id` or serde's `rename` (§59). An
+  attribute macro that adds `#[serde(rename = "_id")]` to the marked
+  field before serde's derive runs, and refuses at compile time a field
+  that isn't `DocId` or `Option<DocId>`. It needs a `proc-macro` crate of
+  its own (`trunkdb-derive`, with `syn` and `quote`), re-exported behind
+  a feature as serde does with `derive`. Purely additive: nothing breaks
+  without it. A good piece for learning how Rust generates code at
+  compile time.
 
 **Tooling and reach**
 - Repairing what `check` finds, beyond export and import (§39.5).
