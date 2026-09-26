@@ -188,11 +188,16 @@ impl Database {
         durability.checkpoint()?;
 
         store.begin();
-        let catalog = match Catalog::load(&mut store) {
+        let catalog = match Catalog::load(&mut store)
+            .map_err(crate::Error::from)
+            .and_then(|catalog| {
+                crate::collection::key_ids_in_old_indexes(&catalog, &mut store)?;
+                Ok(catalog)
+            }) {
             Ok(catalog) => catalog,
             Err(e) => {
                 store.rollback();
-                return Err(e.into());
+                return Err(e);
             }
         };
         let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();

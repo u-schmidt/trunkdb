@@ -1422,19 +1422,107 @@ fn build_index(
     }
     let meta = get_or_create_meta(catalog, store, collection)?;
     let index = catalog.create_index(store, collection, fields, options)?;
+    let documents = BTreeIndex::new(meta.index_root).scan(store)?;
+    fill_index(store, collection, &index, &documents)?;
+    Ok(true)
+}
+
+/// Puts the `documents` (the primary index's entries) into the empty
+/// `index`. A unique index checks each document as it goes in, so the
+/// first duplicate fails the batch.
+fn fill_index(
+    store: &mut dyn PageStore,
+    collection: &str,
+    index: &IndexMeta,
+    documents: &[(Vec<u8>, RecordLocation)],
+) -> crate::Result<()> {
     let mut tree = BTreeIndex::new(index.root);
-    for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
-        let (id, doc) = data::get_record(store, loc)?;
+    for (_key, loc) in documents {
+        let (id, doc) = data::get_record(store, *loc)?;
         if index.unique {
-            for (value_part, values) in unique_tuples(&doc, &index) {
-                check_unique(store, collection, &index, id, &value_part, &values)?;
+            for (value_part, values) in unique_tuples(&doc, index) {
+                check_unique(store, collection, index, id, &value_part, &values)?;
             }
         }
-        for key in index_keys(&doc, &index, id) {
-            tree.insert(store, &key, loc)?;
+        for key in index_keys(&doc, index, id) {
+            tree.insert(store, &key, *loc)?;
         }
     }
-    Ok(true)
+    Ok(())
+}
+
+/// Brings a file from before ids had index keys (format 10, SPEC §62) up
+/// to date, in `Database::open`'s batch: every secondary index that a
+/// document holds an id in is rebuilt in place, and the header is
+/// stamped, so that the check runs once and a build before 10 refuses
+/// the file from then on. Only files with secondary indexes: without
+/// them nothing needs checking, and the first write stamps the file.
+/// Rebuilding a unique index can fail, if documents share an id in it:
+/// before, ids never collided.
+pub(crate) fn key_ids_in_old_indexes(
+    catalog: &Catalog,
+    store: &mut crate::storage::FileStore,
+) -> crate::Result<()> {
+    if !store.predates_id_keys()? {
+        return Ok(());
+    }
+    let mut any = false;
+    for name in catalog.names() {
+        if catalog.indexes(name).is_empty() {
+            continue;
+        }
+        any = true;
+        let (documents, stale) = indexes_lacking_ids(catalog, store, name)?;
+        for index in stale {
+            BTreeIndex::new(index.root).clear(store)?;
+            fill_index(store, name, index, &documents)?;
+        }
+    }
+    if any {
+        store.stamp_format_version()?;
+    }
+    Ok(())
+}
+
+/// Index entries: each key with the location of its document.
+type Entries = Vec<(Vec<u8>, RecordLocation)>;
+
+/// The secondary indexes of `collection` that a document holds an id in
+/// (`holds_id`), and the collection's documents (the primary index's
+/// entries), to rebuild them from.
+fn indexes_lacking_ids<'c>(
+    catalog: &'c Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+) -> crate::Result<(Entries, Vec<&'c IndexMeta>)> {
+    let indexes = catalog.indexes(collection);
+    let meta = catalog.get(collection).expect("a listed collection");
+    let documents = BTreeIndex::new(meta.index_root).scan(store)?;
+    let mut stale = vec![false; indexes.len()];
+    let mut records = data::Records::new(store);
+    for (_key, loc) in &documents {
+        let (_id, doc) = records.get(*loc)?;
+        for (stale, index) in stale.iter_mut().zip(indexes) {
+            *stale |= holds_id(&doc, index);
+        }
+    }
+    let stale = indexes
+        .iter()
+        .zip(stale)
+        .filter(|(_, stale)| *stale)
+        .map(|(index, _)| index)
+        .collect();
+    Ok((documents, stale))
+}
+
+/// Whether `doc` has an id among the values `index` keys: an entry it
+/// lacks if the index was built before format 10 (SPEC §62).
+fn holds_id(doc: &Document, index: &IndexMeta) -> bool {
+    let is_id = |value: &&Document| matches!(value, Document::Id(_));
+    match index.single() {
+        Some(field) => crate::query::values_at(doc, field).iter().any(is_id),
+        None => field_values(doc, index).iter().any(is_id),
+    }
 }
 
 /// "a unique, sparse", "a plain", ... — an index's options in an error.
@@ -2051,8 +2139,8 @@ mod tests {
         assert_eq!(id, batched);
         batch.commit().unwrap();
 
-        // Ids have no index key encoding yet (SPEC §59.6): a filter on
-        // one scans, and finds the same.
+        // A filter on a reference: a scan here, with no index on it
+        // (with one, it reads the index since SPEC §62).
         let by_owner = Filter::new().eq("owner", upserted);
         assert_eq!(
             tasks.explain(&by_owner).unwrap(),
@@ -2264,7 +2352,7 @@ mod tests {
     /// rounding to one f64, long strings agreeing past the key's cut).
     fn random_value(rng: &mut XorShift) -> Document {
         let big = 1i64 << 53;
-        match rng.below(10) {
+        match rng.below(11) {
             0 | 1 => Document::Int(rng.below(11) as i64 - 5),
             2 => Document::Int(big + rng.below(4) as i64),
             3 => Document::Float((rng.below(21) as f64 - 10.0) / 2.0),
@@ -2272,7 +2360,9 @@ mod tests {
             5 | 6 => Document::String(["", "a", "ab", "b", "B", "a\0"][rng.below(6)].to_string()),
             7 => Document::String("x".repeat(1200) + ["a", "b", ""][rng.below(3)]),
             8 => Document::Bool(rng.below(2) == 1),
-            _ => [Document::Null, Document::Array(vec![Document::Int(1)])][rng.below(2)].clone(),
+            9 => [Document::Null, Document::Array(vec![Document::Int(1)])][rng.below(2)].clone(),
+            // A few ids, which compare, sort and are indexed (SPEC §62).
+            _ => Document::Id(DocId([1 + rng.below(3) as u8; 16])),
         }
     }
 
@@ -4068,6 +4158,288 @@ mod tests {
         }
         let db = Database::open(&path).unwrap();
         assert_nested_filters_agree_with_a_scan(&db.collection("docs"), &mut rng);
+    }
+
+    /// A reference to another document, a `DocId` field, has an index
+    /// key (SPEC §62): a filter on it reads its range of the index, a
+    /// sort on it walks the index in the order the ids were made, a
+    /// compound index serves both, a unique index refuses a second
+    /// document with the same one, and an array of them is multikey.
+    #[test]
+    fn an_index_on_a_reference_reads_just_its_documents() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Car {
+            owner: DocId,
+            seats: i64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let owners = (0..10).map(|_| db.id_gen().generate()).collect::<Vec<_>>();
+        let cars = db.collection::<Car>("cars");
+        let mut batch = db.batch();
+        for seats in 0..300 {
+            let owner = owners[seats as usize % 10];
+            batch.insert(&cars, Car { owner, seats }).unwrap();
+        }
+        batch.commit().unwrap();
+        cars.ensure_index("owner").unwrap();
+
+        let owned = Filter::new().eq("owner", owners[3]);
+        let field = "owner".to_string();
+        assert_eq!(cars.explain(&owned).unwrap(), QueryPlan::Index { field });
+        let mut found = Vec::new();
+        let reads = records_read(|| found = cars.find(owned.clone()).unwrap());
+        assert_eq!((found.len(), reads), (30, 30));
+        assert!(found.iter().all(|car| car.owner == owners[3]));
+
+        // Made before the third owner: the first two. The range includes
+        // the bound itself, as every range does (`key::range_for`), and
+        // the check leaves its 30 out.
+        let earlier = Filter::new().lt("owner", owners[2]);
+        let reads = records_read(|| assert_eq!(cars.count(earlier.clone()).unwrap(), 60));
+        assert_eq!(reads, 90);
+
+        let newest = Filter::new().sort_desc("owner").limit(5);
+        let field = "owner".to_string();
+        assert_eq!(
+            cars.explain(&newest).unwrap(),
+            QueryPlan::IndexOrder { field }
+        );
+        let reads = records_read(|| found = cars.find(newest.clone()).unwrap());
+        assert_eq!(reads, 5);
+        assert!(found.iter().all(|car| car.owner == owners[9]));
+
+        cars.ensure_index(vec!["owner", "seats"]).unwrap();
+        let most_seats = Filter::new()
+            .eq("owner", owners[3])
+            .sort_desc("seats")
+            .limit(3);
+        let field = "(owner, seats)".to_string();
+        assert_eq!(
+            cars.explain(&most_seats).unwrap(),
+            QueryPlan::IndexOrder { field }
+        );
+        let reads = records_read(|| found = cars.find(most_seats.clone()).unwrap());
+        let seats = found.iter().map(|car| car.seats).collect::<Vec<_>>();
+        assert_eq!((seats, reads), (vec![293, 283, 273], 3));
+
+        let plates = db.collection::<Document>("plates");
+        plates
+            .ensure_index_with("car", IndexOptions::new().unique())
+            .unwrap();
+        let plate = |car: DocId| object(vec![("car", Document::Id(car))]);
+        plates.insert(plate(owners[0])).unwrap();
+        plates.insert(plate(owners[1])).unwrap();
+        let twice = plates.insert(plate(owners[0]));
+        assert!(
+            matches!(twice, Err(crate::Error::DuplicateValue { .. })),
+            "{twice:?}"
+        );
+
+        let trips = db.collection::<Document>("trips");
+        trips.ensure_index("drivers[*]").unwrap();
+        for pair in owners.windows(2) {
+            let drivers = pair.iter().map(|&id| Document::Id(id)).collect();
+            trips
+                .insert(object(vec![("drivers", Document::Array(drivers))]))
+                .unwrap();
+        }
+        let drove = Filter::new().eq("drivers[*]", owners[4]);
+        let field = "drivers[*]".to_string();
+        assert_eq!(trips.explain(&drove).unwrap(), QueryPlan::Index { field });
+        assert_eq!(trips.count(drove).unwrap(), 2);
+        assert_consistent(&db);
+    }
+
+    /// Makes `collection`'s index on `fields` what a build before format
+    /// 10 made of it (SPEC §62): an id is left out of a one-field index,
+    /// and an "other" in a compound one — as if it were a value no index
+    /// orders. Creates the index if it isn't there.
+    fn key_ids_the_old_way(
+        db: &Database,
+        collection: &str,
+        fields: &[&str],
+        options: IndexOptions,
+    ) {
+        fn without_ids(doc: Document) -> Document {
+            match doc {
+                Document::Id(_) => Document::Binary(Vec::new()),
+                Document::Object(map) => {
+                    Document::Object(map.into_iter().map(|(k, v)| (k, without_ids(v))).collect())
+                }
+                Document::Array(items) => {
+                    Document::Array(items.into_iter().map(without_ids).collect())
+                }
+                other => other,
+            }
+        }
+        let fields = fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        db.transact(|catalog, store| {
+            let existing = catalog
+                .indexes(collection)
+                .iter()
+                .find(|i| i.fields == fields);
+            let index = match existing.cloned() {
+                Some(index) => {
+                    BTreeIndex::new(index.root).clear(store)?;
+                    index
+                }
+                None => catalog.create_index(store, collection, &fields, options)?,
+            };
+            let meta = *catalog.get(collection).unwrap();
+            let mut tree = BTreeIndex::new(index.root);
+            for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
+                let (id, doc) = data::get_record(store, loc)?;
+                for key in index_keys(&without_ids(doc), &index, id) {
+                    tree.insert(store, &key, loc)?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A file from before format 10 (SPEC §62) has indexes without keys
+    /// for ids. Opening it rebuilds those, and only those, in place, and
+    /// stamps the file 10. A file without secondary indexes needs nothing
+    /// and stays as it is, until the first write stamps it.
+    #[test]
+    fn opening_an_older_file_keys_the_ids_its_indexes_lack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let owners;
+        {
+            let db = Database::open(&path).unwrap();
+            owners = (0..3).map(|_| db.id_gen().generate()).collect::<Vec<_>>();
+            let cars = db.collection::<Document>("cars");
+            // Enough that each index takes several pages, all of which a
+            // rebuild must free or reuse.
+            let mut batch = db.batch();
+            for seats in 0..900 {
+                let owner = Document::Id(owners[seats as usize % 3]);
+                let car = object(vec![("owner", owner), ("seats", Document::Int(seats))]);
+                batch.insert(&cars, car).unwrap();
+            }
+            batch
+                .insert(&cars, object(vec![("seats", Document::Int(1000))]))
+                .unwrap();
+            batch.commit().unwrap();
+            cars.ensure_index("seats").unwrap();
+            key_ids_the_old_way(&db, "cars", &["owner"], IndexOptions::new());
+            key_ids_the_old_way(&db, "cars", &["owner", "seats"], IndexOptions::new());
+            let owned = Filter::new().eq("owner", owners[1]);
+            assert_eq!(
+                cars.count(owned).unwrap(),
+                0,
+                "an old index, read by this build"
+            );
+            assert!(!db.check().unwrap().is_ok());
+
+            let state = db.read().unwrap();
+            let (documents, stale) =
+                indexes_lacking_ids(&state.catalog, &state.store, "cars").unwrap();
+            let stale = stale.iter().map(|index| index.name()).collect::<Vec<_>>();
+            assert_eq!(
+                (documents.len(), stale),
+                (901, vec!["owner".to_string(), "(owner, seats)".to_string()])
+            );
+        }
+        crate::storage::rewrite_format_version(&path, 9);
+
+        let mut opened = None;
+        let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
+        assert!(reads >= 901, "every document checked, and read to rebuild");
+        let db = opened.unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 10);
+        assert!(db.check().unwrap().is_ok());
+        let cars = db.collection::<Document>("cars");
+        assert_eq!(
+            cars.index_names().unwrap(),
+            ["seats", "owner", "(owner, seats)"]
+        );
+        let owned = Filter::new().eq("owner", owners[1]);
+        let field = "owner".to_string();
+        assert_eq!(cars.explain(&owned).unwrap(), QueryPlan::Index { field });
+        assert_eq!(cars.count(owned).unwrap(), 300);
+        let first = Filter::new()
+            .eq("owner", owners[2])
+            .sort_asc("seats")
+            .limit(2);
+        let field = "(owner, seats)".to_string();
+        assert_eq!(
+            cars.explain(&first).unwrap(),
+            QueryPlan::IndexOrder { field }
+        );
+        let seats = cars
+            .find(first)
+            .unwrap()
+            .into_iter()
+            .map(|car| crate::query::value_or_null(&car, "seats").clone());
+        assert_eq!(
+            seats.collect::<Vec<_>>(),
+            [Document::Int(2), Document::Int(5)]
+        );
+        drop((cars, db));
+        let reads = records_read(|| drop(Database::open(&path).unwrap()));
+        assert_eq!(reads, 0, "checked once: the file says 10 now");
+
+        // Indexes, none holding an id: nothing to rebuild, but checked,
+        // so the file is stamped, and not checked again.
+        let unkeyed = dir.path().join("unkeyed.trunkdb");
+        let db = Database::open(&unkeyed).unwrap();
+        let notes = db.collection::<Document>("notes");
+        notes.ensure_index("n").unwrap();
+        notes.insert(object(vec![("n", Document::Int(1))])).unwrap();
+        drop((notes, db));
+        crate::storage::rewrite_format_version(&unkeyed, 9);
+        let db = Database::open(&unkeyed).unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 10);
+        drop(db);
+        let reads = records_read(|| drop(Database::open(&unkeyed).unwrap()));
+        assert_eq!(reads, 0);
+
+        // No secondary index: nothing to check, the file stays as it is
+        // until the first write stamps it.
+        let plain = dir.path().join("plain.trunkdb");
+        let db = Database::open(&plain).unwrap();
+        db.collection::<Document>("notes")
+            .insert(object(vec![("n", Document::Int(1))]))
+            .unwrap();
+        drop(db);
+        crate::storage::rewrite_format_version(&plain, 9);
+        let db = Database::open(&plain).unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 9);
+        db.collection::<Document>("notes")
+            .insert(object(vec![("n", Document::Int(2))]))
+            .unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 10);
+    }
+
+    /// Ids never collided in a unique index before format 10 (SPEC §62):
+    /// if two documents share one, rebuilding it fails the open, and the
+    /// file is left as it was — an older build can still open it.
+    #[test]
+    fn an_older_unique_index_with_shared_ids_fails_the_open_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        {
+            let db = Database::open(&path).unwrap();
+            let car = Document::Id(db.id_gen().generate());
+            let plates = db.collection::<Document>("plates");
+            plates.insert(object(vec![("car", car.clone())])).unwrap();
+            plates.insert(object(vec![("car", car)])).unwrap();
+            key_ids_the_old_way(&db, "plates", &["car"], IndexOptions::new().unique());
+        }
+        crate::storage::rewrite_format_version(&path, 9);
+        let before = std::fs::read(&path).unwrap();
+        for _ in 0..2 {
+            let failed = Database::open(&path).err();
+            assert!(
+                matches!(failed, Some(crate::Error::DuplicateValue { .. })),
+                "{failed:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// `eq("_id", id)` looks the document up in the primary index, as

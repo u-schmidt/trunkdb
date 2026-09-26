@@ -40,18 +40,20 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// as if the path named one value; 8 = compound indexes, new catalog
 /// cell kinds (SPEC §43); 9 = documents stored without their `_id`,
 /// which reads take from the cell (SPEC §59): a build before it would
-/// read them without ids.
-const FORMAT_VERSION: u32 = 9;
+/// read them without ids; 10 = ids in index keys (SPEC §62): a build
+/// before it would leave their entries behind when it deletes.
+const FORMAT_VERSION: u32 = 10;
 /// Older formats this build opens as they are, because such a file *is*
 /// a valid `FORMAT_VERSION` file — one that uses none of what came since
 /// (for 4: unique indexes; for 8: a document's `_id` stored in it too,
-/// which reads replace with the cell's). Every header write stamps
+/// which reads replace with the cell's; for 9: no index holding an id,
+/// which `Database::open` makes sure of first). Every header write stamps
 /// `FORMAT_VERSION`, and the first page written in a batch writes the
 /// header too if it's older (SPEC §59) — so a file that uses something
 /// newer always says so, and an older build refuses it instead of
 /// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
 /// the checksum (6), and uses the bytes where it now goes.
-const COMPATIBLE_OLDER_FORMATS: [u32; 3] = [6, 7, 8];
+const COMPATIBLE_OLDER_FORMATS: [u32; 4] = [6, 7, 8, 9];
 const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
@@ -323,6 +325,21 @@ impl FileStore {
         let mut buf = [0u8; USABLE_PAGE_SIZE];
         self.read_raw(HEADER_PAGE, &mut buf)?;
         Ok(u32::from_le_bytes(buf[28..32].try_into().unwrap()))
+    }
+
+    /// Whether the file is from before ids had index keys (format 10,
+    /// SPEC §62), so an index may lack entries for them.
+    pub(crate) fn predates_id_keys(&self) -> io::Result<bool> {
+        Ok(self.format_version()? < 10)
+    }
+
+    /// Stamps the header with `FORMAT_VERSION`, in the current batch, if
+    /// it says an older one: for a change no page write shows (SPEC §62).
+    pub(crate) fn stamp_format_version(&mut self) -> io::Result<()> {
+        if self.header.format_version != FORMAT_VERSION {
+            self.write_header()?;
+        }
+        Ok(())
     }
 
     /// The pages on the free list, in list order. An error if the list
@@ -823,6 +840,21 @@ fn damaged(id: PageId) -> io::Error {
              (a disk error, or a change from outside trunkdb)"
         ),
     )
+}
+
+/// Rewrites a closed file's format version, with the header's checksum
+/// to match: a file from an older build, for tests above this module.
+#[cfg(test)]
+pub(crate) fn rewrite_format_version(path: &Path, version: u32) {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut header = [0u8; USABLE_PAGE_SIZE];
+    read_page_at(&file, HEADER_PAGE, &mut header).unwrap();
+    header[28..32].copy_from_slice(&version.to_le_bytes());
+    write_page_at(&file, HEADER_PAGE, &header).unwrap();
 }
 
 /// A page's bytes above this file, checksum verified and cut off.

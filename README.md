@@ -301,6 +301,11 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 35. **Filters on the id through the primary index** (§61):
     `eq("_id", id)`, or an OR of ids, is a lookup like `get`, not a scan
     — 3.9 µs instead of 67 ms on 100,000 documents.
+36. **An index key for ids** (§62): an index on a reference, a `DocId`
+    field, finds its documents, sorts by it and keeps it unique; ids
+    sort after strings, by when they were made. File format 10: an
+    older file's indexes are checked once at open, and those holding
+    ids rebuilt.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

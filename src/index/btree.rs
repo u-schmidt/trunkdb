@@ -38,6 +38,20 @@ impl BTreeIndex {
         Ok(())
     }
 
+    /// Empties the tree, keeping its root page — where the catalog finds
+    /// it — as an empty leaf, and freeing every other page: for
+    /// rebuilding an index in place (SPEC §62).
+    pub fn clear(&self, store: &mut dyn PageStore) -> std::io::Result<()> {
+        let pages = self.pages(store)?;
+        for &page_id in &pages[1..] {
+            store.free_page(page_id)?;
+        }
+        store.write_page(
+            self.root,
+            &SlottedPage::new(PageType::IndexLeaf).into_bytes(),
+        )
+    }
+
     /// Every page of the tree, root first. A page reached twice is an
     /// error: a tree is a tree.
     pub fn pages(&self, store: &dyn PageStore) -> std::io::Result<Vec<PageId>> {

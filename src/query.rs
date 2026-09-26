@@ -1126,21 +1126,23 @@ fn sort_rank(value: &Document) -> u8 {
         Document::Float(f) if f.is_nan() => UNORDERED,
         Document::Int(_) | Document::Float(_) => 2,
         Document::String(_) => 3,
+        Document::Id(_) => 4,
         _ => UNORDERED,
     }
 }
 
-const UNORDERED: u8 = 4;
+const UNORDERED: u8 = 5;
 
 /// Whether `sort_order` puts `value` among the values nothing orders —
-/// arrays, objects, binary, ids, NaN. No index holds them.
+/// arrays, objects, binary, NaN. No index holds them.
 pub(crate) fn is_unordered(value: &Document) -> bool {
     sort_rank(value) == UNORDERED
 }
 
 /// The order a sort puts two field values in (SPEC §34.1) — a total
 /// order, so any sort is well-defined: null (and missing) before bools
-/// before numbers before strings, each by value, reversed for `Desc`;
+/// before numbers before strings before ids (SPEC §62), each by value,
+/// reversed for `Desc`;
 /// values nothing orders come after all of them in both directions, as
 /// equals. It is the order of an index's keys, so reading an index gives
 /// what sorting in memory gives.
@@ -1174,6 +1176,22 @@ pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::c
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    /// Ids sort after strings, by when they were made, and before the
+    /// values nothing orders, which come last in both directions (SPEC
+    /// §62) — the order of their index keys.
+    #[test]
+    fn ids_sort_after_strings_in_the_order_they_were_made() {
+        use std::cmp::Ordering::{Greater, Less};
+        let (a, b) = (Document::Id(DocId([1; 16])), Document::Id(DocId([2; 16])));
+        let (text, array) = (Document::String("z".into()), Document::Array(vec![]));
+        assert_eq!(sort_order(&text, &a, SortOrder::Asc), Less);
+        assert_eq!(sort_order(&a, &b, SortOrder::Asc), Less);
+        assert_eq!(sort_order(&a, &b, SortOrder::Desc), Greater);
+        assert_eq!(sort_order(&b, &array, SortOrder::Asc), Less);
+        assert_eq!(sort_order(&b, &array, SortOrder::Desc), Less);
+        assert!(!is_unordered(&a) && is_unordered(&array));
+    }
 
     /// Which filters name their documents by id (SPEC §61): an `Eq` on
     /// `_id` with an id, at the top or in an `All`, the fewest of several,

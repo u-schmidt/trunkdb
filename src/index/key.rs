@@ -25,10 +25,15 @@ const TAG_NULL: u8 = 0;
 const TAG_BOOL: u8 = 1;
 const TAG_NUMBER: u8 = 2;
 const TAG_STRING: u8 = 3;
+/// A `DocId`, its 16 bytes after the tag: the order `Filter` compares
+/// ids in (SPEC §59.5), which for UUIDv7 is the order they were made in.
+/// Since file format 10 (SPEC §62); an index built before holds no entry
+/// for an id.
+const TAG_ID: u8 = 4;
 /// A value only compound keys hold (SPEC §43.2): arrays, objects,
-/// binary, ids, NaN — everything `encode_value` leaves out. Last, as
-/// such values sort after everything (§34.1). No bytes after the tag:
-/// they're all one value to the index.
+/// binary, NaN — everything `encode_value` leaves out. Last, as such
+/// values sort after everything (§34.1). No bytes after the tag: they're
+/// all one value to the index.
 const TAG_OTHER: u8 = 0xFF;
 
 /// Most fields a compound index may have: each gets an even share of
@@ -127,6 +132,7 @@ pub fn parts(value_part: &[u8]) -> Vec<&[u8]> {
             TAG_NULL | TAG_OTHER => 1,
             TAG_BOOL => 2,
             TAG_NUMBER => 9,
+            TAG_ID => 17,
             _ => string_len(rest).unwrap_or(rest.len()),
         };
         let (part, after) = rest.split_at(len.min(rest.len()));
@@ -185,9 +191,10 @@ pub fn secondary(value: &Document, id: DocId) -> Option<Vec<u8>> {
 /// That's fine, since every document an index returns is checked against
 /// the full filter again (SPEC §28.3). Only the types a comparison can
 /// match are indexed — `Null` (which also stands for a missing field,
-/// SPEC §32), `Bool`, `Int`/`Float`, `String`. Anything else (arrays,
-/// objects, binary, ids, `NaN`) is `None`: no `Eq`/`Lt`/`Lte`/`Gt`/`Gte`
-/// condition can match it, so leaving it out of the index loses nothing.
+/// SPEC §32), `Bool`, `Int`/`Float`, `String`, and ids (SPEC §62).
+/// Anything else (arrays, objects, binary, `NaN`) is `None`: no
+/// `Eq`/`Lt`/`Lte`/`Gt`/`Gte` condition can match it, so leaving it out
+/// of the index loses nothing.
 ///
 /// The encoding is prefix-free — no encoded value is a proper prefix of
 /// another — so the `DocId` appended after it can't change the order
@@ -205,6 +212,7 @@ fn encode_value_in(value: &Document, fields: usize) -> Option<Vec<u8>> {
         Document::Int(n) => encode_number(*n as f64),
         Document::Float(f) => encode_number(*f),
         Document::String(s) => Some(encode_string(s.as_bytes(), string_budget(fields))),
+        Document::Id(id) => Some([&[TAG_ID][..], &id.0].concat()),
         _ => None,
     }
 }
@@ -483,13 +491,35 @@ mod tests {
     fn only_comparable_types_are_indexed() {
         assert!(encode_value(&Document::Bool(true)).is_some());
         assert_eq!(key(Document::Null), [TAG_NULL]);
-        for value in [
-            Document::Binary(vec![1]),
-            Document::Array(vec![]),
-            Document::Id(DocId([1; 16])),
-        ] {
+        for value in [Document::Binary(vec![1]), Document::Array(vec![])] {
             assert_eq!(encode_value(&value), None, "{value:?}");
         }
+    }
+
+    /// Ids have a key since format 10 (SPEC §62): 16 bytes after their
+    /// tag, after every string and before what compound keys can't
+    /// order, in the order ids compare; a compound key's parts split them.
+    #[test]
+    fn ids_are_keyed_in_the_order_they_compare() {
+        let (a, b) = (DocId([1; 16]), DocId([2; 16]));
+        let (ka, kb) = (key(Document::Id(a)), key(Document::Id(b)));
+        assert_eq!((ka[0], &ka[1..]), (TAG_ID, &a.0[..]));
+        assert!(key(Document::String("\u{10FFFF}".repeat(9))) < ka && ka < kb);
+        assert!(kb < [TAG_OTHER].to_vec());
+
+        let two = encode_values(&[&Document::Id(a), &Document::Int(7)]);
+        let parts = parts(&two);
+        assert_eq!(parts, [&ka[..], &key(Document::Int(7))[..]]);
+        assert!(part_is_exact(parts[0], 2));
+
+        let x = DocId([9; 16]);
+        let eq = range_for(&crate::query::Op::Eq, &Document::Id(a)).unwrap();
+        assert!(eq.contains(&secondary(&Document::Id(a), x).unwrap()));
+        assert!(!eq.contains(&secondary(&Document::Id(b), x).unwrap()));
+        let before = range_for(&crate::query::Op::Lt, &Document::Id(b)).unwrap();
+        assert!(before.contains(&secondary(&Document::Id(a), x).unwrap()));
+        let text = Document::String("a".into());
+        assert!(!before.contains(&secondary(&text, x).unwrap()));
     }
 
     #[test]

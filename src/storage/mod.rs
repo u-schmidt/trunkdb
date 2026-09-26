@@ -5,6 +5,8 @@ mod slotted;
 
 #[cfg(feature = "fuzzing")]
 pub(crate) use file::checksum;
+#[cfg(test)]
+pub(crate) use file::rewrite_format_version;
 pub use file::{DEFAULT_CACHE_SIZE, FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
 pub(crate) use memory::MemoryStore;
 pub use slotted::SlottedPage;
