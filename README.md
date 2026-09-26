@@ -87,8 +87,7 @@ src/
 │   └── in_memory.rs   InMemoryIndex: a fake, for tests
 ├── durability/
 │   ├── mod.rs         Durability trait
-│   ├── wal.rs         WalDurability: the page-image write-ahead log
-│   └── noop.rs        NoopDurability: a fake, for tests
+│   └── wal.rs         WalDurability: the page-image write-ahead log
 ├── txn/
 │   ├── mod.rs         TransactionManager trait, WriteOp
 │   └── global_lock.rs GlobalLockTxnManager: one batch at a time
@@ -125,11 +124,10 @@ struct User {
 
 let db = Database::open("app.trunkdb")?;
 let users = db.collection::<User>("users");
-users.ensure_unique_index("email")?; // once at startup; a no-op after
+users.ensure_index_with("email", IndexOptions::new().unique())?; // once at startup; a no-op after
 users.ensure_index("age")?;
 users.ensure_index(["team", "age"])?; // compound: by team, in age order
-let sparse = IndexOptions { sparse: true, ..IndexOptions::default() };
-users.ensure_index_with("nick", sparse)?; // no entries for users without a nick
+users.ensure_index_with("nick", IndexOptions::new().sparse())?; // no entries for users without a nick
 
 let id = users.insert(User { id: None, name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36, nick: None })?;
 let ada = users.get(&id)?.unwrap(); // ada.id == Some(id)
@@ -292,6 +290,11 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     Option<DocId>` is filled in on every read and used on insert; the id
     is stored once, in the cell (file format 9, 6% smaller files);
     filters on ids now match; `find_with_ids` is deprecated.
+34. **A smaller public API** (§60): the internals are private; one
+    `Batch` for typed and untyped collections; `Filter` and
+    `IndexOptions` built with methods; `indexes()` lists what each index
+    is; limits as constants on `Document` and `Database`; `Error`,
+    `Document` and the reports `#[non_exhaustive]`.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

@@ -52,12 +52,14 @@ fn dir_size(path: &Path) -> u64 {
 // ---- trunkdb ---------------------------------------------------------
 
 use trunkdb::query::Filter;
-use trunkdb::txn::WriteOp;
-use trunkdb::{Collection, Database, DocId};
+use trunkdb::{Collection, Database, DocId, Document};
 
 pub struct Trunk {
     db: Database,
     tasks: Collection<Task>,
+    /// The same collection, untyped: batches write each task under the
+    /// id every store uses, which a `Task` has no field for.
+    docs: Collection<Document>,
     path: PathBuf,
 }
 
@@ -80,19 +82,23 @@ impl Trunk {
         tasks.ensure_index("tenant").unwrap();
         tasks.ensure_index("created").unwrap();
         tasks.ensure_index(["status", "created"]).unwrap();
-        Trunk { db, tasks, path }
+        let docs = db.collection::<Document>("tasks");
+        Trunk {
+            db,
+            tasks,
+            docs,
+            path,
+        }
     }
+}
 
-    fn write(&self, tasks: &[(Id, Task)], op: fn(String, DocId, trunkdb::Document) -> WriteOp) {
-        let ops = tasks
-            .iter()
-            .map(|(id, task)| {
-                let doc = trunkdb::serde_bridge::to_document(task).unwrap();
-                op("tasks".into(), DocId(*id), doc)
-            })
-            .collect();
-        self.db.write_batch(ops).unwrap();
+/// `task` as a document holding `id` as its `_id`, which an insert uses.
+fn document(id: &Id, task: &Task) -> Document {
+    let mut doc = Document::from_value(task).unwrap();
+    if let Document::Object(fields) = &mut doc {
+        fields.insert("_id".into(), Document::Id(DocId(*id)));
     }
+    doc
 }
 
 impl Store for Trunk {
@@ -101,19 +107,29 @@ impl Store for Trunk {
     }
 
     fn insert(&mut self, tasks: &[(Id, Task)]) {
-        self.write(tasks, WriteOp::Insert);
+        let mut batch = self.db.batch();
+        for (id, task) in tasks {
+            batch.insert(&self.docs, document(id, task)).unwrap();
+        }
+        batch.commit().unwrap();
     }
 
     fn update(&mut self, tasks: &[(Id, Task)]) {
-        self.write(tasks, WriteOp::Update);
+        let mut batch = self.db.batch();
+        for (id, task) in tasks {
+            batch
+                .update(&self.docs, &DocId(*id), document(id, task))
+                .unwrap();
+        }
+        batch.commit().unwrap();
     }
 
     fn delete(&mut self, ids: &[Id]) {
-        let ops = ids
-            .iter()
-            .map(|id| WriteOp::Delete("tasks".into(), DocId(*id)))
-            .collect();
-        self.db.write_batch(ops).unwrap();
+        let mut batch = self.db.batch();
+        for id in ids {
+            batch.delete(&self.docs, &DocId(*id));
+        }
+        batch.commit().unwrap();
     }
 
     fn get(&self, id: &Id) -> Option<Task> {

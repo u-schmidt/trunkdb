@@ -13,6 +13,7 @@ use crate::storage::{FileStore, MemoryStore, RecordLocation};
 /// header included. Equal when it was already as small as a rebuild
 /// makes it — then nothing was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Compacted {
     pub pages_before: u64,
     pub pages_after: u64,
@@ -172,7 +173,8 @@ mod tests {
         for name in ["people", "notes", "gone", "emptied"] {
             let docs = db.collection::<Document>(name);
             docs.ensure_index("age").unwrap();
-            docs.ensure_unique_index("email").unwrap();
+            docs.ensure_index_with("email", crate::IndexOptions::new().unique())
+                .unwrap();
             docs.ensure_index("address.city").unwrap();
             let mut ops = Vec::new();
             for i in 0..400i64 {
@@ -234,7 +236,7 @@ mod tests {
             all.sort_by_key(|(id, _)| *id);
             contents.push(format!(
                 "{name}: {:?} {:?} {all:?}",
-                docs.indexes().unwrap(),
+                docs.index_names().unwrap(),
                 docs.unique_indexes().unwrap()
             ));
             for filter in [
@@ -313,9 +315,11 @@ mod tests {
                 fresh.collection::<Document>(&name),
             );
             let unique = from.unique_indexes().unwrap();
-            for field in from.indexes().unwrap() {
+            for field in from.index_names().unwrap() {
                 match unique.contains(&field) {
-                    true => to.ensure_unique_index(&field).unwrap(),
+                    true => to
+                        .ensure_index_with(&field, crate::IndexOptions::new().unique())
+                        .unwrap(),
                     false => to.ensure_index(&field).unwrap(),
                 };
             }

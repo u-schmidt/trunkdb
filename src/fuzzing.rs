@@ -7,7 +7,11 @@
 //! fuzzer's bytes with valid ones, so what's behind the checksums gets
 //! tested: everything that decodes a page, a cell or a record.
 
-use crate::storage::{PAGE_SIZE, PageId, USABLE_PAGE_SIZE, checksum};
+use crate::storage::{PAGE_SIZE, PageId, checksum};
+
+/// A page's size without its checksum: what `seal` cuts pages to, and
+/// what the fuzz targets edit (SPEC §55).
+pub use crate::storage::USABLE_PAGE_SIZE;
 
 /// A database file made of `pages`, cut into `USABLE_PAGE_SIZE` pieces,
 /// each followed by its checksum. A last piece that is shorter is padded

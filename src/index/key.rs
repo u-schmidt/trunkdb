@@ -73,6 +73,7 @@ pub fn value_part(key: &[u8]) -> &[u8] {
 /// different `Int`s round to one `f64`) and strings cut to the key budget
 /// can share an encoding without being equal (SPEC §28.1). Errs towards
 /// `false` — a string exactly as long as the budget counts as cut.
+#[cfg(test)]
 pub fn is_exact(value_part: &[u8]) -> bool {
     part_is_exact(value_part, 1)
 }
@@ -286,6 +287,7 @@ impl KeyRange {
         KeyRange { start, end }
     }
 
+    #[cfg(test)]
     pub fn contains(&self, key: &[u8]) -> bool {
         key >= self.start.as_slice() && self.end.as_deref().is_none_or(|end| key < end)
     }

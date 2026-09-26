@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 /// via the serde bridge (`serde_bridge.rs`, SPEC §13), which is how
 /// `Collection<T>` works on top of `Collection<Document>`.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Document {
     Null,
     Bool(bool),
@@ -21,16 +22,17 @@ pub enum Document {
     Id(DocId),
 }
 
-/// How deeply a document may nest (SPEC §56), counted as MongoDB counts
-/// (its limit is 100): the document is the first level, and every object
-/// or array inside adds one. Far deeper than real data goes, even with
-/// serde's wrapper around each enum variant, and it keeps a damaged
-/// document from recursing the decoder off the end of the stack.
-pub const MAX_NESTING: usize = 64;
-
 impl Document {
+    /// How deeply a document may nest (SPEC §56), counted as MongoDB
+    /// counts (its limit is 100): the document is the first level, and
+    /// every object or array inside adds one. Far deeper than real data
+    /// goes, even with serde's wrapper around each enum variant, and it
+    /// keeps a damaged document from recursing the decoder off the end of
+    /// the stack. A write nested deeper is refused.
+    pub const MAX_NESTING: usize = 64;
+
     /// Whether `self`, as the whole document, nests deeper than
-    /// `MAX_NESTING`: what a write refuses. An object whose only key,
+    /// `Document::MAX_NESTING`: what a write refuses. An object whose only key,
     /// besides `_id`, is an export tag (`$id`, `$object`, ...) counts
     /// twice, since an export writes it inside `{"$object": ...}` (SPEC
     /// §30.1): every export then stays well inside what an import reads.
@@ -54,7 +56,7 @@ impl Document {
                 _ => true,
             }
         }
-        !within(self, MAX_NESTING)
+        !within(self, Document::MAX_NESTING)
     }
 }
 
@@ -292,7 +294,7 @@ fn write_len_prefixed(bytes: &[u8], buffer: &mut Vec<u8>) {
 /// and a length or count in them may be wrong (SPEC §55).
 pub fn decode_document(bytes: &[u8]) -> std::io::Result<(Document, &[u8])> {
     let mut rest = bytes;
-    let doc = decode_value(&mut rest, MAX_NESTING)?;
+    let doc = decode_value(&mut rest, Document::MAX_NESTING)?;
     Ok((doc, rest))
 }
 
@@ -309,7 +311,8 @@ fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
         TAG_BINARY => Document::Binary(take_len_prefixed(bytes, "binary")?.to_vec()),
         TAG_ARRAY | TAG_OBJECT if levels == 0 => {
             return Err(corrupt(format_args!(
-                "a document nests deeper than {MAX_NESTING} levels"
+                "a document nests deeper than {} levels",
+                Document::MAX_NESTING
             )));
         }
         TAG_ARRAY => {
@@ -326,7 +329,7 @@ fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
             let count = take_u32(bytes, "an object's length")? as usize;
             // At the top, room for the `_id` a read adds (SPEC §59):
             // without it, adding one reallocates the map on every read.
-            let top = usize::from(levels == MAX_NESTING);
+            let top = usize::from(levels == Document::MAX_NESTING);
             let mut entries = IndexMap::with_capacity(count.min(bytes.len()) + top);
             for _ in 0..count {
                 let key = decode_string(bytes, "a key")?;
@@ -479,12 +482,12 @@ mod tests {
     /// write, and a damaged cell claiming them is an error on read.
     #[test]
     fn documents_nest_at_most_64_levels() {
-        let deepest = nested(MAX_NESTING, Document::Int(1));
+        let deepest = nested(Document::MAX_NESTING, Document::Int(1));
         assert!(!deepest.nests_too_deep());
         let bytes = encode_document(&deepest);
         assert_eq!(decode_document(&bytes).unwrap().0, deepest);
 
-        let too_deep = nested(MAX_NESTING + 1, Document::Int(1));
+        let too_deep = nested(Document::MAX_NESTING + 1, Document::Int(1));
         assert!(too_deep.nests_too_deep());
         let err = decode_document(&encode_document(&too_deep)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -497,7 +500,7 @@ mod tests {
     fn tag_like_objects_count_twice() {
         let tagged =
             |inner: Document| Document::Object([("$id".to_string(), inner)].into_iter().collect());
-        let half = (0..MAX_NESTING / 2).fold(Document::Null, |inner, _| tagged(inner));
+        let half = (0..Document::MAX_NESTING / 2).fold(Document::Null, |inner, _| tagged(inner));
         assert!(!half.nests_too_deep());
         assert!(tagged(half).nests_too_deep());
         let with_id = |inner: Document| {
@@ -512,8 +515,8 @@ mod tests {
         };
         // 31 tag-like levels around an array: 63. At the top, next to an
         // `_id`, one more tag-like object is two levels, so 65.
-        let inner =
-            (0..MAX_NESTING / 2 - 1).fold(Document::Array(vec![]), |inner, _| tagged(inner));
+        let inner = (0..Document::MAX_NESTING / 2 - 1)
+            .fold(Document::Array(vec![]), |inner, _| tagged(inner));
         assert!(!inner.nests_too_deep());
         assert!(
             with_id(inner).nests_too_deep(),

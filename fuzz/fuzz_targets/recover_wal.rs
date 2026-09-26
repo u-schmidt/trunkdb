@@ -3,7 +3,7 @@
 //! them back (SPEC §55).
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use trunkdb::storage::USABLE_PAGE_SIZE;
+use trunkdb::fuzzing::USABLE_PAGE_SIZE;
 
 fuzz_target!(|input: &[u8]| {
     let Some((&mode, rest)) = input.split_first() else {

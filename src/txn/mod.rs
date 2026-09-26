@@ -15,12 +15,6 @@ pub enum WriteOp {
     Delete(String, DocId),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum TxnError {
-    #[error("write failed: {0}")]
-    Failed(String),
-}
-
 /// Fakeable by design: v0's `GlobalLockTxnManager` serializes batches
 /// with one lock and runs each op through the caller's `apply` closure,
 /// stopping at the first error. All-or-nothing itself comes from the
@@ -28,8 +22,8 @@ pub enum TxnError {
 /// (`FileStore::begin`) and rolls the whole batch back on error. No
 /// isolation yet — that can come later behind this same trait, e.g. MVCC.
 ///
-/// An op's error passes through unchanged (not wrapped in `TxnError`),
-/// so callers can match on e.g. `Error::NotFound`.
+/// An op's error passes through unchanged, so callers can match on e.g.
+/// `Error::NotFound`.
 pub trait TransactionManager {
     fn apply_batch(
         &self,

@@ -1,6 +1,4 @@
-mod noop;
 mod wal;
-pub use noop::NoopDurability;
 pub use wal::WalDurability;
 #[cfg(feature = "fuzzing")]
 pub(crate) use wal::{encode_header, encode_record};

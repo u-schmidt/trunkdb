@@ -9,12 +9,42 @@
 use crate::document::{DocId, Document};
 use indexmap::IndexMap;
 use serde::de::{
-    self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, VariantAccess,
-    Visitor,
+    self, Deserialize, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess,
+    IntoDeserializer, VariantAccess, Visitor,
     value::{MapDeserializer, SeqDeserializer},
 };
 use serde::ser::{self, Serialize, Serializer};
 use std::fmt;
+
+/// Converting between a `Document` and any serde type, where a consumer
+/// looks for it: on `Document` (SPEC §60). What `Collection<T>` does for
+/// every read and write, for code that mixes typed and untyped access.
+impl Document {
+    /// `value` as a document: a struct or a map becomes an `Object`, a
+    /// sequence an `Array`, a `DocId` an `Id` (SPEC §59), and so on.
+    ///
+    /// ```
+    /// # use serde::Serialize;
+    /// use trunkdb::Document;
+    ///
+    /// #[derive(Serialize)]
+    /// struct Car { color: String }
+    ///
+    /// let doc = Document::from_value(&Car { color: "black".into() })?;
+    /// # let _ = doc;
+    /// # Ok::<(), trunkdb::Error>(())
+    /// ```
+    pub fn from_value<T: Serialize>(value: &T) -> crate::Result<Document> {
+        Ok(to_document(value)?)
+    }
+
+    /// This document as a `T`, taking it over: its content moves into the
+    /// value, uncopied. Fields the `T` doesn't have are ignored, as serde
+    /// does; a field it needs and the document lacks is an error.
+    pub fn into_value<T: DeserializeOwned>(self) -> crate::Result<T> {
+        Ok(from_document(self)?)
+    }
+}
 
 /// Converts any `T: Serialize` into a `Document` by driving `T`'s
 /// `Serialize` impl against `DocumentSerializer` instead of, say,

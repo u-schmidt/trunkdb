@@ -1,13 +1,41 @@
 use crate::collection::Collection;
 use crate::database::Database;
-use crate::document::DocId;
-use crate::serde_bridge::to_document;
+use crate::document::{DocId, Document};
 use crate::txn::WriteOp;
 use serde::Serialize;
 
-/// A typed, atomic multi-op write: collect inserts, updates and deletes
-/// against any of this database's collections, then `commit` them as one
-/// `Database::write_batch` — all of them, or (on any error) none.
+/// What a batch stores (SPEC §60): any serde type, as `Collection<T>`
+/// converts it, or a `Document` as it is, for a `Collection<Document>`.
+/// Sealed: only these two.
+pub trait IntoDocument: sealed::Sealed {
+    #[doc(hidden)]
+    fn into_document(self) -> crate::Result<Document>;
+}
+
+mod sealed {
+    /// Outside code can't name this, so it can't implement `IntoDocument`.
+    pub trait Sealed {}
+    impl<T: serde::Serialize> Sealed for T {}
+    impl Sealed for crate::Document {}
+}
+
+/// The two can't overlap: `Document` isn't `Serialize`, and being local to
+/// this crate, only this crate could make it so.
+impl<T: Serialize> IntoDocument for T {
+    fn into_document(self) -> crate::Result<Document> {
+        Document::from_value(&self)
+    }
+}
+
+impl IntoDocument for Document {
+    fn into_document(self) -> crate::Result<Document> {
+        Ok(self)
+    }
+}
+
+/// An atomic multi-op write: collect inserts, updates and deletes against
+/// any of this database's collections, typed or untyped, then `commit`
+/// them as one unit — all of them, or (on any error) none.
 ///
 /// Each op takes the `Collection` handle it targets, so `T` and the
 /// collection name come from the handle rather than being repeated.
@@ -40,13 +68,13 @@ impl Batch {
     /// `_id` if it has one (SPEC §59), otherwise one generated here, not at
     /// `commit`, so later ops in the same batch can refer to it. It only
     /// names a stored document once `commit` succeeds.
-    pub fn insert<T: Serialize>(
+    pub fn insert<T: IntoDocument>(
         &mut self,
         collection: &Collection<T>,
         doc: T,
     ) -> crate::Result<DocId> {
         let name = self.name_of(collection);
-        let document = to_document(&doc)?;
+        let document = doc.into_document()?;
         let id = crate::collection::id_for_insert(&self.db, &document);
         self.ops.push(WriteOp::Insert(name, id, document));
         Ok(id)
@@ -54,14 +82,14 @@ impl Batch {
 
     /// Adds an update. Unlike `Collection::update`, a missing id isn't an
     /// `Ok(false)` here: it fails the whole batch at `commit`.
-    pub fn update<T: Serialize>(
+    pub fn update<T: IntoDocument>(
         &mut self,
         collection: &Collection<T>,
         id: &DocId,
         doc: T,
     ) -> crate::Result<()> {
         let name = self.name_of(collection);
-        let document = to_document(&doc)?;
+        let document = doc.into_document()?;
         self.ops.push(WriteOp::Update(name, *id, document));
         Ok(())
     }
@@ -105,7 +133,7 @@ impl Batch {
 #[allow(deprecated)]
 mod tests {
     use crate::query::{Condition, Filter, Op};
-    use crate::{Database, DocId, Error};
+    use crate::{Database, DocId, Document, Error};
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +163,68 @@ mod tests {
     /// The sync workload's shape (SPEC §5.3): look entries up by
     /// business key, then update the known ones, insert the new ones and
     /// drop the vanished ones — as one batch, surviving a reopen.
+    /// SPEC §60: one batch takes typed and untyped collections alike; an
+    /// untyped document's own `_id` is used (§59), and it all commits or
+    /// none of it does.
+    #[test]
+    fn a_batch_takes_typed_and_untyped_collections() {
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct Car {
+            color: String,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let cars = db.collection::<Car>("cars");
+        let notes = db.collection::<Document>("notes");
+        let given = DocId([5; 16]);
+        let note = |text: &str, id: Option<DocId>| {
+            let mut fields = indexmap::IndexMap::new();
+            if let Some(id) = id {
+                fields.insert("_id".to_string(), Document::Id(id));
+            }
+            fields.insert("text".to_string(), Document::String(text.into()));
+            Document::Object(fields)
+        };
+
+        let mut batch = db.batch();
+        let car = batch
+            .insert(
+                &cars,
+                Car {
+                    color: "black".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            batch.insert(&notes, note("first", Some(given))).unwrap(),
+            given
+        );
+        batch.update(&notes, &given, note("changed", None)).unwrap();
+        batch.commit().unwrap();
+        assert_eq!(cars.get(&car).unwrap().unwrap().color, "black");
+        let Some(Document::Object(stored)) = notes.get(&given).unwrap() else {
+            panic!("the note is there");
+        };
+        assert_eq!(stored["text"], Document::String("changed".into()));
+
+        let mut failing = db.batch();
+        failing
+            .insert(
+                &cars,
+                Car {
+                    color: "red".into(),
+                },
+            )
+            .unwrap();
+        failing.insert(&notes, note("again", Some(given))).unwrap();
+        assert!(failing.commit().is_err(), "the id is taken");
+        assert_eq!(
+            cars.count(crate::query::Filter::new()).unwrap(),
+            1,
+            "rolled back whole"
+        );
+    }
+
     #[test]
     fn a_sync_run_is_one_batch() {
         let dir = tempfile::tempdir().unwrap();

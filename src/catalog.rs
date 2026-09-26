@@ -47,24 +47,88 @@ pub struct IndexMeta {
     pub sparse: bool,
 }
 
-/// How `Collection::ensure_index_with` builds an index: the default is
-/// what `ensure_index` builds.
+/// How `Collection::ensure_index_with` builds an index: `new()` is what
+/// `ensure_index` builds, and each method adds one option (SPEC §60).
 ///
 /// ```
 /// use trunkdb::IndexOptions;
 ///
-/// let options = IndexOptions { sparse: true, ..IndexOptions::default() };
-/// # assert!(options.sparse && !options.unique);
+/// let options = IndexOptions::new().unique().sparse();
+/// assert!(options.is_unique() && options.is_sparse());
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IndexOptions {
-    /// No two documents may have equal values in it (SPEC §33) —
-    /// `ensure_unique_index`.
-    pub unique: bool,
+    pub(crate) unique: bool,
+    pub(crate) sparse: bool,
+}
+
+/// One secondary index, as `Collection::indexes` lists it (SPEC §60): its
+/// fields, and the options it was built with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexInfo {
+    fields: Vec<String>,
+    options: IndexOptions,
+}
+
+impl IndexInfo {
+    /// Its fields: one, or several for a compound index (SPEC §43).
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    /// How lists and errors name it: its field, or a compound index's
+    /// fields in parentheses, `(status, created)`.
+    pub fn name(&self) -> String {
+        match &self.fields[..] {
+            [single] => single.clone(),
+            fields => format!("({})", fields.join(", ")),
+        }
+    }
+
+    pub fn options(&self) -> IndexOptions {
+        self.options
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.options.unique
+    }
+
+    pub fn is_sparse(&self) -> bool {
+        self.options.sparse
+    }
+}
+
+impl IndexOptions {
+    /// A plain index: no option set.
+    pub const fn new() -> Self {
+        IndexOptions {
+            unique: false,
+            sparse: false,
+        }
+    }
+
+    /// No two documents may have equal values in it (SPEC §33); nulls
+    /// and missing values never count.
+    pub const fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+
     /// Documents with a null or missing value get no entry (SPEC §44):
     /// smaller for a field few documents have, but only used for
     /// queries that rule nulls out.
-    pub sparse: bool,
+    pub const fn sparse(mut self) -> Self {
+        self.sparse = true;
+        self
+    }
+
+    pub const fn is_unique(&self) -> bool {
+        self.unique
+    }
+
+    pub const fn is_sparse(&self) -> bool {
+        self.sparse
+    }
 }
 
 impl IndexMeta {
@@ -86,6 +150,14 @@ impl IndexMeta {
         match self.fields.as_slice() {
             [field] => Some(field),
             _ => None,
+        }
+    }
+
+    /// What `Collection::indexes` hands out for it.
+    pub(crate) fn info(&self) -> IndexInfo {
+        IndexInfo {
+            fields: self.fields.clone(),
+            options: self.options(),
         }
     }
 

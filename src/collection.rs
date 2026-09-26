@@ -1,4 +1,4 @@
-use crate::catalog::{Catalog, CollectionMeta, IndexMeta, IndexOptions};
+use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::Cursor;
 use crate::data;
 use crate::database::Database;
@@ -14,8 +14,25 @@ use serde::de::DeserializeOwned;
 /// What `ensure_index`, `ensure_unique_index` and `drop_index` take: one
 /// field — `"age"`, `"address.city"`, `"tags[*]"` — or several, for a
 /// compound index (SPEC §43): `["status", "created"]`.
-pub trait IndexFields {
+///
+/// Sealed (SPEC §60): usable as a bound, implemented only here, for the
+/// forms field names come in.
+pub trait IndexFields: sealed::Sealed {
+    #[doc(hidden)]
     fn into_fields(self) -> Vec<String>;
+}
+
+mod sealed {
+    /// Outside code can't name this, so it can't implement `IndexFields`.
+    pub trait Sealed {}
+    impl Sealed for &str {}
+    impl Sealed for String {}
+    impl Sealed for &String {}
+    impl<const N: usize> Sealed for [&str; N] {}
+    impl Sealed for &[&str] {}
+    impl Sealed for Vec<String> {}
+    impl Sealed for Vec<&str> {}
+    impl Sealed for &[String] {}
 }
 
 impl IndexFields for &str {
@@ -48,9 +65,16 @@ impl IndexFields for &[&str] {
     }
 }
 
+/// Field names known only at run time, from a configuration say.
 impl IndexFields for Vec<String> {
     fn into_fields(self) -> Vec<String> {
         self
+    }
+}
+
+impl IndexFields for Vec<&str> {
+    fn into_fields(self) -> Vec<String> {
+        self.into_iter().map(str::to_string).collect()
     }
 }
 
@@ -147,35 +171,26 @@ impl<T> Collection<T> {
     /// (the primary index) and is rejected here, and so are paths below
     /// it and paths with an empty part (`a..b`, `.a`).
     ///
-    /// An existing unique index on the same fields is an error, not a
-    /// match — see `ensure_unique_index`.
+    /// An existing index on the same fields with other options (unique,
+    /// sparse) is an error, not a match — see `ensure_index_with`.
     pub fn ensure_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
-        self.ensure_index_with(fields, IndexOptions::default())
+        self.ensure_index_with(fields, IndexOptions::new())
     }
 
-    /// `ensure_index`, plus a constraint (SPEC §33): no two documents may
-    /// have equal values in the field — equal as a filter's `Eq` sees it,
-    /// so `1` and `1.0` count as equal, `"a"` and `"A"` don't. Null and
-    /// missing values are exempt: any number of documents may lack the
-    /// field. On several fields, no two documents may be equal in all of
-    /// them, and a document with a null in any is exempt (SPEC §43.4). A
-    /// write that would break it fails with `Error::DuplicateValue`, and
-    /// its whole batch is rolled back.
+    /// `ensure_index` with `options`: unique, sparse, or both.
     ///
-    /// Creating it over documents that already break it fails the same
-    /// way, naming two of them, and creates nothing. An existing
-    /// non-unique index on the same fields is an error too: drop it
-    /// first, then call this.
-    pub fn ensure_unique_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
-        let unique = IndexOptions {
-            unique: true,
-            ..IndexOptions::default()
-        };
-        self.ensure_index_with(fields, unique)
-    }
-
-    /// `ensure_index` with `options`: unique (`ensure_unique_index`),
-    /// sparse, or both. A sparse index (SPEC §44) has no entry for a
+    /// A unique index (SPEC §33) lets no two documents have equal values
+    /// in the field — equal as a filter's `Eq` sees it, so `1` and `1.0`
+    /// count as equal, `"a"` and `"A"` don't. Null and missing values are
+    /// exempt: any number of documents may lack the field. On several
+    /// fields, no two documents may be equal in all of them, and a
+    /// document with a null in any is exempt (SPEC §43.4). A write that
+    /// would break it fails with `Error::DuplicateValue`, and its whole
+    /// batch is rolled back. Creating it over documents that already
+    /// break it fails the same way, naming two of them, and creates
+    /// nothing.
+    ///
+    /// A sparse index (SPEC §44) has no entry for a
     /// null or missing value — on several fields, for a document null in
     /// all of them — so an index on a field few documents have stays
     /// small. The price: `find` uses it only where the filter itself
@@ -189,8 +204,8 @@ impl<T> Collection<T> {
     /// # let users = db.collection::<trunkdb::Document>("users");
     /// use trunkdb::IndexOptions;
     ///
-    /// let sparse = IndexOptions { sparse: true, ..IndexOptions::default() };
-    /// users.ensure_index_with("nick", sparse)?;
+    /// users.ensure_index_with("email", IndexOptions::new().unique())?;
+    /// users.ensure_index_with("nick", IndexOptions::new().sparse())?;
     /// # Ok::<(), trunkdb::Error>(())
     /// ```
     ///
@@ -260,24 +275,37 @@ impl<T> Collection<T> {
         })
     }
 
-    /// This collection's secondary indexes, in creation order — unique
-    /// ones included: each by its field, a compound one by its fields in
-    /// parentheses, `(status, created)`.
-    pub fn indexes(&self) -> crate::Result<Vec<String>> {
-        self.index_names(|_| true)
+    /// This collection's secondary indexes, in creation order: each with
+    /// its fields and options (SPEC §60).
+    pub fn indexes(&self) -> crate::Result<Vec<IndexInfo>> {
+        let state = self.db.read()?;
+        Ok(state
+            .catalog
+            .indexes(&self.name)
+            .iter()
+            .map(IndexMeta::info)
+            .collect())
     }
 
-    /// The names of `indexes` whose index is unique (SPEC §33).
-    pub fn unique_indexes(&self) -> crate::Result<Vec<String>> {
-        self.index_names(|index| index.unique)
+    /// The names of `indexes`: a field, or a compound index's fields in
+    /// parentheses, `(status, created)`. For tests.
+    #[cfg(test)]
+    pub(crate) fn index_names(&self) -> crate::Result<Vec<String>> {
+        self.index_names_where(|_| true)
     }
 
-    /// The names of `indexes` whose index is sparse (SPEC §44).
-    pub fn sparse_indexes(&self) -> crate::Result<Vec<String>> {
-        self.index_names(|index| index.sparse)
+    #[cfg(test)]
+    pub(crate) fn unique_indexes(&self) -> crate::Result<Vec<String>> {
+        self.index_names_where(|index| index.unique)
     }
 
-    fn index_names(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
+    #[cfg(test)]
+    pub(crate) fn sparse_indexes(&self) -> crate::Result<Vec<String>> {
+        self.index_names_where(|index| index.sparse)
+    }
+
+    #[cfg(test)]
+    fn index_names_where(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
         let state = self.db.read()?;
         Ok(state
             .catalog
@@ -1078,7 +1106,7 @@ pub(crate) fn get_or_create_meta(
 /// fails the whole batch (SPEC §22.2). These used to be silent no-ops,
 /// once load-bearing for op replay (§16.1), which page-image recovery
 /// (§19.4) no longer needs.
-/// A document nested deeper than `MAX_NESTING` is refused like a name
+/// A document nested deeper than `Document::MAX_NESTING` is refused like a name
 /// too long (SPEC §56): an `InvalidInput` error, and the batch rolls back.
 fn refuse_too_deep(collection: &str, id: &DocId, doc: &Document) -> crate::Result<()> {
     if doc.nests_too_deep() {
@@ -1086,7 +1114,7 @@ fn refuse_too_deep(collection: &str, id: &DocId, doc: &Document) -> crate::Resul
             std::io::ErrorKind::InvalidInput,
             format!(
                 "document {id} for collection {collection:?} nests deeper than the limit of {} levels",
-                crate::document::MAX_NESTING
+                Document::MAX_NESTING
             ),
         )
         .into());
@@ -1832,6 +1860,65 @@ mod tests {
         assert_eq!(users.get(&grace_id).unwrap(), Some(grace));
     }
 
+    /// SPEC §60: `indexes` says what each index is — its fields and
+    /// options — in creation order; field names come in every form a
+    /// caller holds them in.
+    #[test]
+    fn indexes_list_their_fields_and_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let from_config: Vec<String> = vec!["status".into(), "created".into()];
+        docs.ensure_index("age").unwrap();
+        docs.ensure_index_with("email", IndexOptions::new().unique())
+            .unwrap();
+        docs.ensure_index_with(from_config.clone(), IndexOptions::new().sparse())
+            .unwrap();
+        docs.ensure_index(vec!["a", "b"]).unwrap();
+        docs.ensure_index(&["c".to_string()][..]).unwrap();
+
+        let listed: Vec<(String, Vec<String>, bool, bool)> = docs
+            .indexes()
+            .unwrap()
+            .into_iter()
+            .map(|index| {
+                let fields = index.fields().to_vec();
+                (index.name(), fields, index.is_unique(), index.is_sparse())
+            })
+            .collect();
+        let owned = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            [
+                ("age".to_string(), owned(&["age"]), false, false),
+                ("email".to_string(), owned(&["email"]), true, false),
+                ("(status, created)".to_string(), from_config, false, true),
+                ("(a, b)".to_string(), owned(&["a", "b"]), false, false),
+                ("c".to_string(), owned(&["c"]), false, false),
+            ]
+        );
+        assert_eq!(
+            docs.indexes().unwrap()[1].options(),
+            IndexOptions::new().unique()
+        );
+    }
+
+    /// `limit` takes a number or an `Option` of one, so a caller's
+    /// optional limit passes straight through.
+    #[test]
+    fn limit_takes_an_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        for n in 0..5 {
+            docs.insert(Document::Int(n)).unwrap();
+        }
+        let found = |limit: Option<usize>| docs.find(Filter::new().limit(limit)).unwrap().len();
+        assert_eq!(found(None), 5);
+        assert_eq!(found(Some(2)), 2);
+        assert_eq!(docs.find(Filter::new().limit(3)).unwrap().len(), 3);
+    }
+
     /// SPEC §59: a struct carrying `#[serde(rename = "_id")] id:
     /// Option<DocId>`, and a `DocId` field referring to another document.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2224,7 +2311,7 @@ mod tests {
                     let mut all = docs.find_with_ids(Filter::default()).unwrap();
                     all.sort_by_key(|(id, _)| *id);
                     // Debug text: a NaN isn't equal to itself.
-                    format!("{name} {:?} {all:?}", docs.indexes().unwrap())
+                    format!("{name} {:?} {all:?}", docs.index_names().unwrap())
                 })
                 .collect::<Vec<_>>()
         };
@@ -2328,7 +2415,7 @@ mod tests {
 
         let db = Database::open(&path).unwrap();
         let docs = db.collection::<Document>("docs");
-        assert_eq!(docs.indexes().unwrap(), vec!["v".to_string()]);
+        assert_eq!(docs.index_names().unwrap(), vec!["v".to_string()]);
         assert_index_agrees_with_scan(&docs, &mut rng, "v");
     }
 
@@ -2475,7 +2562,7 @@ mod tests {
 
         let db = Database::open(&path).unwrap();
         let docs = db.collection::<Document>("docs");
-        assert_eq!(docs.indexes().unwrap(), paths);
+        assert_eq!(docs.index_names().unwrap(), paths);
         for path in paths {
             assert_index_agrees_with_scan(&docs, &mut rng, path);
         }
@@ -2603,7 +2690,10 @@ mod tests {
         let copy = Database::open(dir.path().join("copy.trunkdb")).unwrap();
         copy.import(export.as_slice()).unwrap();
         let copied = copy.collection::<Post>("posts");
-        assert_eq!(copied.indexes().unwrap(), ["tags[*]", "comments[*].likes"]);
+        assert_eq!(
+            copied.index_names().unwrap(),
+            ["tags[*]", "comments[*].likes"]
+        );
         let new = Filter::new().eq("tags[*]", "new");
         assert_eq!(
             copied.find(new.clone()).unwrap(),
@@ -2629,7 +2719,9 @@ mod tests {
             let names = names.iter().map(|n| Document::from(*n)).collect();
             object(vec![("aliases", Document::Array(names))])
         };
-        users.ensure_unique_index("aliases[*]").unwrap();
+        users
+            .ensure_index_with("aliases[*]", crate::IndexOptions::new().unique())
+            .unwrap();
         let ada = users.insert(aliases(&["ada", "al"])).unwrap();
         users.insert(aliases(&["bo", "bo"])).unwrap();
         users.insert(aliases(&[])).unwrap();
@@ -2654,10 +2746,10 @@ mod tests {
         other.insert(aliases(&["x", "y"])).unwrap();
         other.insert(aliases(&["y"])).unwrap();
         assert!(matches!(
-            other.ensure_unique_index("aliases[*]"),
+            other.ensure_index_with("aliases[*]", crate::IndexOptions::new().unique()),
             Err(crate::Error::DuplicateValue { .. })
         ));
-        assert_eq!(other.indexes().unwrap(), Vec::<String>::new());
+        assert_eq!(other.index_names().unwrap(), Vec::<String>::new());
     }
 
     /// Two long strings that differ only past the key budget share a key
@@ -2671,7 +2763,9 @@ mod tests {
         let users = db.collection::<Document>("users");
         let long = |end: &str| Document::String("x".repeat(1200) + end);
         let aliases = |names: Vec<Document>| object(vec![("aliases", Document::Array(names))]);
-        users.ensure_unique_index("aliases[*]").unwrap();
+        users
+            .ensure_index_with("aliases[*]", crate::IndexOptions::new().unique())
+            .unwrap();
         users.insert(aliases(vec![long("b")])).unwrap();
         for both in [vec![long("a"), long("b")], vec![long("b"), long("a")]] {
             assert!(matches!(
@@ -2747,7 +2841,7 @@ mod tests {
         assert!(users.ensure_index("age").unwrap());
         assert!(!users.ensure_index("age").unwrap());
         assert!(users.ensure_index("name").unwrap());
-        assert_eq!(users.indexes().unwrap(), ["age", "name"]);
+        assert_eq!(users.index_names().unwrap(), ["age", "name"]);
         assert_eq!(
             users.explain(&adults).unwrap(),
             QueryPlan::Index {
@@ -2758,7 +2852,7 @@ mod tests {
 
         assert!(users.drop_index("age").unwrap());
         assert!(!users.drop_index("age").unwrap());
-        assert_eq!(users.indexes().unwrap(), ["name"]);
+        assert_eq!(users.index_names().unwrap(), ["name"]);
         assert_eq!(users.explain(&adults).unwrap(), QueryPlan::Scan);
         assert_eq!(users.find(adults.clone()).unwrap().len(), 982);
 
@@ -2805,7 +2899,7 @@ mod tests {
             };
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
-        assert!(docs.indexes().unwrap().is_empty());
+        assert!(docs.index_names().unwrap().is_empty());
     }
 
     /// A document with a value at `a.b.c`, or at a spot that path must
@@ -2886,7 +2980,7 @@ mod tests {
 
         let db = Database::open(&path).unwrap();
         let docs = db.collection::<Document>("docs");
-        assert_eq!(docs.indexes().unwrap(), ["a.b.c"]);
+        assert_eq!(docs.index_names().unwrap(), ["a.b.c"]);
         assert_index_agrees_with_scan(&docs, &mut rng, "a.b.c");
     }
 
@@ -3343,7 +3437,7 @@ mod tests {
                 fields => format!("({})", fields.join(", ")),
             })
             .collect();
-        assert_eq!(docs.indexes().unwrap(), names);
+        assert_eq!(docs.index_names().unwrap(), names);
         check(&docs, &mut rng);
     }
 
@@ -3556,7 +3650,9 @@ mod tests {
         let user = |tenant: Document, email: &str| {
             object(vec![("tenant", tenant), ("email", email.into())])
         };
-        users.ensure_unique_index(["tenant", "email"]).unwrap();
+        users
+            .ensure_index_with(["tenant", "email"], crate::IndexOptions::new().unique())
+            .unwrap();
         let ada = users.insert(user("t1".into(), "ada@x")).unwrap();
         users.insert(user("t2".into(), "ada@x")).unwrap();
         users.insert(user("t1".into(), "bob@x")).unwrap();
@@ -3588,10 +3684,10 @@ mod tests {
         other.insert(user("t".into(), "e")).unwrap();
         other.insert(user("t".into(), "e")).unwrap();
         assert!(matches!(
-            other.ensure_unique_index(["tenant", "email"]),
+            other.ensure_index_with(["tenant", "email"], crate::IndexOptions::new().unique()),
             Err(crate::Error::DuplicateValue { .. })
         ));
-        assert_eq!(other.indexes().unwrap(), Vec::<String>::new());
+        assert_eq!(other.index_names().unwrap(), Vec::<String>::new());
     }
 
     /// Strings longer than a compound key's share for them (501 bytes of
@@ -3661,9 +3757,13 @@ mod tests {
         assert!(!docs.ensure_index(["a", "b"]).unwrap());
         // Another order is another index.
         assert!(docs.ensure_index(["b", "a"]).unwrap());
-        assert!(docs.ensure_unique_index(["a", "c"]).unwrap());
         assert!(
-            docs.ensure_unique_index(["a", "b"]).is_err(),
+            docs.ensure_index_with(["a", "c"], crate::IndexOptions::new().unique())
+                .unwrap()
+        );
+        assert!(
+            docs.ensure_index_with(["a", "b"], crate::IndexOptions::new().unique())
+                .is_err(),
             "exists, not unique"
         );
         docs.insert(object(vec![
@@ -3673,7 +3773,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(
-            docs.indexes().unwrap(),
+            docs.index_names().unwrap(),
             ["(a, b, c, d, e, f, g, h)", "(a, b)", "(b, a)", "(a, c)"]
         );
         assert_eq!(docs.unique_indexes().unwrap(), ["(a, c)"]);
@@ -3689,14 +3789,14 @@ mod tests {
         let copy = Database::open(dir.path().join("copy.trunkdb")).unwrap();
         copy.import(export.as_slice()).unwrap();
         let copied = copy.collection::<Document>("docs");
-        assert_eq!(copied.indexes().unwrap(), docs.indexes().unwrap());
+        assert_eq!(copied.index_names().unwrap(), docs.index_names().unwrap());
         assert_eq!(copied.unique_indexes().unwrap(), ["(a, c)"]);
         assert_consistent(&copy);
 
         assert!(docs.drop_index(["b", "a"]).unwrap());
         assert!(!docs.drop_index(["b", "a"]).unwrap());
         assert!(!docs.drop_index("b").unwrap(), "no index on b alone");
-        assert_eq!(docs.indexes().unwrap().len(), 3);
+        assert_eq!(docs.index_names().unwrap().len(), 3);
         assert_consistent(&db);
     }
 
@@ -3994,7 +4094,9 @@ mod tests {
         }
         batch.commit().unwrap();
         users.ensure_index("age").unwrap();
-        users.ensure_unique_index("name").unwrap();
+        users
+            .ensure_index_with("name", crate::IndexOptions::new().unique())
+            .unwrap();
         let ages = || -> Vec<i64> {
             let mut ages: Vec<i64> = users
                 .find(Filter::new())
@@ -4100,7 +4202,9 @@ mod tests {
         }
         batch.commit().unwrap();
         tasks.ensure_index("status").unwrap();
-        tasks.ensure_unique_index("name").unwrap();
+        tasks
+            .ensure_index_with("name", crate::IndexOptions::new().unique())
+            .unwrap();
         let count = |status: &str| tasks.count(Filter::new().eq("status", status)).unwrap();
 
         // Sort and limit count, and `change` sees the matches in order.
@@ -4277,8 +4381,15 @@ mod tests {
         let (ada, bob) = {
             let db = Database::open(&path).unwrap();
             let docs = db.collection::<Document>("docs");
-            assert!(docs.ensure_unique_index("email").unwrap());
-            assert!(!docs.ensure_unique_index("email").unwrap());
+            assert!(
+                docs.ensure_index_with("email", crate::IndexOptions::new().unique())
+                    .unwrap()
+            );
+            assert!(
+                !docs
+                    .ensure_index_with("email", crate::IndexOptions::new().unique())
+                    .unwrap()
+            );
             assert_eq!(docs.unique_indexes().unwrap(), ["email"]);
 
             let ada = docs.insert(email("ada@x")).unwrap();
@@ -4331,7 +4442,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
-        docs.ensure_unique_index("k").unwrap();
+        docs.ensure_index_with("k", crate::IndexOptions::new().unique())
+            .unwrap();
         let k = |value: Document| object(vec![("k", value)]);
         let long = |tail: &str| Document::String("x".repeat(1200) + tail);
         let big = 1i64 << 53;
@@ -4364,24 +4476,31 @@ mod tests {
         let second = users.insert(user("Ada", 20)).unwrap();
 
         assert_eq!(
-            duplicate(users.ensure_unique_index("name")),
+            duplicate(users.ensure_index_with("name", crate::IndexOptions::new().unique())),
             (second, first)
         );
-        assert!(users.indexes().unwrap().is_empty());
+        assert!(users.index_names().unwrap().is_empty());
 
         users.delete(&second).unwrap();
-        assert!(users.ensure_unique_index("name").unwrap());
+        assert!(
+            users
+                .ensure_index_with("name", crate::IndexOptions::new().unique())
+                .unwrap()
+        );
 
         // The other kind of index on the same field is refused, not
         // swapped: dropping it first is the caller's call.
         users.ensure_index("age").unwrap();
-        for result in [users.ensure_unique_index("age"), users.ensure_index("name")] {
+        for result in [
+            users.ensure_index_with("age", crate::IndexOptions::new().unique()),
+            users.ensure_index("name"),
+        ] {
             let Err(crate::Error::Io(err)) = result else {
                 panic!("expected a refusal, got {result:?}");
             };
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
-        assert_eq!(users.indexes().unwrap(), ["name", "age"]);
+        assert_eq!(users.index_names().unwrap(), ["name", "age"]);
         assert_eq!(users.unique_indexes().unwrap(), ["name"]);
     }
 
@@ -4569,9 +4688,7 @@ mod tests {
         let wrap =
             |inner: Document| Document::Object([("a".to_string(), inner)].into_iter().collect());
         // The document is the first level, its field's arrays the rest.
-        let id = docs
-            .insert(wrap(nest(crate::document::MAX_NESTING - 1)))
-            .unwrap();
+        let id = docs.insert(wrap(nest(Document::MAX_NESTING - 1))).unwrap();
 
         let refused = |e: crate::Error| match e {
             crate::Error::Io(e) => {
@@ -4580,12 +4697,9 @@ mod tests {
             }
             other => panic!("{other:?}"),
         };
+        refused(docs.insert(wrap(nest(Document::MAX_NESTING))).unwrap_err());
         refused(
-            docs.insert(wrap(nest(crate::document::MAX_NESTING)))
-                .unwrap_err(),
-        );
-        refused(
-            docs.update(&id, wrap(nest(crate::document::MAX_NESTING)))
+            docs.update(&id, wrap(nest(Document::MAX_NESTING)))
                 .unwrap_err(),
         );
         let ops = [wrap(Document::Int(2)), wrap(nest(100))]
@@ -4602,7 +4716,7 @@ mod tests {
         let Some(Document::Object(stored)) = docs.get(&id).unwrap() else {
             panic!("the first insert is there");
         };
-        assert_eq!(stored["a"], nest(crate::document::MAX_NESTING - 1));
+        assert_eq!(stored["a"], nest(Document::MAX_NESTING - 1));
     }
 
     /// Found by fuzzing (SPEC §55): a damaged compound key with fewer
@@ -4704,9 +4818,9 @@ mod tests {
         assert!(members.ensure_index_with("name", both).unwrap());
         for result in [
             members.ensure_index("nick"),
-            members.ensure_unique_index("nick"),
+            members.ensure_index_with("nick", crate::IndexOptions::new().unique()),
             members.ensure_index_with("nick", both),
-            members.ensure_unique_index("name"),
+            members.ensure_index_with("name", crate::IndexOptions::new().unique()),
         ] {
             let Err(crate::Error::Io(err)) = result else {
                 panic!("expected a refusal, got {result:?}");

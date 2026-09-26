@@ -188,22 +188,25 @@ pub enum SortOrder {
     Desc,
 }
 
-/// One key of a sort: a field, and which way.
+/// One key of a sort: a field, and which way. Internal since SPEC §60: a
+/// filter gets its sort keys from `sort_asc`, `then_desc` and the like.
 #[derive(Debug, Clone)]
-pub struct Sort {
-    pub field: String,
-    pub order: SortOrder,
+pub(crate) struct Sort {
+    pub(crate) field: String,
+    pub(crate) order: SortOrder,
 }
 
 impl Sort {
-    pub fn asc(field: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn asc(field: impl Into<String>) -> Self {
         Sort {
             field: field.into(),
             order: SortOrder::Asc,
         }
     }
 
-    pub fn desc(field: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn desc(field: impl Into<String>) -> Self {
         Sort {
             field: field.into(),
             order: SortOrder::Desc,
@@ -216,14 +219,25 @@ impl Sort {
 /// scanning, or over index ranges when the conditions allow it
 /// (`index_ranges`, SPEC §28.4, §36.3), or by reading an index in sort
 /// order (`index_order`, SPEC §34.2, §47).
+///
+/// Built only through its methods (SPEC §60), so how it holds its parts
+/// isn't part of the API:
+///
+/// ```
+/// use trunkdb::query::Filter;
+///
+/// let newest_queued = Filter::new().eq("status", "Queued").sort_desc("created").limit(20);
+/// let all = Filter::new().limit(None); // `limit` takes an `Option` too
+/// # let _ = (newest_queued, all);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    pub conditions: Vec<Condition>,
+    pub(crate) conditions: Vec<Condition>,
     /// Sort keys, most significant first (SPEC §47): by the first field,
     /// documents equal in it by the second, and so on; equal in all of
     /// them, by id. Empty: no sort.
-    pub sort: Vec<Sort>,
-    pub limit: Option<usize>,
+    pub(crate) sort: Vec<Sort>,
+    pub(crate) limit: Option<usize>,
 }
 
 /// Building a filter one call at a time (SPEC §35) — every condition is
@@ -237,7 +251,7 @@ pub struct Filter {
 ///     .gte("seen", 10)
 ///     .sort_desc("started_at")
 ///     .limit(1);
-/// # assert_eq!(newest_complete.conditions.len(), 2);
+/// # let _ = newest_complete;
 /// ```
 ///
 /// Values are anything that converts into a `Document` — `bool`, the
@@ -374,8 +388,10 @@ impl Filter {
     }
 
     /// At most `n` results — replacing any earlier limit.
-    pub fn limit(mut self, n: usize) -> Self {
-        self.limit = Some(n);
+    /// At most `n` documents: `limit(20)`, or `limit(None)` for no limit,
+    /// so an `Option<usize>` can be passed through as it is.
+    pub fn limit(mut self, n: impl Into<Option<usize>>) -> Self {
+        self.limit = n.into();
         self
     }
 }
@@ -461,6 +477,7 @@ impl std::ops::Not for Condition {
 
 /// How `Collection::find` runs a filter — see `Collection::explain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueryPlan {
     /// Every document of the collection is read and checked.
     Scan,

@@ -211,6 +211,7 @@ impl FileStore {
     /// The lock is the OS's advisory file lock (`flock`/`LockFileEx`), so
     /// it only stops other trunkdb opens, not arbitrary programs, and it
     /// dies with the process — no stale lock file after a crash.
+    #[cfg(test)]
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut store = Self::open_before_recovery(path)?;
         store.check_header()?;
@@ -491,18 +492,6 @@ impl FileStore {
             ));
         }
         Ok(())
-    }
-
-    /// Flushes every page write since the last call all the way to durable
-    /// storage. `write_page`/`allocate_page`/`free_page` alone only
-    /// guarantee the OS has the bytes (survives a process crash, not a
-    /// power-loss/OS crash) — callers doing something that needs to survive
-    /// that (see `durability::WalDurability`) call this once after a batch
-    /// of writes, not after each individual one; a single `fsync` flushes
-    /// every dirty page for this file regardless of how many separate
-    /// writes produced them.
-    pub fn sync(&self) -> io::Result<()> {
-        super::sync(&self.file)
     }
 
     /// Starts staging: from here until `write_back` or `rollback`, no page

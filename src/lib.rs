@@ -2,32 +2,32 @@
 //! A from-scratch, learning-first take on the LiteDB idea in Rust: no
 //! tables, no joins, no schema migrations.
 
-pub mod batch;
-pub mod catalog;
-pub mod check;
-pub mod collection;
-pub mod compact;
+mod batch;
+mod catalog;
+mod check;
+mod collection;
+mod compact;
 mod crc32;
-pub mod cursor;
-pub mod data;
-pub mod database;
+mod cursor;
+mod data;
+mod database;
 mod decode;
-pub mod document;
-pub mod durability;
-pub mod export;
+mod document;
+mod durability;
+mod export;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
-pub mod id;
-pub mod index;
-pub mod json;
+mod id;
+mod index;
+mod json;
 pub mod query;
-pub mod serde_bridge;
-pub mod storage;
-pub mod txn;
+mod serde_bridge;
+mod storage;
+mod txn;
 
-pub use batch::Batch;
-pub use catalog::IndexOptions;
+pub use batch::{Batch, IntoDocument};
+pub use catalog::{IndexInfo, IndexOptions};
 pub use check::{CheckReport, FileInfo};
 pub use collection::{Collection, IndexFields, Upserted};
 pub use compact::Compacted;
@@ -35,13 +35,13 @@ pub use cursor::Cursor;
 pub use database::{Database, OpenOptions};
 pub use document::{DocId, Document};
 pub use export::Summary;
+pub use serde_bridge::DocumentError;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Txn(#[from] txn::TxnError),
     #[error(transparent)]
     Document(#[from] serde_bridge::DocumentError),
     /// A batch was durably logged but writing it to the main file failed,
@@ -54,6 +54,7 @@ pub enum Error {
     Poisoned,
     /// A batch tried to insert a document whose id its collection already
     /// has. The whole batch was rolled back.
+    #[non_exhaustive]
     #[error("collection {collection:?} already has a document with id {id}")]
     DuplicateId {
         collection: String,
@@ -64,6 +65,7 @@ pub enum Error {
     /// `ensure_unique_index`, two stored documents already share one.
     /// Null and missing values never count. The whole batch was rolled
     /// back; `ensure_unique_index` created no index.
+    #[non_exhaustive]
     #[error(
         "collection {collection:?} has a unique index on {field:?}, and documents {existing} and {id} would have the same value there"
     )]
@@ -76,6 +78,7 @@ pub enum Error {
     /// A batch tried to update or delete a document its collection
     /// doesn't have (or the collection doesn't exist). The whole batch
     /// was rolled back.
+    #[non_exhaustive]
     #[error("collection {collection:?} has no document with id {id}")]
     NotFound {
         collection: String,
@@ -83,10 +86,12 @@ pub enum Error {
     },
     /// `upsert` found more than one document matching its filter, so it
     /// couldn't tell which to replace. Nothing was written.
+    #[non_exhaustive]
     #[error("upsert into {collection:?}: {count} documents match the filter, expected at most one")]
     MultipleMatches { collection: String, count: usize },
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
+    #[non_exhaustive]
     #[error("import, line {line}: {message}")]
     Import { line: usize, message: String },
 }

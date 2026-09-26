@@ -50,20 +50,29 @@ impl Store for Trunk {
         "trunkdb"
     }
 
+    /// Each body in an object with its `_id`, which an insert uses: a bare
+    /// value has no field for an id, so it would get a new one.
     fn insert(&self, docs: &[(Id, Vec<u8>)]) {
-        let ops = docs
-            .iter()
-            .map(|(id, body)| {
-                let doc = trunkdb::Document::Binary(body.clone());
-                trunkdb::txn::WriteOp::Insert("docs".into(), trunkdb::DocId(*id), doc)
-            })
-            .collect();
-        self.db.write_batch(ops).unwrap();
+        let mut batch = self.db.batch();
+        for (id, body) in docs {
+            batch.insert(&self.docs, object(id, body)).unwrap();
+        }
+        batch.commit().unwrap();
     }
 
     fn get(&self, id: &Id) -> bool {
         self.docs.get(&trunkdb::DocId(*id)).unwrap().is_some()
     }
+}
+
+/// `{"_id": id, "body": body}`.
+fn object(id: &Id, body: &[u8]) -> trunkdb::Document {
+    let mut doc = trunkdb::Document::Object(Default::default());
+    if let trunkdb::Document::Object(fields) = &mut doc {
+        fields.insert("_id".into(), trunkdb::Document::Id(trunkdb::DocId(*id)));
+        fields.insert("body".into(), trunkdb::Document::Binary(body.to_vec()));
+    }
+    doc
 }
 
 const TABLE: redb::TableDefinition<&[u8; 16], &[u8]> = redb::TableDefinition::new("docs");

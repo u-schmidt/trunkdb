@@ -17,9 +17,18 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// `static`. The file stays open (and locked, §21.1) until the last clone
 /// — including those inside `Collection`s and `Batch`es — is dropped.
 ///
-/// Reads (`get`, `find`) share a read lock and run in parallel; a write
-/// batch takes the write lock for its whole commit (stage to checkpoint,
-/// SPEC §19.3), so readers see a batch entirely or not at all.
+/// Reads (`get`, `find`) share a read lock; a write batch takes the write
+/// lock for its whole commit (stage to checkpoint, SPEC §19.3), so readers
+/// see a batch entirely or not at all.
+///
+/// # Limits
+/// Each where it belongs (SPEC §60), all of them listed here:
+/// - [`Database::MAX_COLLECTION_NAME_LEN`]: a collection's name, in bytes.
+/// - [`Database::MAX_FIELD_NAME_LEN`]: an indexed field's name, in bytes.
+/// - [`Database::MAX_COMPOUND_FIELDS`]: fields in one compound index.
+/// - [`Document::MAX_NESTING`](crate::Document::MAX_NESTING): how deeply a
+///   document nests.
+/// - A document's encoded size: `u32::MAX` bytes (4 GiB).
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<Shared>,
@@ -120,6 +129,15 @@ impl Drop for Shared {
 }
 
 impl Database {
+    /// The longest collection name, in UTF-8 bytes (SPEC §22.3).
+    pub const MAX_COLLECTION_NAME_LEN: usize = crate::catalog::MAX_COLLECTION_NAME_LEN;
+
+    /// The longest indexed field name, in UTF-8 bytes (SPEC §28).
+    pub const MAX_FIELD_NAME_LEN: usize = crate::catalog::MAX_FIELD_NAME_LEN;
+
+    /// The most fields one compound index may have (SPEC §43).
+    pub const MAX_COMPOUND_FIELDS: usize = crate::index::key::MAX_COMPOUND_FIELDS;
+
     /// Opens the file, then recovers: if a prior run logged a batch and
     /// crashed before checkpointing it (see `durability::WalDurability`),
     /// its page images are still in the WAL. They're written back to the
@@ -286,7 +304,9 @@ impl Database {
     /// actual point: a multi-entity update (SPEC §4.4) needs exactly
     /// this, which a sequence of separate `Collection::insert`/`update`/
     /// `delete` calls can't give you, since each of those is its own batch.
-    pub fn write_batch(&self, ops: Vec<WriteOp>) -> crate::Result<()> {
+    /// The engine under `Batch`, `upsert` and import; outside the crate,
+    /// `Batch` is the way in (SPEC §60).
+    pub(crate) fn write_batch(&self, ops: Vec<WriteOp>) -> crate::Result<()> {
         if ops.is_empty() {
             drop(self.write()?); // still reports a poisoned database
             return Ok(());
@@ -415,7 +435,8 @@ mod tests {
     fn fill(db: &Database, name: &str) {
         let docs = db.collection::<Document>(name);
         docs.ensure_index("n").unwrap();
-        docs.ensure_unique_index("u").unwrap();
+        docs.ensure_index_with("u", crate::IndexOptions::new().unique())
+            .unwrap();
         let doc = |i: usize| {
             let pad = if i == 7 { 100_000 } else { i * 37 % 3000 };
             let fields = [
@@ -524,7 +545,7 @@ mod tests {
             (keep1, keep2)
         );
         let again = db.collection::<Document>("again");
-        assert_eq!(again.indexes().unwrap(), ["n", "u"]);
+        assert_eq!(again.index_names().unwrap(), ["n", "u"]);
         assert_eq!(again.unique_indexes().unwrap(), ["u"]);
         let n_is_3 = Filter::new().eq("n", 3);
         assert_eq!(again.find(n_is_3).unwrap().len(), 28);
@@ -535,7 +556,7 @@ mod tests {
         assert_eq!(gone.count(Filter::new()).unwrap(), 0);
         gone.insert(Document::Int(1)).unwrap();
         assert_eq!(gone.count(Filter::new()).unwrap(), 1);
-        assert!(gone.indexes().unwrap().is_empty());
+        assert!(gone.index_names().unwrap().is_empty());
     }
 
     fn insert(collection: &str, id: u8, value: i64) -> WriteOp {

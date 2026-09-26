@@ -29,7 +29,7 @@ All of it is done:
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
-| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured; a struct carries its own id (`#[serde(rename = "_id")] id: Option<DocId>`), and an insert keeps an id given in `_id` — a change from §18; the id stored once, in the cell, file format 9, which still opens format 8; `find_with_ids` and `find_one_with_id` deprecated | §55–§59 |
+| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured; a struct carries its own id (`#[serde(rename = "_id")] id: Option<DocId>`), and an insert keeps an id given in `_id` — a change from §18; the id stored once, in the cell, file format 9, which still opens format 8; `find_with_ids` and `find_one_with_id` deprecated; a smaller public API: the internals private, one `Batch` for typed and untyped collections (`write_batch` internal), `Filter` and `IndexOptions` built with methods, `ensure_unique_index` replaced by `IndexOptions::new().unique()`, `indexes()` returning `IndexInfo`, `Error::Txn` gone | §55–§60 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -50,8 +50,9 @@ documents, data pages and the header are the expensive ones.
   rebuilt in memory at open (none, but a slower open). Either way it
   keeps §57.3.
 - A date/time type in `Document`, as BSON and LiteDB have: a new tag in
-  the document encoding, the index keys and the export's JSON. Decide
-  it, even if the answer is "integers are enough".
+  the document encoding, the index keys and the export's JSON. Since
+  `Document` is `#[non_exhaustive]` (§60), it can come after 1.0 too, as
+  a format change like any other.
 - The WAL's format matters less: it's empty after a clean close, so a
   change needs only a checkpoint before upgrading.
 - Snapshot reads (§57) would most likely live in memory only, as in
@@ -63,14 +64,8 @@ documents, data pages and the header are the expensive ones.
   0.12.0 (§59.4), and let `cursor` hand out `T` instead of `(DocId, T)`,
   like `find`. Document how a type without an id field, or a document
   that isn't an object, gets its id then (a wrapping struct; `get`).
-- A smaller public surface. `storage`, `index`, `catalog`, `data`,
-  `durability` and `txn` are public modules, so `FileStore`,
-  `SlottedPage`, `BTreeIndex` and the rest would be part of the promise.
-  Most belong behind `pub(crate)`.
-- `Error` `#[non_exhaustive]`, so a new kind of error isn't a breaking
-  change (§56 used `InvalidInput` for want of it).
-- `IndexOptions` with builder methods instead of public fields, like
-  `OpenOptions` (§53), so a new option isn't a breaking change.
+- Done in §60: the internals private, `Error`, `Document` and the
+  reports `#[non_exhaustive]`, `IndexOptions` with builder methods.
 
 **What only use can tell:** whether the API holds up in two or three
 applications, and whether the format has anything that hurts over

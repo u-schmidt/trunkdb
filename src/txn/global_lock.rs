@@ -1,4 +1,4 @@
-use super::{TransactionManager, TxnError, WriteOp};
+use super::{TransactionManager, WriteOp};
 use std::sync::Mutex;
 
 /// v0's entire concurrency story: one process-wide lock held for the
@@ -30,7 +30,9 @@ impl TransactionManager for GlobalLockTxnManager {
         let _guard = self
             .lock
             .lock()
-            .map_err(|_| TxnError::Failed("lock poisoned".into()))?;
+            // A writer panicked while holding it: like a failed write,
+            // reopening recovers what's committed (SPEC §60).
+            .map_err(|_| crate::Error::Poisoned)?;
         for op in ops {
             apply(op)?;
         }

@@ -30,7 +30,7 @@ schema validation [§6](spec/06-v0-feature-set.md).
 
 Every layer sits behind a small trait, so a naive version could be
 swapped for a real one without reshaping what's above it [§3](spec/03-architecture-layers-and-whats-real-vs-fakeable.md). All of
-them are real now; the fakes remain for tests.
+them are real now; `InMemoryIndex` remains, for tests.
 
 | Layer | Trait | Implementation | Code |
 |---|---|---|---|
@@ -302,13 +302,22 @@ takes the page cache's mutex, so four readers are no faster than one.
 - `Database::open(path)`, or `open_with(path, OpenOptions)` with
   `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md).
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
-  `delete`, `find`, `find_one`, `find_with_ids`, `count`, `cursor`,
-  `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md); `delete_many` and `update_many` with a closure
-  [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md); `ensure_index`, `ensure_unique_index`, `ensure_index_with`
-  [§28](spec/28-secondary-indexes.md) [§33](spec/33-unique-indexes.md) [§44](spec/44-sparse-indexes.md).
-- **Batches:** `db.batch()` for typed operations across collections
-  [§24](spec/24-typed-batches.md), or `write_batch` with untyped `WriteOp`s [§17](spec/17-batch-writes-wiring-transactionmanager.md); either way all
-  or nothing.
+  `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md);
+  `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);
+  `ensure_index` and `ensure_index_with` (`IndexOptions::new().unique()`,
+  `.sparse()`), `indexes()` listing each index's fields and options
+  [§28](spec/28-secondary-indexes.md) [§33](spec/33-unique-indexes.md) [§44](spec/44-sparse-indexes.md) [§60](spec/60-a-smaller-public-api.md).
+- **Batches:** `db.batch()` across collections, typed and untyped alike
+  [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
+- **Filters** only through `Filter`'s methods; `limit` takes an `Option`
+  too [§60](spec/60-a-smaller-public-api.md).
+- **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
+- **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
+  on `Database` the rest; its documentation lists them all.
+- **What's public** is only this: `Database`, `Collection`, `Batch`,
+  `Cursor`, `Document`, `DocId`, the options, reports and errors, and
+  `query`. Types a caller passes in are built with methods; types it
+  gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md).
 - **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),
   `compact` [§41](spec/41-compaction.md), `checkpoint` [§51](spec/51-one-flush-per-commit.md), `drop_collection` [§37](spec/37-delete-many-and-dropping-a-collection.md).
 - **Errors:** one `Error` enum. A failed batch is rolled back and says

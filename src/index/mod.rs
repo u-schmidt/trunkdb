@@ -1,9 +1,11 @@
 mod branch;
 mod btree;
+#[cfg(test)]
 mod in_memory;
 pub mod key;
 mod leaf;
 pub use btree::BTreeIndex;
+#[cfg(test)]
 pub use in_memory::InMemoryIndex;
 pub use key::KeyRange;
 

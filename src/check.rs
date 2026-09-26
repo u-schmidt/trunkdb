@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// What the file is, from its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileInfo {
     /// The format version in the header (SPEC §21.2, §33.4).
     pub format_version: u32,
@@ -27,6 +28,7 @@ pub struct FileInfo {
 /// What `Database::check` found. `problems` is empty for a consistent
 /// file; each entry says what's wrong and where.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CheckReport {
     pub collections: usize,
     pub documents: usize,
@@ -358,7 +360,8 @@ mod tests {
         for name in ["people", "notes"] {
             let docs = db.collection::<Document>(name);
             docs.ensure_index("age").unwrap();
-            docs.ensure_unique_index("email").unwrap();
+            docs.ensure_index_with("email", crate::IndexOptions::new().unique())
+                .unwrap();
             for i in 0..120 {
                 let pad = if i == 3 { 50_000 } else { i * 53 % 2000 };
                 docs.insert(object(&[
@@ -538,7 +541,9 @@ mod tests {
         let users = db.collection::<Document>("users");
         let long = |end: &str| Document::String("x".repeat(1200) + end);
         let aliases = |names: Vec<Document>| object(&[("aliases", Document::Array(names))]);
-        users.ensure_unique_index("aliases[*]").unwrap();
+        users
+            .ensure_index_with("aliases[*]", crate::IndexOptions::new().unique())
+            .unwrap();
         users.insert(aliases(vec![long("b")])).unwrap();
         let id = users.insert(aliases(vec![long("a"), long("c")])).unwrap();
         // Rewritten in place, past the index's check: `…c` becomes `…b`,

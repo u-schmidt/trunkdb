@@ -3,7 +3,7 @@
 //! export for `import`. Without them, random bytes rarely get past a
 //! file's first check. `cargo run --example seed_corpus` from `fuzz/`.
 
-use trunkdb::storage::USABLE_PAGE_SIZE;
+use trunkdb::fuzzing::USABLE_PAGE_SIZE;
 use trunkdb_fuzz::ALL;
 
 fn write(target: &str, name: &str, bytes: &[u8]) {

@@ -44,6 +44,7 @@ const CHUNK_BYTES: usize = 8 << 20;
 
 /// What an export wrote or an import read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Summary {
     pub collections: usize,
     pub documents: usize,
@@ -353,7 +354,7 @@ fn write_line(out: &mut impl Write, value: &Value) -> std::io::Result<()> {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::document::{DocId, Document, MAX_NESTING};
+    use crate::document::{DocId, Document};
     use crate::query::{Condition, Filter, Op};
     use crate::testing::XorShift;
 
@@ -398,7 +399,7 @@ mod tests {
                     .map(|(id, doc)| (id, crate::document::encode_document(&doc)))
                     .collect();
                 docs.sort();
-                let mut indexes = collection.indexes().unwrap();
+                let mut indexes = collection.index_names().unwrap();
                 let unique = collection.unique_indexes().unwrap();
                 indexes.extend(unique.into_iter().map(|field| format!("unique: {field}")));
                 let sparse = collection.sparse_indexes().unwrap();
@@ -484,11 +485,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = open(&dir, "source.trunkdb");
         let id = Document::Id(DocId([7; 16]));
-        let plain = (0..MAX_NESTING - 1).fold(id.clone(), |inner, i| match i % 2 {
+        let plain = (0..Document::MAX_NESTING - 1).fold(id.clone(), |inner, i| match i % 2 {
             0 => Document::Array(vec![inner]),
             _ => object(&[("x", inner)]),
         });
-        let tag_like = (0..MAX_NESTING / 2 - 1).fold(id, |inner, _| object(&[("$object", inner)]));
+        let tag_like =
+            (0..Document::MAX_NESTING / 2 - 1).fold(id, |inner, _| object(&[("$object", inner)]));
         let docs = source.collection::<Document>("deep");
         for doc in [object(&[("p", plain)]), object(&[("$object", tag_like)])] {
             assert!(!doc.nests_too_deep());
@@ -535,7 +537,8 @@ mod tests {
         let big = source.collection::<Document>("big");
         big.insert(object(&[("text", Document::String("x".repeat(100_000)))]))
             .unwrap();
-        big.ensure_unique_index("text").unwrap();
+        big.ensure_index_with("text", crate::IndexOptions::new().unique())
+            .unwrap();
         // A collection that exists but is empty, and one with only an
         // index, on a nested path.
         source
@@ -547,7 +550,7 @@ mod tests {
             .unwrap();
         source
             .collection::<Document>("indexed")
-            .ensure_unique_index("u")
+            .ensure_index_with("u", crate::IndexOptions::new().unique())
             .unwrap();
         // Sparse ones (SPEC §44), one of them unique and compound.
         let sparse = crate::IndexOptions {
@@ -625,7 +628,7 @@ mod tests {
         );
         assert_eq!(db.collections().unwrap(), ["notes", "people"]);
         let people = db.collection::<Document>("people");
-        assert_eq!(people.indexes().unwrap(), ["name", "born", "nick"]);
+        assert_eq!(people.index_names().unwrap(), ["name", "born", "nick"]);
         assert_eq!(people.unique_indexes().unwrap(), ["born"]);
         assert_eq!(people.sparse_indexes().unwrap(), ["nick"]);
         let found = people
@@ -663,7 +666,7 @@ mod tests {
         assert_eq!(field, "email");
         let people = db.collection::<Document>("people");
         assert_eq!(people.count(Filter::default()).unwrap(), 2);
-        assert!(people.indexes().unwrap().is_empty());
+        assert!(people.index_names().unwrap().is_empty());
     }
 
     #[test]

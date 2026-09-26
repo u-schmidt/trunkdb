@@ -41,12 +41,11 @@ pub fn base() -> &'static [u8] {
         let db = Database::open(&path).unwrap();
         let tasks = db.collection::<Task>("tasks");
         tasks.ensure_index("tenant").unwrap();
-        tasks.ensure_unique_index("created").unwrap();
+        tasks
+            .ensure_index_with("created", trunkdb::IndexOptions::new().unique())
+            .unwrap();
         tasks.ensure_index(["status", "created"]).unwrap();
-        let sparse = IndexOptions {
-            sparse: true,
-            ..IndexOptions::default()
-        };
+        let sparse = IndexOptions::new().sparse();
         tasks.ensure_index_with("nick", sparse).unwrap();
         tasks.ensure_index("tags[*]").unwrap();
         tasks.ensure_index("lines[*].sku").unwrap();
@@ -190,13 +189,13 @@ pub fn exercise(db: &Database, calls: u8) {
 /// `[page][offset, u16][value]`, the page and offset wrapped into range.
 /// Returns which pages changed, in order, each once.
 pub fn apply_edits(pages: &mut [u8], edits: &[u8]) -> Vec<usize> {
-    let count = pages.len() / trunkdb::storage::USABLE_PAGE_SIZE;
+    let count = pages.len() / trunkdb::fuzzing::USABLE_PAGE_SIZE;
     let mut changed = Vec::new();
     for edit in edits.as_chunks::<4>().0 {
         let page = edit[0] as usize % count;
         let offset =
-            u16::from_le_bytes([edit[1], edit[2]]) as usize % trunkdb::storage::USABLE_PAGE_SIZE;
-        pages[page * trunkdb::storage::USABLE_PAGE_SIZE + offset] = edit[3];
+            u16::from_le_bytes([edit[1], edit[2]]) as usize % trunkdb::fuzzing::USABLE_PAGE_SIZE;
+        pages[page * trunkdb::fuzzing::USABLE_PAGE_SIZE + offset] = edit[3];
         if !changed.contains(&page) {
             changed.push(page);
         }

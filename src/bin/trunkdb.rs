@@ -100,20 +100,19 @@ fn info(file: &str, db: &Database) -> Outcome {
         let documents = collection
             .count(trunkdb::query::Filter::new())
             .map_err(failed)?;
-        let unique = collection.unique_indexes().map_err(failed)?;
-        let sparse = collection.sparse_indexes().map_err(failed)?;
         let indexes: Vec<String> = collection
             .indexes()
             .map_err(failed)?
             .into_iter()
-            .map(
-                |field| match (unique.contains(&field), sparse.contains(&field)) {
-                    (false, false) => field,
-                    (true, false) => format!("{field} (unique)"),
-                    (false, true) => format!("{field} (sparse)"),
-                    (true, true) => format!("{field} (unique, sparse)"),
-                },
-            )
+            .map(|index| {
+                let name = index.name();
+                match (index.is_unique(), index.is_sparse()) {
+                    (false, false) => name,
+                    (true, false) => format!("{name} (unique)"),
+                    (false, true) => format!("{name} (sparse)"),
+                    (true, true) => format!("{name} (unique, sparse)"),
+                }
+            })
             .collect();
         let documents = count(documents, "document");
         match indexes.is_empty() {
@@ -150,7 +149,8 @@ fn compact(db: &Database) -> Outcome {
     if after == before {
         println!("already compact: {}", count(after as usize, "page"));
     } else {
-        let freed = (before - after) * trunkdb::storage::PAGE_SIZE as u64;
+        let page_size = db.file_info().map_err(|e| e.to_string())?.page_size;
+        let freed = (before - after) * page_size as u64;
         println!(
             "compacted: {before} → {after} pages, {} smaller",
             size(freed)
