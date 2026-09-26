@@ -31,6 +31,47 @@ All of it is done:
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
 | next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured | §55–§58 |
 
+## Before 1.0
+No date: 1.0 comes after months of real use in more than one
+application, not after a list. This is what it would have to settle, so
+nothing lands in the meantime that makes it harder.
+
+**What 1.0 promises**
+- Every 1.x build opens every file a 1.x build wrote; a file using
+  something an older 1.x build lacks is refused by it, clearly, as now
+  (§21.2, §33.4). Files from before 1.0 move up by export and import
+  (§30).
+- No breaking API change within 1.x.
+
+**Format questions.** Index changes are cheap, since indexes are derived
+data and can be rebuilt from the documents at open. Changes to
+documents, data pages and the header are the expensive ones.
+- A free-space map: persisted (a new page type, a format change) or
+  rebuilt in memory at open (none, but a slower open). Either way it
+  keeps §57.3.
+- A date/time type in `Document`, as BSON and LiteDB have: a new tag in
+  the document encoding, the index keys and the export's JSON. Decide
+  it, even if the answer is "integers are enough".
+- The WAL's format matters less: it's empty after a clean close, so a
+  change needs only a checkpoint before upgrading.
+- Snapshot reads (§57) would most likely live in memory only, as in
+  SQLite's WAL mode; how freed pages are tagged decides whether they
+  touch the file.
+
+**API questions: cheap now, breaking after 1.0**
+- A smaller public surface. `storage`, `index`, `catalog`, `data`,
+  `durability` and `txn` are public modules, so `FileStore`,
+  `SlottedPage`, `BTreeIndex` and the rest would be part of the promise.
+  Most belong behind `pub(crate)`.
+- `Error` `#[non_exhaustive]`, so a new kind of error isn't a breaking
+  change (§56 used `InvalidInput` for want of it).
+- `IndexOptions` with builder methods instead of public fields, like
+  `OpenOptions` (§53), so a new option isn't a breaking change.
+
+**What only use can tell:** whether the API holds up in two or three
+applications, and whether the format has anything that hurts over
+months of real data.
+
 ## Open
 Unordered within each group; each line says where the need or the
 limit is described.
