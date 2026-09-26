@@ -6,7 +6,7 @@
 //! playing the same role here that a generic "value" type plays for those
 //! crates.
 
-use crate::document::Document;
+use crate::document::{DocId, Document};
 use indexmap::IndexMap;
 use serde::de::{
     self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, VariantAccess,
@@ -167,10 +167,17 @@ impl Serializer for DocumentSerializer {
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<Document, DocumentError> {
-        value.serialize(self)
+        let inner = value.serialize(self)?;
+        // A `DocId` is stored as an id, not as its string (SPEC §59).
+        match (name, inner) {
+            (crate::document::DOC_ID_NEWTYPE, Document::String(s)) => DocId::parse(&s)
+                .map(Document::Id)
+                .map_err(DocumentError::custom),
+            (_, inner) => Ok(inner),
+        }
     }
     fn serialize_newtype_variant<T: ?Sized + Serialize>(
         self,
@@ -708,5 +715,61 @@ mod tests {
         let doc = Document::Id(id);
         let back: String = from_document(doc).unwrap();
         assert_eq!(back, id.to_string());
+    }
+
+    /// SPEC §59: a `DocId` is a `Document::Id` here, and its string
+    /// anywhere else; a stored id reads back into either.
+    #[test]
+    fn doc_ids_are_ids_here_and_strings_elsewhere() {
+        let id = DocId([0x42; 16]);
+        assert_eq!(to_document(&id).unwrap(), Document::Id(id));
+        assert_eq!(from_document::<DocId>(Document::Id(id)).unwrap(), id);
+        roundtrip(id);
+        roundtrip(Some(id));
+
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{id}\""));
+        assert_eq!(serde_json::from_str::<DocId>(&json).unwrap(), id);
+
+        let err = from_document::<DocId>(Document::String("not an id".into())).unwrap_err();
+        assert!(err.to_string().contains("not a document id"), "{err}");
+        assert!(serde_json::from_str::<DocId>("\"nope\"").is_err());
+    }
+
+    /// The documented way for a struct to carry its id: `None` becomes
+    /// a null `_id`, `Some` an id.
+    #[test]
+    fn an_optional_id_field_is_null_or_an_id() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Task {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            title: String,
+        }
+        let id = DocId([7; 16]);
+        let fields = |doc: Document| match doc {
+            Document::Object(map) => map,
+            other => panic!("{other:?}"),
+        };
+        let none = fields(
+            to_document(&Task {
+                id: None,
+                title: "a".into(),
+            })
+            .unwrap(),
+        );
+        assert_eq!(none.get("_id"), Some(&Document::Null));
+        let some = fields(
+            to_document(&Task {
+                id: Some(id),
+                title: "a".into(),
+            })
+            .unwrap(),
+        );
+        assert_eq!(some.get("_id"), Some(&Document::Id(id)));
+        roundtrip(Task {
+            id: Some(id),
+            title: "a".into(),
+        });
     }
 }

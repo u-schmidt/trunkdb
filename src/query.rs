@@ -1016,6 +1016,10 @@ fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> {
         (Float(x), Int(y)) => int_vs_float(*y, *x).map(std::cmp::Ordering::reverse),
         (String(x), String(y)) => x.partial_cmp(y),
         (Bool(x), Bool(y)) => x.partial_cmp(y),
+        // By their bytes: creation order, for UUIDv7 ids. Missing until
+        // §59, so no filter on an id matched (not even `eq("_id", id)`).
+        // Sorting still ranks ids as unordered (`sort_rank`).
+        (Id(x), Id(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
@@ -1102,6 +1106,24 @@ pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::c
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    /// SPEC §59: ids compare with ids, by their bytes, so a filter on
+    /// `_id` or on a reference finds it; with anything else, not at all.
+    #[test]
+    fn ids_compare_with_ids() {
+        use crate::document::DocId;
+        let (a, b) = (DocId([1; 16]), DocId([2; 16]));
+        let item = doc(&[("_id", Document::Id(a)), ("owner", Document::Id(b))]);
+        assert!(Filter::new().eq("_id", a).matches(&item));
+        assert!(Filter::new().eq("owner", b).matches(&item));
+        assert!(!Filter::new().eq("owner", a).matches(&item));
+        assert!(Filter::new().ne("owner", a).matches(&item));
+        assert!(Filter::new().lt("_id", b).matches(&item));
+        assert!(
+            !Filter::new().eq("owner", b.to_string()).matches(&item),
+            "a string isn't an id"
+        );
+    }
 
     fn doc(pairs: &[(&str, Document)]) -> Document {
         let mut map = IndexMap::new();

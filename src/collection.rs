@@ -2,7 +2,7 @@ use crate::catalog::{Catalog, CollectionMeta, IndexMeta, IndexOptions};
 use crate::cursor::Cursor;
 use crate::data;
 use crate::database::Database;
-use crate::document::{DocId, Document, encode_document};
+use crate::document::{DocId, Document, encode_document, with_id};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::query::{Filter, OrderedRead, QueryPlan, SortOrder};
@@ -74,6 +74,26 @@ use std::marker::PhantomData;
 /// storage operation to a `Collection<Document>` built from the same
 /// `db`/`name` — so the catalog/index/data-page logic exists in exactly
 /// one place, not duplicated per `T`.
+///
+/// A `T` can carry its document's id (SPEC §59): every read fills the
+/// field in, and an insert uses it if it's `Some`, or makes one:
+///
+/// ```
+/// # use serde::{Deserialize, Serialize};
+/// # use trunkdb::{Database, DocId, query::Filter};
+/// #[derive(Serialize, Deserialize)]
+/// struct Task {
+///     #[serde(rename = "_id")]
+///     id: Option<DocId>,
+///     title: String,
+/// }
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = Database::open(dir.path().join("doc.trunkdb")).unwrap();
+/// let tasks = db.collection::<Task>("tasks");
+/// let id = tasks.insert(Task { id: None, title: "write it down".into() }).unwrap();
+/// let found = tasks.find_one(Filter::new().eq("title", "write it down")).unwrap();
+/// assert_eq!(found.unwrap().id, Some(id));
+/// ```
 pub struct Collection<T> {
     db: Database,
     name: String,
@@ -347,17 +367,22 @@ where
     }
 
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<T>> {
-        Ok(self
-            .find_with_ids(filter)?
+        self.as_document()
+            .find(filter)?
             .into_iter()
-            .map(|(_id, doc)| doc)
-            .collect())
+            .map(from_document)
+            .collect()
     }
 
-    /// `find`, plus each document's id — which a `T` has nowhere to carry
-    /// (SPEC §13.5), so without this a caller can only get ids from
-    /// `insert`, and loses them on restart. With it, a caller can look a
-    /// document up by any field and then `update`/`delete` it by id.
+    /// `find`, plus each document's id. A `T` can carry its own id in a
+    /// `#[serde(rename = "_id")] id: Option<DocId>` field, which every
+    /// read fills in (SPEC §59); this is for a `T` without one, such as a
+    /// type from another crate.
+    #[allow(deprecated)] // on the untyped one it calls
+    #[deprecated(
+        since = "0.12.0",
+        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find`, which fills it in (SPEC §59); to be removed before 1.0"
+    )]
     pub fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, T)>> {
         self.as_document()
             .find_with_ids(filter)?
@@ -368,9 +393,14 @@ where
 
     /// The first match — see the untyped `find_one`.
     pub fn find_one(&self, filter: Filter) -> crate::Result<Option<T>> {
-        Ok(self.find_one_with_id(filter)?.map(|(_id, doc)| doc))
+        let first = self.cursor(first_only(filter))?.next().transpose()?;
+        Ok(first.map(|(_id, doc)| doc))
     }
 
+    #[deprecated(
+        since = "0.12.0",
+        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find_one`, which fills it in (SPEC §59); to be removed before 1.0"
+    )]
     pub fn find_one_with_id(&self, filter: Filter) -> crate::Result<Option<(DocId, T)>> {
         self.cursor(first_only(filter))?.next().transpose()
     }
@@ -391,6 +421,19 @@ where
     pub fn upsert(&self, filter: Filter, doc: T) -> crate::Result<Upserted> {
         let document = crate::serde_bridge::to_document(&doc)?;
         self.as_document().upsert(filter, document)
+    }
+}
+
+/// The id an insert stores `doc` under (SPEC §59): the id in its `_id`
+/// field, if it has one and it isn't `DocId::NIL`; otherwise a new one.
+/// Any other `_id` (a string, `null`) is overwritten, as before.
+pub(crate) fn id_for_insert(db: &Database, doc: &Document) -> DocId {
+    match doc {
+        Document::Object(map) => match map.get("_id") {
+            Some(Document::Id(id)) if *id != DocId::NIL => *id,
+            _ => db.id_gen().generate(),
+        },
+        _ => db.id_gen().generate(),
     }
 }
 
@@ -425,8 +468,10 @@ impl Collection<Document> {
         self.db.write_batch(vec![op])
     }
 
+    /// Inserts `doc`, under its own `_id` if it has one (SPEC §59), and
+    /// returns the id it's stored under.
     pub fn insert(&self, doc: Document) -> crate::Result<DocId> {
-        let id = self.db.id_gen().generate();
+        let id = id_for_insert(&self.db, &doc);
         self.write(WriteOp::Insert(self.name.clone(), id, doc))?;
         Ok(id)
     }
@@ -520,10 +565,17 @@ impl Collection<Document> {
 
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<Document>> {
         Ok(self
-            .find_with_ids(filter)?
+            .matches_with_ids(&filter)?
             .into_iter()
             .map(|(_id, doc)| doc)
             .collect())
+    }
+
+    /// Every match with the id of its cell: what `find`, a sorted `cursor`
+    /// and `find_with_ids` read.
+    fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
+        let state = self.db.read()?;
+        find_in(&state.catalog, &state.store, &self.name, filter)
     }
 
     /// `find`, plus each document's id. An `Object` document already
@@ -540,9 +592,12 @@ impl Collection<Document> {
     /// With a `sort` and a `limit`, and an index on the sort field, it
     /// reads that index in order instead and stops after `limit` matches
     /// (SPEC §34.2). Equal sort values come in id order either way.
+    #[deprecated(
+        since = "0.12.0",
+        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find`, which fills it in (SPEC §59); to be removed before 1.0"
+    )]
     pub fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, Document)>> {
-        let state = self.db.read()?;
-        find_in(&state.catalog, &state.store, &self.name, &filter)
+        self.matches_with_ids(&filter)
     }
 
     /// The first match, reading no further than it: the first in `sort`
@@ -550,9 +605,14 @@ impl Collection<Document> {
     /// matches. With a `sort` on an indexed field this reads one index
     /// entry's worth of documents, not every match (SPEC §34.2).
     pub fn find_one(&self, filter: Filter) -> crate::Result<Option<Document>> {
-        Ok(self.find_one_with_id(filter)?.map(|(_id, doc)| doc))
+        let first = self.cursor(first_only(filter))?.next().transpose()?;
+        Ok(first.map(|(_id, doc)| doc))
     }
 
+    #[deprecated(
+        since = "0.12.0",
+        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find_one`, which fills it in (SPEC §59); to be removed before 1.0"
+    )]
     pub fn find_one_with_id(&self, filter: Filter) -> crate::Result<Option<(DocId, Document)>> {
         self.cursor(first_only(filter))?.next().transpose()
     }
@@ -588,7 +648,7 @@ impl Collection<Document> {
         convert: fn(Document) -> crate::Result<T>,
     ) -> crate::Result<Cursor<T>> {
         if !filter.sort.is_empty() {
-            let results = self.find_with_ids(filter)?;
+            let results = self.matches_with_ids(&filter)?;
             let converted = results
                 .into_iter()
                 .map(|(id, doc)| Ok((id, convert(doc)?)))
@@ -610,7 +670,7 @@ impl Collection<Document> {
     /// with a secondary index on the key's field, the lookup is cheap
     /// (SPEC §29.3).
     pub fn upsert(&self, filter: Filter, doc: Document) -> crate::Result<Upserted> {
-        let id_if_new = self.db.id_gen().generate();
+        let id_if_new = id_for_insert(&self.db, &doc);
         self.db.transact(|catalog, store| {
             let matches: Vec<DocId> = read_candidates(catalog, store, &self.name, &filter)?
                 .into_iter()
@@ -1360,27 +1420,10 @@ fn save_current_data_page(
     Ok(())
 }
 
-/// Merges `_id` into `doc` before it's stored, so the untyped path's
-/// documents always report their own id when read back — LiteDB/Mongo
-/// convention — even though the physical primary key lives outside the
-/// document content as far as `data.rs`/`BTreeIndex` are concerned (see
-/// SPEC §13.5). Overwrites any existing `_id` key rather than trusting
-/// one the caller supplied, since the real id is always the one `insert`/
-/// `update` were actually called with. Non-`Object` documents (a bare
-/// `Document::Int`, a top-level `String`, ...) have no field to attach an
-/// id to, so they pass through unchanged — not every document is shaped
-/// to carry one.
-fn with_id(doc: Document, id: DocId) -> Document {
-    match doc {
-        Document::Object(mut map) => {
-            map.insert("_id".to_string(), Document::Id(id));
-            Document::Object(map)
-        }
-        other => other,
-    }
-}
-
 #[cfg(test)]
+// `find_with_ids` and `find_one_with_id` are deprecated (SPEC §59) but
+// work until they're removed before 1.0; these tests keep them covered.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::database::Database;
@@ -1583,30 +1626,41 @@ mod tests {
         assert_eq!(doc.get("_id"), Some(&Document::Id(id)));
     }
 
+    /// An id in `_id` is the one an insert uses (SPEC §59, which changed
+    /// §18's rule of always making a new one); any other `_id` — a
+    /// string, the nil id — is still overwritten with the real one.
     #[test]
-    fn insert_overwrites_a_caller_supplied_id_field() {
+    fn insert_keeps_a_caller_supplied_id_and_overwrites_anything_else() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
-
-        let mut fields = indexmap::IndexMap::new();
-        fields.insert("_id".to_string(), Document::Id(DocId([0xFF; 16])));
-        fields.insert("name".to_string(), Document::String("Ada".to_string()));
-        let id = users.insert(Document::Object(fields)).unwrap();
-
-        assert_ne!(
-            id,
-            DocId([0xFF; 16]),
-            "the real id is always freshly generated"
-        );
-        let Document::Object(found) = users.get(&id).unwrap().unwrap() else {
-            panic!("expected an Object back");
+        let with_id = |id: Document| {
+            let mut fields = indexmap::IndexMap::new();
+            fields.insert("_id".to_string(), id);
+            fields.insert("name".to_string(), Document::String("Ada".to_string()));
+            Document::Object(fields)
         };
-        assert_eq!(
-            found.get("_id"),
-            Some(&Document::Id(id)),
-            "the bogus caller-supplied _id must be overwritten with the real one"
+
+        let chosen = DocId([0xFF; 16]);
+        assert_eq!(users.insert(with_id(Document::Id(chosen))).unwrap(), chosen);
+        let err = users.insert(with_id(Document::Id(chosen))).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DuplicateId { id, .. } if id == chosen),
+            "{err:?}"
         );
+
+        for other in [
+            Document::String("mine".into()),
+            Document::Id(DocId::NIL),
+            Document::Null,
+        ] {
+            let id = users.insert(with_id(other.clone())).unwrap();
+            assert!(id != chosen && id != DocId::NIL, "{other:?}");
+            let Document::Object(found) = users.get(&id).unwrap().unwrap() else {
+                panic!("expected an Object back");
+            };
+            assert_eq!(found.get("_id"), Some(&Document::Id(id)), "{other:?}");
+        }
     }
 
     #[test]
@@ -1776,6 +1830,161 @@ mod tests {
         grace.age = 46;
         assert!(users.update(&grace_id, grace.clone()).unwrap());
         assert_eq!(users.get(&grace_id).unwrap(), Some(grace));
+    }
+
+    /// SPEC §59: a struct carrying `#[serde(rename = "_id")] id:
+    /// Option<DocId>`, and a `DocId` field referring to another document.
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    struct Todo {
+        #[serde(rename = "_id")]
+        id: Option<DocId>,
+        title: String,
+        owner: Option<DocId>,
+    }
+
+    fn todo(title: &str) -> Todo {
+        Todo {
+            id: None,
+            title: title.to_string(),
+            owner: None,
+        }
+    }
+
+    /// Every way of reading fills the id in; `None` on insert makes one,
+    /// `Some` is used; an update's id argument wins over the field.
+    #[test]
+    fn a_struct_carries_its_own_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Todo>("tasks");
+
+        let made = tasks.insert(todo("made")).unwrap();
+        let chosen = DocId([0xAB; 16]);
+        let given = Todo {
+            id: Some(chosen),
+            ..todo("given")
+        };
+        assert_eq!(tasks.insert(given.clone()).unwrap(), chosen);
+        assert!(matches!(
+            tasks.insert(given.clone()).unwrap_err(),
+            crate::Error::DuplicateId { id, .. } if id == chosen
+        ));
+
+        assert_eq!(tasks.get(&made).unwrap().unwrap().id, Some(made));
+        assert_eq!(tasks.get(&chosen).unwrap(), Some(given));
+        let everything = || Filter::new().sort_asc("title");
+        let found: Vec<Option<DocId>> = tasks
+            .find(everything())
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(found, [Some(chosen), Some(made)]);
+        let with_ids: Vec<Option<DocId>> = tasks
+            .find_with_ids(everything())
+            .unwrap()
+            .into_iter()
+            .map(|(id, t)| {
+                assert_eq!(t.id, Some(id));
+                t.id
+            })
+            .collect();
+        assert_eq!(with_ids, found);
+        let one = tasks.find_one(Filter::new().eq("title", "made")).unwrap();
+        assert_eq!(one.unwrap().id, Some(made));
+        let streamed: Vec<Option<DocId>> = tasks
+            .cursor(Filter::new())
+            .unwrap()
+            .map(|item| {
+                let (id, todo) = item.unwrap();
+                assert_eq!(todo.id, Some(id));
+                todo.id
+            })
+            .collect();
+        assert_eq!(streamed.len(), 2);
+        assert!(streamed.iter().all(Option::is_some));
+
+        // The argument names the document; the field can't move it.
+        let moved = Todo {
+            id: Some(DocId([1; 16])),
+            ..todo("renamed")
+        };
+        assert!(tasks.update(&made, moved).unwrap());
+        assert_eq!(tasks.get(&made).unwrap().unwrap().id, Some(made));
+        assert_eq!(tasks.get(&DocId([1; 16])).unwrap(), None);
+    }
+
+    /// `upsert` and a typed batch use a given id too, and a `DocId` field
+    /// is stored as an id, so a filter on it finds it.
+    #[test]
+    fn upserts_batches_and_references_keep_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Todo>("tasks");
+
+        let upserted = DocId([2; 16]);
+        let outcome = tasks
+            .upsert(
+                Filter::new().eq("title", "nothing"),
+                Todo {
+                    id: Some(upserted),
+                    ..todo("upserted")
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome, Upserted::Inserted(upserted));
+
+        let batched = DocId([3; 16]);
+        let mut batch = db.batch();
+        let id = batch
+            .insert(
+                &tasks,
+                Todo {
+                    id: Some(batched),
+                    owner: Some(upserted),
+                    ..todo("batched")
+                },
+            )
+            .unwrap();
+        assert_eq!(id, batched);
+        batch.commit().unwrap();
+
+        // Ids have no index key encoding yet (SPEC §59.6): a filter on
+        // one scans, and finds the same.
+        let by_owner = Filter::new().eq("owner", upserted);
+        assert_eq!(
+            tasks.explain(&by_owner).unwrap(),
+            crate::query::QueryPlan::Scan
+        );
+        let found = tasks.find(by_owner).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].id, found[0].owner),
+            (Some(batched), Some(upserted))
+        );
+    }
+
+    /// The other style: a plain `DocId` field, `DocId::NIL` meaning "make
+    /// one".
+    #[test]
+    fn a_plain_id_field_with_nil_for_new() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Note {
+            #[serde(rename = "_id")]
+            id: DocId,
+            text: String,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let notes = db.collection::<Note>("notes");
+        let id = notes
+            .insert(Note {
+                id: DocId::NIL,
+                text: "hi".into(),
+            })
+            .unwrap();
+        assert_ne!(id, DocId::NIL);
+        assert_eq!(notes.get(&id).unwrap().unwrap().id, id);
     }
 
     /// Sort and limit act on the documents, and each id stays with its

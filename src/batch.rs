@@ -1,7 +1,6 @@
 use crate::collection::Collection;
 use crate::database::Database;
 use crate::document::DocId;
-use crate::id::IdGenerator;
 use crate::serde_bridge::to_document;
 use crate::txn::WriteOp;
 use serde::Serialize;
@@ -37,10 +36,10 @@ impl Batch {
         }
     }
 
-    /// Adds an insert and returns the new document's id right away — it's
-    /// generated here, not at `commit`, so later ops in the same batch can
-    /// refer to it. It only names a stored document once `commit`
-    /// succeeds.
+    /// Adds an insert and returns the document's id right away — its own
+    /// `_id` if it has one (SPEC §59), otherwise one generated here, not at
+    /// `commit`, so later ops in the same batch can refer to it. It only
+    /// names a stored document once `commit` succeeds.
     pub fn insert<T: Serialize>(
         &mut self,
         collection: &Collection<T>,
@@ -48,7 +47,7 @@ impl Batch {
     ) -> crate::Result<DocId> {
         let name = self.name_of(collection);
         let document = to_document(&doc)?;
-        let id = self.db.id_gen().generate();
+        let id = crate::collection::id_for_insert(&self.db, &document);
         self.ops.push(WriteOp::Insert(name, id, document));
         Ok(id)
     }
@@ -101,6 +100,9 @@ impl Batch {
 }
 
 #[cfg(test)]
+// `find_with_ids` and `find_one_with_id` are deprecated (SPEC §59) but
+// work until they're removed before 1.0; these tests keep them covered.
+#[allow(deprecated)]
 mod tests {
     use crate::query::{Condition, Filter, Op};
     use crate::{Database, DocId, Error};

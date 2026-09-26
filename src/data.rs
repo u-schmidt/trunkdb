@@ -1,5 +1,5 @@
 use crate::decode::{take_array, take_u8, take_u32, take_u64};
-use crate::document::{DocId, Document, decode_document, encode_document};
+use crate::document::{DocId, Document, decode_document, encode_stored, with_id};
 use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage, USABLE_PAGE_SIZE};
 
 /// Flags byte value for a document stored entirely inside its cell.
@@ -134,7 +134,7 @@ impl<'a> Records<'a> {
             }
         };
         match Cell::parse(live_cell(page, loc)?)? {
-            Cell::Inline(id, encoded) => Ok((id, decode(encoded)?)),
+            Cell::Inline(id, encoded) => Ok((id, with_id(decode(encoded)?, id))),
             Cell::Overflow { id, len, first } => {
                 // `len` is from the file: the chain has to back it up
                 // before it sizes anything (SPEC §55).
@@ -142,7 +142,7 @@ impl<'a> Records<'a> {
                 walk_chain(self.store, first, len, |_page, bytes| {
                     encoded.extend_from_slice(bytes)
                 })?;
-                Ok((id, decode(&encoded)?))
+                Ok((id, with_id(decode(&encoded)?, id)))
             }
         }
     }
@@ -246,7 +246,7 @@ pub fn collection_pages(
 /// newly written chain. The choice depends on the size alone, so a
 /// document switches kinds when an update moves it across the line.
 fn write_cell(store: &mut dyn PageStore, id: DocId, doc: &Document) -> std::io::Result<Vec<u8>> {
-    let encoded = encode_document(doc);
+    let encoded = encode_stored(doc);
     let mut cell = Vec::with_capacity(CELL_HEADER_LEN + encoded.len());
     if SlottedPage::new(PageType::Data).has_room_for(CELL_HEADER_LEN + encoded.len()) {
         cell.push(INLINE);
@@ -768,6 +768,73 @@ mod tests {
             delete_record(&mut store, current, loc).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData,
             "a delete must not free pages of a chain it can't follow"
+        );
+    }
+
+    fn object(fields: &[(&str, Document)]) -> Document {
+        Document::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    /// SPEC §59: an object's `_id` isn't stored in its cell, only the
+    /// cell's own id is, and a read puts that one first in the document,
+    /// whatever `_id` the written document had.
+    #[test]
+    fn the_id_is_stored_once_and_read_back_first() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let doc = object(&[
+            ("color", Document::String("black".into())),
+            ("_id", Document::Id(id(9))),
+        ]);
+        let loc = insert_record(&mut store, &mut current, id(1), &doc).unwrap();
+
+        let page = read_data_page(&store, loc.page).unwrap();
+        let cell = page.get_cell(loc.slot).unwrap();
+        assert_eq!(cell[1..17], id(1).0, "the cell's id");
+        assert!(
+            !cell.windows(3).any(|w| w == b"_id"),
+            "no `_id` in the document"
+        );
+        assert!(
+            !cell[17..].windows(16).any(|w| w == id(9).0),
+            "nor the one it had"
+        );
+
+        let (found, read) = get_record(&store, loc).unwrap();
+        assert_eq!(found, id(1));
+        let Document::Object(fields) = read else {
+            panic!("an object")
+        };
+        let keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["_id", "color"]);
+        assert_eq!(fields["_id"], Document::Id(id(1)));
+    }
+
+    /// A document written by format 8 still holds its `_id`: a read
+    /// replaces it with the cell's, so the cell's id is the only one that
+    /// counts even in an older file.
+    #[test]
+    fn a_stored_id_from_an_older_format_gives_way_to_the_cell() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let loc = insert_record(&mut store, &mut current, id(1), &Document::Null).unwrap();
+        let mut page = read_data_page(&store, loc.page).unwrap();
+        let old = object(&[("_id", Document::Id(id(7))), ("n", Document::Int(5))]);
+        let mut cell = vec![INLINE];
+        cell.extend_from_slice(&id(1).0);
+        cell.extend_from_slice(&crate::document::encode_document(&old));
+        assert!(page.update_cell(loc.slot, &cell));
+        store.write_page(loc.page, &page.into_bytes()).unwrap();
+
+        let (_, read) = get_record(&store, loc).unwrap();
+        assert_eq!(
+            read,
+            object(&[("_id", Document::Id(id(1))), ("n", Document::Int(5))])
         );
     }
 

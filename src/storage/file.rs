@@ -38,17 +38,20 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// checksum at the end of every page (SPEC §40); 7 = multikey indexes,
 /// on paths with `[*]` (SPEC §42), which a build before them would fill
 /// as if the path named one value; 8 = compound indexes, new catalog
-/// cell kinds (SPEC §43).
-const FORMAT_VERSION: u32 = 8;
+/// cell kinds (SPEC §43); 9 = documents stored without their `_id`,
+/// which reads take from the cell (SPEC §59): a build before it would
+/// read them without ids.
+const FORMAT_VERSION: u32 = 9;
 /// Older formats this build opens as they are, because such a file *is*
 /// a valid `FORMAT_VERSION` file — one that uses none of what came since
-/// (for 4: unique indexes). Every header write stamps `FORMAT_VERSION`,
-/// and creating anything newer allocates a page, which writes the header
-/// in the same batch — so a file that uses something newer always says
-/// so, and an older build refuses it instead of misreading it (SPEC §33.4).
-/// 4 and 5 aren't: every page of theirs lacks the checksum (6), and uses
-/// the bytes where it now goes.
-const COMPATIBLE_OLDER_FORMATS: [u32; 2] = [6, 7];
+/// (for 4: unique indexes; for 8: a document's `_id` stored in it too,
+/// which reads replace with the cell's). Every header write stamps
+/// `FORMAT_VERSION`, and the first page written in a batch writes the
+/// header too if it's older (SPEC §59) — so a file that uses something
+/// newer always says so, and an older build refuses it instead of
+/// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
+/// the checksum (6), and uses the bytes where it now goes.
+const COMPATIBLE_OLDER_FORMATS: [u32; 3] = [6, 7, 8];
 const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
@@ -66,6 +69,10 @@ struct Header {
     page_size: u32,
     page_count: u64,
     free_list_head: PageId,
+    /// What the file on disk says: `FORMAT_VERSION`, or an older one this
+    /// build reads as it is, until the next header write stamps the
+    /// current one. `encode` always writes `FORMAT_VERSION`.
+    format_version: u32,
 }
 
 impl Header {
@@ -136,6 +143,7 @@ impl Header {
             page_size,
             page_count,
             free_list_head,
+            format_version,
         })
     }
 }
@@ -269,6 +277,7 @@ impl FileStore {
                 page_size: PAGE_SIZE as u32,
                 page_count: 1, // just the header page so far
                 free_list_head: NO_FREE_PAGE,
+                format_version: FORMAT_VERSION,
             }
         } else {
             Header::decode(&read_disk_page(&file, HEADER_PAGE)?[..USABLE_PAGE_SIZE])?
@@ -361,7 +370,9 @@ impl FileStore {
 
     fn write_header(&mut self) -> io::Result<()> {
         let header = self.header.encode();
-        self.write_raw(HEADER_PAGE, &header)
+        self.write_raw(HEADER_PAGE, &header)?;
+        self.header.format_version = FORMAT_VERSION;
+        Ok(())
     }
 
     /// Reads a page's current bytes: from the dirty set if it's there,
@@ -758,6 +769,12 @@ impl PageStore for FileStore {
                 ),
             ));
         }
+        // A page written by this build may use what an older format lacks
+        // (a document without its `_id`, SPEC §59): the header says so in
+        // the same batch, and a rollback takes both back.
+        if self.header.format_version != FORMAT_VERSION {
+            self.write_header()?;
+        }
         self.write_raw(id, data)
     }
 
@@ -1043,6 +1060,7 @@ mod tests {
             page_size: PAGE_SIZE as u32,
             page_count: 1,
             free_list_head: NO_FREE_PAGE,
+            format_version: FORMAT_VERSION,
         }
         .encode();
         header[28..32].copy_from_slice(&version.to_le_bytes());
@@ -1125,6 +1143,7 @@ mod tests {
                 page_size: PAGE_SIZE as u32,
                 page_count: 2,
                 free_list_head: NO_FREE_PAGE,
+                format_version: FORMAT_VERSION,
             }
             .encode()
             .to_vec();
@@ -1138,6 +1157,44 @@ mod tests {
     // ---------- checksums ----------
 
     /// A closed file with pages 1 and 2 written, `[1; …]` and `[2; …]`.
+    /// SPEC §59: an older format's file is stamped with the current one
+    /// by the first page a batch writes, allocation or not, and a batch
+    /// rolled back takes the stamp back with it.
+    #[test]
+    fn an_older_format_is_stamped_by_the_first_page_written() {
+        let (_dir, path) = open_temp();
+        let mut header = Header {
+            page_size: PAGE_SIZE as u32,
+            page_count: 2,
+            free_list_head: NO_FREE_PAGE,
+            format_version: FORMAT_VERSION,
+        }
+        .encode();
+        header[28..32].copy_from_slice(&8u32.to_le_bytes());
+        write_file(
+            &path,
+            &[(HEADER_PAGE, &header), (1, &[1; USABLE_PAGE_SIZE])],
+        );
+
+        let mut store = FileStore::open(&path).unwrap();
+        assert_eq!(store.format_version().unwrap(), 8);
+        store.begin();
+        store.write_page(1, &[2; USABLE_PAGE_SIZE]).unwrap();
+        assert_eq!(store.format_version().unwrap(), FORMAT_VERSION);
+        // Remembered, so the batch's next page doesn't write it again.
+        assert_eq!(store.header.format_version, FORMAT_VERSION);
+        store.rollback();
+        assert_eq!(store.format_version().unwrap(), 8, "rolled back with it");
+
+        store.begin();
+        store.write_page(1, &[3; USABLE_PAGE_SIZE]).unwrap();
+        store.write_back().unwrap();
+        drop(store);
+        let store = FileStore::open(&path).unwrap();
+        assert_eq!(store.format_version().unwrap(), FORMAT_VERSION);
+        assert_eq!(store.read_page(1).unwrap(), vec![3; USABLE_PAGE_SIZE]);
+    }
+
     fn two_page_file(path: &Path) {
         let mut store = FileStore::open(path).unwrap();
         for fill in [1u8, 2] {
@@ -1277,6 +1334,7 @@ mod tests {
                 page_size: PAGE_SIZE as u32,
                 page_count,
                 free_list_head,
+                format_version: FORMAT_VERSION,
             }
             .encode();
             write_file(&path, &[(HEADER_PAGE, &header)]);
@@ -1320,6 +1378,7 @@ mod tests {
                 page_size: PAGE_SIZE as u32,
                 page_count,
                 free_list_head: NO_FREE_PAGE,
+                format_version: FORMAT_VERSION,
             };
             header.encode().to_vec()
         };

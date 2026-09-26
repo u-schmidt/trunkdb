@@ -348,6 +348,9 @@ fn write_line(out: &mut impl Write, value: &Value) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+// `find_with_ids` and `find_one_with_id` are deprecated (SPEC §59) but
+// work until they're removed before 1.0; these tests keep them covered.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::document::{DocId, Document, MAX_NESTING};
@@ -807,7 +810,8 @@ mod tests {
         };
         db.export(&mut meddler).unwrap();
         let text = String::from_utf8(meddler.out).unwrap();
-        assert_eq!(text.matches(r#"{"v":0,"#).count(), 200, "the update got in");
+        // `_id` comes first in every object (SPEC §59), so `v` follows it.
+        assert_eq!(text.matches(r#","v":0,"#).count(), 200, "the update got in");
         meddler.writer.unwrap().join().unwrap();
         let now = db
             .collection::<Document>("c")

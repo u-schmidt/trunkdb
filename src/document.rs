@@ -70,6 +70,64 @@ impl std::fmt::Display for DocId {
     }
 }
 
+impl DocId {
+    /// The all-zero id, which no generator makes: on an insert, `_id`
+    /// holding it means "make one", like `None` (SPEC §59).
+    pub const NIL: DocId = DocId([0; 16]);
+
+    /// An id from its string form, as `Display` writes it (a UUID).
+    pub(crate) fn parse(s: &str) -> Result<DocId, String> {
+        uuid::Uuid::parse_str(s)
+            .map(|uuid| DocId(uuid.into_bytes()))
+            .map_err(|e| format!("{s:?} is not a document id: {e}"))
+    }
+}
+
+/// The name `DocId`'s serde impls give their newtype (SPEC §59), so the
+/// serde bridge can tell an id from a string and store it as
+/// `Document::Id`: the technique `serde_bytes` uses for byte strings. Any
+/// other format sees a newtype around the id's string form, and writes
+/// the string.
+pub(crate) const DOC_ID_NEWTYPE: &str = "$trunkdb::DocId";
+
+/// Lets a struct in a `Collection<T>` carry its own id (SPEC §59):
+/// `#[serde(rename = "_id")] id: Option<DocId>`, filled in on every read,
+/// and on insert used if it's `Some`, generated if it's `None`.
+impl serde::Serialize for DocId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_newtype_struct(DOC_ID_NEWTYPE, &self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DocId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IdVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for IdVisitor {
+            type Value = DocId;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a document id, as a UUID string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<DocId, E> {
+                DocId::parse(s).map_err(E::custom)
+            }
+
+            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<DocId, D::Error> {
+                deserializer.deserialize_str(self)
+            }
+        }
+
+        // The serde bridge hands a stored `Document::Id` over as its string
+        // (SPEC §13.5); a format like JSON, the newtype around it.
+        deserializer.deserialize_newtype_struct(DOC_ID_NEWTYPE, IdVisitor)
+    }
+}
+
 // Plain Rust values as `Document`s, so a filter can say
 // `.eq("age", 36)` instead of `Document::Int(36)` (SPEC §35.2). Only
 // lossless ones: no `u64`/`usize`, which can exceed `i64`, and no `Vec`,
@@ -132,6 +190,40 @@ const TAG_ID: u8 = 8;
 /// their elements/values, which is also how a nested `_id` field
 /// (`Document::Id`) round-trips — there's nothing document-shape-specific
 /// about it, it's just another tagged value.
+/// A document as a data cell stores it (SPEC §59): `encode_document`,
+/// except that an object's own `_id` is left out. The cell holds the id
+/// already, and reads put it back (`with_id`), so there's one id, not a
+/// copy that could say something else.
+pub(crate) fn encode_stored(doc: &Document) -> Vec<u8> {
+    let Document::Object(entries) = doc else {
+        return encode_document(doc);
+    };
+    let fields = entries.iter().filter(|(key, _)| *key != ID_FIELD);
+    let mut buffer = Vec::new();
+    buffer.push(TAG_OBJECT);
+    buffer.extend_from_slice(&(fields.clone().count() as u32).to_le_bytes());
+    for (key, value) in fields {
+        write_len_prefixed(key.as_bytes(), &mut buffer);
+        write_document(value, &mut buffer);
+    }
+    buffer
+}
+
+/// The field a document's id appears in: `_id`, as in MongoDB.
+pub(crate) const ID_FIELD: &str = "_id";
+
+/// `doc` with `id` in its `_id` field, first, replacing whatever was
+/// there (SPEC §18, §59). Other documents have no field for it.
+pub(crate) fn with_id(doc: Document, id: DocId) -> Document {
+    match doc {
+        Document::Object(mut map) => {
+            map.shift_insert(0, ID_FIELD.to_string(), Document::Id(id));
+            Document::Object(map)
+        }
+        other => other,
+    }
+}
+
 pub fn encode_document(doc: &Document) -> Vec<u8> {
     let mut buffer = Vec::new();
     write_document(doc, &mut buffer);
@@ -232,7 +324,10 @@ fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
         }
         TAG_OBJECT => {
             let count = take_u32(bytes, "an object's length")? as usize;
-            let mut entries = IndexMap::with_capacity(count.min(bytes.len()));
+            // At the top, room for the `_id` a read adds (SPEC §59):
+            // without it, adding one reallocates the map on every read.
+            let top = usize::from(levels == MAX_NESTING);
+            let mut entries = IndexMap::with_capacity(count.min(bytes.len()) + top);
             for _ in 0..count {
                 let key = decode_string(bytes, "a key")?;
                 entries.insert(key, decode_value(bytes, levels - 1)?);

@@ -69,3 +69,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 56. [A limit on nesting (`document.rs`, `collection.rs`)](56-a-limit-on-nesting.md)
 57. [Concurrency: one writer, and snapshots kept possible](57-concurrency.md)
 58. [Measuring how long readers wait (`bench/src/bin/reader_wait.rs`)](58-measuring-reader-waits.md)
+59. [A struct carries its own id (`document.rs`, `serde_bridge.rs`, `data.rs`, `collection.rs`, `batch.rs`, `query.rs`, `storage/file.rs`)](59-a-struct-carries-its-own-id.md)

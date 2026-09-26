@@ -29,7 +29,7 @@ All of it is done:
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
-| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured | §55–§58 |
+| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured; a struct carries its own id (`#[serde(rename = "_id")] id: Option<DocId>`), and an insert keeps an id given in `_id` — a change from §18; the id stored once, in the cell, file format 9, which still opens format 8; `find_with_ids` and `find_one_with_id` deprecated | §55–§59 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -59,6 +59,10 @@ documents, data pages and the header are the expensive ones.
   touch the file.
 
 **API questions: cheap now, breaking after 1.0**
+- **Remove `find_with_ids` and `find_one_with_id`**, deprecated since
+  0.12.0 (§59.4), and let `cursor` hand out `T` instead of `(DocId, T)`,
+  like `find`. Document how a type without an id field, or a document
+  that isn't an object, gets its id then (a wrapping struct; `get`).
 - A smaller public surface. `storage`, `index`, `catalog`, `data`,
   `durability` and `txn` are public modules, so `FileStore`,
   `SlottedPage`, `BTreeIndex` and the rest would be part of the promise.
@@ -112,8 +116,9 @@ limit is described.
 **API**
 - Update operators (`$set`, `$inc`, `$unset` on paths) next to
   `update_many`'s closure (§38.1).
-- A struct with its own id field (`#[serde(rename = "_id")]`, §13.5,
-  §18) — `find_with_ids` (§23) covers most needs; unscheduled.
+- An index key for ids, so a filter on a reference (a `DocId` field)
+  uses an index instead of a scan. Indexes built before it lack entries
+  for id values: a format bump, or a rebuild at open (§59.6).
 
 **Tooling and reach**
 - Repairing what `check` finds, beyond export and import (§39.5).

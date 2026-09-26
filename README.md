@@ -110,10 +110,12 @@ fuzz/                  fuzz targets: damaged files, WALs and exports
 
 ```rust
 use serde::{Deserialize, Serialize};
-use trunkdb::{Database, IndexOptions, query::Filter};
+use trunkdb::{Database, DocId, IndexOptions, query::Filter};
 
 #[derive(Serialize, Deserialize)]
 struct User {
+    #[serde(rename = "_id")]
+    id: Option<DocId>, // None on insert: one is made; filled in on every read
     name: String,
     email: String,
     team: String,
@@ -129,7 +131,8 @@ users.ensure_index(["team", "age"])?; // compound: by team, in age order
 let sparse = IndexOptions { sparse: true, ..IndexOptions::default() };
 users.ensure_index_with("nick", sparse)?; // no entries for users without a nick
 
-users.insert(User { name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36, nick: None })?;
+let id = users.insert(User { id: None, name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36, nick: None })?;
+let ada = users.get(&id)?.unwrap(); // ada.id == Some(id)
 
 let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
 let youngest_in_core = users.find(Filter::new().eq("team", "core").sort_asc("age").limit(5))?;
@@ -285,6 +288,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 32. **Reader waits, measured** (§58): paced writers cost readers
     nothing; back-to-back commits starve them; the page cache's mutex
     keeps readers from running in parallel.
+33. **A struct carries its own id** (§59): `#[serde(rename = "_id")] id:
+    Option<DocId>` is filled in on every read and used on insert; the id
+    is stored once, in the cell (file format 9, 6% smaller files);
+    filters on ids now match; `find_with_ids` is deprecated.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

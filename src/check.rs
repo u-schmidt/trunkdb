@@ -334,6 +334,9 @@ fn check_order(check: &mut Check, name: &str, what: &str, entries: &[(Vec<u8>, R
 }
 
 #[cfg(test)]
+// `find_with_ids` and `find_one_with_id` are deprecated (SPEC §59) but
+// work until they're removed before 1.0; these tests keep them covered.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::query::Filter;
@@ -449,7 +452,7 @@ mod tests {
         assert_eq!(report.problems, Vec::<String>::new());
         assert_eq!((report.collections, report.documents), (2, 200));
         let info = db.file_info().unwrap();
-        assert_eq!((info.format_version, info.page_size), (8, PAGE_SIZE));
+        assert_eq!((info.format_version, info.page_size), (9, PAGE_SIZE));
         assert_eq!(info.pages, report.pages);
         assert!(info.free_pages > 0, "the deletes freed pages");
 

@@ -101,8 +101,9 @@ cell is long enough for its entry [§55](spec/55-fuzzing.md).
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
 shrink until a compaction [§41](spec/41-compaction.md).
 
-**The format version** is 8 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md). A build opens its own format and
-the older ones that are valid files of it (6 and 7); it refuses newer
+**The format version** is 9 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md). A build opens its own format and
+the older ones that are valid files of it (6, 7 and 8), and the first
+page a batch writes stamps them with the current one; it refuses newer
 ones, and older ones that need converting. Moving between formats is
 export and import [§30](spec/30-export-and-import-as-json-lines.md). The history is in the comment on
 `FORMAT_VERSION` in `storage/file.rs`.
@@ -155,9 +156,14 @@ everything below the API works in, like LiteDB's `BsonValue`.
 `Collection<T>` converts any `T: Serialize + DeserializeOwned` to and
 from it through serde, and delegates to `Collection<Document>`: one
 code path, not two [§13](spec/13-the-serde-bridge.md). Each stored object gets its id as an `_id`
-field, so an untyped read reports it [§18](spec/18-merging-id-into-the-untyped-path.md); a typed `T` needn't have
-the field, and `find_with_ids` returns each id next to its document
-[§13.5](spec/13-the-serde-bridge.md) [§23](spec/23-find-with-ids.md).
+field [§18](spec/18-merging-id-into-the-untyped-path.md), and a struct takes it with `#[serde(rename = "_id")] id:
+Option<DocId>`: filled in on every read, used on insert if `Some`, made
+if `None` [§59](spec/59-a-struct-carries-its-own-id.md). The id is stored once, in the cell: an object is
+encoded without its `_id`, and every read puts the cell's id there,
+first, so there's no second copy that could say something else. `DocId`
+serializes as a marked newtype the bridge stores as `Document::Id`, and
+other formats as a UUID string. `find_with_ids` [§23](spec/23-find-with-ids.md) is deprecated, to be
+removed before 1.0.
 
 **Nesting** is limited to 64 levels, counted as MongoDB counts (the
 document is the first, each object or array inside adds one): deeper
