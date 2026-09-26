@@ -296,6 +296,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     is; limits as constants on `Document` and `Database`; `Error`,
     `Document` and the reports `#[non_exhaustive]`.
 
+    Items 29–34 → 0.12.0: file format 9 (still opens 6–8), and breaking
+    API changes; SPEC §59 and §60 say what moved where.
+
 What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License
