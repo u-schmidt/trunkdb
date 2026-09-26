@@ -298,6 +298,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 
     Items 29–34 → 0.12.0: file format 9 (still opens 6–8), and breaking
     API changes; SPEC §59 and §60 say what moved where.
+35. **Filters on the id through the primary index** (§61):
+    `eq("_id", id)`, or an OR of ids, is a lookup like `get`, not a scan
+    — 3.9 µs instead of 67 ms on 100,000 documents.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

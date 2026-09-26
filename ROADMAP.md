@@ -30,6 +30,7 @@ All of it is done:
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
 | 0.12.0 | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured; a struct carries its own id (`#[serde(rename = "_id")] id: Option<DocId>`), and an insert keeps an id given in `_id` — a change from §18; the id stored once, in the cell, file format 9, which still opens format 8; `find_with_ids` and `find_one_with_id` deprecated; a smaller public API: the internals private, one `Batch` for typed and untyped collections (`write_batch` internal), `Filter` and `IndexOptions` built with methods, `ensure_unique_index` replaced by `IndexOptions::new().unique()`, `indexes()` returning `IndexInfo`, `Error::Txn` gone | §55–§60 |
+| next | Filters on the id (`eq("_id", id)`, or an OR of ids) looked up in the primary index instead of scanned; `QueryPlan::ById` | §61 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -112,10 +113,10 @@ limit is described.
 - Update operators (`$set`, `$inc`, `$unset` on paths) next to
   `update_many`'s closure (§38.1).
 - An index key for ids, so a filter on a reference (a `DocId` field)
-  uses an index instead of a scan. Indexes built before it lack entries
+  uses an index instead of a scan, as a filter on `_id` does (§61). Indexes built before it lack entries
   for id values: a format bump, or a rebuild at open (§59.6).
-- `eq("_id", id)` through the primary index, as `get` does, instead of a
-  scan (§59.6).
+- An OR mixing ids and other conditions, served by lookups and index
+  ranges together; now one branch without ids means no lookups (§61.4).
 - A filter for a document's id that doesn't need `"_id"` spelled out:
   `Filter::new().id(some_id)`, or a public `ID_FIELD` constant. Filters
   see stored names, after serde's `rename`, so `eq("id", ...)` on a

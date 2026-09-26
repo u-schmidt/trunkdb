@@ -1,5 +1,5 @@
 use crate::catalog::IndexMeta;
-use crate::document::Document;
+use crate::document::{DocId, Document, ID_FIELD};
 use crate::index::{KeyRange, key};
 
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
@@ -492,6 +492,40 @@ pub enum QueryPlan {
     /// indexes on `fields` — each document once, then checked against
     /// the whole filter (SPEC §36.3).
     IndexUnion { fields: Vec<String> },
+    /// The filter names its documents by id — `eq("_id", id)`, or an OR
+    /// of such — and they are looked up in the primary index, as `get`
+    /// does, then checked against the whole filter (SPEC §61).
+    ById,
+}
+
+/// The ids `conditions`, all holding, name their documents by: the
+/// fewest any of them names (`ids_for`). `None` if none names any.
+fn ids_for_all(conditions: &[Condition]) -> Option<Vec<DocId>> {
+    conditions
+        .iter()
+        .filter_map(ids_for)
+        .min_by_key(|ids| ids.len())
+}
+
+/// The ids a document must have one of to meet `condition` (SPEC §61):
+/// an `Eq` on `_id` with an id names one, an `All` what its conditions
+/// name, an `Any` its branches' ids together if every branch names some.
+/// Anything else names none.
+fn ids_for(condition: &Condition) -> Option<Vec<DocId>> {
+    match condition {
+        Condition::Compare {
+            field,
+            op: Op::Eq,
+            value: Document::Id(id),
+        } if field == ID_FIELD => Some(vec![*id]),
+        Condition::All(conditions) => ids_for_all(conditions),
+        Condition::Any(branches) => branches
+            .iter()
+            .map(ids_for)
+            .collect::<Option<Vec<_>>>()
+            .map(|ids| ids.concat()),
+        _ => None,
+    }
 }
 
 /// Index ranges whose union holds every document a condition can match
@@ -762,6 +796,19 @@ fn field_range(index: &IndexMeta, conditions: &[Condition], field: &str) -> Opti
 }
 
 impl Filter {
+    /// The ids of the only documents that can match, in id order, each
+    /// once — `None` unless the conditions name documents by id
+    /// (`ids_for`). Then `find` looks them up in the primary index and
+    /// needs no other index (SPEC §61); each is still checked against
+    /// the whole filter, so an id that doesn't exist, or whose document
+    /// fails another condition, is no match.
+    pub(crate) fn ids(&self) -> Option<Vec<DocId>> {
+        let mut ids = ids_for_all(&self.conditions)?;
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
+    }
+
     /// The index ranges `find` reads, among `indexes` — `None` for a full
     /// scan. Rule-based, not cost-based (SPEC §28.4, §36.3): an `Eq` on an
     /// indexed field, else an OR whose every branch an index can bound,
@@ -776,7 +823,8 @@ impl Filter {
     }
 
     /// The index `find` reads in sort order (SPEC §34.2) — for a filter
-    /// with a `sort` and a `limit` — and how: see `OrderedRead`. An index
+    /// with a `sort` and a `limit`, that doesn't name its documents by id
+    /// (`ids`) — and how: see `OrderedRead`. An index
     /// on the first sort field, unless the conditions
     /// find documents by value some other way: an `Eq` on another indexed
     /// field, or an OR of indexed branches (a few documents found by value
@@ -796,6 +844,9 @@ impl Filter {
     pub(crate) fn index_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
         let sort = self.sort.first()?;
         self.limit?;
+        if self.ids().is_some() {
+            return None; // a few documents by id beat any walk (SPEC §61)
+        }
         let mut best: Option<(&IndexMeta, Vec<u8>, usize, usize)> = None;
         for index in indexes {
             // A multikey index holds a document once per element, in
@@ -1123,6 +1174,37 @@ pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::c
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    /// Which filters name their documents by id (SPEC §61): an `Eq` on
+    /// `_id` with an id, at the top or in an `All`, the fewest of several,
+    /// an OR only if every branch names some; each id once, in order.
+    #[test]
+    fn ids_are_what_a_filter_names_its_documents_by() {
+        let (a, b, c) = (DocId([1; 16]), DocId([2; 16]), DocId([3; 16]));
+        let id = |id: DocId| Condition::eq("_id", id);
+        let ids = |f: Filter| f.ids();
+        assert_eq!(ids(Filter::new().eq("_id", a)), Some(vec![a]));
+        assert_eq!(ids(Filter::new().eq("x", 1).eq("_id", a)), Some(vec![a]));
+        assert_eq!(
+            ids(Filter::new().and(Condition::All(vec![id(b)]))),
+            Some(vec![b])
+        );
+        let or = Filter::new().any_of([id(c), id(a), id(c)]);
+        assert_eq!(ids(or.clone()), Some(vec![a, c]));
+        assert_eq!(ids(or.eq("_id", b)), Some(vec![b]));
+        assert_eq!(
+            ids(Filter::new().any_of([id(a), Condition::eq("x", 1)])),
+            None
+        );
+
+        assert_eq!(ids(Filter::new()), None);
+        assert_eq!(ids(Filter::new().eq("_id", a.to_string())), None);
+        assert_eq!(ids(Filter::new().ne("_id", a)), None);
+        assert_eq!(ids(Filter::new().lt("_id", a)), None);
+        assert_eq!(ids(Filter::new().eq("id", a)), None);
+        assert_eq!(ids(Filter::new().eq("ref._id", a)), None);
+        assert_eq!(ids(Filter::new().and(!id(a))), None);
+    }
 
     /// SPEC §59: ids compare with ids, by their bytes, so a filter on
     /// `_id` or on a reference finds it; with anything else, not at all.

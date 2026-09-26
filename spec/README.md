@@ -71,3 +71,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 58. [Measuring how long readers wait (`bench/src/bin/reader_wait.rs`)](58-measuring-reader-waits.md)
 59. [A struct carries its own id (`document.rs`, `serde_bridge.rs`, `data.rs`, `collection.rs`, `batch.rs`, `query.rs`, `storage/file.rs`)](59-a-struct-carries-its-own-id.md)
 60. [A smaller public API (`lib.rs`, and every module it no longer exports)](60-a-smaller-public-api.md)
+61. [Filters on the id through the primary index (`query.rs`, `collection.rs`)](61-filters-on-the-id-through-the-primary-index.md)

@@ -316,9 +316,12 @@ impl<T> Collection<T> {
             .collect())
     }
 
-    /// How `find` would run `filter`: a full scan, or a range of one
-    /// secondary index.
+    /// How `find` would run `filter`: a full scan, lookups by id in the
+    /// primary index, or ranges of secondary indexes.
     pub fn explain(&self, filter: &Filter) -> crate::Result<QueryPlan> {
+        if filter.ids().is_some() {
+            return Ok(QueryPlan::ById);
+        }
         let state = self.db.read()?;
         let indexes = state.catalog.indexes(&self.name);
         if let Some(order) = filter.index_order(indexes) {
@@ -747,7 +750,8 @@ fn find_in(
     Ok(filter.apply_to(candidates, |(_id, doc)| doc))
 }
 
-/// The index entries `find` has to look at for `filter`: the secondary
+/// The index entries `find` has to look at for `filter`: the primary
+/// index's entries for the ids it names (SPEC §61), else the secondary
 /// index ranges its conditions allow (SPEC §28.4, §36.3), otherwise the
 /// whole primary index. Each entry's key ends with its document's id, and
 /// each document comes once, even if several ranges hold it (an OR
@@ -762,6 +766,17 @@ fn candidate_entries(
     let Some(meta) = catalog.get(collection) else {
         return Ok(Vec::new());
     };
+    if let Some(ids) = filter.ids() {
+        let primary = BTreeIndex::new(meta.index_root);
+        let mut entries = Vec::new();
+        for id in ids {
+            let key = key::primary(id);
+            if let Some(loc) = primary.lookup(store, &key)? {
+                entries.push((key, loc));
+            }
+        }
+        return Ok(entries);
+    }
     match filter.index_ranges(catalog.indexes(collection)) {
         None => BTreeIndex::new(meta.index_root).scan(store),
         Some(ranges) => {
@@ -3965,7 +3980,8 @@ mod tests {
     }
 
     /// Every random nested filter must find, count and stream exactly
-    /// what checking every document finds — whichever plan it runs.
+    /// what checking every document finds — whichever plan it runs,
+    /// also when it names documents by id.
     fn assert_nested_filters_agree_with_a_scan(docs: &Collection<Document>, rng: &mut XorShift) {
         assert_consistent(docs.db());
         let mut all = docs.find_with_ids(Filter::default()).unwrap();
@@ -3975,6 +3991,17 @@ mod tests {
             let mut f = Filter::new();
             for _ in 0..1 + rng.below(2) {
                 f = f.and(random_condition(rng, 3));
+            }
+            if rng.below(4) == 0 {
+                // Documents named by id (SPEC §61): one or an OR of a few,
+                // now and then one that doesn't exist.
+                let named = (0..1 + rng.below(3))
+                    .map(|_| match rng.below(5) {
+                        0 => Condition::eq("_id", DocId([0xAB; 16])),
+                        _ => Condition::eq("_id", all[rng.below(all.len())].0),
+                    })
+                    .collect::<Vec<_>>();
+                f = f.and(Condition::Any(named));
             }
             if rng.below(3) == 0 {
                 f = f.sort_desc("v").limit([1, 5, 50][rng.below(3)]);
@@ -4011,7 +4038,11 @@ mod tests {
             assert_eq!(counted, expected.len(), "count: {f:?} via {plan:?}");
             plans.insert(std::mem::discriminant(&plan));
         }
-        assert_eq!(plans.len(), 4, "scan, index, union and order all ran");
+        assert_eq!(
+            plans.len(),
+            5,
+            "scan, index, union, order and by id all ran"
+        );
     }
 
     #[test]
@@ -4037,6 +4068,81 @@ mod tests {
         }
         let db = Database::open(&path).unwrap();
         assert_nested_filters_agree_with_a_scan(&db.collection("docs"), &mut rng);
+    }
+
+    /// `eq("_id", id)` looks the document up in the primary index, as
+    /// `get` does, instead of reading every document (SPEC §61): alone,
+    /// next to other conditions, as an OR of several ids, and ahead of an
+    /// index that could serve the sort.
+    #[test]
+    fn a_filter_on_the_id_reads_just_those_documents() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Car {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            seats: i64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let cars = db.collection::<Car>("cars");
+        let mut batch = db.batch();
+        let ids = (0..300)
+            .map(|seats| batch.insert(&cars, Car { id: None, seats }).unwrap())
+            .collect::<Vec<_>>();
+        batch.commit().unwrap();
+        cars.ensure_index("seats").unwrap();
+        let car = |i: usize| Car {
+            id: Some(ids[i]),
+            seats: i as i64,
+        };
+
+        let one = Filter::new().eq("_id", ids[100]);
+        assert_eq!(cars.explain(&one).unwrap(), QueryPlan::ById);
+        let mut found = Vec::new();
+        let reads = records_read(|| found = cars.find(one.clone()).unwrap());
+        assert_eq!((&found[..], reads), (&[car(100)][..], 1));
+        assert_eq!(cars.find_one(one.clone()).unwrap(), Some(car(100)));
+        assert_eq!(cars.count(one.clone()).unwrap(), 1);
+
+        // The other conditions still count, and an unknown id is no match.
+        let both = one.clone().eq("seats", 101);
+        assert_eq!(cars.explain(&both).unwrap(), QueryPlan::ById);
+        assert!(cars.find(both).unwrap().is_empty());
+        let unknown = Filter::new().eq("_id", DocId([0xAB; 16]));
+        let reads = records_read(|| assert!(cars.find(unknown).unwrap().is_empty()));
+        assert_eq!(reads, 0);
+
+        // Several ids, one of them twice: each document once, sorted
+        // without walking the index on `seats`.
+        let some = Filter::new()
+            .any_of([
+                Condition::eq("_id", ids[7]),
+                Condition::eq("_id", ids[250]),
+                Condition::eq("_id", ids[7]),
+            ])
+            .sort_desc("seats")
+            .limit(10);
+        assert_eq!(cars.explain(&some).unwrap(), QueryPlan::ById);
+        let reads = records_read(|| found = cars.find(some.clone()).unwrap());
+        assert_eq!((&found[..], reads), (&[car(250), car(7)][..], 2));
+        let streamed = cars.cursor(some.clone()).unwrap();
+        let streamed = streamed.map(|r| r.map(|(_id, car)| car.seats));
+        assert_eq!(
+            streamed.collect::<crate::Result<Vec<_>>>().unwrap(),
+            [250, 7]
+        );
+
+        // Writes find their documents the same way.
+        let raised = cars.update_many(one.clone(), |car| car.seats += 1000);
+        assert_eq!(raised.unwrap(), 1);
+        assert_eq!(cars.get(&ids[100]).unwrap().unwrap().seats, 1100);
+        assert_eq!(cars.delete_many(some).unwrap(), 2);
+        assert_eq!(cars.count(Filter::new()).unwrap(), 298);
+
+        // An id's string is not an id (SPEC §59.5): no lookup, no match.
+        let text = Filter::new().eq("_id", ids[100].to_string());
+        assert_eq!(cars.explain(&text).unwrap(), QueryPlan::Scan);
+        assert!(cars.find(text).unwrap().is_empty());
     }
 
     /// The typed path end to end: `status` is one of two values, read as

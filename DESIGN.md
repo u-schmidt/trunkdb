@@ -247,6 +247,9 @@ numbers: an `Int` and a `Float` compare by exact value [§34](spec/34-sorting-th
 what it picked (`QueryPlan`):
 
 - **`Scan`:** read every document of the collection and check it.
+- **`ById`:** the filter names its documents by id: `eq("_id", id)`,
+  or an OR of such. Look each up in the primary index, as `get` does.
+  Beats every other plan [§61](spec/61-filters-on-the-id-through-the-primary-index.md).
 - **`Index`:** read one index range, then check each document against
   the whole filter. An `Eq` beats an OR of indexed branches, which beats
   a range; bounds on more fields beat fewer [§43.3](spec/43-compound-indexes.md). `ne`, `contains`
