@@ -22,8 +22,9 @@ into as few pages as it needs, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
-cloneable, thread-safe handle; reads run in parallel, writes one at a
-time). See [DESIGN.md](DESIGN.md) for how it works,
+cloneable, thread-safe handle; reads share a lock, writes take it one
+at a time — though the page cache still lets readers through one at a
+time, SPEC §58). See [DESIGN.md](DESIGN.md) for how it works,
 [the spec](spec/README.md) for why, and [ROADMAP.md](ROADMAP.md) for progress.
 
 ## Why
@@ -180,6 +181,7 @@ read.
 
 ```
 cd bench && cargo run --release
+cd bench && cargo run --release --bin reader_wait   # readers while a writer commits
 ```
 
 ## Roadmap (short version)
@@ -280,6 +282,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     damaged one can't overflow the stack, and every export imports again.
 31. **Concurrency, decided** (§57): one writer, readers in parallel;
     snapshot reads deferred, with rules that keep them possible.
+32. **Reader waits, measured** (§58): paced writers cost readers
+    nothing; back-to-back commits starve them; the page cache's mutex
+    keeps readers from running in parallel.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

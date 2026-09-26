@@ -3,6 +3,8 @@ name = "trunkdb-bench"
 version = "0.1.0"
 edition = "2024"
 publish = false
+# `cargo run` runs the comparison; `--bin reader_wait` the other one.
+default-run = "trunkdb-bench"
 description = "trunkdb against SQLite, redb and sled on one document workload (SPEC §48)"
 
 [dependencies]

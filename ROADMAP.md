@@ -29,7 +29,7 @@ All of it is done:
 | 0.9.0 | `Exists` and array size; `Op` and `Condition` `#[non_exhaustive]`; `elem_match`; sorting by several fields (`Filter.sort` became a list — breaking) | §45–§47 |
 | 0.10.0 | Benchmarks against SQLite, redb and sled; a lazy B-tree walk; a page cache (`Database::open_with`) | §48–§50 |
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
-| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred | §55–§57 |
+| next | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured | §55–§58 |
 
 ## Open
 Unordered within each group; each line says where the need or the
@@ -57,11 +57,14 @@ limit is described.
   page is also still copied whole on every read and write.
 
 **Concurrency**
-- Measure how long readers wait while a writer commits, in `bench/`:
-  one commit a second, and batches (§57.2). The number that would reopen
-  the next two.
+- Readers that run in parallel: the page cache's mutex lets them
+  through one at a time, so four readers are no faster than one (§58.3).
+  Shared pages instead of a copy under the lock, or a cache in shards.
+  The first thing to fix.
 - Writers that stage and flush beside the readers, taking the lock only
-  to publish (§57.2, option B). Not scheduled.
+  to publish (§57.2, option B). A writer committing back to back
+  starves readers now (§58.3); no current workload does. Not
+  scheduled.
 - Snapshot reads (MVCC): deferred, not rejected (§57). They would also
   stop an export from blocking writers (§30.6).
 

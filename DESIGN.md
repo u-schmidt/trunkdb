@@ -265,8 +265,9 @@ what matches.
 `Collection` and `Batch` shares one open database [§27](spec/27-a-thread-safe-cloneable-database-handle.md). The state sits
 behind one `RwLock`:
 
-- **reads** (`get`, `find`, `count`, `cursor`) share the read lock and
-  run in parallel;
+- **reads** (`get`, `find`, `count`, `cursor`) share the read lock, so
+  they could run in parallel; the page cache's mutex still serializes
+  them (see below);
 - **a write batch** holds the write lock from staging to its
   checkpoint, so a reader sees a batch entirely or not at all, and
   readers wait for it.
@@ -283,6 +284,12 @@ storage layer follows six rules. The one to know first: **a freed page
 isn't reused while a reader could still need its old contents**. It
 costs nothing today, since no reader overlaps a commit, but a
 free-space map or any other change to allocation must keep it.
+
+**Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
+once or ten times a second costs readers nothing measurable; one that
+commits back to back makes them wait tens of milliseconds, up to half a
+second. And readers don't really run in parallel yet: every page read
+takes the page cache's mutex, so four readers are no faster than one.
 
 ## 10. The API
 

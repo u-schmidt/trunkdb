@@ -58,8 +58,10 @@ Why defer C:
 **When to reopen it:** a real workload where readers measurably wait (a
 p99 in the tens of milliseconds), an export blocking writers in use, or
 a need to read one consistent state across several calls. The
-measurement to watch is reader latency while a writer commits; `bench/`
-doesn't measure it yet (ROADMAP.md).
+measurement to watch is reader latency while a writer commits:
+measured in §58 — paced writers cost readers nothing, writers that
+commit back to back do, and readers turned out to serialize on the page
+cache.
 
 ## 57.3 Rules for the storage layer
 None of these costs anything today, because no reader overlaps a
