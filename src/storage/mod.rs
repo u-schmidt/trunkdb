@@ -1,6 +1,7 @@
 mod cache;
 mod file;
 mod memory;
+mod page;
 mod slotted;
 
 #[cfg(feature = "fuzzing")]
@@ -9,6 +10,7 @@ pub(crate) use file::checksum;
 pub(crate) use file::rewrite_format_version;
 pub use file::{DEFAULT_CACHE_SIZE, FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
 pub(crate) use memory::MemoryStore;
+pub use page::Page;
 pub use slotted::SlottedPage;
 
 pub type PageId = u64;
@@ -81,7 +83,9 @@ impl PageType {
 /// through every layer that sits on top of it.
 pub trait PageStore {
     fn allocate_page(&mut self) -> std::io::Result<PageId>;
-    fn read_page(&self, id: PageId) -> std::io::Result<Vec<u8>>;
+    /// The page's current bytes, shared with the cache, not copied
+    /// (SPEC §64): `Page::make_mut` copies them before a change.
+    fn read_page(&self, id: PageId) -> std::io::Result<Page>;
     /// Like `read_page`, but `Ok(None)` for a page that was never
     /// allocated — an expected, ordinary outcome (e.g. "this is a fresh
     /// database") rather than an error. Only distinguishes "never
@@ -89,7 +93,7 @@ pub trait PageStore {
     /// page is currently on the free list — callers that care (like the
     /// catalog, which is never freed) verify that separately, e.g. via the
     /// page's own type tag.
-    fn try_read_page(&self, id: PageId) -> std::io::Result<Option<Vec<u8>>>;
+    fn try_read_page(&self, id: PageId) -> std::io::Result<Option<Page>>;
     fn write_page(&mut self, id: PageId, data: &[u8]) -> std::io::Result<()>;
     fn free_page(&mut self, id: PageId) -> std::io::Result<()>;
 }

@@ -62,10 +62,10 @@ mod tests {
         fn allocate_page(&mut self) -> std::io::Result<PageId> {
             unimplemented!()
         }
-        fn read_page(&self, _id: PageId) -> std::io::Result<Vec<u8>> {
+        fn read_page(&self, _id: PageId) -> std::io::Result<crate::storage::Page> {
             unimplemented!()
         }
-        fn try_read_page(&self, _id: PageId) -> std::io::Result<Option<Vec<u8>>> {
+        fn try_read_page(&self, _id: PageId) -> std::io::Result<Option<crate::storage::Page>> {
             unimplemented!()
         }
         fn write_page(&mut self, _id: PageId, _data: &[u8]) -> std::io::Result<()> {

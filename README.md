@@ -316,6 +316,13 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     Items 35–37 → 0.13.0: file format 10 (still opens 6–9, and rebuilds
     an older index that holds ids at the first open); no breaking API
     change.
+38. **Shared pages** (§64): a read gets the page cache's page instead
+    of a copy, and a change copies it first. One reader is 30% faster;
+    two readers now do 1.7 times the work of one, where before they did
+    less.
+39. **A read lock for the page cache** (§65): readers look pages up
+    together. Four readers do 3.2 times the work of one; before §64,
+    four did as much as one.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

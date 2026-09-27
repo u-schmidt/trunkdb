@@ -1,4 +1,4 @@
-use super::{PageId, PageType, USABLE_PAGE_SIZE};
+use super::{Page, PageId, PageType, USABLE_PAGE_SIZE};
 
 // Header layout (13 bytes), then the slot directory, then cells packed
 // backward from the end of the page. Shared by Catalog, Data and IndexLeaf
@@ -28,9 +28,13 @@ impl PageType {
 /// pages both use. A cell's identity is its slot index, not its byte
 /// offset, so a cell can be relocated within the page later (compaction)
 /// without invalidating anything that references it by slot.
+///
+/// Its bytes are a shared `Page` (SPEC §64): reading a page from the
+/// cache and looking at its cells copies nothing, and the first change
+/// copies the page (`bytes_mut`), so the cache's copy stays as it was.
 #[derive(Clone)]
 pub struct SlottedPage {
-    buf: Vec<u8>,
+    buf: Page,
 }
 
 impl SlottedPage {
@@ -39,14 +43,15 @@ impl SlottedPage {
         let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         buf[0] = page_type as u8;
         buf[11..13].copy_from_slice(&(USABLE_PAGE_SIZE as u16).to_le_bytes());
-        Self { buf }
+        Self { buf: buf.into() }
     }
 
     /// Interprets an existing page buffer (as read from a `PageStore`) as a
     /// slotted page. Fails if the type byte is unknown or not a slotted page
     /// type, if the slot directory runs into the cells, or if a cell lies
     /// outside the page. Overlapping cells are not detected (SPEC §54).
-    pub fn from_bytes(buf: Vec<u8>) -> std::io::Result<Self> {
+    pub fn from_bytes(buf: impl Into<Page>) -> std::io::Result<Self> {
+        let buf = buf.into();
         if buf.len() != USABLE_PAGE_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -111,8 +116,15 @@ impl SlottedPage {
         Ok(page)
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
+    /// The page, to write back: `store.write_page(id, &page.into_page())`.
+    pub fn into_page(self) -> Page {
         self.buf
+    }
+
+    /// The bytes, to change: copied first if they're shared, as a page
+    /// just read from the cache is.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self.buf.make_mut()
     }
 
     pub fn page_type(&self) -> PageType {
@@ -124,7 +136,7 @@ impl SlottedPage {
     }
 
     pub fn set_next_page(&mut self, id: PageId) {
-        self.buf[1..9].copy_from_slice(&id.to_le_bytes());
+        self.bytes_mut()[1..9].copy_from_slice(&id.to_le_bytes());
     }
 
     pub fn slot_count(&self) -> u16 {
@@ -132,7 +144,7 @@ impl SlottedPage {
     }
 
     fn set_slot_count(&mut self, n: u16) {
-        self.buf[9..11].copy_from_slice(&n.to_le_bytes());
+        self.bytes_mut()[9..11].copy_from_slice(&n.to_le_bytes());
     }
 
     fn data_start(&self) -> u16 {
@@ -140,7 +152,7 @@ impl SlottedPage {
     }
 
     fn set_data_start(&mut self, v: u16) {
-        self.buf[11..13].copy_from_slice(&v.to_le_bytes());
+        self.bytes_mut()[11..13].copy_from_slice(&v.to_le_bytes());
     }
 
     fn slot_offset(index: u16) -> usize {
@@ -156,8 +168,8 @@ impl SlottedPage {
 
     fn write_slot(&mut self, index: u16, offset: u16, length: u16) {
         let at = Self::slot_offset(index);
-        self.buf[at..at + 2].copy_from_slice(&offset.to_le_bytes());
-        self.buf[at + 2..at + 4].copy_from_slice(&length.to_le_bytes());
+        self.bytes_mut()[at..at + 2].copy_from_slice(&offset.to_le_bytes());
+        self.bytes_mut()[at + 2..at + 4].copy_from_slice(&length.to_le_bytes());
     }
 
     /// Bytes available for one more slot + its cell, right now.
@@ -205,7 +217,7 @@ impl SlottedPage {
         }
         let count = self.slot_count();
         let from = Self::slot_offset(slot);
-        self.buf
+        self.bytes_mut()
             .copy_within(from..Self::slot_offset(count), from + SLOT_LEN);
         self.set_slot_count(count + 1);
         self.place_cell(slot, data);
@@ -219,11 +231,11 @@ impl SlottedPage {
         let count = self.slot_count();
         assert!(slot < count, "remove of slot {slot} past the end");
         let (offset, length) = self.read_slot(slot);
-        self.buf[offset as usize..(offset + length) as usize].fill(0);
+        self.bytes_mut()[offset as usize..(offset + length) as usize].fill(0);
         let from = Self::slot_offset(slot + 1);
-        self.buf
+        self.bytes_mut()
             .copy_within(from..Self::slot_offset(count), from - SLOT_LEN);
-        self.buf[Self::slot_offset(count - 1)..Self::slot_offset(count)].fill(0);
+        self.bytes_mut()[Self::slot_offset(count - 1)..Self::slot_offset(count)].fill(0);
         self.set_slot_count(count - 1);
     }
 
@@ -269,7 +281,7 @@ impl SlottedPage {
         );
         if data.len() <= length as usize {
             let offset = offset as usize;
-            self.buf[offset..offset + data.len()].copy_from_slice(data);
+            self.bytes_mut()[offset..offset + data.len()].copy_from_slice(data);
             self.write_slot(slot, offset as u16, data.len() as u16);
             return true;
         }
@@ -289,7 +301,7 @@ impl SlottedPage {
     /// covers it.
     fn place_cell(&mut self, slot: u16, data: &[u8]) {
         let new_data_start = self.data_start() as usize - data.len();
-        self.buf[new_data_start..new_data_start + data.len()].copy_from_slice(data);
+        self.bytes_mut()[new_data_start..new_data_start + data.len()].copy_from_slice(data);
         self.set_data_start(new_data_start as u16);
         self.write_slot(slot, new_data_start as u16, data.len() as u16);
     }
@@ -325,7 +337,7 @@ impl SlottedPage {
         }
         // Zero the gap, so bytes of deleted documents don't linger on disk.
         let gap = HEADER_LEN + slot_count as usize * SLOT_LEN..self.data_start() as usize;
-        self.buf[gap].fill(0);
+        self.bytes_mut()[gap].fill(0);
     }
 
     /// Whether every slot is tombstoned (or there are none).
@@ -352,6 +364,24 @@ impl SlottedPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page's bytes are shared until it changes (SPEC §64): changing a
+    /// page made from another's bytes leaves those as they were.
+    #[test]
+    fn a_change_leaves_the_bytes_it_started_from_alone() {
+        let mut first = SlottedPage::new(PageType::Data);
+        first.insert_cell(b"kept").unwrap();
+        let bytes = first.into_page();
+        let mut second = SlottedPage::from_bytes(bytes.clone()).unwrap();
+        second.insert_cell(b"added").unwrap();
+        second.set_next_page(7);
+        second.delete_cell(0);
+
+        let first = SlottedPage::from_bytes(bytes).unwrap();
+        assert_eq!((first.slot_count(), first.next_page()), (1, 0));
+        assert_eq!(first.get_cell(0), Some(&b"kept"[..]));
+        assert_eq!((second.slot_count(), second.get_cell(0)), (2, None));
+    }
 
     #[test]
     fn insert_get_roundtrip() {
@@ -408,7 +438,7 @@ mod tests {
         page.insert_cell(b"trunk-collection").unwrap();
         page.set_next_page(7);
 
-        let bytes = page.into_bytes();
+        let bytes = page.into_page();
         let restored = SlottedPage::from_bytes(bytes).unwrap();
 
         assert_eq!(restored.page_type(), PageType::Catalog);
@@ -557,9 +587,9 @@ mod tests {
         assert!(!page.has_room_for(2000), "dead, not free, until compaction");
         assert!(page.insert_cell_at(1, &[9; 2000]));
         assert!(page.insert_cell_at(1, &[8; 1000]));
-        let before = page.clone().into_bytes();
+        let before = page.clone().into_page();
         assert!(!page.insert_cell_at(0, &[7; 2000]));
-        assert_eq!(page.clone().into_bytes(), before);
+        assert_eq!(page.clone().into_page(), before);
         assert_eq!(
             cells(&page),
             [vec![1; 2000], vec![8; 1000], vec![9; 2000], vec![4; 2000]]
@@ -593,7 +623,7 @@ mod tests {
         page.remove_cell_at(1);
         assert_eq!(cells(&page), [&b"first"[..], b"last"]);
         assert_eq!(page.slot_count(), 2);
-        let bytes = page.clone().into_bytes();
+        let bytes = page.clone().into_page();
         assert!(!bytes.windows(6).any(|w| w == b"secret"));
         // The old last slot entry is cleared too.
         assert!(
@@ -684,7 +714,7 @@ mod tests {
         page.delete_cell(0);
 
         let page =
-            SlottedPage::from_bytes(page.into_bytes()).expect("a page with a tombstone must load");
+            SlottedPage::from_bytes(page.into_page()).expect("a page with a tombstone must load");
 
         assert_eq!(page.slot_count(), 2, "a delete keeps the slot");
         assert_eq!(page.get_cell(0), None);

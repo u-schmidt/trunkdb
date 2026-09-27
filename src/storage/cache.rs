@@ -1,9 +1,13 @@
-use super::PageId;
+use super::{Page, PageId};
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Pages read from the file, kept in memory so the next read of one
-/// costs a copy instead of a `pread`, a checksum and an allocation (SPEC
-/// §50). Holds pages as they are on disk, checked: `FileStore` puts a page
+/// costs a shared `Page` (SPEC §64) instead of a `pread`, a checksum and
+/// an allocation (SPEC §50). Holds pages as they are on disk, checked:
+/// `FileStore` puts a page
 /// in after reading it or writing it back, and takes staged pages from
 /// its dirty set before asking here, so a batch's changes never land in
 /// the cache before they're in the file.
@@ -11,7 +15,10 @@ use std::collections::HashMap;
 /// Eviction is CLOCK (second chance): a hand sweeps the slots; a page read
 /// since the hand last passed is spared once, the first one that wasn't
 /// goes. That approximates least-recently-used without keeping an order
-/// on every read — a read only sets a flag.
+/// on every read — a read only sets a flag. The flag is atomic, so a
+/// read changes nothing else and needs only `&self`: readers share the
+/// cache behind a read lock, and only `put` and the others take the
+/// write lock (SPEC §65).
 pub(crate) struct PageCache {
     /// At most this many pages; 0 keeps nothing.
     capacity: usize,
@@ -21,16 +28,16 @@ pub(crate) struct PageCache {
     /// The next slot the hand looks at.
     hand: usize,
     #[cfg(test)]
-    pub(crate) hits: usize,
+    pub(crate) hits: AtomicUsize,
     #[cfg(test)]
-    pub(crate) misses: usize,
+    pub(crate) misses: AtomicUsize,
 }
 
 struct Slot {
     id: PageId,
-    page: Box<[u8]>,
+    page: Page,
     /// Read since the hand last passed.
-    referenced: bool,
+    referenced: AtomicBool,
 }
 
 impl PageCache {
@@ -41,9 +48,9 @@ impl PageCache {
             index: HashMap::new(),
             hand: 0,
             #[cfg(test)]
-            hits: 0,
+            hits: AtomicUsize::new(0),
             #[cfg(test)]
-            misses: 0,
+            misses: AtomicUsize::new(0),
         }
     }
 
@@ -52,40 +59,39 @@ impl PageCache {
         self.capacity
     }
 
-    /// Copies page `id` into `buf`, if it's here.
-    pub(crate) fn read(&mut self, id: PageId, buf: &mut [u8]) -> bool {
-        self.get(id).map(|page| buf.copy_from_slice(page)).is_some()
-    }
-
-    /// Page `id`, if it's here.
-    pub(crate) fn get(&mut self, id: PageId) -> Option<&[u8]> {
+    /// Page `id`, if it's here: shared, not copied (SPEC §64), and
+    /// through `&self`, so readers look pages up together (SPEC §65).
+    pub(crate) fn get(&self, id: PageId) -> Option<Page> {
         match self.index.get(&id) {
             Some(&at) => {
-                let slot = &mut self.slots[at];
-                slot.referenced = true;
-                #[cfg(test)]
-                {
-                    self.hits += 1;
+                let slot = &self.slots[at];
+                // Set only if it isn't: the pages every lookup reads, the
+                // root first, would otherwise have their flag written by
+                // every reader, each write taking the cache line from the
+                // other cores.
+                if !slot.referenced.load(Ordering::Relaxed) {
+                    slot.referenced.store(true, Ordering::Relaxed);
                 }
-                Some(&self.slots[at].page)
+                #[cfg(test)]
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(slot.page.clone())
             }
             None => {
                 #[cfg(test)]
-                {
-                    self.misses += 1;
-                }
+                self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
     }
 
     /// Puts page `id` in, replacing an older copy of it, or evicting
-    /// another page if the cache is full.
-    pub(crate) fn put(&mut self, id: PageId, page: &[u8]) {
+    /// another page if the cache is full. A reader still holding the
+    /// page it replaces keeps that one.
+    pub(crate) fn put(&mut self, id: PageId, page: Page) {
         if let Some(&at) = self.index.get(&id) {
             let slot = &mut self.slots[at];
-            slot.page.copy_from_slice(page);
-            slot.referenced = true;
+            slot.page = page;
+            *slot.referenced.get_mut() = true;
             return;
         }
         if self.capacity == 0 {
@@ -95,9 +101,9 @@ impl PageCache {
             self.index.insert(id, self.slots.len());
             self.slots.push(Slot {
                 id,
-                page: page.into(),
+                page,
                 // Not read yet: the first to go if it never is.
-                referenced: false,
+                referenced: AtomicBool::new(false),
             });
             return;
         }
@@ -105,14 +111,15 @@ impl PageCache {
             let at = self.hand;
             self.hand = (self.hand + 1) % self.slots.len();
             let slot = &mut self.slots[at];
-            if slot.referenced {
-                slot.referenced = false;
+            let referenced = slot.referenced.get_mut();
+            if *referenced {
+                *referenced = false;
                 continue;
             }
             self.index.remove(&slot.id);
             self.index.insert(id, at);
             slot.id = id;
-            slot.page.copy_from_slice(page);
+            slot.page = page;
             return;
         }
     }
@@ -162,24 +169,23 @@ impl PageCache {
 mod tests {
     use super::*;
 
-    fn page(fill: u8) -> Vec<u8> {
-        vec![fill; 16]
+    fn page(fill: u8) -> Page {
+        Page::from(vec![fill; 16])
     }
 
-    fn has(cache: &mut PageCache, id: PageId) -> Option<u8> {
-        let mut buf = vec![0u8; 16];
-        cache.read(id, &mut buf).then_some(buf[0])
+    fn has(cache: &PageCache, id: PageId) -> Option<u8> {
+        cache.get(id).map(|page| page[0])
     }
 
     #[test]
     fn keeps_what_was_put_and_replaces_older_copies() {
         let mut cache = PageCache::new(3);
-        assert_eq!(has(&mut cache, 1), None);
-        cache.put(1, &page(1));
-        cache.put(2, &page(2));
-        assert_eq!(has(&mut cache, 1), Some(1));
-        cache.put(1, &page(9));
-        assert_eq!(has(&mut cache, 1), Some(9));
+        assert_eq!(has(&cache, 1), None);
+        cache.put(1, page(1));
+        cache.put(2, page(2));
+        assert_eq!(has(&cache, 1), Some(1));
+        cache.put(1, page(9));
+        assert_eq!(has(&cache, 1), Some(9));
         assert_eq!(cache.len(), 2);
     }
 
@@ -189,40 +195,54 @@ mod tests {
     fn a_full_cache_evicts_what_was_not_read() {
         let mut cache = PageCache::new(3);
         for id in 1..=3 {
-            cache.put(id, &page(id as u8));
+            cache.put(id, page(id as u8));
         }
-        assert_eq!(has(&mut cache, 1), Some(1));
-        assert_eq!(has(&mut cache, 3), Some(3));
-        cache.put(4, &page(4));
+        assert_eq!(has(&cache, 1), Some(1));
+        assert_eq!(has(&cache, 3), Some(3));
+        cache.put(4, page(4));
         assert_eq!(cache.len(), 3);
-        assert_eq!(has(&mut cache, 2), None, "the one not read goes");
+        assert_eq!(has(&cache, 2), None, "the one not read goes");
         for id in [1, 3, 4] {
-            assert_eq!(has(&mut cache, id), Some(id as u8));
+            assert_eq!(has(&cache, id), Some(id as u8));
         }
         // All read now: the hand clears them all, then takes the first.
-        cache.put(5, &page(5));
+        cache.put(5, page(5));
         assert_eq!(cache.len(), 3);
-        assert_eq!(has(&mut cache, 5), Some(5));
+        assert_eq!(has(&cache, 5), Some(5));
         let kept = [1, 3, 4]
             .iter()
-            .filter(|&&id| has(&mut cache, id).is_some())
+            .filter(|&&id| has(&cache, id).is_some())
             .count();
         assert_eq!(kept, 2);
+    }
+
+    /// A page put in again, as a checkpoint does with a page it wrote
+    /// back, counts as used: the hand spares it once.
+    #[test]
+    fn a_page_replaced_is_spared_like_one_read() {
+        let mut cache = PageCache::new(3);
+        for id in 1..=3 {
+            cache.put(id, page(id as u8));
+        }
+        cache.put(1, page(9));
+        cache.put(4, page(4));
+        assert_eq!(has(&cache, 1), Some(9));
+        assert_eq!(has(&cache, 2), None, "the first one not used goes");
     }
 
     #[test]
     fn retain_clear_resize_and_nothing_at_capacity_zero() {
         let mut cache = PageCache::new(4);
         for id in 1..=4 {
-            cache.put(id, &page(id as u8));
+            cache.put(id, page(id as u8));
         }
         cache.retain(|id| id % 2 == 0);
-        assert_eq!(has(&mut cache, 1), None);
-        assert_eq!(has(&mut cache, 2), Some(2));
-        assert_eq!(has(&mut cache, 4), Some(4));
+        assert_eq!(has(&cache, 1), None);
+        assert_eq!(has(&cache, 2), Some(2));
+        assert_eq!(has(&cache, 4), Some(4));
         // Still findable after the slots moved.
-        cache.put(5, &page(5));
-        assert_eq!(has(&mut cache, 5), Some(5));
+        cache.put(5, page(5));
+        assert_eq!(has(&cache, 5), Some(5));
         cache.resize(1);
         assert_eq!(cache.len(), 1);
         cache.clear();
@@ -230,7 +250,7 @@ mod tests {
         assert_eq!(cache.capacity(), 1);
 
         let mut none = PageCache::new(0);
-        none.put(1, &page(1));
-        assert_eq!(has(&mut none, 1), None);
+        none.put(1, page(1));
+        assert_eq!(has(&none, 1), None);
     }
 }

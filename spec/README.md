@@ -74,3 +74,5 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 61. [Filters on the id through the primary index (`query.rs`, `collection.rs`)](61-filters-on-the-id-through-the-primary-index.md)
 62. [An index key for ids (`index/key.rs`, `query.rs`, `collection.rs`, `index/btree.rs`, `storage/file.rs`, `database.rs`)](62-an-index-key-for-ids.md)
 63. [A filter on the id, and ids parsed from text (`query.rs`, `document.rs`, `lib.rs`)](63-an-id-filter-and-parsing-ids.md)
+64. [Shared pages (`storage/page.rs`, `storage/cache.rs`, `storage/file.rs`, `storage/slotted.rs`)](64-shared-pages.md)
+65. [A read lock for the page cache (`storage/cache.rs`, `storage/file.rs`)](65-a-read-lock-for-the-page-cache.md)

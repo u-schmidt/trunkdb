@@ -31,6 +31,7 @@ All of it is done:
 | 0.11.0 | One flush per commit (`Database::checkpoint`); B-tree pages changed in place; a configurable checkpoint threshold (`OpenOptions::checkpoint_pages`, and the `OpenOptions` fields private — breaking for code that read `cache_size`); a page's layout checked when it is read | §51–§54 |
 | 0.12.0 | Fuzzing (`fuzz/`), and fourteen ways a damaged file crashed or hung trunkdb fixed; documents nest at most 64 levels; the concurrency model written down, snapshots deferred; how long readers wait, measured; a struct carries its own id (`#[serde(rename = "_id")] id: Option<DocId>`), and an insert keeps an id given in `_id` — a change from §18; the id stored once, in the cell, file format 9, which still opens format 8; `find_with_ids` and `find_one_with_id` deprecated; a smaller public API: the internals private, one `Batch` for typed and untyped collections (`write_batch` internal), `Filter` and `IndexOptions` built with methods, `ensure_unique_index` replaced by `IndexOptions::new().unique()`, `indexes()` returning `IndexInfo`, `Error::Txn` gone | §55–§60 |
 | 0.13.0 | Filters on the id (`eq("_id", id)`, or an OR of ids) looked up in the primary index instead of scanned; `QueryPlan::ById`; an index key for ids, so an index on a reference (a `DocId` field) works, and ids sort after strings, by when they were made — file format 10, which still opens 6–9 and rebuilds, at the first open, an older index that holds ids; `Filter::id` and `Condition::id`; `DocId: FromStr`, with `ParseIdError` | §61–§63 |
+| next | Shared pages: the page cache hands out its page (`Page`, an `Arc`) instead of a copy, and a change copies it first; the cache behind an `RwLock`, looked up under its read lock; one reader 30% faster, four 3.2 times one | §64–§65 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -80,8 +81,10 @@ limit is described.
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
 
 **Storage and durability**
-- Scan resistance for the page cache, and shared pages instead of a
-  copy per read (§50.7).
+- Scan resistance for the page cache (§50.7).
+- A page's layout checked once, when it comes into the cache, not on
+  every read: in a profile of four readers it costs as much as reading
+  the cells (§64.3).
 - A free-space map, so inserts refill half-empty data pages between
   compactions (§20.1, §41.5). It must keep the storage rules of §57.3:
   above all, space freed by a commit isn't reused while a reader could
@@ -94,14 +97,17 @@ limit is described.
   crosses the default checkpoint threshold once the indexes are large.
   `OpenOptions::checkpoint_pages` can raise it (§53), but the WAL then
   grows with every commit, not with the threshold: a second trigger, on
-  the WAL's size, would make a large value reasonable (§53.3). A staged
-  page is also still copied whole on every read and write.
+  the WAL's size, would make a large value reasonable (§53.3). A changed
+  page is still copied twice, on its first change and by `write_page`,
+  which could take the `Page` itself (§64.1).
 
 **Concurrency**
-- Readers that run in parallel: the page cache's mutex lets them
-  through one at a time, so four readers are no faster than one (§58.3).
-  Shared pages instead of a copy under the lock, or a cache in shards.
-  The first thing to fix.
+- Readers that run in parallel past four: four do 3.2 times the work
+  of one, eight no more than four, and nobody waits in the kernel. Most
+  likely the atomic writes every page read makes to shared memory (the
+  cache's read lock, the page's reference count): the lock taken once
+  per operation instead of once per page, or cached pages borrowed
+  instead of counted (§65.3).
 - Writers that stage and flush beside the readers, taking the lock only
   to publish (§57.2, option B). A writer committing back to back
   starves readers now (§58.3); no current workload does. Not

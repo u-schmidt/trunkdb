@@ -280,15 +280,18 @@ what matches.
 `Collection` and `Batch` shares one open database [§27](spec/27-a-thread-safe-cloneable-database-handle.md). The state sits
 behind one `RwLock`:
 
-- **reads** (`get`, `find`, `count`, `cursor`) share the read lock, so
-  they could run in parallel; the page cache's mutex still serializes
-  them (see below);
+- **reads** (`get`, `find`, `count`, `cursor`) share the read lock and
+  run in parallel;
 - **a write batch** holds the write lock from staging to its
   checkpoint, so a reader sees a batch entirely or not at all, and
   readers wait for it.
 
-The page cache is behind its own mutex inside the store, so parallel
-readers take turns only for the cache lookup itself [§50](spec/50-a-page-cache.md). There is
+The page cache is behind its own `RwLock` inside the store [§50](spec/50-a-page-cache.md):
+readers look pages up together under its read lock, since a lookup
+changes only an atomic flag, and a page coming in from the file takes
+the write lock [§65](spec/65-a-read-lock-for-the-page-cache.md). Pages are
+shared, not copied: a read gets the cache's page (`Page`, an `Arc`),
+and a change copies it first, so the cache's stays as it was [§64](spec/64-shared-pages.md). There is
 one writer at a time, and one process per file.
 
 **Snapshot reads are deferred, not rejected** [§57](spec/57-concurrency.md). Readers that
@@ -303,8 +306,9 @@ free-space map or any other change to allocation must keep it.
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
 once or ten times a second costs readers nothing measurable; one that
 commits back to back makes them wait tens of milliseconds, up to half a
-second. And readers don't really run in parallel yet: every page read
-takes the page cache's mutex, so four readers are no faster than one.
+second. Readers run in parallel since pages are shared [§64](spec/64-shared-pages.md) and looked up
+under a read lock [§65](spec/65-a-read-lock-for-the-page-cache.md): four do 3.2 times the work of one. Eight do no
+more than four.
 
 ## 10. The API
 
@@ -360,8 +364,8 @@ current table. Each gap had a measured cause, fixed one at a time:
 | One commit | 16 ms | one flush per commit; write-back at checkpoints [§51](spec/51-one-flush-per-commit.md) |
 | Batched inserts | 7.5k/s | B-tree pages changed in place [§52](spec/52-b-tree-pages-changed-in-place.md) |
 
-Still behind: full scans (decoding), a copy per page read, and whole
-8 KB page images in the WAL for every changed page.
+Still behind: full scans (decoding), and whole 8 KB page images in the
+WAL for every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md).
 
 ## 13. How it's tested
 

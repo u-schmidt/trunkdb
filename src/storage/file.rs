@@ -1,11 +1,11 @@
 use super::cache::PageCache;
-use super::{PageId, PageImage, PageStore, PageType};
+use super::{Page, PageId, PageImage, PageStore, PageType};
 use crate::crc32::Crc32;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A page's size in the file. Matches LiteDB's page size, partly so
 /// numbers stay comparable to it later, and because a document DB's
@@ -174,13 +174,15 @@ impl Header {
 pub struct FileStore {
     file: File,
     header: Header,
-    /// Checked pages as they are in the file (SPEC §50). Behind a mutex
-    /// because reads take `&self` and run in parallel (§27).
-    cache: Mutex<PageCache>,
+    /// Checked pages as they are in the file (SPEC §50). Behind a lock
+    /// because reads take `&self` and run in parallel (§27): a read lock
+    /// to look a page up, which readers share, and the write lock to put
+    /// one in (SPEC §65).
+    cache: RwLock<PageCache>,
     /// Pages of committed batches — durable in the WAL — not yet written
     /// back to the file (SPEC §51): the newest image of each. Reads look
     /// here before the cache and the file; `checkpoint` writes them back.
-    unwritten: BTreeMap<PageId, Vec<u8>>,
+    unwritten: BTreeMap<PageId, Page>,
     /// Whether the header's checksum has been checked — not yet between
     /// `open_before_recovery` and `check_header` (SPEC §40.4).
     header_checked: bool,
@@ -201,7 +203,7 @@ struct Staging {
     /// Every page changed since `begin`, keyed by id — so a page written
     /// many times in one batch is held (and later logged) once. Includes
     /// the header, as page 0, once anything has changed it.
-    dirty: BTreeMap<PageId, Vec<u8>>,
+    dirty: BTreeMap<PageId, Page>,
 }
 
 impl FileStore {
@@ -289,7 +291,7 @@ impl FileStore {
         Ok(Self {
             file,
             header,
-            cache: Mutex::new(PageCache::new(DEFAULT_CACHE_SIZE / PAGE_SIZE)),
+            cache: RwLock::new(PageCache::new(DEFAULT_CACHE_SIZE / PAGE_SIZE)),
             unwritten: BTreeMap::new(),
             // A fresh file's header isn't on disk yet: nothing to check.
             header_checked: is_fresh,
@@ -322,8 +324,7 @@ impl FileStore {
     /// one this build reads as it is (`COMPATIBLE_OLDER_FORMATS`) until
     /// the header is next written.
     pub(crate) fn format_version(&self) -> io::Result<u32> {
-        let mut buf = [0u8; USABLE_PAGE_SIZE];
-        self.read_raw(HEADER_PAGE, &mut buf)?;
+        let buf = self.read_current(HEADER_PAGE)?;
         Ok(u32::from_le_bytes(buf[28..32].try_into().unwrap()))
     }
 
@@ -357,8 +358,7 @@ impl FileStore {
             if pages.len() as u64 >= self.header.page_count {
                 return Err(corrupt("it loops".to_string()));
             }
-            let mut buf = [0u8; USABLE_PAGE_SIZE];
-            self.read_raw(next, &mut buf)?;
+            let buf = self.read_current(next)?;
             if buf[0] != PageType::Free as u8 {
                 return Err(corrupt(format!("page {next} isn't tagged free")));
             }
@@ -393,32 +393,12 @@ impl FileStore {
         Ok(())
     }
 
-    /// Reads a page's current bytes: from the dirty set if it's there,
-    /// otherwise from the cache, otherwise from the file — and keeps it in
-    /// the cache. No bounds check — callers do that.
-    fn read_raw(&self, id: PageId, buf: &mut [u8]) -> io::Result<()> {
-        if let Some(staging) = &self.staging
-            && let Some(page) = staging.dirty.get(&id)
-        {
-            buf.copy_from_slice(page);
-            return Ok(());
-        }
-        if let Some(page) = self.unwritten.get(&id) {
-            buf.copy_from_slice(page);
-            return Ok(());
-        }
-        if self.cache().read(id, buf) {
-            return Ok(());
-        }
-        read_page_at(&self.file, id, buf)?;
-        self.cache().put(id, buf);
-        Ok(())
-    }
-
-    /// `read_raw` into a new `Vec`, copied straight from wherever the page
-    /// is — no zeroed buffer first; a lookup reads several pages, and
-    /// clearing 8 KB each time showed in the profile (SPEC §50.2).
-    fn read_vec(&self, id: PageId) -> io::Result<Vec<u8>> {
+    /// A page's current bytes: from the dirty set if it's there, then
+    /// the committed pages not written back, then the cache, then the
+    /// file — and keeps a page read from the file in the cache. Shared
+    /// wherever it comes from, never copied (SPEC §64): the cache's lock
+    /// is held for the lookup only. No bounds check — callers do that.
+    fn read_current(&self, id: PageId) -> io::Result<Page> {
         if let Some(staging) = &self.staging
             && let Some(page) = staging.dirty.get(&id)
         {
@@ -428,15 +408,11 @@ impl FileStore {
             return Ok(page.clone());
         }
         if let Some(page) = self.cache().get(id) {
-            return Ok(page.to_vec());
+            return Ok(page);
         }
-        let disk = read_disk_page(&self.file, id)?;
-        if !checksum_matches(id, &disk) {
-            return Err(damaged(id));
-        }
-        let page = &disk[..USABLE_PAGE_SIZE];
-        self.cache().put(id, page);
-        Ok(page.to_vec())
+        let page = read_page_at(&self.file, id)?;
+        self.cache_mut().put(id, page.clone());
+        Ok(page)
     }
 
     /// Writes a page: into the dirty set while staging, otherwise
@@ -445,29 +421,38 @@ impl FileStore {
     fn write_raw(&mut self, id: PageId, data: &[u8]) -> io::Result<()> {
         match &mut self.staging {
             Some(staging) => {
-                staging.dirty.insert(id, data.to_vec());
+                staging.dirty.insert(id, Page::from(data));
                 Ok(())
             }
             None => {
-                self.cache().put(id, data);
+                self.cache_mut().put(id, Page::from(data));
                 write_page_at(&self.file, id, data)
             }
         }
     }
 
-    /// The page cache. A panic while it was held can't have left it
-    /// half-changed in a way that matters — at worst a page is missing —
-    /// so a poisoned lock is taken over, not passed on.
-    fn cache(&self) -> std::sync::MutexGuard<'_, PageCache> {
+    /// The page cache, to look pages up: readers share it (SPEC §65).
+    /// A panic while it was held can't have left it half-changed in a way
+    /// that matters — at worst a page is missing — so a poisoned lock is
+    /// taken over, not passed on.
+    fn cache(&self) -> RwLockReadGuard<'_, PageCache> {
         self.cache
-            .lock()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The page cache, to change: one thread at a time, and no reader
+    /// meanwhile. A read that misses takes it to put the page in.
+    fn cache_mut(&self) -> RwLockWriteGuard<'_, PageCache> {
+        self.cache
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// How many bytes of pages the cache holds at most (SPEC §50); 0
     /// turns it off. Pages over the new size are forgotten.
     pub fn set_cache_size(&mut self, bytes: usize) {
-        self.cache().resize(bytes / PAGE_SIZE);
+        self.cache_mut().resize(bytes / PAGE_SIZE);
     }
 
     #[cfg(test)]
@@ -489,13 +474,14 @@ impl FileStore {
     #[cfg(test)]
     pub(crate) fn cache_stats(&self) -> (usize, usize) {
         let cache = self.cache();
-        (cache.hits, cache.misses)
+        let count =
+            |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::Relaxed);
+        (count(&cache.hits), count(&cache.misses))
     }
 
     #[cfg(test)]
-    fn cached(&self, id: PageId) -> Option<Vec<u8>> {
-        let mut buf = vec![0u8; USABLE_PAGE_SIZE];
-        self.cache().read(id, &mut buf).then_some(buf)
+    fn cached(&self, id: PageId) -> Option<Page> {
+        self.cache().get(id)
     }
 
     fn check_bounds(&self, id: PageId) -> io::Result<()> {
@@ -543,7 +529,7 @@ impl FileStore {
         self.staging
             .iter()
             .flat_map(|staging| staging.dirty.iter())
-            .map(|(&id, page)| (id, page.as_slice()))
+            .map(|(&id, page)| (id, &**page))
     }
 
     /// Makes `pages` — ids 1 and up, as a `MemoryStore` built them — the
@@ -585,7 +571,7 @@ impl FileStore {
         if self.file.metadata()?.len() > len {
             self.file.set_len(len)?;
             let page_count = self.header.page_count;
-            self.cache().retain(|id| id < page_count);
+            self.cache_mut().retain(|id| id < page_count);
         }
         Ok(())
     }
@@ -621,10 +607,11 @@ impl FileStore {
         super::sync(&self.file)?;
         let written = std::mem::take(&mut self.unwritten);
         let page_count = self.header.page_count;
-        let mut cache = self.cache();
-        // Not pages a later batch cut off the end: they're gone.
-        for (id, page) in written.range(..page_count) {
-            cache.put(*id, page);
+        let mut cache = self.cache_mut();
+        // Not pages a later batch cut off the end: they're gone. Moved,
+        // not copied: the cache takes the pages the batch staged.
+        for (id, page) in written.into_iter().filter(|(id, _)| *id < page_count) {
+            cache.put(id, page);
         }
         Ok(())
     }
@@ -686,7 +673,7 @@ impl FileStore {
             }
         }
         // Pages are about to change under it.
-        self.cache().clear();
+        self.cache_mut().clear();
         for (id, page) in pages {
             write_page_at(&self.file, *id, page)?;
         }
@@ -709,8 +696,7 @@ impl PageStore for FileStore {
     fn allocate_page(&mut self) -> io::Result<PageId> {
         let id = if self.header.free_list_head != NO_FREE_PAGE {
             let id = self.header.free_list_head;
-            let mut buf = [0u8; USABLE_PAGE_SIZE];
-            self.read_raw(id, &mut buf)?;
+            let buf = self.read_current(id)?;
             if buf[0] != PageType::Free as u8 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -746,16 +732,16 @@ impl PageStore for FileStore {
         Ok(id)
     }
 
-    fn read_page(&self, id: PageId) -> io::Result<Vec<u8>> {
+    fn read_page(&self, id: PageId) -> io::Result<Page> {
         self.check_bounds(id)?;
-        self.read_vec(id)
+        self.read_current(id)
     }
 
-    fn try_read_page(&self, id: PageId) -> io::Result<Option<Vec<u8>>> {
+    fn try_read_page(&self, id: PageId) -> io::Result<Option<Page>> {
         if id >= self.header.page_count {
             return Ok(None);
         }
-        self.read_vec(id).map(Some)
+        self.read_current(id).map(Some)
     }
 
     fn write_page(&mut self, id: PageId, data: &[u8]) -> io::Result<()> {
@@ -851,20 +837,18 @@ pub(crate) fn rewrite_format_version(path: &Path, version: u32) {
         .write(true)
         .open(path)
         .unwrap();
-    let mut header = [0u8; USABLE_PAGE_SIZE];
-    read_page_at(&file, HEADER_PAGE, &mut header).unwrap();
-    header[28..32].copy_from_slice(&version.to_le_bytes());
+    let mut header = read_page_at(&file, HEADER_PAGE).unwrap();
+    header.make_mut()[28..32].copy_from_slice(&version.to_le_bytes());
     write_page_at(&file, HEADER_PAGE, &header).unwrap();
 }
 
 /// A page's bytes above this file, checksum verified and cut off.
-fn read_page_at(file: &File, id: PageId, buf: &mut [u8]) -> io::Result<()> {
+fn read_page_at(file: &File, id: PageId) -> io::Result<Page> {
     let disk = read_disk_page(file, id)?;
     if !checksum_matches(id, &disk) {
         return Err(damaged(id));
     }
-    buf.copy_from_slice(&disk[..USABLE_PAGE_SIZE]);
-    Ok(())
+    Ok(Page::from(&disk[..USABLE_PAGE_SIZE]))
 }
 
 /// Writes a page's bytes with their checksum appended.
@@ -1026,8 +1010,8 @@ mod tests {
         let id = store.allocate_page().unwrap();
         store.write_page(id, &[7u8; USABLE_PAGE_SIZE]).unwrap();
         assert_eq!(
-            store.try_read_page(id).unwrap(),
-            Some(vec![7u8; USABLE_PAGE_SIZE])
+            store.try_read_page(id).unwrap().unwrap(),
+            vec![7u8; USABLE_PAGE_SIZE]
         );
     }
 
@@ -1230,7 +1214,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn assert_damaged(result: io::Result<Vec<u8>>, id: PageId) {
+    fn assert_damaged(result: io::Result<Page>, id: PageId) {
         let err = result.expect_err("a damaged page must not be read");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
@@ -1375,7 +1359,7 @@ mod tests {
         two_page_file(&path);
         let mut store = FileStore::open(&path).unwrap();
         store.free_page(2).unwrap();
-        let mut free = store.read_page(2).unwrap();
+        let mut free = store.read_page(2).unwrap().to_vec();
         free[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
         store.write_raw(2, &free).unwrap();
 
@@ -1685,6 +1669,52 @@ mod tests {
         assert_eq!(since(&store, before), (0, 2));
     }
 
+    /// Pages are shared, not copied (SPEC §64): two reads of a cached
+    /// page get the same bytes in memory, and so do the reads before and
+    /// after a checkpoint moves a committed page into the cache. Changing
+    /// a page read changes no one else's, and a reader holding a page
+    /// keeps it as it was when a write replaces it.
+    #[test]
+    fn pages_are_shared_until_one_is_changed() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let held = store.read_page(1).unwrap();
+        assert!(store.read_page(1).unwrap().shares(&held));
+
+        let mut changed = store.read_page(1).unwrap();
+        changed.make_mut()[0] = 42;
+        assert_eq!(store.read_page(1).unwrap(), filled(1));
+
+        store.begin();
+        store.write_page(1, &filled(9)).unwrap();
+        let staged = store.read_page(1).unwrap();
+        store.commit();
+        assert!(store.read_page(1).unwrap().shares(&staged));
+        store.checkpoint().unwrap();
+        let cached = store.read_page(1).unwrap();
+        assert!(cached.shares(&staged), "moved into the cache, not copied");
+        assert_eq!(cached, filled(9));
+        assert_eq!(held, filled(1));
+    }
+
+    /// Readers share the cache (SPEC §65): while one holds it to look a
+    /// page up, another's read of a cached page goes through, where a
+    /// mutex would make it wait.
+    #[test]
+    fn readers_look_pages_up_together() {
+        let (_dir, path) = open_temp();
+        let store = five_page_file(&path);
+        store.read_page(1).unwrap();
+        let held = store.cache();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| sent.send(store.read_page(1).unwrap()).unwrap());
+            let page = received.recv_timeout(std::time::Duration::from_secs(10));
+            drop(held);
+            assert_eq!(page.expect("the second reader waited"), filled(1));
+        });
+    }
+
     /// Staged pages never reach the cache: a rolled-back write isn't read
     /// back, a written-back one is, from the cache.
     #[test]
@@ -1738,7 +1768,7 @@ mod tests {
         let disk = on_disk(&store);
         for id in 1..=3 {
             assert_eq!(disk.read_page(id).unwrap(), filled(7), "{id}");
-            assert_eq!(store.cached(id), Some(filled(7)), "{id}");
+            assert_eq!(store.cached(id).unwrap(), filled(7), "{id}");
         }
     }
 
@@ -1795,7 +1825,21 @@ mod tests {
         store.replace_all([(1, filled(8))], 2).unwrap();
         store.write_back().unwrap();
         assert!(store.cached(5).is_none());
-        assert_eq!(store.cached(1), Some(filled(8)));
+        assert_eq!(store.cached(1).unwrap(), filled(8));
+
+        // Committed by one batch, cut off by the next, before either is
+        // written back: the checkpoint doesn't cache it either.
+        store.begin();
+        store
+            .replace_all([(1, filled(1)), (4, filled(4))], 5)
+            .unwrap();
+        store.commit();
+        store.begin();
+        store.replace_all([(1, filled(7))], 2).unwrap();
+        store.commit();
+        store.checkpoint().unwrap();
+        assert!(store.cached(4).is_none());
+        assert_eq!(store.cached(1).unwrap(), filled(7));
     }
 
     /// The cache answers for a page that was damaged on disk after it was

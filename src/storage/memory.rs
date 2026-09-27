@@ -1,4 +1,4 @@
-use super::{PageId, PageStore, USABLE_PAGE_SIZE};
+use super::{Page, PageId, PageStore, USABLE_PAGE_SIZE};
 use std::io;
 
 /// Pages in memory, for building a whole database image before it goes
@@ -61,11 +61,13 @@ impl PageStore for MemoryStore {
         Ok(self.page_count() - 1)
     }
 
-    fn read_page(&self, id: PageId) -> io::Result<Vec<u8>> {
-        Ok(self.pages[self.check_id(id)?].clone())
+    /// A copy: the image is built once and handed to the file whole,
+    /// so there's no cache here to share pages with.
+    fn read_page(&self, id: PageId) -> io::Result<Page> {
+        Ok(Page::from(&self.pages[self.check_id(id)?][..]))
     }
 
-    fn try_read_page(&self, id: PageId) -> io::Result<Option<Vec<u8>>> {
+    fn try_read_page(&self, id: PageId) -> io::Result<Option<Page>> {
         if id >= self.page_count() {
             return Ok(None);
         }
@@ -107,8 +109,8 @@ mod tests {
         store.write_page(2, &[7u8; USABLE_PAGE_SIZE]).unwrap();
         assert_eq!(store.read_page(1).unwrap(), vec![0u8; USABLE_PAGE_SIZE]);
         assert_eq!(
-            store.try_read_page(2).unwrap(),
-            Some(vec![7u8; USABLE_PAGE_SIZE])
+            store.try_read_page(2).unwrap().unwrap(),
+            vec![7u8; USABLE_PAGE_SIZE]
         );
         assert_eq!(store.page_count(), 3);
         let pages: Vec<PageId> = store.into_pages().map(|(id, _)| id).collect();
