@@ -1,3 +1,4 @@
+use crate::datetime::DateTime;
 use crate::decode::{corrupt, take, take_array, take_u8, take_u32};
 use indexmap::IndexMap;
 use std::time::SystemTime;
@@ -21,10 +22,10 @@ pub enum Document {
     Array(Vec<Document>),
     Object(IndexMap<String, Document>),
     Id(DocId),
-    /// A point in time, in UTC (SPEC §69): what a `SystemTime` field
-    /// stores, to the nanosecond. Filters compare, sort and index it in
-    /// time order; it equals no string or number.
-    DateTime(SystemTime),
+    /// A point in time, in UTC, to the nanosecond (SPEC §69, §70): what a
+    /// `SystemTime` or `DateTime` field stores. Filters compare, sort and
+    /// index it in time order; it equals no string or number.
+    DateTime(DateTime),
 }
 
 impl Document {
@@ -189,7 +190,8 @@ document_from! {
     String => String as String,
     &str => String as String,
     DocId => Id as DocId,
-    SystemTime => DateTime as SystemTime,
+    SystemTime => DateTime as DateTime,
+    DateTime => DateTime as DateTime,
 }
 
 /// `None` is `Null`, so an `Option` field's value can go into a filter
@@ -311,11 +313,9 @@ fn write_document(doc: &Document, buffer: &mut Vec<u8>) {
             buffer.extend_from_slice(&id.0);
         }
         Document::DateTime(time) => {
-            let (secs, nanos) =
-                crate::datetime::to_parts(*time).expect("no SystemTime is that far from 1970");
             buffer.push(TAG_DATETIME);
-            buffer.extend_from_slice(&secs.to_le_bytes());
-            buffer.extend_from_slice(&nanos.to_le_bytes());
+            buffer.extend_from_slice(&time.unix_seconds().to_le_bytes());
+            buffer.extend_from_slice(&time.subsec_nanos().to_le_bytes());
         }
     }
 }
@@ -384,10 +384,8 @@ fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
         TAG_DATETIME => {
             let secs = i64::from_le_bytes(take_array(bytes, "a date-time")?);
             let nanos = u32::from_le_bytes(take_array(bytes, "a date-time")?);
-            let time = crate::datetime::from_parts(secs, nanos).ok_or_else(|| {
-                corrupt(format_args!(
-                    "a date-time out of range: {secs} s, {nanos} ns"
-                ))
+            let time = DateTime::from_unix(secs, nanos).ok_or_else(|| {
+                corrupt(format_args!("a date-time with {nanos} ns past its second"))
             })?;
             Document::DateTime(time)
         }
@@ -473,7 +471,7 @@ mod tests {
     /// before 1970 too; nanoseconds of a second or more are damage.
     #[test]
     fn datetimes_roundtrip_and_bad_nanoseconds_are_damage() {
-        let at = |secs, nanos| crate::datetime::from_parts(secs, nanos).unwrap();
+        let at = |secs, nanos| crate::DateTime::from_unix(secs, nanos).unwrap();
         for time in [
             at(0, 0),
             at(1_790_000_000, 123_456_789),

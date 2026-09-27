@@ -221,11 +221,9 @@ fn encode_value_in(value: &Document, fields: usize) -> Option<Vec<u8>> {
         Document::String(s) => Some(encode_string(s.as_bytes(), string_budget(fields))),
         Document::Id(id) => Some([&[TAG_ID][..], &id.0].concat()),
         Document::DateTime(time) => {
-            let (secs, nanos) =
-                crate::datetime::to_parts(*time).expect("no SystemTime is that far from 1970");
             let mut out = vec![TAG_DATETIME];
-            out.extend_from_slice(&((secs as u64) ^ (1 << 63)).to_be_bytes());
-            out.extend_from_slice(&nanos.to_be_bytes());
+            out.extend_from_slice(&((time.unix_seconds() as u64) ^ (1 << 63)).to_be_bytes());
+            out.extend_from_slice(&time.subsec_nanos().to_be_bytes());
             Some(out)
         }
         _ => None,
@@ -515,8 +513,7 @@ mod tests {
     /// the nanosecond, after every id; a compound key's parts split them.
     #[test]
     fn datetimes_are_keyed_in_time_order() {
-        let at =
-            |secs, nanos| Document::DateTime(crate::datetime::from_parts(secs, nanos).unwrap());
+        let at = |secs, nanos| Document::DateTime(crate::DateTime::from_unix(secs, nanos).unwrap());
         let times = [
             at(i64::MIN / 4, 0),
             at(-86_400, 0),

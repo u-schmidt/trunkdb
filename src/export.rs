@@ -459,7 +459,7 @@ mod tests {
             7 if rng.below(2) == 0 => Document::Float(rng.next() as f64 / 3.0),
             // Anywhere within ±3,000 years of 1970, to the nanosecond.
             7 => Document::DateTime(
-                crate::datetime::from_parts(
+                crate::DateTime::from_unix(
                     (rng.next() % 190_000_000_000) as i64 - 95_000_000_000,
                     (rng.next() % 1_000_000_000) as u32,
                 )
@@ -705,7 +705,7 @@ mod tests {
             };
             Ok::<_, crate::Error>(fields.shift_remove("at").unwrap())
         };
-        let time = crate::datetime::from_parts(1_790_000_000, 0).unwrap();
+        let time = crate::DateTime::from_unix(1_790_000_000, 0).unwrap();
         let date = r#""2026-09-21T14:13:20Z""#;
         assert_eq!(import("a", 2, date).unwrap(), Document::DateTime(time));
         let object = |value: Document| Document::Object([("$date".to_string(), value)].into());

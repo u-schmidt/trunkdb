@@ -78,9 +78,7 @@ pub fn to_json(doc: &Document) -> Value {
         Document::String(s) => Value::String(s.clone()),
         Document::Binary(bytes) => tagged(TAG_BINARY, Value::String(base64_encode(bytes))),
         Document::Id(id) => tagged(TAG_ID, Value::String(id.to_string())),
-        Document::DateTime(time) => {
-            tagged(TAG_DATE, Value::String(crate::datetime::to_rfc3339(*time)))
-        }
+        Document::DateTime(time) => tagged(TAG_DATE, Value::String(time.to_string())),
         Document::Array(items) => Value::Array(items.iter().map(to_json).collect()),
         Document::Object(map) => {
             let object = object_to_json(map);
@@ -239,11 +237,7 @@ fn from_tag(tag: String, value: Value, tags: Tags) -> Result<Document, JsonError
         },
         TAG_DATE => {
             let s = text(value)?;
-            Document::DateTime(crate::datetime::from_rfc3339(&s).ok_or_else(|| {
-                error(format!(
-                    "`$date` {s:?} is not an RFC 3339 date and time (like \"2026-09-27T14:05:00Z\")"
-                ))
-            })?)
+            Document::DateTime(s.parse().map_err(|e| error(format!("`$date`: {e}")))?)
         }
         TAG_OBJECT => match value {
             Value::Object(inner) => Document::Object(object_from_json(inner, tags)?),
@@ -431,7 +425,7 @@ mod tests {
     /// the object it was then.
     #[test]
     fn datetimes_are_tagged_and_older_exports_keep_their_date_objects() {
-        let time = crate::datetime::from_parts(1_790_000_000, 120_000_000).unwrap();
+        let time = crate::DateTime::from_unix(1_790_000_000, 120_000_000).unwrap();
         let json = to_json(&Document::DateTime(time));
         assert_eq!(json.to_string(), r#"{"$date":"2026-09-21T14:13:20.12Z"}"#);
         assert_eq!(

@@ -343,6 +343,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     Items 38–43 → 0.14.0: file format 11 (still opens 6–10) and export
     format 2 (still imports 1); new API only, no breaking change.
 
+44. **A portable date-time** (§70): `Document::DateTime` holds
+    `trunkdb::DateTime`, not a `SystemTime`, so a time reads the same on
+    every platform; a `DateTime` field holds times before 1970 too.
+
 What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License

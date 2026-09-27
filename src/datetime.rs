@@ -1,80 +1,215 @@
-//! A point in time as `Document::DateTime` holds it (SPEC §69): a
-//! `SystemTime`, an instant in UTC, stored as whole seconds since
-//! 1970-01-01T00:00:00Z (negative before) and nanoseconds past that
-//! second, so a `SystemTime` reads back exactly as it was written. And its
-//! text, RFC 3339 in UTC, for the export and for reading it as a string.
+//! `DateTime`, what `Document::DateTime` holds (SPEC §69, §70): an
+//! instant in UTC as whole seconds since 1970-01-01T00:00:00Z (negative
+//! before) and nanoseconds past that second. The same on every platform,
+//! unlike `SystemTime`, which it converts from and to. And its text, RFC
+//! 3339 in UTC, for the export, `Display` and reading it as a string.
 
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
 
-/// `time` as seconds since the epoch, rounded down, and the nanoseconds
-/// after that second (`0..1_000_000_000`, also before the epoch). `None`
-/// for a time too far from 1970 for an `i64` of seconds, 292 billion
-/// years, which no platform's `SystemTime` reaches.
-pub(crate) fn to_parts(time: SystemTime) -> Option<(i64, u32)> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(after) => Some((i64::try_from(after.as_secs()).ok()?, after.subsec_nanos())),
-        Err(before) => {
-            let before = before.duration();
-            let secs = i64::try_from(before.as_secs()).ok()?;
-            match before.subsec_nanos() {
-                0 => Some((-secs, 0)),
-                nanos => Some((-secs - 1, NANOS_PER_SECOND - nanos)),
+/// A point in time, in UTC, to the nanosecond (SPEC §69, §70): what a
+/// `SystemTime` field is stored as, and what a filter compares it with.
+/// Any time an `i64` of seconds reaches, 292 billion years either side of
+/// 1970, on every platform: a file written on one reads the same on
+/// another.
+///
+/// ```
+/// use std::time::SystemTime;
+/// use trunkdb::DateTime;
+///
+/// let now = DateTime::now();
+/// let text = now.to_string();                  // "2026-09-27T14:05:00.123456789Z"
+/// assert_eq!(text.parse::<DateTime>().unwrap(), now);
+/// assert_eq!(DateTime::from(SystemTime::UNIX_EPOCH), DateTime::UNIX_EPOCH);
+/// ```
+///
+/// A struct can hold a `SystemTime` or a `DateTime`; both are stored as
+/// date-times. A `DateTime` also holds what serde's `SystemTime` refuses,
+/// times before 1970, and what a platform's `SystemTime` can't, like
+/// Windows' times before 1601 or finer than 100 ns.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DateTime {
+    // In this order: the derived `Ord` is time order, as `nanos` is
+    // always below a second.
+    secs: i64,
+    nanos: u32,
+}
+
+impl DateTime {
+    /// 1970-01-01T00:00:00Z.
+    pub const UNIX_EPOCH: DateTime = DateTime { secs: 0, nanos: 0 };
+
+    /// The current time, from `SystemTime::now()`.
+    pub fn now() -> Self {
+        SystemTime::now().into()
+    }
+
+    /// The time `secs` seconds after 1970-01-01T00:00:00Z (before, if
+    /// negative) and `nanos` nanoseconds after that. `None` if `nanos` is
+    /// a second or more.
+    pub fn from_unix(secs: i64, nanos: u32) -> Option<Self> {
+        (nanos < NANOS_PER_SECOND).then_some(DateTime { secs, nanos })
+    }
+
+    /// Whole seconds since 1970-01-01T00:00:00Z, rounded down: negative
+    /// before it.
+    pub fn unix_seconds(&self) -> i64 {
+        self.secs
+    }
+
+    /// Nanoseconds after `unix_seconds`, below a second.
+    pub fn subsec_nanos(&self) -> u32 {
+        self.nanos
+    }
+
+    /// This time as a `SystemTime`, if this platform's holds it: not a
+    /// time before 1601 on Windows, and there rounded down to 100 ns.
+    pub fn to_system_time(&self) -> Option<SystemTime> {
+        if self.secs >= 0 {
+            UNIX_EPOCH.checked_add(Duration::new(self.secs as u64, self.nanos))
+        } else {
+            UNIX_EPOCH
+                .checked_sub(Duration::new(self.secs.unsigned_abs(), 0))?
+                .checked_add(Duration::new(0, self.nanos))
+        }
+    }
+}
+
+/// Every `SystemTime` a platform has is within an `i64` of seconds.
+impl From<SystemTime> for DateTime {
+    fn from(time: SystemTime) -> Self {
+        let far = "no SystemTime is 292 billion years from 1970";
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(after) => DateTime {
+                secs: i64::try_from(after.as_secs()).expect(far),
+                nanos: after.subsec_nanos(),
+            },
+            Err(before) => {
+                let before = before.duration();
+                let secs = i64::try_from(before.as_secs()).expect(far);
+                match before.subsec_nanos() {
+                    0 => DateTime {
+                        secs: -secs,
+                        nanos: 0,
+                    },
+                    nanos => DateTime {
+                        secs: -secs - 1,
+                        nanos: NANOS_PER_SECOND - nanos,
+                    },
+                }
             }
         }
     }
 }
 
-/// `to_parts` backwards. `None` if `nanos` is a second or more, or the
-/// time is beyond what this platform's `SystemTime` holds.
-pub(crate) fn from_parts(secs: i64, nanos: u32) -> Option<SystemTime> {
-    if nanos >= NANOS_PER_SECOND {
-        return None;
-    }
-    if secs >= 0 {
-        UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos))
-    } else {
-        let before = Duration::new(secs.unsigned_abs(), 0);
-        UNIX_EPOCH
-            .checked_sub(before)?
-            .checked_add(Duration::new(0, nanos))
+/// RFC 3339, in UTC: `2026-09-27T14:05:00Z`, with as many fractional
+/// digits as the nanoseconds need, up to nine. A year before 0 or after
+/// 9999 gets a sign and as many digits as it has (ISO 8601's expanded
+/// years), so every `DateTime` has a text.
+impl fmt::Display for DateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (days, second_of_day) = (self.secs.div_euclid(86_400), self.secs.rem_euclid(86_400));
+        let (year, month, day) = civil_from_days(days);
+        if (0..=9999).contains(&year) {
+            write!(f, "{year:04}")?;
+        } else {
+            write!(f, "{year:+05}")?;
+        }
+        let (hour, minute, second) = (
+            second_of_day / 3600,
+            second_of_day / 60 % 60,
+            second_of_day % 60,
+        );
+        write!(f, "-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")?;
+        if self.nanos != 0 {
+            let fraction = format!("{:09}", self.nanos);
+            write!(f, ".{}", fraction.trim_end_matches('0'))?;
+        }
+        f.write_str("Z")
     }
 }
 
-/// `time` in RFC 3339, in UTC: `2026-09-27T14:05:00Z`, with as many
-/// fractional digits as the nanoseconds need, up to nine. A year before
-/// 0 or after 9999 gets a sign and as many digits as it has (ISO 8601's
-/// expanded years), so every `SystemTime` has a text.
-pub(crate) fn to_rfc3339(time: SystemTime) -> String {
-    let (secs, nanos) = to_parts(time).expect("no SystemTime is that far from 1970");
-    let (days, second_of_day) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let (year, month, day) = civil_from_days(days);
-    let year = if (0..=9999).contains(&year) {
-        format!("{year:04}")
-    } else {
-        format!("{year:+05}")
-    };
-    let (hour, minute, second) = (
-        second_of_day / 3600,
-        second_of_day / 60 % 60,
-        second_of_day % 60,
-    );
-    let mut text = format!("{year}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
-    if nanos != 0 {
-        let fraction = format!("{nanos:09}");
-        text.push('.');
-        text.push_str(fraction.trim_end_matches('0'));
+/// The text, as `Display` writes it.
+impl fmt::Debug for DateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DateTime({self})")
     }
-    text.push('Z');
-    text
 }
 
-/// `to_rfc3339` backwards, and RFC 3339 as others write it: an offset
-/// (`+02:00`) instead of `Z`, a lower-case `t` or `z`, a space for the
-/// `T`. The fraction may have one to nine digits. `None` for anything
-/// else, and for a time this platform's `SystemTime` can't hold.
-pub(crate) fn from_rfc3339(text: &str) -> Option<SystemTime> {
+/// RFC 3339: what `Display` writes, and as others write it too, with an
+/// offset (`+02:00`) instead of `Z`, a lower-case `t` or `z`, or a space
+/// for the `T`. The fraction may have one to nine digits.
+impl std::str::FromStr for DateTime {
+    type Err = ParseDateTimeError;
+
+    fn from_str(text: &str) -> Result<Self, ParseDateTimeError> {
+        parse_rfc3339(text).ok_or_else(|| ParseDateTimeError {
+            input: text.to_string(),
+        })
+    }
+}
+
+/// A string that isn't an RFC 3339 date and time: what
+/// `str::parse::<DateTime>` returns (SPEC §70).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDateTimeError {
+    input: String,
+}
+
+impl fmt::Display for ParseDateTimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} is not an RFC 3339 date and time (like \"2026-09-27T14:05:00Z\")",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for ParseDateTimeError {}
+
+/// The name `DateTime`'s serde impls give their newtype (SPEC §70), so the
+/// serde bridge stores it as `Document::DateTime`, as it does `DocId`
+/// (§59). Any other format sees a newtype around the RFC 3339 text.
+pub(crate) const DATETIME_NEWTYPE: &str = "$trunkdb::DateTime";
+
+impl serde::Serialize for DateTime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_newtype_struct(DATETIME_NEWTYPE, &self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DateTime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TextVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TextVisitor {
+            type Value = DateTime;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a date and time, as RFC 3339 text")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<DateTime, E> {
+                s.parse().map_err(E::custom)
+            }
+
+            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<DateTime, D::Error> {
+                deserializer.deserialize_str(self)
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(DATETIME_NEWTYPE, TextVisitor)
+    }
+}
+
+/// `Display` backwards (see `FromStr`). `None` for anything else.
+fn parse_rfc3339(text: &str) -> Option<DateTime> {
     let (date, rest) = text.split_at(text.find(['T', 't', ' '])?);
     let rest = &rest[1..];
     let (year, month, day) = parse_date(date)?;
@@ -105,12 +240,13 @@ pub(crate) fn from_rfc3339(text: &str) -> Option<SystemTime> {
             sign * (h * 3600 + m * 60)
         }
     };
+    // In `i128`: at the start of the range, the whole days before it are
+    // already more seconds than an `i64` holds, and the time of day brings
+    // it back.
     let days = days_from_civil(year, month, day);
-    let secs = days
-        .checked_mul(86_400)?
-        .checked_add(hour * 3600 + minute * 60 + second)?
-        .checked_sub(offset_secs)?;
-    from_parts(secs, nanos)
+    let secs = i128::from(days) * 86_400 + i128::from(hour * 3600 + minute * 60 + second)
+        - i128::from(offset_secs);
+    DateTime::from_unix(i64::try_from(secs).ok()?, nanos)
 }
 
 /// `YYYY-MM-DD`, or a signed year of more digits (`+12345-01-01`), a day
@@ -127,8 +263,10 @@ fn parse_date(date: &str) -> Option<(i64, u32, u32)> {
     if fields.next().is_some() || !digits(year) || month.len() != 2 || day.len() != 2 {
         return None;
     }
-    // Four digits without a sign, four or more (up to i64's) with one.
-    if year.len() < 4 || (sign == 0 && year.len() != 4) || year.len() > 18 {
+    // Four digits without a sign, four to twelve with one: 292 billion
+    // years is as far as an `i64` of seconds goes, and the arithmetic
+    // below checks for going past it.
+    if year.len() < 4 || (sign == 0 && year.len() != 4) || year.len() > 12 {
         return None;
     }
     let year = if sign < 0 {
@@ -198,75 +336,90 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
-    fn at(secs: i64, nanos: u32) -> SystemTime {
-        from_parts(secs, nanos).unwrap()
+    fn at(secs: i64, nanos: u32) -> DateTime {
+        DateTime::from_unix(secs, nanos).unwrap()
     }
 
     #[test]
-    fn parts_round_trip_before_and_after_1970() {
+    fn system_times_convert_both_ways() {
+        // Times every platform's `SystemTime` holds: after 1601, in whole
+        // 100 ns.
         for (secs, nanos) in [
             (0, 0),
-            (1, 1),
-            (1_790_000_000, 123_456_789),
+            (1, 100),
+            (1_790_000_000, 123_456_700),
             (-1, 0),
-            (-1, 999_999_999),
-            (-86_400 * 365 * 400, 5),
-            (253_402_300_799, 999_999_999),
+            (-1, 999_999_900),
+            (-86_400 * 365 * 300, 500),
+            (253_402_300_799, 999_999_900),
         ] {
-            assert_eq!(
-                to_parts(at(secs, nanos)),
-                Some((secs, nanos)),
-                "{secs} {nanos}"
-            );
+            let time = at(secs, nanos);
+            let system = time.to_system_time().unwrap();
+            assert_eq!(DateTime::from(system), time, "{time}");
         }
         // Half a second before 1970: the second before, plus half.
         let before = UNIX_EPOCH - Duration::from_millis(500);
-        assert_eq!(to_parts(before), Some((-1, 500_000_000)));
-        assert_eq!(from_parts(0, NANOS_PER_SECOND), None);
+        assert_eq!(DateTime::from(before), at(-1, 500_000_000));
+        assert_eq!(DateTime::from(UNIX_EPOCH), DateTime::UNIX_EPOCH);
+        assert_eq!(DateTime::from_unix(0, NANOS_PER_SECOND), None);
+    }
+
+    #[test]
+    fn datetimes_order_in_time() {
+        let times = [
+            at(i64::MIN, 0),
+            at(-1, 0),
+            at(-1, 999_999_999),
+            at(0, 0),
+            at(0, 1),
+            at(i64::MAX, 999_999_999),
+        ];
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(at(7, 5).unix_seconds(), 7);
+        assert_eq!(at(7, 5).subsec_nanos(), 5);
     }
 
     #[test]
     fn rfc3339_is_written_in_utc_with_the_digits_needed() {
-        assert_eq!(to_rfc3339(at(0, 0)), "1970-01-01T00:00:00Z");
-        assert_eq!(to_rfc3339(at(1_790_000_000, 0)), "2026-09-21T14:13:20Z");
-        assert_eq!(
-            to_rfc3339(at(1_790_000_000, 120_000_000)),
-            "2026-09-21T14:13:20.12Z"
-        );
-        assert_eq!(
-            to_rfc3339(at(1_790_000_000, 1)),
-            "2026-09-21T14:13:20.000000001Z"
-        );
-        assert_eq!(to_rfc3339(at(-1, 500_000_000)), "1969-12-31T23:59:59.5Z");
-        assert_eq!(to_rfc3339(at(951_782_400, 0)), "2000-02-29T00:00:00Z");
-        assert_eq!(to_rfc3339(at(-62_135_596_800, 0)), "0001-01-01T00:00:00Z");
-        assert_eq!(to_rfc3339(at(253_402_300_800, 0)), "+10000-01-01T00:00:00Z");
-        assert_eq!(to_rfc3339(at(-62_198_755_200, 0)), "-0001-01-01T00:00:00Z");
+        let text = |secs, nanos| at(secs, nanos).to_string();
+        assert_eq!(text(0, 0), "1970-01-01T00:00:00Z");
+        assert_eq!(text(1_790_000_000, 0), "2026-09-21T14:13:20Z");
+        assert_eq!(text(1_790_000_000, 120_000_000), "2026-09-21T14:13:20.12Z");
+        assert_eq!(text(1_790_000_000, 1), "2026-09-21T14:13:20.000000001Z");
+        assert_eq!(text(-1, 500_000_000), "1969-12-31T23:59:59.5Z");
+        assert_eq!(text(951_782_400, 0), "2000-02-29T00:00:00Z");
+        assert_eq!(text(-62_135_596_800, 0), "0001-01-01T00:00:00Z");
+        assert_eq!(text(253_402_300_800, 0), "+10000-01-01T00:00:00Z");
+        assert_eq!(text(-62_198_755_200, 0), "-0001-01-01T00:00:00Z");
+        assert_eq!(format!("{:?}", at(0, 0)), "DateTime(1970-01-01T00:00:00Z)");
     }
 
-    /// Every day for eight centuries and some odd times: what's written
-    /// reads back.
+    /// Every third day or so for eight centuries, some odd times, and the
+    /// ends of the range: what's written reads back.
     #[test]
     fn rfc3339_reads_back_what_it_wrote() {
         let mut secs = -62_135_596_800; // 0001-01-01
         while secs < 32_503_680_000 {
             // 3000-01-01
             let time = at(secs + 37_199, (secs.rem_euclid(1000) as u32) * 1_000_003);
-            assert_eq!(
-                from_rfc3339(&to_rfc3339(time)),
-                Some(time),
-                "{}",
-                to_rfc3339(time)
-            );
+            assert_eq!(parse_rfc3339(&time.to_string()), Some(time), "{time}");
             secs += 86_400 * 3 + 7;
         }
         for extreme in [
             at(253_402_300_800, 0),
             at(-62_198_755_200, 7),
             at(1 << 40, 1),
+            at(i64::MAX, 999_999_999),
+            at(i64::MIN, 0),
         ] {
-            assert_eq!(from_rfc3339(&to_rfc3339(extreme)), Some(extreme));
+            assert_eq!(
+                parse_rfc3339(&extreme.to_string()),
+                Some(extreme),
+                "{extreme}"
+            );
         }
+        let past_the_end = format!("{}", at(i64::MAX, 0)).replace("-12-04T", "-12-05T");
+        assert_eq!(parse_rfc3339(&past_the_end), None, "{past_the_end}");
     }
 
     #[test]
@@ -280,17 +433,17 @@ mod tests {
             "2026-09-21T08:43:20-05:30",
             "2026-09-21T14:13:20.000Z",
         ] {
-            assert_eq!(from_rfc3339(text), Some(utc), "{text}");
+            assert_eq!(text.parse::<DateTime>(), Ok(utc), "{text}");
         }
         assert_eq!(
-            from_rfc3339("2026-09-21T14:13:20.5Z"),
+            parse_rfc3339("2026-09-21T14:13:20.5Z"),
             Some(at(1_790_000_000, 500_000_000))
         );
         for bad in [
             "",
             "2026-09-21",
             "2026-09-21T14:13:20",
-            "2026-09-21T13:33Z",
+            "2026-09-21T14:13Z",
             "2026-9-21T14:13:20Z",
             "26-09-21T14:13:20Z",
             "2026-02-30T00:00:00Z",
@@ -298,23 +451,26 @@ mod tests {
             "1900-02-29T00:00:00Z",
             "2026-13-01T00:00:00Z",
             "2026-09-21T24:00:00Z",
-            "2026-09-21T13:60:00Z",
+            "2026-09-21T14:60:00Z",
             "2026-09-21T14:13:20.Z",
             "2026-09-21T14:13:20.1234567890Z",
             "2026-09-21T14:13:20+2:00",
             "2026-09-21T14:13:20+02",
             "12026-09-21T14:13:20Z",
+            "+1000000000000-01-01T00:00:00Z",
             "2026-09-21T14:13:20Zjunk",
         ] {
-            assert_eq!(from_rfc3339(bad), None, "{bad}");
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
         }
         assert_eq!(
-            from_rfc3339("2024-02-29T00:00:00Z"),
+            parse_rfc3339("2024-02-29T00:00:00Z"),
             Some(at(1_709_164_800, 0))
         );
         assert_eq!(
-            from_rfc3339("2000-02-29T00:00:00Z"),
+            parse_rfc3339("2000-02-29T00:00:00Z"),
             Some(at(951_782_400, 0))
         );
+        let error = "soon".parse::<DateTime>().unwrap_err().to_string();
+        assert!(error.starts_with("\"soon\" is not an RFC 3339"), "{error}");
     }
 }

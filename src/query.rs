@@ -1218,7 +1218,7 @@ mod tests {
     #[test]
     fn datetimes_compare_in_time_order_and_sort_after_ids() {
         use std::cmp::Ordering::Less;
-        let at = |secs| Document::DateTime(crate::datetime::from_parts(secs, 0).unwrap());
+        let at = |secs| Document::DateTime(crate::DateTime::from_unix(secs, 0).unwrap());
         let (before, after) = (at(-5), at(1_790_000_000));
         let item = doc(&[("seen", after.clone())]);
         assert!(Filter::new().eq("seen", after.clone()).matches(&item));

@@ -201,11 +201,16 @@ impl Serializer for DocumentSerializer {
         value: &T,
     ) -> Result<Document, DocumentError> {
         let inner = value.serialize(self)?;
-        // A `DocId` is stored as an id, not as its string (SPEC §59).
+        // A `DocId` is stored as an id, not as its string (SPEC §59), and a
+        // `DateTime` as a date-time (SPEC §70).
         match (name, inner) {
             (crate::document::DOC_ID_NEWTYPE, Document::String(s)) => s
                 .parse::<DocId>()
                 .map(Document::Id)
+                .map_err(DocumentError::custom),
+            (crate::datetime::DATETIME_NEWTYPE, Document::String(s)) => s
+                .parse::<crate::DateTime>()
+                .map(Document::DateTime)
                 .map_err(DocumentError::custom),
             (_, inner) => Ok(inner),
         }
@@ -406,7 +411,7 @@ const SYSTEM_TIME: &str = "SystemTime";
 const SYSTEM_TIME_FIELDS: [&str; 2] = ["secs_since_epoch", "nanos_since_epoch"];
 
 /// The time a serialized `SystemTime` holds, if `fields` are its two.
-fn system_time(fields: &IndexMap<String, Document>) -> Option<std::time::SystemTime> {
+fn system_time(fields: &IndexMap<String, Document>) -> Option<crate::DateTime> {
     let mut fields = fields.iter();
     let (Some((secs_key, Document::Int(secs))), Some((nanos_key, Document::Int(nanos))), None) =
         (fields.next(), fields.next(), fields.next())
@@ -416,7 +421,7 @@ fn system_time(fields: &IndexMap<String, Document>) -> Option<std::time::SystemT
     if [secs_key.as_str(), nanos_key.as_str()] != SYSTEM_TIME_FIELDS {
         return None;
     }
-    crate::datetime::from_parts(*secs, u32::try_from(*nanos).ok()?)
+    crate::DateTime::from_unix(*secs, u32::try_from(*nanos).ok()?)
 }
 
 /// `Document::Object` keys are always `String` — a map key can be any
@@ -501,11 +506,12 @@ impl<'de> Deserializer<'de> for Document {
             // As serde's `SystemTime` reads it: a struct of two fields.
             // Also what a `serde_json::Value` or an untagged enum sees.
             Document::DateTime(time) => {
-                let (secs, nanos) =
-                    crate::datetime::to_parts(time).expect("no SystemTime is that far from 1970");
                 let fields = [
-                    (SYSTEM_TIME_FIELDS[0], Document::Int(secs)),
-                    (SYSTEM_TIME_FIELDS[1], Document::Int(nanos.into())),
+                    (SYSTEM_TIME_FIELDS[0], Document::Int(time.unix_seconds())),
+                    (
+                        SYSTEM_TIME_FIELDS[1],
+                        Document::Int(time.subsec_nanos().into()),
+                    ),
                 ];
                 visitor.visit_map(MapDeserializer::new(fields.into_iter()))
             }
@@ -554,7 +560,7 @@ impl<'de> Deserializer<'de> for Document {
     /// `String` field, or a type that parses one, can hold it.
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DocumentError> {
         match self {
-            Document::DateTime(time) => visitor.visit_string(crate::datetime::to_rfc3339(time)),
+            Document::DateTime(time) => visitor.visit_string(time.to_string()),
             other => other.deserialize_any(visitor),
         }
     }
@@ -563,9 +569,23 @@ impl<'de> Deserializer<'de> for Document {
         self.deserialize_str(visitor)
     }
 
+    /// A `DateTime` field reads its date-time as its text (SPEC §70),
+    /// which holds every one, before 1970 and beyond any platform's
+    /// `SystemTime`.
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, DocumentError> {
+        if name == crate::datetime::DATETIME_NEWTYPE {
+            return self.deserialize_str(visitor);
+        }
+        self.deserialize_any(visitor)
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char
-        bytes byte_buf unit unit_struct newtype_struct seq tuple
+        bytes byte_buf unit unit_struct seq tuple
         tuple_struct map struct identifier ignored_any
     }
 }
@@ -677,10 +697,11 @@ mod tests {
     }
 
     /// SPEC §69: a `SystemTime` is stored as a `DateTime` and read back
-    /// to the nanosecond, in a struct, an `Option` or on its own; read
-    /// into a `String`, it's RFC 3339; a `serde_json::Value` sees serde's
-    /// own shape for it; a struct of another name with the same fields
-    /// stays an object.
+    /// as it was, in a struct, an `Option` or on its own; read into a
+    /// `String`, it's RFC 3339; a `serde_json::Value` sees serde's own
+    /// shape for it; a struct of another name with the same fields stays
+    /// an object. Times every platform's `SystemTime` holds: after 1601,
+    /// in whole 100 ns.
     #[test]
     fn system_times_are_datetimes() {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -689,27 +710,27 @@ mod tests {
             at: SystemTime,
             done: Option<SystemTime>,
         }
-        let at = UNIX_EPOCH + Duration::new(1_790_000_000, 123_456_789);
+        let at = UNIX_EPOCH + Duration::new(1_790_000_000, 123_456_700);
         let scan = Scan { at, done: None };
         let doc = to_document(&scan).unwrap();
         let Document::Object(fields) = &doc else {
             panic!("{doc:?}")
         };
-        assert_eq!(fields["at"], Document::DateTime(at));
+        assert_eq!(fields["at"], Document::DateTime(at.into()));
         roundtrip(scan);
         roundtrip(Scan {
             at,
-            done: Some(at + Duration::from_nanos(1)),
+            done: Some(at + Duration::from_micros(1)),
         });
         roundtrip(SystemTime::now());
         roundtrip(UNIX_EPOCH);
 
-        let text: String = from_document(Document::DateTime(at)).unwrap();
-        assert_eq!(text, "2026-09-21T14:13:20.123456789Z");
-        let value: serde_json::Value = from_document(Document::DateTime(at)).unwrap();
+        let text: String = from_document(Document::DateTime(at.into())).unwrap();
+        assert_eq!(text, "2026-09-21T14:13:20.1234567Z");
+        let value: serde_json::Value = from_document(Document::DateTime(at.into())).unwrap();
         assert_eq!(
             value.to_string(),
-            r#"{"secs_since_epoch":1790000000,"nanos_since_epoch":123456789}"#
+            r#"{"secs_since_epoch":1790000000,"nanos_since_epoch":123456700}"#
         );
 
         #[derive(Serialize)]
@@ -727,17 +748,49 @@ mod tests {
         ));
     }
 
-    /// SPEC §69.4: serde itself writes no `SystemTime` before 1970, and
-    /// reads none back; a `DateTime` before 1970 is still a `DateTime`,
-    /// through the untyped path.
+    /// SPEC §69.5: serde itself writes no `SystemTime` before 1970, and
+    /// reads none back; a `DateTime` field holds one, and anything else a
+    /// platform's `SystemTime` can't, to the nanosecond (SPEC §70).
     #[test]
-    fn times_before_1970_are_serdes_limit() {
+    fn datetime_fields_hold_what_system_time_cant() {
+        use crate::DateTime;
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let before = UNIX_EPOCH - Duration::from_secs(1);
         assert!(to_document(&before).is_err());
-        assert!(from_document::<SystemTime>(Document::DateTime(before)).is_err());
-        let text: String = from_document(Document::DateTime(before)).unwrap();
-        assert_eq!(text, "1969-12-31T23:59:59Z");
+        let early = DateTime::from_unix(-1, 0).unwrap();
+        assert!(from_document::<SystemTime>(Document::DateTime(early)).is_err());
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Event {
+            at: DateTime,
+            until: Option<DateTime>,
+        }
+        for at in [
+            early,
+            DateTime::from_unix(-20_000_000_000, 1).unwrap(),
+            DateTime::from_unix(1_790_000_000, 1).unwrap(),
+        ] {
+            let event = Event {
+                at,
+                until: Some(at),
+            };
+            let doc = to_document(&event).unwrap();
+            let Document::Object(fields) = &doc else {
+                panic!("{doc:?}")
+            };
+            assert_eq!(fields["at"], Document::DateTime(at));
+            roundtrip(event);
+        }
+        // A stored `SystemTime` reads into a `DateTime`, and back.
+        let now = SystemTime::now();
+        let as_datetime: DateTime = from_document(to_document(&now).unwrap()).unwrap();
+        assert_eq!(as_datetime, DateTime::from(now));
+        let back: SystemTime = from_document(to_document(&as_datetime).unwrap()).unwrap();
+        assert_eq!(back, now);
+        // Other formats see its text.
+        let json = serde_json::to_string(&early).unwrap();
+        assert_eq!(json, r#""1969-12-31T23:59:59Z""#);
+        assert_eq!(serde_json::from_str::<DateTime>(&json).unwrap(), early);
     }
 
     #[test]

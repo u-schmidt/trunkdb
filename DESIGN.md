@@ -156,7 +156,10 @@ couldn't repair; page images need no structure-specific recovery at all
 
 **The value type** is `Document`: `Null`, `Bool`, `Int`, `Float`,
 `String`, `Binary`, `Array`, `Object`, `Id` [§4.1](spec/04-key-decisions-and-rationale.md) [§11](spec/11-document-encoding.md), and `DateTime`, an
-instant in UTC to the nanosecond, what a `SystemTime` field stores [§69](spec/69-a-date-time-type.md). It's what
+instant in UTC to the nanosecond, what a `SystemTime` or a
+`trunkdb::DateTime` field stores [§69](spec/69-a-date-time-type.md). It holds trunkdb's `DateTime`, not a
+`SystemTime`, which differs between platforms: the same everywhere,
+over the whole range of an `i64` of seconds [§70](spec/70-a-portable-date-time.md). It's what
 everything below the API works in, like LiteDB's `BsonValue`.
 `Collection<T>` converts any `T: Serialize + DeserializeOwned` to and
 from it through serde, and delegates to `Collection<Document>`: one

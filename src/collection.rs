@@ -2432,11 +2432,8 @@ mod tests {
             10 => Document::Id(DocId([1 + rng.below(3) as u8; 16])),
             // A few date-times, before and after 1970 (SPEC §69).
             _ => Document::DateTime(
-                crate::datetime::from_parts(
-                    rng.below(5) as i64 - 2,
-                    [0, 999_999_999][rng.below(2)],
-                )
-                .unwrap(),
+                crate::DateTime::from_unix(rng.below(5) as i64 - 2, [0, 999_999_999][rng.below(2)])
+                    .unwrap(),
             ),
         }
     }
@@ -5193,8 +5190,9 @@ mod tests {
         let db = Database::open(&path).unwrap();
         let scans = db.collection::<Scan>("scans");
         scans.ensure_index("at").unwrap();
-        let start = UNIX_EPOCH + Duration::new(1_790_000_000, 999_999_999);
-        let at = |i: u64| start + Duration::from_nanos(i * 1_000_000_001);
+        // Whole 100 ns, as every platform's `SystemTime` holds them.
+        let start = UNIX_EPOCH + Duration::new(1_790_000_000, 999_999_900);
+        let at = |i: u64| start + Duration::from_nanos(i * 1_000_000_100);
         let mut batch = db.batch();
         for i in 0..200 {
             let device = format!("d{}", i % 3);
@@ -5252,7 +5250,7 @@ mod tests {
         db.export(&mut export).unwrap();
         let text = String::from_utf8(export.clone()).unwrap();
         assert!(
-            text.contains(r#""at":{"$date":"2026-09-21T14:13:20.999999999Z"}"#),
+            text.contains(r#""at":{"$date":"2026-09-21T14:13:20.9999999Z"}"#),
             "{text}"
         );
         let copy = Database::open(dir.path().join("copy.trunkdb")).unwrap();
