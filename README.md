@@ -347,6 +347,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `trunkdb::DateTime`, not a `SystemTime`, so a time reads the same on
     every platform; a `DateTime` field holds times before 1970 too.
 
+    Item 44 → 0.15.0: breaking only for code that builds or matches
+    `Document::DateTime` (write `system_time.into()`); files and exports
+    as in 0.14.0.
+
 What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License
