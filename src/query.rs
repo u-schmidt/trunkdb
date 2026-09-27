@@ -223,7 +223,7 @@ impl Sort {
 }
 
 /// A query: conditions that must all hold (each may nest ORs, ANDs and
-/// NOTs, SPEC §36), plus an optional sort and limit. Evaluated by
+/// NOTs, SPEC §36), plus an optional sort, skip and limit. Evaluated by
 /// scanning, or over index ranges when the conditions allow it
 /// (`index_ranges`, SPEC §28.4, §36.3), or by reading an index in sort
 /// order (`index_order`, SPEC §34.2, §47).
@@ -235,8 +235,9 @@ impl Sort {
 /// use trunkdb::query::Filter;
 ///
 /// let newest_queued = Filter::new().eq("status", "Queued").sort_desc("created").limit(20);
+/// let third_page = Filter::new().sort_asc("name").skip(40).limit(20);
 /// let all = Filter::new().limit(None); // `limit` takes an `Option` too
-/// # let _ = (newest_queued, all);
+/// # let _ = (newest_queued, third_page, all);
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
@@ -245,6 +246,9 @@ pub struct Filter {
     /// documents equal in it by the second, and so on; equal in all of
     /// them, by id. Empty: no sort.
     pub(crate) sort: Vec<Sort>,
+    /// How many matches to pass over, after the sort and before the
+    /// limit (SPEC §72). 0: none.
+    pub(crate) skip: usize,
     pub(crate) limit: Option<usize>,
 }
 
@@ -267,7 +271,7 @@ pub struct Filter {
 /// `Option` of those (`None` is null) — or a `Document` itself. Fields
 /// can be dotted paths (`"address.city"`, SPEC §31).
 impl Filter {
-    /// Matches every document: no conditions, no sort, no limit.
+    /// Matches every document: no conditions, no sort, no skip, no limit.
     pub fn new() -> Self {
         Self::default()
     }
@@ -404,11 +408,27 @@ impl Filter {
         self
     }
 
-    /// At most `n` results — replacing any earlier limit.
     /// At most `n` documents: `limit(20)`, or `limit(None)` for no limit,
-    /// so an `Option<usize>` can be passed through as it is.
+    /// so an `Option<usize>` can be passed through as it is. Replaces any
+    /// earlier limit.
     pub fn limit(mut self, n: impl Into<Option<usize>>) -> Self {
         self.limit = n.into();
+        self
+    }
+
+    /// Passes over the first `n` matches, in `sort` order, before `limit`
+    /// counts (SPEC §72): page `p` (from 0) of `size` is
+    /// `.skip(p * size).limit(size)`. Replaces any earlier skip; `skip(0)`
+    /// is none. Without a sort the order is unspecified, so the pages of
+    /// an unsorted filter may overlap.
+    ///
+    /// The skipped documents are still read: a deep page costs as much
+    /// as all the pages before it, as SQL's `OFFSET` does. To page
+    /// through many, start each page after the last value of the one
+    /// before, `gt(field, last).sort_asc(field).limit(size)`, which an
+    /// index on `field` reads from there.
+    pub fn skip(mut self, n: usize) -> Self {
+        self.skip = n;
         self
     }
 }
@@ -418,8 +438,8 @@ impl Filter {
         self.conditions.iter().all(|c| c.matches(doc))
     }
 
-    /// Applies conditions, then sort, then limit — in that order,
-    /// matching SQL's `WHERE` -> `ORDER BY` -> `LIMIT` evaluation order
+    /// Applies conditions, then sort, then skip, then limit — in that
+    /// order, matching SQL's `WHERE` -> `ORDER BY` -> `OFFSET` -> `LIMIT`
     /// (sorting an already-filtered set is both correct and cheaper than
     /// sorting everything first).
     pub fn apply(&self, docs: impl IntoIterator<Item = Document>) -> Vec<Document> {
@@ -444,6 +464,7 @@ impl Filter {
             results.sort_by(|a, b| compare_by(&self.sort, doc_of(a), doc_of(b)));
         }
 
+        results.drain(..self.skip.min(results.len()));
         if let Some(limit) = self.limit {
             results.truncate(limit);
         }
@@ -2058,7 +2079,9 @@ mod tests {
             .sort_asc("x")
             .sort_desc("y") // replaces the first
             .limit(10)
-            .limit(5); // replaces the first
+            .limit(5) // replaces the first
+            .skip(3)
+            .skip(1); // replaces the first
         let spelled_out = Filter {
             conditions: vec![
                 cond("a", Op::Eq, Document::Int(1)),
@@ -2076,6 +2099,7 @@ mod tests {
                 field: "y".into(),
                 order: SortOrder::Desc,
             }],
+            skip: 1,
             limit: Some(5),
         };
         // `Filter` has no `PartialEq` (a `Float` NaN isn't equal to itself).
@@ -2475,16 +2499,29 @@ mod tests {
                 field: "age".into(),
                 order: SortOrder::Asc,
             }],
+            skip: 0,
             limit: Some(2),
         };
 
         assert_eq!(
-            filter.apply(docs),
+            filter.apply(docs.clone()),
             vec![
                 doc(&[("age", Document::Int(20))]),
                 doc(&[("age", Document::Int(30))]),
             ]
         );
+        // SPEC §72: skip after the sort, before the limit.
+        let second_page = filter.clone().skip(1);
+        assert_eq!(
+            second_page.apply(docs.clone()),
+            vec![
+                doc(&[("age", Document::Int(30))]),
+                doc(&[("age", Document::Int(40))]),
+            ]
+        );
+        assert_eq!(filter.clone().skip(2).apply(docs.clone()).len(), 1);
+        assert_eq!(filter.clone().skip(4).apply(docs.clone()), vec![]);
+        assert_eq!(filter.limit(None).skip(1).apply(docs).len(), 2);
     }
 
     fn cond(field: &str, op: Op, value: Document) -> Condition {

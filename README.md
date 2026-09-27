@@ -10,7 +10,7 @@ collections of documents.
 **Status: v0 core is real and usable.** Page storage, the catalog, a real
 B-tree primary index, document encoding (both the untyped `Document` path
 and a serde bridge so any `T: Serialize + DeserializeOwned` works),
-scan/filter/sort/limit queries (`find`, `find_one`, `count`, a streaming
+scan/filter/sort/skip/limit queries (`find`, `find_one`, `count`, a streaming
 `cursor`), `upsert`, secondary indexes (also unique, on nested paths like
 `address.city`, multikey on array elements like `tags[*]`, compound on
 several fields like `(status, created)`, and sparse for fields few documents
@@ -139,6 +139,7 @@ let parsed: DocId = id.to_string().parse()?; // ids go to text and back
 let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
 let youngest_in_core = users.find(Filter::new().eq("team", "core").sort_asc("age").limit(5))?;
 let by_team_then_age = users.find(Filter::new().sort_asc("team").then_asc("age").limit(20))?;
+let third_page = users.find(Filter::new().sort_asc("name").skip(40).limit(20))?;
 
 let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new().set("team", "platform").inc("age", 1))?;
 ```
@@ -355,6 +356,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `Document` as tagged JSON (`{:#}` indented), and
     `text.parse::<Document>()` reads it back, with `ParseDocumentError`:
     for tools that work in JSON, through `Collection<Document>`.
+46. **Skip, for paging** (§72): `Filter::skip(n)`, after the sort and
+    before the limit, in every call that takes a filter; through an
+    index, the reading stops after skip plus limit.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

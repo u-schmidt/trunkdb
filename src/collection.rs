@@ -543,8 +543,8 @@ impl Collection<Document> {
         found(self.write(WriteOp::Delete(self.name.clone(), *id)))
     }
 
-    /// Changes the documents `find(filter)` would return — `sort` and
-    /// `limit` included — by calling `change` on each, in that order, and
+    /// Changes the documents `find(filter)` would return — `sort`, `skip`
+    /// and `limit` included — by calling `change` on each, in that order, and
     /// writes the ones it changed; returns how many (SPEC §38). One batch
     /// under one write lock, like `delete_many`: all changes land or none
     /// — a unique index refusing one (§33) rolls back every one. An `_id`
@@ -567,7 +567,7 @@ impl Collection<Document> {
     /// Changes the documents `find(filter)` would return by `update`'s
     /// operators, `set`, `unset` and `inc` on dotted paths, and returns
     /// how many changed (SPEC §68). Otherwise as `update_many`: one batch,
-    /// all or nothing, `sort` and `limit` included, unchanged matches
+    /// all or nothing, `sort`, `skip` and `limit` included, unchanged matches
     /// neither written nor counted.
     ///
     /// ```no_run
@@ -645,8 +645,8 @@ impl Collection<Document> {
         })
     }
 
-    /// Deletes exactly the documents `find(filter)` would return — `sort`
-    /// and `limit` included, so "the oldest 100" works — and says how many
+    /// Deletes exactly the documents `find(filter)` would return — `sort`,
+    /// `skip` and `limit` included, so "the oldest 100" works — and says how many
     /// (SPEC §37). One batch under one write lock, like `upsert`: all of
     /// them go or none, and no write lands between the lookup and the
     /// deletes. A collection that doesn't exist has nothing to delete and
@@ -688,8 +688,9 @@ impl Collection<Document> {
     /// results is unspecified.
     ///
     /// With a `sort` and a `limit`, and an index on the sort field, it
-    /// reads that index in order instead and stops after `limit` matches
-    /// (SPEC §34.2). Equal sort values come in id order either way.
+    /// reads that index in order instead and stops after `skip` plus
+    /// `limit` matches (SPEC §34.2, §72). Equal sort values come in id
+    /// order either way.
     #[deprecated(
         since = "0.12.0",
         note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find`, which fills it in (SPEC §59); to be removed before 1.0"
@@ -715,9 +716,11 @@ impl Collection<Document> {
         self.cursor(first_only(filter))?.next().transpose()
     }
 
-    /// How many documents match `filter`'s conditions, at most its
-    /// `limit`; `sort` is irrelevant. Without conditions it only counts
-    /// the primary index's entries — no document is read.
+    /// How many documents `find(filter)` would return: those matching its
+    /// conditions, less its `skip`, at most its `limit`; `sort` is
+    /// irrelevant. For the total behind a page, count without `skip` and
+    /// `limit` (SPEC §72). Without conditions it only counts the primary
+    /// index's entries — no document is read.
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
         let state = self.db.read()?;
         let count = if filter.conditions.is_empty() {
@@ -728,6 +731,7 @@ impl Collection<Document> {
                 .filter(|(_id, doc)| filter.matches(doc))
                 .count()
         };
+        let count = count.saturating_sub(filter.skip);
         Ok(filter.limit.map_or(count, |limit| count.min(limit)))
     }
 
@@ -762,8 +766,8 @@ impl Collection<Document> {
 
     /// Replaces the one document matching `filter`'s conditions (keeping
     /// its id), or inserts `doc` with a new id if none matches;
-    /// `Error::MultipleMatches` if several do. `sort` and `limit` don't
-    /// matter. Atomic: the lookup and the write happen under one write
+    /// `Error::MultipleMatches` if several do. `sort`, `skip` and `limit`
+    /// don't matter. Atomic: the lookup and the write happen under one write
     /// lock, so two threads upserting the same key can't both insert —
     /// with a secondary index on the key's field, the lookup is cheap
     /// (SPEC §29.3).
@@ -806,7 +810,10 @@ fn find_in(
     filter: &Filter,
 ) -> crate::Result<Vec<(DocId, Document)>> {
     if let Some(order) = filter.index_order(catalog.indexes(collection)) {
-        return read_in_index_order(catalog, store, collection, filter, order);
+        // Read as far as skip plus limit, then pass over the skipped (SPEC §72).
+        let mut found = read_in_index_order(catalog, store, collection, filter, order)?;
+        found.drain(..filter.skip.min(found.len()));
+        return Ok(found);
     }
     let mut candidates = read_candidates(catalog, store, collection, filter)?;
     if !filter.sort.is_empty() {
@@ -898,6 +905,9 @@ fn read_in_index_order(
     if limit == 0 {
         return Ok(results);
     }
+    // The skipped matches come first, so read as far as them too; the
+    // caller passes over them (SPEC §72).
+    let limit = limit.saturating_add(filter.skip);
     let index = order.index;
     let unordered_can_match = order.range.is_none() && !index.is_compound();
     let backward = first.order == SortOrder::Desc;
@@ -938,6 +948,7 @@ fn read_in_index_order(
                 .map(|(_key, loc)| read(loc))
                 .collect::<Result<Vec<_>, _>>()?;
             let unlimited = Filter {
+                skip: 0,
                 limit: None,
                 ..filter.clone()
             };
@@ -991,6 +1002,7 @@ fn read_in_index_order(
         }
         let unlimited = Filter {
             conditions: Vec::new(),
+            skip: 0,
             limit: None,
             ..filter.clone()
         };
@@ -3368,9 +3380,11 @@ mod tests {
             Some(60),
             Some(1000),
         ];
+        let skips = [0, 0, 0, 1, 3, 25, 1000];
         Filter {
             conditions,
             sort: vec![crate::query::Sort { field, order }],
+            skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
         }
     }
@@ -3512,9 +3526,11 @@ mod tests {
             })
             .collect();
         let limits = [None, Some(0), Some(1), Some(3), Some(10), Some(1000)];
+        let skips = [0, 0, 0, 1, 4, 30];
         Filter {
             conditions,
             sort,
+            skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
         }
     }
@@ -3582,10 +3598,11 @@ mod tests {
                 let expected = ids(f.apply_to(all.clone(), |(_, doc)| doc));
                 let plan = docs.explain(&f).unwrap();
                 let found = ids(docs.find_with_ids(f.clone()).unwrap());
-                if f.sort.is_empty() && f.limit.is_some() {
-                    // Which documents a limit without a sort keeps isn't
-                    // promised: any that match, as many as it allows.
+                if f.sort.is_empty() && (f.limit.is_some() || f.skip > 0) {
+                    // Which documents a skip or limit without a sort keeps
+                    // isn't promised: any that match, as many as they allow.
                     let unlimited = Filter {
+                        skip: 0,
                         limit: None,
                         ..f.clone()
                     };
@@ -4013,6 +4030,84 @@ mod tests {
         assert!(!docs.drop_index(["b", "a"]).unwrap());
         assert!(!docs.drop_index("b").unwrap(), "no index on b alone");
         assert_eq!(docs.index_names().unwrap().len(), 3);
+        assert_consistent(&db);
+    }
+
+    /// SPEC §72: `skip` passes over matches after the sort, before the
+    /// limit — in `find`, `count`, `find_one`, a cursor and `delete_many`;
+    /// through an index, the reading stops after skip plus limit.
+    #[test]
+    fn skip_and_limit_page_through_the_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<User>("users");
+        let mut batch = db.batch();
+        for age in 0..1000 {
+            batch
+                .insert(&users, user(&format!("user {age}"), age))
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        let page = |p: usize| by_age(SortOrder::Asc).skip(p * 20).limit(20);
+        let ages = |found: &[User]| found.iter().map(|u| u.age).collect::<Vec<_>>();
+
+        let mut found = Vec::new();
+        let reads = records_read(|| found = users.find(page(2)).unwrap());
+        assert_eq!((reads, ages(&found)), (1000, (40..60).collect()));
+
+        users.ensure_index("age").unwrap();
+        let reads = records_read(|| found = users.find(page(2)).unwrap());
+        assert_eq!(
+            (reads, ages(&found)),
+            (60, (40..60).collect()),
+            "skip + limit read"
+        );
+        let desc = by_age(SortOrder::Desc).skip(995).limit(20);
+        assert_eq!(ages(&users.find(desc).unwrap()), [4, 3, 2, 1, 0]);
+        assert!(users.find(page(50)).unwrap().is_empty());
+        let beyond = by_age(SortOrder::Asc).skip(usize::MAX).limit(20);
+        assert!(users.find(beyond).unwrap().is_empty());
+        let unlimited = by_age(SortOrder::Asc).skip(990).limit(None);
+        assert_eq!(
+            ages(&users.find(unlimited).unwrap()),
+            (990..1000).collect::<Vec<_>>()
+        );
+
+        // `count` counts what `find` returns; without skip and limit, the total.
+        assert_eq!(users.count(page(2)).unwrap(), 20);
+        assert_eq!(users.count(page(49)).unwrap(), 20);
+        assert_eq!(users.count(Filter::new().skip(990)).unwrap(), 10);
+        assert_eq!(users.count(Filter::new().skip(2000)).unwrap(), 0);
+        let under_ten = filter(vec![cond("age", Op::Lt, Document::Int(10))]);
+        assert_eq!(users.count(under_ten.clone().skip(4).limit(5)).unwrap(), 5);
+        assert_eq!(users.count(under_ten.clone().skip(8).limit(5)).unwrap(), 2);
+
+        // `find_one` is the first after the skipped.
+        let seventh = users.find_one(by_age(SortOrder::Asc).skip(7)).unwrap();
+        assert_eq!(seventh.map(|u| u.age), Some(7));
+
+        // An unsorted cursor streams, and passes over the first matches.
+        let all: Vec<DocId> = users
+            .cursor(under_ten.clone())
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        let rest: Vec<DocId> = users
+            .cursor(under_ten.clone().skip(3).limit(4))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!((all.len(), &rest[..]), (10, &all[3..7]));
+
+        // `delete_many` deletes the page `find` returns.
+        assert_eq!(
+            users
+                .delete_many(by_age(SortOrder::Desc).skip(1).limit(3))
+                .unwrap(),
+            3
+        );
+        let left = ages(&users.find(by_age(SortOrder::Desc).limit(3)).unwrap());
+        assert_eq!(left, [999, 995, 994]);
         assert_consistent(&db);
     }
 

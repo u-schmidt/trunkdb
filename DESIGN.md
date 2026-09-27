@@ -245,7 +245,8 @@ documents it covers, so it can't disagree with them after a crash.
 
 ## 8. Queries
 
-A `Filter` holds a tree of conditions, a list of sort keys and a limit
+A `Filter` holds a tree of conditions, a list of sort keys, a skip and
+a limit, applied in that order [§72](spec/72-skip-for-paging.md)
 [§35](spec/35-a-filter-builder.md) [§36](spec/36-or-not-and-nesting.md) [§47](spec/47-sorting-by-several-fields.md):
 
 - **comparisons** (`eq`, `ne`, `lt`, `lte`, `gt`, `gte`) and a
@@ -275,7 +276,7 @@ what it picked (`QueryPlan`):
 - **`IndexUnion`:** one range per branch of an OR, each document read
   once [§36.3](spec/36-or-not-and-nesting.md).
 - **`IndexOrder`:** with a sort and a limit, walk the index on the
-  first sort key and stop at the limit [§34.2](spec/34-sorting-through-an-index.md) [§49](spec/49-a-lazy-b-tree-walk.md). A compound index
+  first sort key and stop at the limit, past any skip [§34.2](spec/34-sorting-through-an-index.md) [§49](spec/49-a-lazy-b-tree-walk.md) [§72](spec/72-skip-for-paging.md). A compound index
   whose leading fields an `Eq` fixes gives both the filter and the order
   (`status == "Queued"`, newest first, on `(status, created)`). Sort
   keys the index doesn't serve are sorted in memory within each run of

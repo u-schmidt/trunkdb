@@ -33,6 +33,8 @@ enum Source<T> {
         documents: Collection<Document>,
         ids: std::vec::IntoIter<DocId>,
         filter: Filter,
+        /// Matches still to pass over (`Filter::skip`, SPEC §72).
+        skipping: usize,
         remaining: Option<usize>,
         /// `Document` to `T`: the identity for the untyped path, the
         /// serde bridge for the typed one.
@@ -48,12 +50,13 @@ impl<T> Cursor<T> {
         filter: Filter,
         convert: fn(Document) -> crate::Result<T>,
     ) -> Self {
-        let remaining = filter.limit;
+        let (skipping, remaining) = (filter.skip, filter.limit);
         Cursor {
             source: Source::Streaming {
                 documents,
                 ids: ids.into_iter(),
                 filter,
+                skipping,
                 remaining,
                 convert,
             },
@@ -79,6 +82,7 @@ impl<T> Iterator for Cursor<T> {
                 documents,
                 ids,
                 filter,
+                skipping,
                 remaining,
                 convert,
             } => {
@@ -90,6 +94,10 @@ impl<T> Iterator for Cursor<T> {
                         Err(e) => return Some(Err(e)),
                         Ok(None) => continue, // deleted since the cursor was created
                         Ok(Some(doc)) if filter.matches(&doc) => {
+                            if *skipping > 0 {
+                                *skipping -= 1;
+                                continue;
+                            }
                             if let Some(n) = remaining {
                                 *n -= 1;
                             }

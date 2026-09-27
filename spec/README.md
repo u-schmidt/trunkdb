@@ -82,3 +82,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 69. [A date-time type (`datetime.rs`, `document.rs`, `serde_bridge.rs`, `index/key.rs`, `query.rs`, `json.rs`, `export.rs`)](69-a-date-time-type.md)
 70. [A portable date-time (`datetime.rs`, `document.rs`, `serde_bridge.rs`)](70-a-portable-date-time.md)
 71. [Documents as JSON text (`document.rs`, `json.rs`)](71-documents-as-json-text.md)
+72. [Skip, for paging (`query.rs`, `collection.rs`, `cursor.rs`)](72-skip-for-paging.md)
