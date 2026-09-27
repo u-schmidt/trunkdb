@@ -320,6 +320,7 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     Items 35–37 → 0.13.0: file format 10 (still opens 6–9, and rebuilds
     an older index that holds ids at the first open); no breaking API
     change.
+
 38. **Shared pages** (§64): a read gets the page cache's page instead
     of a copy, and a change copies it first. One reader is 30% faster;
     two readers now do 1.7 times the work of one, where before they did
@@ -338,6 +339,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `SystemTime` field stores, to the nanosecond; compared, sorted and
     indexed in time order; `{"$date": "<RFC 3339>"}` in an export
     (export format 2). File format 11, which still opens 6–10.
+
+    Items 38–43 → 0.14.0: file format 11 (still opens 6–10) and export
+    format 2 (still imports 1); new API only, no breaking change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
