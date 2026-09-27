@@ -25,6 +25,7 @@ pub mod query;
 mod serde_bridge;
 mod storage;
 mod txn;
+mod update;
 
 pub use batch::{Batch, IntoDocument};
 pub use catalog::{IndexInfo, IndexOptions};
@@ -89,6 +90,17 @@ pub enum Error {
     #[non_exhaustive]
     #[error("upsert into {collection:?}: {count} documents match the filter, expected at most one")]
     MultipleMatches { collection: String, count: usize },
+    /// `update_fields` couldn't make a change to document `id` (SPEC
+    /// §68): an `inc` of something that isn't a number, or that
+    /// overflows; a path through a value that isn't an object. The whole
+    /// batch was rolled back.
+    #[non_exhaustive]
+    #[error("update of document {id} in collection {collection:?}: {message}")]
+    Update {
+        collection: String,
+        id: document::DocId,
+        message: String,
+    },
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
     #[non_exhaustive]

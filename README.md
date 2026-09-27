@@ -61,10 +61,12 @@ src/
 ├── lib.rs             public re-exports, the crate's Error type
 ├── database.rs        Database: open, recovery, the commit protocol,
 │                        checkpoints, OpenOptions
-├── collection.rs      Collection<T>: CRUD, find, indexes, update_many
+├── collection.rs      Collection<T>: CRUD, find, indexes, update_many,
+│                        update_fields
 ├── batch.rs           Batch: typed atomic multi-op writes
 ├── cursor.rs          Cursor: streaming find
 ├── query.rs           Filter, Condition, Sort; the planner
+├── update.rs          Update: set, unset and inc on dotted paths
 ├── document.rs        Document and DocId: the schema-less value type
 ├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document
 ├── json.rs            tagged JSON <-> Document, lossless
@@ -109,7 +111,7 @@ fuzz/                  fuzz targets: damaged files, WALs and exports
 
 ```rust
 use serde::{Deserialize, Serialize};
-use trunkdb::{Database, DocId, IndexOptions, query::Filter};
+use trunkdb::{Database, DocId, IndexOptions, query::{Filter, Update}};
 
 #[derive(Serialize, Deserialize)]
 struct User {
@@ -137,6 +139,8 @@ let parsed: DocId = id.to_string().parse()?; // ids go to text and back
 let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
 let youngest_in_core = users.find(Filter::new().eq("team", "core").sort_asc("age").limit(5))?;
 let by_team_then_age = users.find(Filter::new().sort_asc("team").then_asc("age").limit(20))?;
+
+let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new().set("team", "platform").inc("age", 1))?;
 ```
 
 ## Building
@@ -327,6 +331,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     commits, not on every read; one reader 14% faster.
 41. **`write_page` takes the page** (§67): a changed page is copied
     once, not twice; compaction 11% faster.
+42. **Update operators** (§68): `update_fields(filter,
+    &Update::new().set(..).inc(..).unset(..))`, on dotted paths, next
+    to `update_many`'s closure.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

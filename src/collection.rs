@@ -5,7 +5,7 @@ use crate::database::Database;
 use crate::document::{DocId, Document, encode_document, with_id};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
-use crate::query::{Filter, OrderedRead, QueryPlan, SortOrder};
+use crate::query::{Filter, OrderedRead, QueryPlan, SortOrder, Update};
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
 use serde::Serialize;
@@ -385,11 +385,21 @@ where
         filter: Filter,
         mut change: impl FnMut(&mut T),
     ) -> crate::Result<usize> {
-        self.as_document().update_matching(filter, |doc| {
+        self.as_document().update_matching(filter, |_id, doc| {
             let mut value: T = from_document(doc)?;
             change(&mut value);
             Ok(crate::serde_bridge::to_document(&value)?)
         })
+    }
+
+    /// See the untyped `update_fields`. Each document the update changes
+    /// must still convert to `T`, or the whole batch fails: a field set
+    /// to a value of the wrong type is caught here, not by the next read.
+    pub fn update_fields(&self, filter: Filter, update: &Update) -> crate::Result<usize> {
+        self.as_document()
+            .update_fields_then(filter, update, |doc| {
+                from_document::<T>(doc.clone()).map(drop)
+            })
     }
 
     /// See the untyped `delete_many`. No document is converted to `T`.
@@ -548,24 +558,81 @@ impl Collection<Document> {
         filter: Filter,
         mut change: impl FnMut(&mut Document),
     ) -> crate::Result<usize> {
-        self.update_matching(filter, |mut doc| {
+        self.update_matching(filter, |_id, mut doc| {
             change(&mut doc);
             Ok(doc)
         })
     }
 
-    /// `update_many` for both paths: `change` maps each document found to
-    /// its new version, or fails the whole batch.
+    /// Changes the documents `find(filter)` would return by `update`'s
+    /// operators, `set`, `unset` and `inc` on dotted paths, and returns
+    /// how many changed (SPEC §68). Otherwise as `update_many`: one batch,
+    /// all or nothing, `sort` and `limit` included, unchanged matches
+    /// neither written nor counted.
+    ///
+    /// ```no_run
+    /// # fn main() -> trunkdb::Result<()> {
+    /// use trunkdb::{Database, Document, query::{Filter, Update}};
+    ///
+    /// let db = Database::open("app.trunkdb")?;
+    /// let jobs = db.collection::<Document>("jobs");
+    /// let started = jobs.update_fields(
+    ///     Filter::new().eq("status", "Queued"),
+    ///     &Update::new().set("status", "Running").inc("tries", 1).unset("error"),
+    /// )?;
+    /// # let _ = started;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// An update that names `_id`, uses brackets or has an empty step in
+    /// a path, or `inc`s by something that isn't a number, is refused
+    /// before anything is read (`ErrorKind::InvalidInput`). One that
+    /// can't be made to a document found, an `inc` of a string, a `set`
+    /// through a number, fails the batch with `Error::Update`.
+    pub fn update_fields(&self, filter: Filter, update: &Update) -> crate::Result<usize> {
+        self.update_fields_then(filter, update, |_doc| Ok(()))
+    }
+
+    /// `update_fields`, with `accept` to refuse a changed document: the
+    /// typed path's check that it still converts to `T`.
+    fn update_fields_then(
+        &self,
+        filter: Filter,
+        update: &Update,
+        mut accept: impl FnMut(&Document) -> crate::Result<()>,
+    ) -> crate::Result<usize> {
+        update.check().map_err(|message| {
+            crate::Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ))
+        })?;
+        self.update_matching(filter, |id, mut doc| {
+            update
+                .apply(&mut doc)
+                .map_err(|message| crate::Error::Update {
+                    collection: self.name.clone(),
+                    id,
+                    message,
+                })?;
+            accept(&doc)?;
+            Ok(doc)
+        })
+    }
+
+    /// `update_many` and `update_fields` for both paths: `change` maps
+    /// each document found to its new version, or fails the whole batch.
     fn update_matching(
         &self,
         filter: Filter,
-        mut change: impl FnMut(Document) -> crate::Result<Document>,
+        mut change: impl FnMut(DocId, Document) -> crate::Result<Document>,
     ) -> crate::Result<usize> {
         self.db.transact(|catalog, store| {
             let found = find_in(catalog, store, &self.name, &filter)?;
             let mut changed = 0;
             for (id, old) in found {
-                let new = with_id(change(old.clone())?, id);
+                let new = with_id(change(id, old.clone())?, id);
                 // By encoding, not `==`: a NaN isn't equal to itself, and
                 // a document holding one would never count as unchanged.
                 if encode_document(&new) == encode_document(&old) {
@@ -4883,6 +4950,217 @@ mod tests {
         assert!(changed_any > 50, "only {changed_any} changed");
         assert_index_agrees_with_scan(&docs, &mut rng, "v");
         assert_nested_filters_agree_with_a_scan(&docs, &mut rng);
+    }
+
+    // --- Update operators (SPEC §68) ---
+
+    /// `update_fields` on typed tasks: what `find` would return changes,
+    /// sort and limit included; unchanged matches aren't counted; the
+    /// indexes follow; a change `T` can't hold, an operator that can't be
+    /// made, and an update refused as written each change nothing.
+    #[test]
+    fn update_fields_changes_what_find_would_return() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Task {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            status: String,
+            rank: i64,
+            tries: i64,
+            error: Option<String>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Task>("tasks");
+        let mut batch = db.batch();
+        for rank in 0..30 {
+            let status = if rank < 20 { "Queued" } else { "Done" }.to_string();
+            let error = (rank % 2 == 0).then(|| "timeout".to_string());
+            let task = Task {
+                id: None,
+                status,
+                rank,
+                tries: 0,
+                error,
+            };
+            batch.insert(&tasks, task).unwrap();
+        }
+        batch.commit().unwrap();
+        tasks.ensure_index("status").unwrap();
+        tasks.ensure_index("tries").unwrap();
+        let count = |f: Filter| tasks.count(f).unwrap();
+
+        let start = Update::new()
+            .set("status", "Running")
+            .inc("tries", 1)
+            .unset("error");
+        let first_five = Filter::new()
+            .eq("status", "Queued")
+            .sort_asc("rank")
+            .limit(5);
+        assert_eq!(tasks.update_fields(first_five, &start).unwrap(), 5);
+        let running = tasks
+            .find(Filter::new().eq("status", "Running").sort_asc("rank"))
+            .unwrap();
+        let ranks: Vec<i64> = running.iter().map(|t| t.rank).collect();
+        assert_eq!(ranks, [0, 1, 2, 3, 4]);
+        assert!(running.iter().all(|t| t.tries == 1 && t.error.is_none()));
+        assert_eq!(
+            count(Filter::new().eq("tries", 1)),
+            5,
+            "the index on tries follows"
+        );
+        assert_eq!(count(Filter::new().eq("status", "Queued")), 15);
+
+        // Matches left as they were aren't written or counted.
+        let same = Update::new().set("status", "Done");
+        assert_eq!(
+            tasks
+                .update_fields(Filter::new().gte("rank", 20), &same)
+                .unwrap(),
+            0
+        );
+
+        // A change `T` can't hold fails the batch: none of it lands.
+        let wrong_type = Update::new().set("tries", "many");
+        let Err(crate::Error::Document(_)) = tasks.update_fields(Filter::new(), &wrong_type) else {
+            panic!("a string in an i64 field must fail");
+        };
+        // So does an operator that can't be made. Untyped, so nothing but
+        // the operator can fail: ranks 0 to 4 have no `error` since the
+        // `unset`, and `inc` starts it; rank 5's is null, and fails.
+        let untyped = db.collection::<Document>("tasks");
+        let bad = Update::new().inc("tries", 1).inc("error", 1);
+        let by_rank = Filter::new().sort_asc("rank");
+        let Err(crate::Error::Update { id, message, .. }) = untyped.update_fields(by_rank, &bad)
+        else {
+            panic!("an inc of null must fail");
+        };
+        let rank_5 = tasks
+            .find_one(Filter::new().eq("rank", 5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some(id), rank_5.id);
+        assert!(
+            message.contains("\"error\"") && message.contains("null"),
+            "{message}"
+        );
+        assert_eq!(count(Filter::new().eq("tries", 1)), 5, "rolled back");
+        assert_eq!(count(Filter::new().eq("tries", 0)), 25, "rolled back");
+        assert_eq!(count(Filter::new().exists("error")), 25, "rolled back");
+
+        // Refused as written, before anything is read.
+        for refused in [Update::new().set("_id", 1), Update::new().unset("tags[*]")] {
+            let Err(crate::Error::Io(e)) = tasks.update_fields(Filter::new(), &refused) else {
+                panic!("{refused:?} must be refused");
+            };
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        let nothing = db.collection::<Document>("nothing");
+        assert!(
+            nothing
+                .update_fields(Filter::new(), &Update::new().inc("n", "x"))
+                .is_err()
+        );
+    }
+
+    /// Random filters and random updates on the indexed `v` and `w`, some
+    /// of which can't be made to every match: the count, every document
+    /// and the indexes afterwards must match a model that applies the
+    /// update to each match on its own, and a failed batch changes
+    /// nothing.
+    #[test]
+    fn update_fields_matches_a_model_through_random_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("v").unwrap();
+        docs.ensure_index("w").unwrap();
+        docs.ensure_index("o.x").unwrap();
+        let mut rng = XorShift(0x005E_71BC_0FF5_E7A5);
+        let text = |all: Vec<(DocId, Document)>| {
+            let mut all: Vec<_> = all
+                .into_iter()
+                .map(|(id, doc)| (id, format!("{doc:?}")))
+                .collect();
+            all.sort();
+            all
+        };
+        let (mut changed_any, mut failed_any) = (0, 0);
+        for _ in 0..40 {
+            let ops = (0..10)
+                .map(|_| {
+                    WriteOp::Insert(
+                        "docs".into(),
+                        db.id_gen().generate(),
+                        random_document(&mut rng),
+                    )
+                })
+                .collect();
+            db.write_batch(ops).unwrap();
+
+            let mut update = Update::new();
+            for _ in 0..1 + rng.below(3) {
+                let path = ["v", "w", "o.x"][rng.below(3)];
+                update = match rng.below(3) {
+                    0 => update.set(path, random_value(&mut rng)),
+                    1 => update.unset(path),
+                    _ => update.inc(
+                        path,
+                        [Document::Int(1), Document::Float(0.5)][rng.below(2)].clone(),
+                    ),
+                };
+            }
+            let mut f = Filter::new().and(random_condition(&mut rng, 2));
+            if rng.below(2) == 0 {
+                f = f.sort_by("w", SortOrder::Asc).limit(rng.below(8));
+            }
+
+            let before = docs.find_with_ids(Filter::new()).unwrap();
+            let mut model = before.clone();
+            let mut expected = Ok(0);
+            for (id, old) in docs.find_with_ids(f.clone()).unwrap() {
+                let mut new = old.clone();
+                if update.apply(&mut new).is_err() {
+                    expected = Err(());
+                    break;
+                }
+                if encode_document(&new) != encode_document(&old) {
+                    expected = expected.map(|n| n + 1);
+                    model.iter_mut().find(|(other, _)| *other == id).unwrap().1 = new;
+                }
+            }
+
+            let result = docs.update_fields(f.clone(), &update);
+            match expected {
+                Ok(n) => {
+                    assert_eq!(result.unwrap(), n, "{f:?} {update:?}");
+                    assert_eq!(
+                        text(docs.find_with_ids(Filter::new()).unwrap()),
+                        text(model)
+                    );
+                    changed_any += n;
+                }
+                Err(()) => {
+                    assert!(
+                        matches!(result, Err(crate::Error::Update { .. })),
+                        "{result:?}"
+                    );
+                    assert_eq!(
+                        text(docs.find_with_ids(Filter::new()).unwrap()),
+                        text(before)
+                    );
+                    failed_any += 1;
+                }
+            }
+        }
+        assert!(
+            changed_any > 30 && failed_any > 3,
+            "{changed_any} changed, {failed_any} failed"
+        );
+        for path in ["v", "w", "o.x"] {
+            assert_index_agrees_with_scan(&docs, &mut rng, path);
+        }
     }
 
     // --- Unique indexes (SPEC §33) ---

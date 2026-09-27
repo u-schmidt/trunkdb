@@ -1,6 +1,7 @@
 use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
 use crate::index::{KeyRange, key};
+pub use crate::update::Update;
 
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
 /// arm, so a new operator isn't a breaking change (SPEC §45.4).
