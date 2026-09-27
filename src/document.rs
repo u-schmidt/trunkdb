@@ -66,6 +66,36 @@ impl Document {
     }
 }
 
+/// A document as tagged JSON text (SPEC §71): compact, or indented with
+/// `{:#}`. Plain JSON, except for what JSON has no type for: an id is
+/// `{"$id": "<uuid>"}`, a date-time `{"$date": "<RFC 3339>"}`, binary
+/// `{"$binary": "<base64>"}` (§30.1). `str::parse` reads it back, equal
+/// to what was written.
+///
+/// ```
+/// use trunkdb::Document;
+///
+/// let doc: Document = r#"{"name": "Ann", "seen": {"$date": "2026-09-27T14:05:00Z"}}"#.parse()?;
+/// assert_eq!(doc.to_string(), r#"{"name":"Ann","seen":{"$date":"2026-09-27T14:05:00Z"}}"#);
+/// # Ok::<(), trunkdb::ParseDocumentError>(())
+/// ```
+impl std::fmt::Display for Document {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&crate::json::to_json(self), f)
+    }
+}
+
+/// A document from JSON text (SPEC §71): any JSON, with the tags that
+/// `Display` writes read back as ids, date-times and binary. Integers
+/// outside `i64` and malformed tags are errors.
+impl std::str::FromStr for Document {
+    type Err = crate::json::ParseDocumentError;
+
+    fn from_str(s: &str) -> Result<Document, Self::Err> {
+        crate::json::parse(s)
+    }
+}
+
 /// A document's primary key: 16 bytes, generated as a UUIDv7 by default
 /// (see `id.rs`) so ids created in sequence sort close together — good
 /// insert locality once a real B-tree index replaces `LinearIndex`.

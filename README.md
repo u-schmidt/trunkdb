@@ -351,6 +351,11 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `Document::DateTime` (write `system_time.into()`); files and exports
     as in 0.14.0.
 
+45. **Documents as JSON text** (§71): `doc.to_string()` writes a
+    `Document` as tagged JSON (`{:#}` indented), and
+    `text.parse::<Document>()` reads it back, with `ParseDocumentError`:
+    for tools that work in JSON, through `Collection<Document>`.
+
 What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License

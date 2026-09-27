@@ -33,6 +33,7 @@ All of it is done:
 | 0.13.0 | Filters on the id (`eq("_id", id)`, or an OR of ids) looked up in the primary index instead of scanned; `QueryPlan::ById`; an index key for ids, so an index on a reference (a `DocId` field) works, and ids sort after strings, by when they were made — file format 10, which still opens 6–9 and rebuilds, at the first open, an older index that holds ids; `Filter::id` and `Condition::id`; `DocId: FromStr`, with `ParseIdError` | §61–§63 |
 | 0.14.0 | Shared pages: the page cache hands out its page (`Page`, an `Arc`) instead of a copy, and a change copies it first; the cache behind an `RwLock`, looked up under its read lock; one reader 30% faster, four 3.2 times one; a page's layout checked once, as it enters the cache or its batch commits; `write_page` takes the `Page`, so a change copies a page once, and compaction is 11% faster; update operators, `update_fields` with `Update::new().set(..).inc(..).unset(..)` on dotted paths, and `Error::Update`; a date-time type, `Document::DateTime`, what a `SystemTime` field stores, to the nanosecond, compared, sorted and indexed in time order, `{"$date": ...}` in export format 2 — file format 11, which still opens 6–10 | §64–§69 |
 | 0.15.0 | `Document::DateTime` holds `trunkdb::DateTime` instead of a `SystemTime` (breaking), the same on every platform over an `i64` of seconds; `DateTime` fields, times before 1970 included; `ParseDateTimeError` | §70 |
+| next | Documents as JSON text: `Display` and `FromStr` for `Document`, tagged JSON as an export writes it, and `ParseDocumentError` | §71 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -84,6 +85,15 @@ limit is described.
 
 **Queries**
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
+- `Filter::skip(n)`, for paging with `limit`: after the sort, before
+  the limit; with an index on the sort field, read only as far as skip
+  plus limit (§34.2). Deep pages still read every document they skip,
+  as SQL's `OFFSET` does; paging by the last value seen (`gt(field,
+  last)`) doesn't, and wants a word in the docs.
+- An explain that runs the query, as MongoDB's `executionStats`: the
+  results with the plan, index bounds, keys and documents examined,
+  documents returned and time taken; now `explain` only names the kind
+  of plan (`QueryPlan`) without running it.
 
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).
@@ -116,6 +126,9 @@ limit is described.
   stop an export from blocking writers (§30.6).
 
 **API**
+- A document as `serde_json::Value`, beside its text form (§71), if a
+  tool needs it: behind a feature named `serde_json-1`, so `serde_json`
+  stays out of the default public API (§71.4).
 - More update operators: `push` and `pull` on arrays, `min`, `max`,
   `rename`; operators in a `Batch` and in `upsert` (§68.3).
 - An OR mixing ids and other conditions, served by lookups and index

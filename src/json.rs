@@ -57,16 +57,19 @@ impl Tags {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+/// Text that isn't a document: what `str::parse::<Document>` returns
+/// (SPEC §71), and what an import reports for a line it can't read. Its
+/// message says what's wrong, and where.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct JsonError(String);
+pub struct ParseDocumentError(String);
 
-fn error(message: impl Into<String>) -> JsonError {
-    JsonError(message.into())
+fn error(message: impl Into<String>) -> ParseDocumentError {
+    ParseDocumentError(message.into())
 }
 
 /// A `Document` as tagged JSON.
-pub fn to_json(doc: &Document) -> Value {
+pub(crate) fn to_json(doc: &Document) -> Value {
     match doc {
         Document::Null => Value::Null,
         Document::Bool(b) => Value::Bool(*b),
@@ -93,14 +96,20 @@ pub fn to_json(doc: &Document) -> Value {
 
 /// Tagged JSON back to a `Document`. Accepts any JSON, except integers
 /// outside `i64` (a `Document::Int` can't hold them) and malformed tags.
-/// For tests: an import reads with the tags its export's version knows.
-#[cfg(test)]
-pub fn from_json(value: Value) -> Result<Document, JsonError> {
+/// With every tag this build knows; an import reads with the tags its
+/// export's version knows.
+pub(crate) fn from_json(value: Value) -> Result<Document, ParseDocumentError> {
     read(value, Tags::CURRENT)
 }
 
+/// Tagged JSON text to a `Document` (SPEC §71): `from_json` of the text.
+pub(crate) fn parse(text: &str) -> Result<Document, ParseDocumentError> {
+    let value = serde_json::from_str(text).map_err(|e| error(format!("not JSON: {e}")))?;
+    from_json(value)
+}
+
 /// `from_json`, knowing only `tags`.
-fn read(value: Value, tags: Tags) -> Result<Document, JsonError> {
+fn read(value: Value, tags: Tags) -> Result<Document, ParseDocumentError> {
     Ok(match value {
         Value::Null => Document::Null,
         Value::Bool(b) => Document::Bool(b),
@@ -159,7 +168,7 @@ pub(crate) fn document_line(id: DocId, doc: &Document) -> Value {
 pub(crate) fn parse_document_line(
     line: Value,
     tags: Tags,
-) -> Result<(Option<DocId>, Document), JsonError> {
+) -> Result<(Option<DocId>, Document), ParseDocumentError> {
     let Value::Object(mut object) = line else {
         return Err(error("a document line must be a JSON object"));
     };
@@ -207,7 +216,7 @@ fn looks_like_tag(object: &Map<String, Value>, tags: Tags) -> bool {
     object.len() == 1 && object.keys().all(|k| tags.has(k))
 }
 
-fn from_tag(tag: String, value: Value, tags: Tags) -> Result<Document, JsonError> {
+fn from_tag(tag: String, value: Value, tags: Tags) -> Result<Document, ParseDocumentError> {
     let text = |value: Value| match value {
         Value::String(s) => Ok(s),
         other => Err(error(format!("`{tag}` must hold a string, got {other}"))),
@@ -251,7 +260,7 @@ fn from_tag(tag: String, value: Value, tags: Tags) -> Result<Document, JsonError
     })
 }
 
-fn number(n: &Number) -> Result<Document, JsonError> {
+fn number(n: &Number) -> Result<Document, ParseDocumentError> {
     if let Some(i) = n.as_i64() {
         Ok(Document::Int(i))
     } else if n.is_u64() {
@@ -280,7 +289,7 @@ fn object_to_json(map: &IndexMap<String, Document>) -> Map<String, Value> {
 fn object_from_json(
     object: Map<String, Value>,
     tags: Tags,
-) -> Result<IndexMap<String, Document>, JsonError> {
+) -> Result<IndexMap<String, Document>, ParseDocumentError> {
     object
         .into_iter()
         .map(|(k, v)| Ok((k, read(v, tags)?)))
@@ -353,9 +362,11 @@ mod tests {
         crate::document::encode_document(a) == crate::document::encode_document(b)
     }
 
+    /// Through the public text form (SPEC §71), compact and indented.
     fn roundtrip(doc: &Document) -> Document {
-        let text = serde_json::to_string(&to_json(doc)).unwrap();
-        from_json(serde_json::from_str(&text).unwrap()).unwrap()
+        let pretty: Document = format!("{doc:#}").parse().unwrap();
+        assert!(same(&pretty, doc), "{pretty:?}");
+        doc.to_string().parse().unwrap()
     }
 
     #[test]
@@ -477,7 +488,47 @@ mod tests {
         ] {
             let value: Value = serde_json::from_str(text).unwrap();
             assert!(from_json(value).is_err(), "{text}");
+            assert!(text.parse::<Document>().is_err(), "{text}");
         }
+    }
+
+    /// SPEC §71: `Display` writes compact JSON, `{:#}` indents it, and
+    /// `parse` reads plain JSON, tags included.
+    #[test]
+    fn documents_print_as_json_and_parse_back() {
+        let id: DocId = "0192f0c1-0000-7000-8000-000000000001".parse().unwrap();
+        let at: crate::DateTime = "2026-09-27T14:05:00.5Z".parse().unwrap();
+        let doc = object(&[
+            ("_id", Document::Id(id)),
+            ("name", Document::String("Ann".into())),
+            ("seen", Document::DateTime(at)),
+            ("n", Document::Float(2.0)),
+        ]);
+        let text = r#"{"_id":{"$id":"0192f0c1-0000-7000-8000-000000000001"},"name":"Ann","seen":{"$date":"2026-09-27T14:05:00.5Z"},"n":2.0}"#;
+        assert_eq!(doc.to_string(), text);
+        assert_eq!(text.parse::<Document>().unwrap(), doc);
+        assert_eq!(format!("{doc:#}").lines().count(), 10);
+        assert_eq!(Document::Int(5).to_string(), "5");
+        assert_eq!(
+            " [1, 2.5] ".parse(),
+            Ok(Document::Array(vec![
+                Document::Int(1),
+                Document::Float(2.5)
+            ]))
+        );
+    }
+
+    /// SPEC §71: text that isn't JSON says so and where; nesting past
+    /// what `serde_json` reads is an error, not a stack overflow.
+    #[test]
+    fn text_that_is_not_json_is_an_error() {
+        let error = "{\"a\": 1,\n \"b\"}".parse::<Document>().unwrap_err();
+        assert!(error.to_string().starts_with("not JSON: "), "{error}");
+        assert!(error.to_string().contains("line 2"), "{error}");
+        for text in ["", "{", "[1,]", "{\"a\":1} x", "nul"] {
+            assert!(text.parse::<Document>().is_err(), "{text}");
+        }
+        assert!("[".repeat(100_000).parse::<Document>().is_err());
     }
 
     #[test]

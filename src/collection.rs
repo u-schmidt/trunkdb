@@ -2281,6 +2281,45 @@ mod tests {
 
     /// Non-`Object` documents have no `_id` field (SPEC §18) — their ids
     /// are only available this way.
+    /// SPEC §71: a tool that only speaks JSON text — inserts it, reads
+    /// it, edits it, writes it back — through `Collection<Document>`.
+    #[test]
+    fn documents_go_in_and_out_as_json_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let people = db.collection::<Document>("people");
+
+        let new: Document = r#"{"name":"Ann","born":{"$date":"1990-05-01T12:00:00Z"}}"#
+            .parse()
+            .unwrap();
+        let id = people.insert(new).unwrap();
+        let text = people.get(&id).unwrap().unwrap().to_string();
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"_id":{{"$id":"{id}"}},"name":"Ann","born":{{"$date":"1990-05-01T12:00:00Z"}}}}"#
+            )
+        );
+
+        let edited = text.replace("Ann", "Bea").parse().unwrap();
+        assert!(people.update(&id, edited).unwrap());
+        let found = people.find(Filter::new().eq("name", "Bea")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].to_string(), text.replace("Ann", "Bea"));
+
+        // The id in the text is kept on insert, as any `_id` holding an id is (§59).
+        let other = DocId([0x42; 16]);
+        let copy: Document = text
+            .replace(&id.to_string(), &other.to_string())
+            .parse()
+            .unwrap();
+        assert_eq!(people.insert(copy.clone()).unwrap(), other);
+        // An update takes its id from its argument; the text's `_id` is ignored.
+        assert!(people.update(&id, copy).unwrap());
+        let got = people.get(&id).unwrap().unwrap();
+        assert_eq!(got.to_string(), text);
+    }
+
     #[test]
     fn untyped_find_with_ids_covers_non_object_documents() {
         let dir = tempfile::tempdir().unwrap();

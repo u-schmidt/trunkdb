@@ -38,6 +38,7 @@ pub use database::{Database, OpenOptions};
 pub use datetime::{DateTime, ParseDateTimeError};
 pub use document::{DocId, Document, ParseIdError};
 pub use export::Summary;
+pub use json::ParseDocumentError;
 pub use serde_bridge::DocumentError;
 
 #[derive(Debug, thiserror::Error)]

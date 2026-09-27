@@ -171,7 +171,11 @@ encoded without its `_id`, and every read puts the cell's id there,
 first, so there's no second copy that could say something else. `DocId`
 serializes as a marked newtype the bridge stores as `Document::Id`, and
 other formats as a UUID string, and `str::parse` reads that string back
-into a `DocId` [§63](spec/63-an-id-filter-and-parsing-ids.md). `find_with_ids` [§23](spec/23-find-with-ids.md) is deprecated, to be
+into a `DocId` [§63](spec/63-an-id-filter-and-parsing-ids.md). A `Document` has a text form too: `to_string` writes
+it as the tagged JSON an export uses (`{:#}` indented), and
+`str::parse` reads it back, for tools that work in JSON rather than
+structs; text, not `serde_json::Value`, so `serde_json` stays out of the
+public API [§71](spec/71-documents-as-json-text.md). `find_with_ids` [§23](spec/23-find-with-ids.md) is deprecated, to be
 removed before 1.0.
 
 **Nesting** is limited to 64 levels, counted as MongoDB counts (the
