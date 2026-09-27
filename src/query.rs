@@ -76,6 +76,13 @@ impl Condition {
         Self::compare(field, Op::Eq, value)
     }
 
+    /// The document's id is `id`: `eq("_id", id)`, without spelling the
+    /// field (SPEC §63). An OR of them fetches several documents by id,
+    /// each a lookup in the primary index (SPEC §61).
+    pub fn id(id: DocId) -> Self {
+        Self::eq(ID_FIELD, id)
+    }
+
     pub fn ne(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Ne, value)
     }
@@ -278,6 +285,15 @@ impl Filter {
     /// Adds an OR: at least one of `conditions` holds.
     pub fn any_of(self, conditions: impl IntoIterator<Item = Condition>) -> Self {
         self.and(Condition::any(conditions))
+    }
+
+    /// The document's id is `id` (SPEC §63): `eq("_id", id)`, a lookup
+    /// in the primary index (SPEC §61). Filters see a field by its stored
+    /// name, so on a struct's `#[serde(rename = "_id")] id` field,
+    /// `eq("id", ...)` would find nothing; this can't be misspelled.
+    /// Several ids: `any_of(ids.into_iter().map(Condition::id))`.
+    pub fn id(self, id: DocId) -> Self {
+        self.and(Condition::id(id))
     }
 
     /// `field == value`. Against null, also true for a missing field
@@ -1222,6 +1238,24 @@ mod tests {
         assert_eq!(ids(Filter::new().eq("id", a)), None);
         assert_eq!(ids(Filter::new().eq("ref._id", a)), None);
         assert_eq!(ids(Filter::new().and(!id(a))), None);
+    }
+
+    /// SPEC §63: `id` is `eq("_id", id)`, on a `Filter` and a
+    /// `Condition` alike, so it names its documents as that does.
+    #[test]
+    fn id_is_eq_on_the_id_field() {
+        let (a, b) = (DocId([1; 16]), DocId([2; 16]));
+        let ids = |f: Filter| f.ids();
+        assert_eq!(ids(Filter::new().id(a)), Some(vec![a]));
+        assert_eq!(ids(Filter::new().eq("x", 1).id(b)), Some(vec![b]));
+        let or = Filter::new().any_of([b, a].map(Condition::id));
+        assert_eq!(ids(or), Some(vec![a, b]));
+
+        let item = doc(&[("_id", Document::Id(a)), ("id", Document::Id(b))]);
+        assert!(Filter::new().id(a).matches(&item));
+        assert!(!Filter::new().id(b).matches(&item), "not the `id` field");
+        assert!(Condition::id(a).matches(&item));
+        assert!(!Condition::id(b).matches(&item));
     }
 
     /// SPEC §59: ids compare with ids, by their bytes, so a filter on

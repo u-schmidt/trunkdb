@@ -76,14 +76,40 @@ impl DocId {
     /// The all-zero id, which no generator makes: on an insert, `_id`
     /// holding it means "make one", like `None` (SPEC §59).
     pub const NIL: DocId = DocId([0; 16]);
+}
 
-    /// An id from its string form, as `Display` writes it (a UUID).
-    pub(crate) fn parse(s: &str) -> Result<DocId, String> {
+/// An id from its string form (SPEC §63), so `id.to_string()` and
+/// `text.parse::<DocId>()` go back and forth: a UUID, as `Display`
+/// writes it, or in the other forms UUIDs are written in (no hyphens,
+/// braces, `urn:uuid:`).
+impl std::str::FromStr for DocId {
+    type Err = ParseIdError;
+
+    fn from_str(s: &str) -> Result<DocId, ParseIdError> {
         uuid::Uuid::parse_str(s)
             .map(|uuid| DocId(uuid.into_bytes()))
-            .map_err(|e| format!("{s:?} is not a document id: {e}"))
+            .map_err(|reason| ParseIdError {
+                input: s.to_string(),
+                reason,
+            })
     }
 }
+
+/// A string that isn't a document id: what `str::parse::<DocId>` returns
+/// (SPEC §63). Its message says which string and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseIdError {
+    input: String,
+    reason: uuid::Error,
+}
+
+impl std::fmt::Display for ParseIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} is not a document id: {}", self.input, self.reason)
+    }
+}
+
+impl std::error::Error for ParseIdError {}
 
 /// The name `DocId`'s serde impls give their newtype (SPEC §59), so the
 /// serde bridge can tell an id from a string and store it as
@@ -113,7 +139,7 @@ impl<'de> serde::Deserialize<'de> for DocId {
             }
 
             fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<DocId, E> {
-                DocId::parse(s).map_err(E::custom)
+                s.parse::<DocId>().map_err(E::custom)
             }
 
             fn visit_newtype_struct<D: serde::Deserializer<'de>>(
@@ -212,6 +238,7 @@ pub(crate) fn encode_stored(doc: &Document) -> Vec<u8> {
 }
 
 /// The field a document's id appears in: `_id`, as in MongoDB.
+/// `Filter::id` spares callers spelling it (SPEC §63).
 pub(crate) const ID_FIELD: &str = "_id";
 
 /// `doc` with `id` in its `_id` field, first, replacing whatever was
@@ -374,6 +401,46 @@ mod tests {
         roundtrip(Document::String("hello".to_string()));
         roundtrip(Document::Binary(vec![1, 2, 3, 4]));
         roundtrip(Document::Id(DocId([7; 16])));
+    }
+
+    /// SPEC §63: an id and its string go back and forth; the other ways
+    /// UUIDs are written parse too; anything else is an error that says
+    /// which string.
+    #[test]
+    fn ids_parse_from_their_strings() {
+        let id = crate::id::IdGenerator::generate(&crate::id::UuidV7Generator);
+        assert_eq!(id.to_string().parse::<DocId>(), Ok(id));
+        assert_eq!(DocId::NIL.to_string().parse::<DocId>(), Ok(DocId::NIL));
+
+        let id = DocId([
+            0x01, 0x92, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5,
+            0xf6, 0x07,
+        ]);
+        let text = "01923a4b-5c6d-7e8f-90a1-b2c3d4e5f607";
+        assert_eq!(id.to_string(), text);
+        for form in [
+            text,
+            "01923a4b5c6d7e8f90a1b2c3d4e5f607",
+            "{01923a4b-5c6d-7e8f-90a1-b2c3d4e5f607}",
+            "urn:uuid:01923a4b-5c6d-7e8f-90a1-b2c3d4e5f607",
+            "01923A4B-5C6D-7E8F-90A1-B2C3D4E5F607",
+        ] {
+            assert_eq!(form.parse::<DocId>(), Ok(id), "{form}");
+        }
+
+        for bad in [
+            "",
+            "abc",
+            "01923a4b-5c6d-7e8f-90a1-b2c3d4e5f60",
+            "01923a4b-5c6d-7e8f-90a1-b2c3d4e5f6077",
+        ] {
+            let error = bad.parse::<DocId>().unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.starts_with(&format!("{bad:?} is not a document id: ")),
+                "{message}"
+            );
+        }
     }
 
     #[test]

@@ -131,6 +131,8 @@ users.ensure_index_with("nick", IndexOptions::new().sparse())?; // no entries fo
 
 let id = users.insert(User { id: None, name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36, nick: None })?;
 let ada = users.get(&id)?.unwrap(); // ada.id == Some(id)
+let same = users.find_one(Filter::new().id(id))?; // a lookup, like get
+let parsed: DocId = id.to_string().parse()?; // ids go to text and back
 
 let oldest_adults = users.find(Filter::new().gte("age", 18).sort_desc("age").limit(10))?;
 let youngest_in_core = users.find(Filter::new().eq("team", "core").sort_asc("age").limit(5))?;
@@ -298,6 +300,7 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 
     Items 29–34 → 0.12.0: file format 9 (still opens 6–8), and breaking
     API changes; SPEC §59 and §60 say what moved where.
+
 35. **Filters on the id through the primary index** (§61):
     `eq("_id", id)`, or an OR of ids, is a lookup like `get`, not a scan
     — 3.9 µs instead of 67 ms on 100,000 documents.
@@ -306,6 +309,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     sort after strings, by when they were made. File format 10: an
     older file's indexes are checked once at open, and those holding
     ids rebuilt.
+37. **A filter on the id, and ids parsed from text** (§63):
+    `Filter::new().id(id)` and `Condition::id(id)` instead of spelling
+    `"_id"`; `"…".parse::<DocId>()`, with `ParseIdError`.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

@@ -164,7 +164,8 @@ if `None` [§59](spec/59-a-struct-carries-its-own-id.md). The id is stored once,
 encoded without its `_id`, and every read puts the cell's id there,
 first, so there's no second copy that could say something else. `DocId`
 serializes as a marked newtype the bridge stores as `Document::Id`, and
-other formats as a UUID string. `find_with_ids` [§23](spec/23-find-with-ids.md) is deprecated, to be
+other formats as a UUID string, and `str::parse` reads that string back
+into a `DocId` [§63](spec/63-an-id-filter-and-parsing-ids.md). `find_with_ids` [§23](spec/23-find-with-ids.md) is deprecated, to be
 removed before 1.0.
 
 **Nesting** is limited to 64 levels, counted as MongoDB counts (the
@@ -251,8 +252,9 @@ numbers: an `Int` and a `Float` compare by exact value [§34](spec/34-sorting-th
 what it picked (`QueryPlan`):
 
 - **`Scan`:** read every document of the collection and check it.
-- **`ById`:** the filter names its documents by id: `eq("_id", id)`,
-  or an OR of such. Look each up in the primary index, as `get` does.
+- **`ById`:** the filter names its documents by id: `eq("_id", id)`
+  (or `Filter::id`, which spares spelling `_id` [§63](spec/63-an-id-filter-and-parsing-ids.md)), or an OR of
+  such. Look each up in the primary index, as `get` does.
   Beats every other plan [§61](spec/61-filters-on-the-id-through-the-primary-index.md).
 - **`Index`:** read one index range, then check each document against
   the whole filter. An `Eq` beats an OR of indexed branches, which beats

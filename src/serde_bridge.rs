@@ -203,7 +203,8 @@ impl Serializer for DocumentSerializer {
         let inner = value.serialize(self)?;
         // A `DocId` is stored as an id, not as its string (SPEC §59).
         match (name, inner) {
-            (crate::document::DOC_ID_NEWTYPE, Document::String(s)) => DocId::parse(&s)
+            (crate::document::DOC_ID_NEWTYPE, Document::String(s)) => s
+                .parse::<DocId>()
                 .map(Document::Id)
                 .map_err(DocumentError::custom),
             (_, inner) => Ok(inner),

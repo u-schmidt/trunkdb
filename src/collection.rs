@@ -4517,6 +4517,49 @@ mod tests {
         assert!(cars.find(text).unwrap().is_empty());
     }
 
+    /// `Filter::id` and `Condition::id` (SPEC §63) find a struct by the
+    /// id it carries, through the primary index, where `eq("id", ...)`,
+    /// the struct's own name for the field, finds nothing.
+    #[test]
+    fn a_filter_by_id_finds_the_struct_that_carries_it() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Task {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            title: String,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Task>("tasks");
+        let ids = ["a", "b", "c"].map(|title| {
+            tasks
+                .insert(Task {
+                    id: None,
+                    title: title.into(),
+                })
+                .unwrap()
+        });
+
+        // As a command line would get it: the id as text.
+        let wanted: DocId = ids[1].to_string().parse().unwrap();
+        let one = Filter::new().id(wanted);
+        assert_eq!(tasks.explain(&one).unwrap(), QueryPlan::ById);
+        let task = tasks.find_one(one).unwrap().unwrap();
+        assert_eq!((task.id, &task.title[..]), (Some(ids[1]), "b"));
+        assert!(
+            tasks
+                .find(Filter::new().eq("id", wanted))
+                .unwrap()
+                .is_empty()
+        );
+
+        let two = Filter::new().any_of([ids[2], ids[0]].map(Condition::id));
+        assert_eq!(tasks.explain(&two).unwrap(), QueryPlan::ById);
+        let titles = tasks.find(two.sort_asc("title")).unwrap();
+        let titles = titles.iter().map(|t| &t.title[..]).collect::<Vec<_>>();
+        assert_eq!(titles, ["a", "c"]);
+    }
+
     /// The typed path end to end: `status` is one of two values, read as
     /// a union of two ranges of its index.
     #[test]
