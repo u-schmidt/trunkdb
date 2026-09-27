@@ -71,7 +71,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["info", &db]);
     assert!(output.status.success());
     let info = stdout(&output);
-    assert!(info.contains("format 10"), "{info}");
+    assert!(info.contains("format 11"), "{info}");
     assert!(
         info.contains(
             "users: 2 documents, indexes: age, email (unique), nick (sparse), \
@@ -91,6 +91,10 @@ fn import_info_check_and_export_round_trip() {
     let exported = std::fs::read_to_string(&out).unwrap();
     let output = trunkdb(&["export", &db]);
     assert_eq!(stdout(&output), exported);
+    assert!(
+        exported.starts_with("{\"$trunkdb_export\":2}\n"),
+        "{exported}"
+    );
     assert!(exported.contains(r#"{"field":"email","unique":true}"#));
     assert!(exported.contains(r#"{"field":"nick","sparse":true}"#));
 

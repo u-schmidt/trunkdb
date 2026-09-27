@@ -79,3 +79,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 66. [A page checked once (`storage/page.rs`, `storage/slotted.rs`, `storage/file.rs`)](66-a-page-checked-once.md)
 67. [`write_page` takes the page (`storage/mod.rs`, `storage/file.rs`, `storage/memory.rs`)](67-write-page-takes-the-page.md)
 68. [Update operators (`update.rs`, `collection.rs`)](68-update-operators.md)
+69. [A date-time type (`datetime.rs`, `document.rs`, `serde_bridge.rs`, `index/key.rs`, `query.rs`, `json.rs`, `export.rs`)](69-a-date-time-type.md)

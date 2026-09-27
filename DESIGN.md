@@ -103,8 +103,8 @@ cell is long enough for its entry [§55](spec/55-fuzzing.md).
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
 shrink until a compaction [§41](spec/41-compaction.md).
 
-**The format version** is 10 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md). A build opens its own format and
-the older ones that are valid files of it (6 to 9), and the first
+**The format version** is 11 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md). A build opens its own format and
+the older ones that are valid files of it (6 to 10), and the first
 page a batch writes stamps them with the current one; it refuses newer
 ones, and older ones that need converting. Opening a 6–9 file with
 secondary indexes checks them once and rebuilds any that a document
@@ -155,7 +155,8 @@ couldn't repair; page images need no structure-specific recovery at all
 ## 6. Documents and data pages
 
 **The value type** is `Document`: `Null`, `Bool`, `Int`, `Float`,
-`String`, `Binary`, `Array`, `Object`, `Id` [§4.1](spec/04-key-decisions-and-rationale.md) [§11](spec/11-document-encoding.md). It's what
+`String`, `Binary`, `Array`, `Object`, `Id` [§4.1](spec/04-key-decisions-and-rationale.md) [§11](spec/11-document-encoding.md), and `DateTime`, an
+instant in UTC to the nanosecond, what a `SystemTime` field stores [§69](spec/69-a-date-time-type.md). It's what
 everything below the API works in, like LiteDB's `BsonValue`.
 `Collection<T>` converts any `T: Serialize + DeserializeOwned` to and
 from it through serde, and delegates to `Collection<Document>`: one
@@ -228,7 +229,8 @@ compares values in [§34.1](spec/34-sorting-through-an-index.md). They cover:
 - **sparse:** no entry for null or missing values, for fields few
   documents have [§44](spec/44-sparse-indexes.md);
 - **references:** a `DocId` field has a key, in the order ids were
-  made, and sorts after strings [§62](spec/62-an-index-key-for-ids.md).
+  made, and sorts after strings [§62](spec/62-an-index-key-for-ids.md);
+- **date-times:** a key in time order, sorting after ids [§69](spec/69-a-date-time-type.md).
 
 An index is built and kept up to date in the same batch as the
 documents it covers, so it can't disagree with them after a crash.
@@ -351,8 +353,10 @@ more than four.
   with full pages, logs it through the WAL like any batch and truncates
   the file [§41](spec/41-compaction.md). The whole new image is held in memory while it runs.
 - **Export and import** write and read JSON Lines, with the types JSON
-  lacks kept by tags (`{"$id": ...}`, `{"$binary": ...}`), so an export
-  is a readable backup and the path between file formats [§30](spec/30-export-and-import-as-json-lines.md).
+  lacks kept by tags (`{"$id": ...}`, `{"$binary": ...}`, `{"$date":
+  "<RFC 3339>"}`), so an export is a readable backup and the path
+  between file formats [§30](spec/30-export-and-import-as-json-lines.md). Exports are format 2 since `$date`; an
+  import reads format 1 too [§69](spec/69-a-date-time-type.md).
 
 ## 12. Performance
 

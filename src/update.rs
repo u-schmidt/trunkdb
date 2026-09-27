@@ -189,6 +189,7 @@ fn kind(value: &Document) -> &'static str {
         Document::Array(_) => "an array",
         Document::Object(_) => "an object",
         Document::Id(_) => "an id",
+        Document::DateTime(_) => "a date-time",
     }
 }
 

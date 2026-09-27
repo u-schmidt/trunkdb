@@ -30,6 +30,11 @@ const TAG_STRING: u8 = 3;
 /// Since file format 10 (SPEC §62); an index built before holds no entry
 /// for an id.
 const TAG_ID: u8 = 4;
+/// A `DateTime` (SPEC §69): its seconds as a big-endian `i64` with the
+/// sign bit flipped, so byte order is numeric order, then its nanoseconds
+/// as a big-endian `u32`. After ids, as the sort puts them; since file
+/// format 11, the first that can hold one.
+const TAG_DATETIME: u8 = 5;
 /// A value only compound keys hold (SPEC §43.2): arrays, objects,
 /// binary, NaN — everything `encode_value` leaves out. Last, as such
 /// values sort after everything (§34.1). No bytes after the tag: they're
@@ -133,6 +138,7 @@ pub fn parts(value_part: &[u8]) -> Vec<&[u8]> {
             TAG_BOOL => 2,
             TAG_NUMBER => 9,
             TAG_ID => 17,
+            TAG_DATETIME => 13,
             _ => string_len(rest).unwrap_or(rest.len()),
         };
         let (part, after) = rest.split_at(len.min(rest.len()));
@@ -191,7 +197,8 @@ pub fn secondary(value: &Document, id: DocId) -> Option<Vec<u8>> {
 /// That's fine, since every document an index returns is checked against
 /// the full filter again (SPEC §28.3). Only the types a comparison can
 /// match are indexed — `Null` (which also stands for a missing field,
-/// SPEC §32), `Bool`, `Int`/`Float`, `String`, and ids (SPEC §62).
+/// SPEC §32), `Bool`, `Int`/`Float`, `String`, ids (SPEC §62) and
+/// date-times (SPEC §69).
 /// Anything else (arrays, objects, binary, `NaN`) is `None`: no
 /// `Eq`/`Lt`/`Lte`/`Gt`/`Gte` condition can match it, so leaving it out
 /// of the index loses nothing.
@@ -213,6 +220,14 @@ fn encode_value_in(value: &Document, fields: usize) -> Option<Vec<u8>> {
         Document::Float(f) => encode_number(*f),
         Document::String(s) => Some(encode_string(s.as_bytes(), string_budget(fields))),
         Document::Id(id) => Some([&[TAG_ID][..], &id.0].concat()),
+        Document::DateTime(time) => {
+            let (secs, nanos) =
+                crate::datetime::to_parts(*time).expect("no SystemTime is that far from 1970");
+            let mut out = vec![TAG_DATETIME];
+            out.extend_from_slice(&((secs as u64) ^ (1 << 63)).to_be_bytes());
+            out.extend_from_slice(&nanos.to_be_bytes());
+            Some(out)
+        }
         _ => None,
     }
 }
@@ -494,6 +509,40 @@ mod tests {
         for value in [Document::Binary(vec![1]), Document::Array(vec![])] {
             assert_eq!(encode_value(&value), None, "{value:?}");
         }
+    }
+
+    /// SPEC §69: date-times are keyed in time order, before 1970 and to
+    /// the nanosecond, after every id; a compound key's parts split them.
+    #[test]
+    fn datetimes_are_keyed_in_time_order() {
+        let at =
+            |secs, nanos| Document::DateTime(crate::datetime::from_parts(secs, nanos).unwrap());
+        let times = [
+            at(i64::MIN / 4, 0),
+            at(-86_400, 0),
+            at(-1, 0),
+            at(-1, 999_999_999),
+            at(0, 0),
+            at(0, 1),
+            at(0, 256),
+            at(0, 65_536),
+            at(1, 0),
+            at(1_790_000_000, 5),
+            at(i64::MAX / 4, 999_999_999),
+        ];
+        let keys: Vec<_> = times.iter().map(|t| key(t.clone())).collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+        assert!(keys.iter().all(|k| k.len() == 13 && k[0] == TAG_DATETIME));
+        assert!(key(Document::Id(DocId([0xFF; 16]))) < keys[0]);
+        assert!(*keys.last().unwrap() < [TAG_OTHER].to_vec());
+
+        let two = encode_values(&[&times[4], &Document::String("x".into())]);
+        let parts = parts(&two);
+        assert_eq!(
+            parts,
+            [&keys[4][..], &key(Document::String("x".into()))[..]]
+        );
+        assert!(part_is_exact(parts[0], 2));
     }
 
     /// Ids have a key since format 10 (SPEC §62): 16 bytes after their

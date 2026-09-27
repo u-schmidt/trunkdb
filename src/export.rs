@@ -26,8 +26,10 @@ use serde_json::{Map, Value};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 
 /// The version of the export format itself — not the file format
-/// (SPEC §21.2), which an export deliberately doesn't depend on.
-const EXPORT_VERSION: u64 = 1;
+/// (SPEC §21.2), which an export deliberately doesn't depend on. 2 since
+/// `$date` (SPEC §69); an import reads 1 too, without it.
+const EXPORT_VERSION: u64 = 2;
+const OLDEST_EXPORT_VERSION: u64 = 1;
 const HEADER_KEY: &str = "$trunkdb_export";
 const COLLECTION_KEY: &str = "$collection";
 const INDEXES_KEY: &str = "$indexes";
@@ -133,7 +135,7 @@ impl Database {
     /// Each collection's indexes are built once its documents are in.
     pub fn import(&self, input: impl Read) -> crate::Result<Summary> {
         let mut summary = Summary::default();
-        let mut seen_header = false;
+        let mut tags: Option<crate::json::Tags> = None;
         let mut current: Option<CollectionHeader> = None;
         let mut chunk = Chunk::default();
 
@@ -150,11 +152,13 @@ impl Database {
             let value: Value =
                 serde_json::from_str(&line).map_err(|e| fail(format!("not JSON: {e}")))?;
 
-            if !seen_header {
-                check_header(&value).map_err(fail)?;
-                seen_header = true;
+            let Some(tags) = tags else {
+                let version = check_header(&value).map_err(fail)?;
+                tags = Some(crate::json::Tags {
+                    dates: version >= 2,
+                });
                 continue;
-            }
+            };
             if let Some(header) = CollectionHeader::parse(&value).map_err(fail)? {
                 chunk.write(self)?;
                 if let Some(done) = current.take() {
@@ -174,7 +178,7 @@ impl Database {
                     "a document before the first {{\"{COLLECTION_KEY}\": ...}} line"
                 )));
             };
-            let (id, doc) = parse_document_line(value).map_err(|e| fail(e.to_string()))?;
+            let (id, doc) = parse_document_line(value, tags).map_err(|e| fail(e.to_string()))?;
             let id = id.unwrap_or_else(|| self.id_gen().generate());
             chunk.push(
                 WriteOp::Insert(collection.name.clone(), id, doc),
@@ -186,7 +190,7 @@ impl Database {
             }
         }
 
-        if !seen_header {
+        if tags.is_none() {
             return Err(Error::Import {
                 line: 1,
                 message: "empty input: no header line".into(),
@@ -320,15 +324,17 @@ fn parse_index(index: &Value) -> Result<(Vec<String>, IndexOptions), String> {
     }
 }
 
-fn check_header(value: &Value) -> Result<(), String> {
+/// The export format version the header names, if this build reads it.
+fn check_header(value: &Value) -> Result<u64, String> {
     let expected = format!("the first line must be {{\"{HEADER_KEY}\": {EXPORT_VERSION}}}");
     let Value::Object(object) = value else {
         return Err(expected);
     };
     match object.get(HEADER_KEY).and_then(Value::as_u64) {
-        Some(EXPORT_VERSION) if object.len() == 1 => Ok(()),
+        Some(version @ OLDEST_EXPORT_VERSION..=EXPORT_VERSION) if object.len() == 1 => Ok(version),
         Some(version) if object.len() == 1 => Err(format!(
-            "export format version {version} is not supported (this trunkdb reads {EXPORT_VERSION})"
+            "export format version {version} is not supported (this trunkdb reads \
+             {OLDEST_EXPORT_VERSION} to {EXPORT_VERSION})"
         )),
         _ => Err(expected),
     }
@@ -450,7 +456,15 @@ mod tests {
             6 => Document::Id(DocId(
                 rng.next().to_le_bytes().repeat(2).try_into().unwrap(),
             )),
-            7 => Document::Float(rng.next() as f64 / 3.0),
+            7 if rng.below(2) == 0 => Document::Float(rng.next() as f64 / 3.0),
+            // Anywhere within ±3,000 years of 1970, to the nanosecond.
+            7 => Document::DateTime(
+                crate::datetime::from_parts(
+                    (rng.next() % 190_000_000_000) as i64 - 95_000_000_000,
+                    (rng.next() % 1_000_000_000) as u32,
+                )
+                .unwrap(),
+            ),
             8 => Document::Array(
                 (0..rng.below(4))
                     .map(|_| random_value(rng, depth - 1))
@@ -464,6 +478,7 @@ mod tests {
                     "$object",
                     "$value",
                     "$binary",
+                    "$date",
                     "_id",
                     "$collection",
                 ];
@@ -669,6 +684,42 @@ mod tests {
         assert!(people.index_names().unwrap().is_empty());
     }
 
+    /// SPEC §69: an export's version decides what `{"$date": ...}` is:
+    /// in format 2 a date-time, which must be RFC 3339; in format 1,
+    /// written before trunkdb had date-times, the object it was.
+    #[test]
+    fn the_export_version_decides_what_a_date_tag_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let import = |name: &str, version: u64, value: &str| {
+            let db = Database::open(dir.path().join(name)).unwrap();
+            let text = format!(
+                "{{\"$trunkdb_export\":{version}}}\n{{\"$collection\":\"c\"}}\n{{\"at\":{{\"$date\":{value}}}}}\n"
+            );
+            db.import(text.as_bytes())?;
+            let doc = db
+                .collection::<Document>("c")
+                .find_one(Filter::new())?
+                .unwrap();
+            let Document::Object(mut fields) = doc else {
+                panic!()
+            };
+            Ok::<_, crate::Error>(fields.shift_remove("at").unwrap())
+        };
+        let time = crate::datetime::from_parts(1_790_000_000, 0).unwrap();
+        let date = r#""2026-09-21T14:13:20Z""#;
+        assert_eq!(import("a", 2, date).unwrap(), Document::DateTime(time));
+        let object = |value: Document| Document::Object([("$date".to_string(), value)].into());
+        assert_eq!(
+            import("b", 1, date).unwrap(),
+            object(Document::String(date.trim_matches('"').into()))
+        );
+        assert_eq!(import("c", 1, "7").unwrap(), object(Document::Int(7)));
+        let Err(Error::Import { line: 3, message }) = import("d", 2, r#""soon""#) else {
+            panic!("a `$date` that isn't RFC 3339 must fail the import");
+        };
+        assert!(message.contains("RFC 3339"), "{message}");
+    }
+
     #[test]
     fn bad_lines_name_their_line_number() {
         let dir = tempfile::tempdir().unwrap();
@@ -676,7 +727,7 @@ mod tests {
         let collection = "{\"$collection\":\"c\"}\n";
         let cases: Vec<(String, usize, &str)> = vec![
             (String::new(), 1, "empty input"),
-            ("{\"$trunkdb_export\":2}\n".into(), 1, "version 2"),
+            ("{\"$trunkdb_export\":3}\n".into(), 1, "version 3"),
             ("{\"a\":1}\n".into(), 1, "first line must be"),
             (format!("{header}{{\"a\":1}}\n"), 2, "before the first"),
             (format!("{header}{collection}not json\n"), 3, "not JSON"),

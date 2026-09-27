@@ -334,6 +334,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 42. **Update operators** (§68): `update_fields(filter,
     &Update::new().set(..).inc(..).unset(..))`, on dotted paths, next
     to `update_many`'s closure.
+43. **A date-time type** (§69): `Document::DateTime`, what a
+    `SystemTime` field stores, to the nanosecond; compared, sorted and
+    indexed in time order; `{"$date": "<RFC 3339>"}` in an export
+    (export format 2). File format 11, which still opens 6–10.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

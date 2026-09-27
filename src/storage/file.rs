@@ -41,8 +41,10 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// cell kinds (SPEC §43); 9 = documents stored without their `_id`,
 /// which reads take from the cell (SPEC §59): a build before it would
 /// read them without ids; 10 = ids in index keys (SPEC §62): a build
-/// before it would leave their entries behind when it deletes.
-const FORMAT_VERSION: u32 = 10;
+/// before it would leave their entries behind when it deletes; 11 =
+/// date-times in documents and index keys (SPEC §69), a type tag a build
+/// before it can't decode.
+const FORMAT_VERSION: u32 = 11;
 /// Older formats this build opens as they are, because such a file *is*
 /// a valid `FORMAT_VERSION` file — one that uses none of what came since
 /// (for 4: unique indexes; for 8: a document's `_id` stored in it too,
@@ -53,7 +55,7 @@ const FORMAT_VERSION: u32 = 10;
 /// newer always says so, and an older build refuses it instead of
 /// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
 /// the checksum (6), and uses the bytes where it now goes.
-const COMPATIBLE_OLDER_FORMATS: [u32; 4] = [6, 7, 8, 9];
+const COMPATIBLE_OLDER_FORMATS: [u32; 5] = [6, 7, 8, 9, 10];
 const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.

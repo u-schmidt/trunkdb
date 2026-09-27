@@ -1105,6 +1105,8 @@ fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> {
         // §59, so no filter on an id matched (not even `eq("_id", id)`).
         // Sorting still ranks ids as unordered (`sort_rank`).
         (Id(x), Id(y)) => Some(x.cmp(y)),
+        // In time order (SPEC §69); never equal to a string or number.
+        (DateTime(x), DateTime(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
@@ -1144,11 +1146,12 @@ fn sort_rank(value: &Document) -> u8 {
         Document::Int(_) | Document::Float(_) => 2,
         Document::String(_) => 3,
         Document::Id(_) => 4,
+        Document::DateTime(_) => 5,
         _ => UNORDERED,
     }
 }
 
-const UNORDERED: u8 = 5;
+const UNORDERED: u8 = 6;
 
 /// Whether `sort_order` puts `value` among the values nothing orders —
 /// arrays, objects, binary, NaN. No index holds them.
@@ -1158,8 +1161,8 @@ pub(crate) fn is_unordered(value: &Document) -> bool {
 
 /// The order a sort puts two field values in (SPEC §34.1) — a total
 /// order, so any sort is well-defined: null (and missing) before bools
-/// before numbers before strings before ids (SPEC §62), each by value,
-/// reversed for `Desc`;
+/// before numbers before strings before ids (SPEC §62) before date-times
+/// (SPEC §69), each by value, reversed for `Desc`;
 /// values nothing orders come after all of them in both directions, as
 /// equals. It is the order of an index's keys, so reading an index gives
 /// what sorting in memory gives.
@@ -1208,6 +1211,35 @@ mod tests {
         assert_eq!(sort_order(&b, &array, SortOrder::Asc), Less);
         assert_eq!(sort_order(&b, &array, SortOrder::Desc), Less);
         assert!(!is_unordered(&a) && is_unordered(&array));
+    }
+
+    /// SPEC §69: date-times compare with date-times, in time order, and
+    /// sort after ids; a string or number never equals one.
+    #[test]
+    fn datetimes_compare_in_time_order_and_sort_after_ids() {
+        use std::cmp::Ordering::Less;
+        let at = |secs| Document::DateTime(crate::datetime::from_parts(secs, 0).unwrap());
+        let (before, after) = (at(-5), at(1_790_000_000));
+        let item = doc(&[("seen", after.clone())]);
+        assert!(Filter::new().eq("seen", after.clone()).matches(&item));
+        assert!(Filter::new().gt("seen", before.clone()).matches(&item));
+        assert!(!Filter::new().lt("seen", before.clone()).matches(&item));
+        assert!(
+            !Filter::new()
+                .eq("seen", "2026-09-21T14:13:20Z")
+                .matches(&item)
+        );
+        assert!(!Filter::new().gte("seen", 0).matches(&item));
+        assert!(Filter::new().ne("seen", 1_790_000_000).matches(&item));
+
+        let id = Document::Id(DocId([0xFF; 16]));
+        assert_eq!(sort_order(&id, &before, SortOrder::Asc), Less);
+        assert_eq!(sort_order(&before, &after, SortOrder::Asc), Less);
+        assert_eq!(
+            sort_order(&after, &Document::Array(vec![]), SortOrder::Desc),
+            Less
+        );
+        assert!(!is_unordered(&after));
     }
 
     /// Which filters name their documents by id (SPEC §61): an `Eq` on

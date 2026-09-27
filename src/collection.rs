@@ -2419,7 +2419,7 @@ mod tests {
     /// rounding to one f64, long strings agreeing past the key's cut).
     fn random_value(rng: &mut XorShift) -> Document {
         let big = 1i64 << 53;
-        match rng.below(11) {
+        match rng.below(12) {
             0 | 1 => Document::Int(rng.below(11) as i64 - 5),
             2 => Document::Int(big + rng.below(4) as i64),
             3 => Document::Float((rng.below(21) as f64 - 10.0) / 2.0),
@@ -2429,7 +2429,15 @@ mod tests {
             8 => Document::Bool(rng.below(2) == 1),
             9 => [Document::Null, Document::Array(vec![Document::Int(1)])][rng.below(2)].clone(),
             // A few ids, which compare, sort and are indexed (SPEC §62).
-            _ => Document::Id(DocId([1 + rng.below(3) as u8; 16])),
+            10 => Document::Id(DocId([1 + rng.below(3) as u8; 16])),
+            // A few date-times, before and after 1970 (SPEC §69).
+            _ => Document::DateTime(
+                crate::datetime::from_parts(
+                    rng.below(5) as i64 - 2,
+                    [0, 999_999_999][rng.below(2)],
+                )
+                .unwrap(),
+            ),
         }
     }
 
@@ -4417,7 +4425,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 901, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 10);
+        assert_eq!(db.file_info().unwrap().format_version, 11);
         assert!(db.check().unwrap().is_ok());
         let cars = db.collection::<Document>("cars");
         assert_eq!(
@@ -4448,7 +4456,7 @@ mod tests {
         );
         drop((cars, db));
         let reads = records_read(|| drop(Database::open(&path).unwrap()));
-        assert_eq!(reads, 0, "checked once: the file says 10 now");
+        assert_eq!(reads, 0, "checked once: the file says 11 now");
 
         // Indexes, none holding an id: nothing to rebuild, but checked,
         // so the file is stamped, and not checked again.
@@ -4460,7 +4468,7 @@ mod tests {
         drop((notes, db));
         crate::storage::rewrite_format_version(&unkeyed, 9);
         let db = Database::open(&unkeyed).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 10);
+        assert_eq!(db.file_info().unwrap().format_version, 11);
         drop(db);
         let reads = records_read(|| drop(Database::open(&unkeyed).unwrap()));
         assert_eq!(reads, 0);
@@ -4479,7 +4487,7 @@ mod tests {
         db.collection::<Document>("notes")
             .insert(object(vec![("n", Document::Int(2))]))
             .unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 10);
+        assert_eq!(db.file_info().unwrap().format_version, 11);
     }
 
     /// Ids never collided in a unique index before format 10 (SPEC §62):
@@ -5161,6 +5169,97 @@ mod tests {
         for path in ["v", "w", "o.x"] {
             assert_index_agrees_with_scan(&docs, &mut rng, path);
         }
+    }
+
+    // --- Date-times (SPEC §69) ---
+
+    /// A struct with `SystemTime` fields end to end: stored as
+    /// date-times, found by a range through their index, sorted, changed
+    /// by `update_fields`, and the same to the nanosecond after a reopen
+    /// and after an export and import.
+    #[test]
+    fn system_time_fields_are_indexed_ranged_sorted_and_exported() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        struct Scan {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            device: String,
+            at: SystemTime,
+            done: Option<SystemTime>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let scans = db.collection::<Scan>("scans");
+        scans.ensure_index("at").unwrap();
+        let start = UNIX_EPOCH + Duration::new(1_790_000_000, 999_999_999);
+        let at = |i: u64| start + Duration::from_nanos(i * 1_000_000_001);
+        let mut batch = db.batch();
+        for i in 0..200 {
+            let device = format!("d{}", i % 3);
+            let scan = Scan {
+                id: None,
+                device,
+                at: at(i),
+                done: None,
+            };
+            batch.insert(&scans, scan).unwrap();
+        }
+        batch.commit().unwrap();
+
+        let window = Filter::new().gte("at", at(50)).lt("at", at(60));
+        assert_eq!(
+            scans.explain(&window).unwrap(),
+            QueryPlan::Index { field: "at".into() }
+        );
+        let found = scans.find(window.sort_desc("at")).unwrap();
+        let times: Vec<SystemTime> = found.iter().map(|s| s.at).collect();
+        assert_eq!(times, (50..60).rev().map(at).collect::<Vec<_>>());
+        let newest = scans
+            .find_one(Filter::new().sort_desc("at"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest.at, at(199));
+        assert_eq!(scans.count(Filter::new().lt("at", start)).unwrap(), 0);
+        assert_eq!(
+            scans
+                .count(Filter::new().eq("at", "2026-09-21T14:13:20Z"))
+                .unwrap(),
+            0
+        );
+
+        let finished = SystemTime::now();
+        let first_ten = Filter::new().lt("at", at(10));
+        let changed = scans
+            .update_fields(first_ten.clone(), &Update::new().set("done", finished))
+            .unwrap();
+        assert_eq!(changed, 10);
+        assert_eq!(scans.count(Filter::new().eq("done", finished)).unwrap(), 10);
+
+        let everything = |db: &Database| {
+            let mut all = db.collection::<Scan>("scans").find(Filter::new()).unwrap();
+            all.sort_by_key(|s| s.id);
+            all
+        };
+        let before = everything(&db);
+        drop((scans, db));
+        let db = Database::open(&path).unwrap();
+        assert_eq!(everything(&db), before, "after a reopen");
+        assert!(db.check().unwrap().is_ok());
+
+        let mut export = Vec::new();
+        db.export(&mut export).unwrap();
+        let text = String::from_utf8(export.clone()).unwrap();
+        assert!(
+            text.contains(r#""at":{"$date":"2026-09-21T14:13:20.999999999Z"}"#),
+            "{text}"
+        );
+        let copy = Database::open(dir.path().join("copy.trunkdb")).unwrap();
+        copy.import(&export[..]).unwrap();
+        assert_eq!(everything(&copy), before, "after an export and import");
+        let window = Filter::new().gte("at", at(50)).lt("at", at(60));
+        assert_eq!(copy.collection::<Scan>("scans").count(window).unwrap(), 10);
     }
 
     // --- Unique indexes (SPEC §33) ---

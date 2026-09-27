@@ -11,6 +11,7 @@ mod crc32;
 mod cursor;
 mod data;
 mod database;
+mod datetime;
 mod decode;
 mod document;
 mod durability;

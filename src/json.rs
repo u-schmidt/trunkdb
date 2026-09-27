@@ -8,6 +8,7 @@
 //! | `Id`                   | `{"$id": "<uuid>"}`                   |
 //! | `Binary`               | `{"$binary": "<base64>"}`             |
 //! | `Float` NaN / ±inf     | `{"$float": "NaN"}`, `"Infinity"`, `"-Infinity"` |
+//! | `DateTime`             | `{"$date": "2026-09-27T14:05:00Z"}` (RFC 3339, UTC) |
 //! | `Object` that looks like a tag | `{"$object": {...}}`          |
 //!
 //! Everything else is plain JSON: `Int` is an integer, `Float` a number
@@ -17,9 +18,13 @@
 //!
 //! Only a one-key object whose key is a tag name is read as a tag; any
 //! other object, including one with an unknown `$` key such as MongoDB's
-//! `$date`, is an ordinary object. An `Object` that is itself a one-key
+//! `$oid`, is an ordinary object. An `Object` that is itself a one-key
 //! object with a tag name is written inside `$object`, so it can't be
 //! mistaken for a tag.
+//!
+//! `$date` is a tag since export format 2 (SPEC §69). An export of
+//! format 1 is read without it, so a `{"$date": ...}` object in it stays
+//! the object it was.
 
 use crate::document::{DocId, Document};
 use indexmap::IndexMap;
@@ -28,11 +33,29 @@ use serde_json::{Map, Number, Value};
 const TAG_ID: &str = "$id";
 const TAG_BINARY: &str = "$binary";
 const TAG_FLOAT: &str = "$float";
+const TAG_DATE: &str = "$date";
 const TAG_OBJECT: &str = "$object";
 /// Only at the top of an export line: a document that isn't an `Object`
 /// (see `document_line`).
 const TAG_VALUE: &str = "$value";
-const TAGS: [&str; 5] = [TAG_ID, TAG_BINARY, TAG_FLOAT, TAG_OBJECT, TAG_VALUE];
+const TAGS: [&str; 6] = [
+    TAG_ID, TAG_BINARY, TAG_FLOAT, TAG_DATE, TAG_OBJECT, TAG_VALUE,
+];
+
+/// Which tags a reader knows: `$date` came with export format 2.
+#[derive(Clone, Copy)]
+pub(crate) struct Tags {
+    pub(crate) dates: bool,
+}
+
+impl Tags {
+    /// What this build writes.
+    pub(crate) const CURRENT: Tags = Tags { dates: true };
+
+    fn has(self, key: &str) -> bool {
+        TAGS.contains(&key) && (self.dates || key != TAG_DATE)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -55,10 +78,13 @@ pub fn to_json(doc: &Document) -> Value {
         Document::String(s) => Value::String(s.clone()),
         Document::Binary(bytes) => tagged(TAG_BINARY, Value::String(base64_encode(bytes))),
         Document::Id(id) => tagged(TAG_ID, Value::String(id.to_string())),
+        Document::DateTime(time) => {
+            tagged(TAG_DATE, Value::String(crate::datetime::to_rfc3339(*time)))
+        }
         Document::Array(items) => Value::Array(items.iter().map(to_json).collect()),
         Document::Object(map) => {
             let object = object_to_json(map);
-            if looks_like_tag(&object) {
+            if looks_like_tag(&object, Tags::CURRENT) {
                 tagged(TAG_OBJECT, Value::Object(object))
             } else {
                 Value::Object(object)
@@ -69,20 +95,30 @@ pub fn to_json(doc: &Document) -> Value {
 
 /// Tagged JSON back to a `Document`. Accepts any JSON, except integers
 /// outside `i64` (a `Document::Int` can't hold them) and malformed tags.
+/// For tests: an import reads with the tags its export's version knows.
+#[cfg(test)]
 pub fn from_json(value: Value) -> Result<Document, JsonError> {
+    read(value, Tags::CURRENT)
+}
+
+/// `from_json`, knowing only `tags`.
+fn read(value: Value, tags: Tags) -> Result<Document, JsonError> {
     Ok(match value {
         Value::Null => Document::Null,
         Value::Bool(b) => Document::Bool(b),
         Value::Number(n) => number(&n)?,
         Value::String(s) => Document::String(s),
-        Value::Array(items) => {
-            Document::Array(items.into_iter().map(from_json).collect::<Result<_, _>>()?)
-        }
-        Value::Object(object) if looks_like_tag(&object) => {
+        Value::Array(items) => Document::Array(
+            items
+                .into_iter()
+                .map(|item| read(item, tags))
+                .collect::<Result<_, _>>()?,
+        ),
+        Value::Object(object) if looks_like_tag(&object, tags) => {
             let (tag, inner) = object.into_iter().next().expect("one key");
-            from_tag(tag, inner)?
+            from_tag(tag, inner, tags)?
         }
-        Value::Object(object) => Document::Object(object_from_json(object)?),
+        Value::Object(object) => Document::Object(object_from_json(object, tags)?),
     })
 }
 
@@ -122,13 +158,16 @@ pub(crate) fn document_line(id: DocId, doc: &Document) -> Value {
 
 /// Reverses `document_line`: the document, and its id if the line has
 /// an `_id` (a hand-written line may leave it out to get a new one).
-pub(crate) fn parse_document_line(line: Value) -> Result<(Option<DocId>, Document), JsonError> {
+pub(crate) fn parse_document_line(
+    line: Value,
+    tags: Tags,
+) -> Result<(Option<DocId>, Document), JsonError> {
     let Value::Object(mut object) = line else {
         return Err(error("a document line must be a JSON object"));
     };
     let id = match object.get("_id") {
         None => None,
-        Some(value) => match from_json(value.clone())? {
+        Some(value) => match read(value.clone(), tags)? {
             Document::Id(id) => Some(id),
             _ => {
                 return Err(error(
@@ -143,10 +182,14 @@ pub(crate) fn parse_document_line(line: Value) -> Result<(Option<DocId>, Documen
         _ => None,
     };
     let doc = match wrapper.as_deref() {
-        Some(TAG_VALUE) => from_json(object.shift_remove(TAG_VALUE).unwrap())?,
+        Some(TAG_VALUE) => read(object.shift_remove(TAG_VALUE).unwrap(), tags)?,
         // The whole object, `_id` included, in its original field order.
-        Some(_) => from_tag(TAG_OBJECT.into(), object.shift_remove(TAG_OBJECT).unwrap())?,
-        None => Document::Object(object_from_json(object)?),
+        Some(_) => from_tag(
+            TAG_OBJECT.into(),
+            object.shift_remove(TAG_OBJECT).unwrap(),
+            tags,
+        )?,
+        None => Document::Object(object_from_json(object, tags)?),
     };
     Ok((id, doc))
 }
@@ -162,11 +205,11 @@ pub(crate) fn is_tag(key: &str) -> bool {
     TAGS.contains(&key)
 }
 
-fn looks_like_tag(object: &Map<String, Value>) -> bool {
-    object.len() == 1 && object.keys().all(|k| TAGS.contains(&k.as_str()))
+fn looks_like_tag(object: &Map<String, Value>, tags: Tags) -> bool {
+    object.len() == 1 && object.keys().all(|k| tags.has(k))
 }
 
-fn from_tag(tag: String, value: Value) -> Result<Document, JsonError> {
+fn from_tag(tag: String, value: Value, tags: Tags) -> Result<Document, JsonError> {
     let text = |value: Value| match value {
         Value::String(s) => Ok(s),
         other => Err(error(format!("`{tag}` must hold a string, got {other}"))),
@@ -194,8 +237,16 @@ fn from_tag(tag: String, value: Value) -> Result<Document, JsonError> {
                 )));
             }
         },
+        TAG_DATE => {
+            let s = text(value)?;
+            Document::DateTime(crate::datetime::from_rfc3339(&s).ok_or_else(|| {
+                error(format!(
+                    "`$date` {s:?} is not an RFC 3339 date and time (like \"2026-09-27T14:05:00Z\")"
+                ))
+            })?)
+        }
         TAG_OBJECT => match value {
-            Value::Object(inner) => Document::Object(object_from_json(inner)?),
+            Value::Object(inner) => Document::Object(object_from_json(inner, tags)?),
             other => return Err(error(format!("`$object` must hold an object, got {other}"))),
         },
         _ => {
@@ -232,10 +283,13 @@ fn object_to_json(map: &IndexMap<String, Document>) -> Map<String, Value> {
     map.iter().map(|(k, v)| (k.clone(), to_json(v))).collect()
 }
 
-fn object_from_json(object: Map<String, Value>) -> Result<IndexMap<String, Document>, JsonError> {
+fn object_from_json(
+    object: Map<String, Value>,
+    tags: Tags,
+) -> Result<IndexMap<String, Document>, JsonError> {
     object
         .into_iter()
-        .map(|(k, v)| Ok((k, from_json(v)?)))
+        .map(|(k, v)| Ok((k, read(v, tags)?)))
         .collect()
 }
 
@@ -371,17 +425,48 @@ mod tests {
         }
     }
 
+    /// SPEC §69: a date-time is `{"$date": "<RFC 3339>"}`, to the
+    /// nanosecond; an object that is `{"$date": ...}` is written inside
+    /// `$object`; an export of format 1 knew no `$date`, and reads it as
+    /// the object it was then.
+    #[test]
+    fn datetimes_are_tagged_and_older_exports_keep_their_date_objects() {
+        let time = crate::datetime::from_parts(1_790_000_000, 120_000_000).unwrap();
+        let json = to_json(&Document::DateTime(time));
+        assert_eq!(json.to_string(), r#"{"$date":"2026-09-21T14:13:20.12Z"}"#);
+        assert_eq!(
+            roundtrip(&Document::DateTime(time)),
+            Document::DateTime(time)
+        );
+
+        let lookalike = object(&[("$date", Document::String("soon".into()))]);
+        assert_eq!(
+            to_json(&lookalike).to_string(),
+            r#"{"$object":{"$date":"soon"}}"#
+        );
+        assert_eq!(roundtrip(&lookalike), lookalike);
+
+        let line: Value = serde_json::from_str(r#"{"at":{"$date":"soon"}}"#).unwrap();
+        let old = Tags { dates: false };
+        let (_, doc) = parse_document_line(line.clone(), old).unwrap();
+        assert_eq!(doc, object(&[("at", lookalike)]));
+        let error = parse_document_line(line, Tags::CURRENT).unwrap_err();
+        assert!(error.to_string().contains("RFC 3339"), "{error}");
+        let offset: Value =
+            serde_json::from_str(r#"{"$date":"2026-09-21T16:13:20.12+02:00"}"#).unwrap();
+        assert_eq!(from_json(offset).unwrap(), Document::DateTime(time));
+    }
+
     #[test]
     fn plain_json_is_tagged_json() {
         let value: Value =
-            serde_json::from_str(r#"{"name":"Ada","age":36,"tags":["a"],"x":{"$date":1}}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"name":"Ada","age":36,"tags":["a"],"x":{"$oid":1}}"#).unwrap();
         let doc = from_json(value).unwrap();
         let Document::Object(map) = &doc else {
             panic!()
         };
         assert_eq!(map["age"], Document::Int(36));
-        assert_eq!(map["x"], object(&[("$date", Document::Int(1))]));
+        assert_eq!(map["x"], object(&[("$oid", Document::Int(1))]));
     }
 
     #[test]
@@ -418,7 +503,7 @@ mod tests {
         for doc in cases {
             let text = serde_json::to_string(&document_line(id, &doc)).unwrap();
             let (back_id, back) =
-                parse_document_line(serde_json::from_str(&text).unwrap()).unwrap();
+                parse_document_line(serde_json::from_str(&text).unwrap(), Tags::CURRENT).unwrap();
             assert_eq!(back_id, Some(id), "{text}");
             assert!(same(&back, &doc), "{text} -> {back:?}");
         }
@@ -426,11 +511,15 @@ mod tests {
 
     #[test]
     fn a_line_without_id_gets_none_and_a_bad_id_is_rejected() {
-        let (id, doc) = parse_document_line(serde_json::from_str(r#"{"a":1}"#).unwrap()).unwrap();
+        let (id, doc) =
+            parse_document_line(serde_json::from_str(r#"{"a":1}"#).unwrap(), Tags::CURRENT)
+                .unwrap();
         assert_eq!(id, None);
         assert_eq!(doc, object(&[("a", Document::Int(1))]));
         for text in [r#"{"_id":"abc","a":1}"#, r#"[1]"#] {
-            assert!(parse_document_line(serde_json::from_str(text).unwrap()).is_err());
+            assert!(
+                parse_document_line(serde_json::from_str(text).unwrap(), Tags::CURRENT).is_err()
+            );
         }
     }
 
