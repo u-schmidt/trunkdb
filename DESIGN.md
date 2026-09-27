@@ -91,6 +91,8 @@ identity and a deleted one is reused; on B-tree pages slot order is key
 order, and a cell is inserted or removed in place by moving the
 directory [§52](spec/52-b-tree-pages-changed-in-place.md). A page's layout is checked when it's read: a slot
 outside the cell area is an error saying what is wrong, not a panic [§54](spec/54-checking-a-page-when-it-is-read.md).
+A page is checked once, as it goes into the cache or its batch
+commits, and marked; reads of a marked page skip the check [§66](spec/66-a-page-checked-once.md).
 The same holds for everything decoded from a page: bytes that run out,
 a count past what's left, a link back to a page already seen or past
 the file's end are `InvalidData` errors. Decoders read through
@@ -365,7 +367,8 @@ current table. Each gap had a measured cause, fixed one at a time:
 | Batched inserts | 7.5k/s | B-tree pages changed in place [§52](spec/52-b-tree-pages-changed-in-place.md) |
 
 Still behind: full scans (decoding), and whole 8 KB page images in the
-WAL for every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md).
+WAL for every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md), and a
+changed page is copied once, not twice: `write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md).
 
 ## 13. How it's tested
 

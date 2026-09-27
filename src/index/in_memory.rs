@@ -68,7 +68,7 @@ mod tests {
         fn try_read_page(&self, _id: PageId) -> std::io::Result<Option<crate::storage::Page>> {
             unimplemented!()
         }
-        fn write_page(&mut self, _id: PageId, _data: &[u8]) -> std::io::Result<()> {
+        fn write_page(&mut self, _id: PageId, _data: crate::storage::Page) -> std::io::Result<()> {
             unimplemented!()
         }
         fn free_page(&mut self, _id: PageId) -> std::io::Result<()> {

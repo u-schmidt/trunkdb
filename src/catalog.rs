@@ -212,7 +212,7 @@ impl Catalog {
                         "catalog page must be the first page ever allocated in the file"
                     );
                     let bytes = SlottedPage::new(PageType::Catalog).into_page();
-                    store.write_page(id, &bytes)?;
+                    store.write_page(id, bytes.clone())?;
                     bytes
                 }
                 None => {
@@ -359,7 +359,7 @@ impl Catalog {
                 ))
             })?;
         page.delete_cell(slot);
-        store.write_page(page_id, &page.into_page())?;
+        store.write_page(page_id, page.into_page())?;
         Ok(Some(index))
     }
 
@@ -382,7 +382,7 @@ impl Catalog {
         let (page_id, mut page, slot) = find_cell(store, |c| c == cell.as_slice())?
             .ok_or_else(|| corrupt(format!("collection {name:?} has no catalog entry")))?;
         page.delete_cell(slot);
-        store.write_page(page_id, &page.into_page())?;
+        store.write_page(page_id, page.into_page())?;
         self.collections.remove(name);
         self.indexes.remove(name);
         Ok(Some((meta, indexes)))
@@ -417,7 +417,7 @@ impl Catalog {
             page.update_cell(slot, &entry_bytes),
             "same length, fits in place"
         );
-        store.write_page(page_id, &page.into_page())?;
+        store.write_page(page_id, page.into_page())?;
         Ok(())
     }
 }
@@ -427,7 +427,7 @@ impl Catalog {
 /// (SPEC §10.7).
 fn allocate_index_root(store: &mut dyn PageStore) -> std::io::Result<PageId> {
     let root = store.allocate_page()?;
-    store.write_page(root, &SlottedPage::new(PageType::IndexLeaf).into_page())?;
+    store.write_page(root, SlottedPage::new(PageType::IndexLeaf).into_page())?;
     Ok(root)
 }
 
@@ -447,7 +447,7 @@ fn append_cell(store: &mut dyn PageStore, cell: &[u8]) -> std::io::Result<()> {
 
         let new_page_id = store.allocate_page()?;
         page.set_next_page(new_page_id);
-        store.write_page(page_id, &page.into_page())?;
+        store.write_page(page_id, page.into_page())?;
 
         page = SlottedPage::new(PageType::Catalog);
         page_id = new_page_id;
@@ -455,7 +455,7 @@ fn append_cell(store: &mut dyn PageStore, cell: &[u8]) -> std::io::Result<()> {
 
     page.insert_cell(cell)
         .expect("just verified has_room_for(cell.len())");
-    store.write_page(page_id, &page.into_page())
+    store.write_page(page_id, page.into_page())
 }
 
 /// The first catalog cell `matches` accepts: its page's id, the page,
@@ -857,9 +857,7 @@ mod tests {
         catalog.create_collection(&mut store, "users").unwrap();
         let mut page = SlottedPage::from_bytes(store.read_page(CATALOG_PAGE_ID).unwrap()).unwrap();
         page.set_next_page(CATALOG_PAGE_ID);
-        store
-            .write_page(CATALOG_PAGE_ID, &page.into_page())
-            .unwrap();
+        store.write_page(CATALOG_PAGE_ID, page.into_page()).unwrap();
 
         let Err(err) = Catalog::load(&mut store) else {
             panic!("a looping catalog loaded");

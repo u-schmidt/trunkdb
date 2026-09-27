@@ -388,14 +388,15 @@ impl FileStore {
 
     fn write_header(&mut self) -> io::Result<()> {
         let header = self.header.encode();
-        self.write_raw(HEADER_PAGE, &header)?;
+        self.write_raw(HEADER_PAGE, Page::from(&header[..]))?;
         self.header.format_version = FORMAT_VERSION;
         Ok(())
     }
 
     /// A page's current bytes: from the dirty set if it's there, then
     /// the committed pages not written back, then the cache, then the
-    /// file — and keeps a page read from the file in the cache. Shared
+    /// file — and keeps a page read from the file in the cache, its
+    /// layout checked (SPEC §66). Shared
     /// wherever it comes from, never copied (SPEC §64): the cache's lock
     /// is held for the lookup only. No bounds check — callers do that.
     fn read_current(&self, id: PageId) -> io::Result<Page> {
@@ -410,7 +411,7 @@ impl FileStore {
         if let Some(page) = self.cache().get(id) {
             return Ok(page);
         }
-        let page = read_page_at(&self.file, id)?;
+        let page = read_page_at(&self.file, id)?.checked();
         self.cache_mut().put(id, page.clone());
         Ok(page)
     }
@@ -418,15 +419,16 @@ impl FileStore {
     /// Writes a page: into the dirty set while staging, otherwise
     /// straight to the file — and the cache. No bounds check — callers do
     /// that.
-    fn write_raw(&mut self, id: PageId, data: &[u8]) -> io::Result<()> {
+    fn write_raw(&mut self, id: PageId, data: Page) -> io::Result<()> {
         match &mut self.staging {
             Some(staging) => {
-                staging.dirty.insert(id, Page::from(data));
+                staging.dirty.insert(id, data);
                 Ok(())
             }
             None => {
-                self.cache_mut().put(id, Page::from(data));
-                write_page_at(&self.file, id, data)
+                write_page_at(&self.file, id, &data)?;
+                self.cache_mut().put(id, data.checked());
+                Ok(())
             }
         }
     }
@@ -538,7 +540,7 @@ impl FileStore {
     /// the file to that length (SPEC §41).
     pub(crate) fn replace_all(
         &mut self,
-        pages: impl IntoIterator<Item = (PageId, Vec<u8>)>,
+        pages: impl IntoIterator<Item = (PageId, impl Into<Page>)>,
         page_count: u64,
     ) -> io::Result<()> {
         assert!(
@@ -546,6 +548,7 @@ impl FileStore {
             "FileStore::replace_all without begin"
         );
         for (id, page) in pages {
+            let page = page.into();
             assert!(
                 id != HEADER_PAGE && id < page_count,
                 "page {id} out of range"
@@ -556,7 +559,7 @@ impl FileStore {
                     format!("page {id} is {} bytes, not {USABLE_PAGE_SIZE}", page.len()),
                 ));
             }
-            self.write_raw(id, &page)?;
+            self.write_raw(id, page)?;
         }
         self.header.page_count = page_count;
         self.header.free_list_head = NO_FREE_PAGE;
@@ -579,12 +582,18 @@ impl FileStore {
     /// Ends staging for a batch the WAL now holds (SPEC §51): its pages
     /// become the newest committed ones, read from memory until
     /// `checkpoint` writes them back. Nothing is written to the file.
+    /// Their layout is checked here, once, so reads until then skip it
+    /// (SPEC §66), as reads of the cache do.
     pub fn commit(&mut self) {
         let staging = self
             .staging
             .take()
             .expect("FileStore::commit without begin");
-        self.unwritten.extend(staging.dirty);
+        let checked = staging
+            .dirty
+            .into_iter()
+            .map(|(id, page)| (id, page.checked()));
+        self.unwritten.extend(checked);
     }
 
     /// How many committed pages wait for `checkpoint`.
@@ -725,7 +734,7 @@ impl PageStore for FileStore {
             // (or, while staging, so reads of it don't run past the file's
             // end); content is unspecified (see struct doc) until the
             // caller writes it.
-            self.write_raw(id, &[0u8; USABLE_PAGE_SIZE])?;
+            self.write_raw(id, Page::from(vec![0u8; USABLE_PAGE_SIZE]))?;
             id
         };
         self.write_header()?;
@@ -744,7 +753,7 @@ impl PageStore for FileStore {
         self.read_current(id).map(Some)
     }
 
-    fn write_page(&mut self, id: PageId, data: &[u8]) -> io::Result<()> {
+    fn write_page(&mut self, id: PageId, data: Page) -> io::Result<()> {
         if id == HEADER_PAGE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -784,7 +793,7 @@ impl PageStore for FileStore {
         let mut buf = [0u8; USABLE_PAGE_SIZE];
         buf[0] = PageType::Free as u8;
         buf[1..9].copy_from_slice(&self.header.free_list_head.to_le_bytes());
-        self.write_raw(id, &buf)?;
+        self.write_raw(id, Page::from(&buf[..]))?;
 
         self.header.free_list_head = id;
         self.write_header()
@@ -945,7 +954,7 @@ mod tests {
 
         let mut data = vec![0u8; USABLE_PAGE_SIZE];
         data[0..5].copy_from_slice(b"hello");
-        store.write_page(id, &data).unwrap();
+        store.write_page(id, data.clone().into()).unwrap();
 
         let read_back = store.read_page(id).unwrap();
         assert_eq!(&read_back[0..5], b"hello");
@@ -975,7 +984,7 @@ mod tests {
             let id = store.allocate_page().unwrap();
             let mut data = vec![0u8; USABLE_PAGE_SIZE];
             data[0] = 42;
-            store.write_page(id, &data).unwrap();
+            store.write_page(id, data.clone().into()).unwrap();
             let extra = store.allocate_page().unwrap();
             store.free_page(extra).unwrap();
         } // store dropped, file closed
@@ -993,7 +1002,11 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         assert!(store.read_page(99).is_err());
-        assert!(store.write_page(99, &[0u8; USABLE_PAGE_SIZE]).is_err());
+        assert!(
+            store
+                .write_page(99, vec![0u8; USABLE_PAGE_SIZE].into())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1008,7 +1021,9 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         let id = store.allocate_page().unwrap();
-        store.write_page(id, &[7u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(id, vec![7u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
         assert_eq!(
             store.try_read_page(id).unwrap().unwrap(),
             vec![7u8; USABLE_PAGE_SIZE]
@@ -1020,7 +1035,7 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         let id = store.allocate_page().unwrap();
-        assert!(store.write_page(id, &[0u8; 10]).is_err());
+        assert!(store.write_page(id, vec![0u8; 10].into()).is_err());
     }
 
     #[test]
@@ -1029,7 +1044,7 @@ mod tests {
         let mut store = FileStore::open(&path).unwrap();
         assert!(
             store
-                .write_page(HEADER_PAGE, &[0u8; USABLE_PAGE_SIZE])
+                .write_page(HEADER_PAGE, vec![0u8; USABLE_PAGE_SIZE].into())
                 .is_err()
         );
         assert!(store.free_page(HEADER_PAGE).is_err());
@@ -1184,7 +1199,9 @@ mod tests {
         let mut store = FileStore::open(&path).unwrap();
         assert_eq!(store.format_version().unwrap(), 8);
         store.begin();
-        store.write_page(1, &[2; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(1, vec![2; USABLE_PAGE_SIZE].into())
+            .unwrap();
         assert_eq!(store.format_version().unwrap(), FORMAT_VERSION);
         // Remembered, so the batch's next page doesn't write it again.
         assert_eq!(store.header.format_version, FORMAT_VERSION);
@@ -1192,7 +1209,9 @@ mod tests {
         assert_eq!(store.format_version().unwrap(), 8, "rolled back with it");
 
         store.begin();
-        store.write_page(1, &[3; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(1, vec![3; USABLE_PAGE_SIZE].into())
+            .unwrap();
         store.write_back().unwrap();
         drop(store);
         let store = FileStore::open(&path).unwrap();
@@ -1204,7 +1223,9 @@ mod tests {
         let mut store = FileStore::open(path).unwrap();
         for fill in [1u8, 2] {
             let id = store.allocate_page().unwrap();
-            store.write_page(id, &[fill; USABLE_PAGE_SIZE]).unwrap();
+            store
+                .write_page(id, vec![fill; USABLE_PAGE_SIZE].into())
+                .unwrap();
         }
     }
 
@@ -1313,7 +1334,9 @@ mod tests {
         two_page_file(&path);
         let mut store = FileStore::open(&path).unwrap();
         store.begin();
-        store.write_page(2, &[9u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(2, vec![9u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
         let pages: Vec<PageImage> = store
             .dirty_pages()
             .map(|(id, page)| (id, page.to_vec()))
@@ -1361,7 +1384,7 @@ mod tests {
         store.free_page(2).unwrap();
         let mut free = store.read_page(2).unwrap().to_vec();
         free[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
-        store.write_raw(2, &free).unwrap();
+        store.write_raw(2, free.into()).unwrap();
 
         let err = store.allocate_page().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
@@ -1411,7 +1434,9 @@ mod tests {
         let mut store = FileStore::open(path).unwrap();
         for fill in 1..=5u8 {
             let id = store.allocate_page().unwrap();
-            store.write_page(id, &[fill; USABLE_PAGE_SIZE]).unwrap();
+            store
+                .write_page(id, vec![fill; USABLE_PAGE_SIZE].into())
+                .unwrap();
         }
         store.free_page(4).unwrap();
         store
@@ -1499,7 +1524,9 @@ mod tests {
 
         store.begin();
         let id = store.allocate_page().unwrap();
-        store.write_page(id, &[7u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(id, vec![7u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
 
         assert_eq!(store.read_page(id).unwrap(), vec![7u8; USABLE_PAGE_SIZE]);
         let disk = on_disk(&store);
@@ -1517,7 +1544,9 @@ mod tests {
 
         store.begin();
         let id = store.allocate_page().unwrap();
-        store.write_page(id, &[9u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(id, vec![9u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
         store.write_back().unwrap();
 
         assert_eq!(store.dirty_pages().count(), 0, "write_back ends staging");
@@ -1531,7 +1560,9 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = FileStore::open(&path).unwrap();
         let a = store.allocate_page().unwrap();
-        store.write_page(a, &[1u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(a, vec![1u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
         let b = store.allocate_page().unwrap();
         store.free_page(b).unwrap(); // free list: b
 
@@ -1542,7 +1573,9 @@ mod tests {
             "pops b off the free list"
         );
         let c = store.allocate_page().unwrap(); // grows the file
-        store.write_page(a, &[2u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(a, vec![2u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
         store.free_page(a).unwrap();
         store.rollback();
 
@@ -1569,8 +1602,12 @@ mod tests {
         let mut store = FileStore::open(&path).unwrap();
         let a = store.allocate_page().unwrap();
         let b = store.allocate_page().unwrap();
-        store.write_page(a, &[1u8; USABLE_PAGE_SIZE]).unwrap();
-        store.write_page(b, &[1u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(a, vec![1u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
+        store
+            .write_page(b, vec![1u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
 
         store.begin();
         store.free_page(a).unwrap();
@@ -1590,8 +1627,12 @@ mod tests {
 
         store.begin();
         assert_eq!(store.dirty_pages().count(), 0);
-        store.write_page(a, &[1u8; USABLE_PAGE_SIZE]).unwrap();
-        store.write_page(a, &[2u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(a, vec![1u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
+        store
+            .write_page(a, vec![2u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
         let b = store.allocate_page().unwrap();
 
         let dirty: Vec<(PageId, Vec<u8>)> = store
@@ -1619,7 +1660,7 @@ mod tests {
         store.begin();
         assert!(
             store
-                .write_page(HEADER_PAGE, &[0u8; USABLE_PAGE_SIZE])
+                .write_page(HEADER_PAGE, vec![0u8; USABLE_PAGE_SIZE].into())
                 .is_err()
         );
         assert!(store.free_page(HEADER_PAGE).is_err());
@@ -1686,7 +1727,7 @@ mod tests {
         assert_eq!(store.read_page(1).unwrap(), filled(1));
 
         store.begin();
-        store.write_page(1, &filled(9)).unwrap();
+        store.write_page(1, filled(9).into()).unwrap();
         let staged = store.read_page(1).unwrap();
         store.commit();
         assert!(store.read_page(1).unwrap().shares(&staged));
@@ -1695,6 +1736,50 @@ mod tests {
         assert!(cached.shares(&staged), "moved into the cache, not copied");
         assert_eq!(cached, filled(9));
         assert_eq!(held, filled(1));
+    }
+
+    /// A slotted page is checked when its batch commits or it comes in
+    /// from the file, and every read of it after carries the mark (SPEC
+    /// §66); a staged page and one that isn't slotted don't.
+    #[test]
+    fn cached_pages_come_with_their_layout_checked() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let slotted = super::super::SlottedPage::new(PageType::Data).into_page();
+        store.begin();
+        store.write_page(2, slotted.clone()).unwrap();
+        assert!(!store.read_page(2).unwrap().layout_checked(), "staged");
+        store.commit();
+        assert!(store.read_page(2).unwrap().layout_checked(), "committed");
+        store.checkpoint().unwrap();
+        assert!(store.read_page(2).unwrap().layout_checked(), "cached");
+        assert!(!store.read_page(1).unwrap().layout_checked(), "not slotted");
+        store.write_page(3, slotted.clone()).unwrap();
+        assert!(store.read_page(3).unwrap().layout_checked(), "unstaged");
+        drop(store);
+        let store = FileStore::open(&path).unwrap();
+        assert!(
+            store.read_page(2).unwrap().layout_checked(),
+            "from the file"
+        );
+    }
+
+    /// `write_page` keeps the page it's given (SPEC §67), in a batch or
+    /// outside one, and so does the checkpoint that caches it: a page
+    /// changed once isn't copied again.
+    #[test]
+    fn a_written_page_is_kept_not_copied() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let staged: Page = filled(9).into();
+        store.begin();
+        store.write_page(1, staged.clone()).unwrap();
+        assert!(store.read_page(1).unwrap().shares(&staged));
+        store.write_back().unwrap();
+        assert!(store.read_page(1).unwrap().shares(&staged));
+        let unstaged: Page = filled(8).into();
+        store.write_page(2, unstaged.clone()).unwrap();
+        assert!(store.read_page(2).unwrap().shares(&unstaged));
     }
 
     /// Readers share the cache (SPEC §65): while one holds it to look a
@@ -1723,13 +1808,13 @@ mod tests {
         let mut store = five_page_file(&path);
         assert_eq!(store.read_page(1).unwrap(), filled(1));
         store.begin();
-        store.write_page(1, &filled(9)).unwrap();
+        store.write_page(1, filled(9).into()).unwrap();
         assert_eq!(store.read_page(1).unwrap(), filled(9));
         store.rollback();
         assert_eq!(store.read_page(1).unwrap(), filled(1));
 
         store.begin();
-        store.write_page(1, &filled(8)).unwrap();
+        store.write_page(1, filled(8).into()).unwrap();
         store.write_back().unwrap();
         let before = store.cache_stats();
         assert_eq!(store.read_page(1).unwrap(), filled(8));
@@ -1750,7 +1835,7 @@ mod tests {
         }
         store.begin();
         for id in 1..=3 {
-            store.write_page(id, &filled(7)).unwrap();
+            store.write_page(id, filled(7).into()).unwrap();
         }
         store.commit();
         store.failing_write_backs = 1;
@@ -1779,14 +1864,14 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = five_page_file(&path);
         store.begin();
-        store.write_page(2, &filled(9)).unwrap();
+        store.write_page(2, filled(9).into()).unwrap();
         let new = store.allocate_page().unwrap();
-        store.write_page(new, &filled(6)).unwrap();
+        store.write_page(new, filled(6).into()).unwrap();
         store.commit();
         // A second batch, with a page past the file's end.
         store.begin();
         let beyond = store.allocate_page().unwrap();
-        store.write_page(beyond, &filled(5)).unwrap();
+        store.write_page(beyond, filled(5).into()).unwrap();
         store.commit();
         let disk = on_disk(&store);
         assert_eq!(disk.read_page(2).unwrap(), filled(2));

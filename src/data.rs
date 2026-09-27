@@ -171,7 +171,7 @@ pub fn update_record(
     }
     let cell = write_cell(store, id, doc)?;
     if page.update_cell(loc.slot, &cell) {
-        store.write_page(loc.page, &page.into_page())?;
+        store.write_page(loc.page, page.into_page())?;
         return Ok(loc);
     }
 
@@ -284,7 +284,7 @@ fn place_cell(
     if *current != 0 {
         let mut page = read_data_page(store, *current)?;
         if let Some(slot) = page.insert_cell_reusing_slot(cell) {
-            store.write_page(*current, &page.into_page())?;
+            store.write_page(*current, page.into_page())?;
             return Ok(RecordLocation {
                 page: *current,
                 slot,
@@ -297,7 +297,7 @@ fn place_cell(
     let slot = page
         .insert_cell(cell)
         .expect("write_cell only makes cells that fit on an empty page");
-    store.write_page(page_id, &page.into_page())?;
+    store.write_page(page_id, page.into_page())?;
     *current = page_id;
 
     Ok(RecordLocation {
@@ -322,7 +322,7 @@ fn write_chain(store: &mut dyn PageStore, bytes: &[u8]) -> std::io::Result<PageI
         buf[0] = PageType::Overflow as u8;
         buf[1..OVERFLOW_HEADER_LEN].copy_from_slice(&next.to_le_bytes());
         buf[OVERFLOW_HEADER_LEN..OVERFLOW_HEADER_LEN + chunk.len()].copy_from_slice(chunk);
-        store.write_page(pages[i], &buf)?;
+        store.write_page(pages[i], buf.into())?;
     }
     Ok(pages[0])
 }
@@ -398,7 +398,7 @@ fn write_or_free(
     if page.is_empty() && page_id != current {
         store.free_page(page_id)
     } else {
-        store.write_page(page_id, &page.into_page())
+        store.write_page(page_id, page.into_page())
     }
 }
 
@@ -477,7 +477,7 @@ mod tests {
         fn try_read_page(&self, _id: PageId) -> std::io::Result<Option<crate::storage::Page>> {
             unreachable!()
         }
-        fn write_page(&mut self, _id: PageId, _data: &[u8]) -> std::io::Result<()> {
+        fn write_page(&mut self, _id: PageId, _data: crate::storage::Page) -> std::io::Result<()> {
             unreachable!()
         }
         fn free_page(&mut self, _id: PageId) -> std::io::Result<()> {
@@ -522,7 +522,7 @@ mod tests {
         let mut cell = page.get_cell(loc.slot).unwrap().to_vec();
         cell[0] = 0x7F;
         assert!(page.update_cell(loc.slot, &cell));
-        store.write_page(loc.page, &page.into_page()).unwrap();
+        store.write_page(loc.page, page.into_page()).unwrap();
 
         assert_eq!(
             get_record(&store, loc).unwrap_err().kind(),
@@ -754,14 +754,14 @@ mod tests {
         // Cut the chain after its second page: it ends early.
         let mut page = store.read_page(second).unwrap().to_vec();
         page[1..9].copy_from_slice(&0u64.to_le_bytes());
-        store.write_page(second, &page).unwrap();
+        store.write_page(second, page.clone().into()).unwrap();
         let err = get_record(&store, loc).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("early"), "{err}");
 
         // Point it at a page that isn't an overflow page.
         page[1..9].copy_from_slice(&loc.page.to_le_bytes());
-        store.write_page(second, &page).unwrap();
+        store.write_page(second, page.clone().into()).unwrap();
         let err = get_record(&store, loc).unwrap_err();
         assert!(err.to_string().contains("isn't an overflow page"), "{err}");
         assert_eq!(
@@ -829,7 +829,7 @@ mod tests {
         cell.extend_from_slice(&id(1).0);
         cell.extend_from_slice(&crate::document::encode_document(&old));
         assert!(page.update_cell(loc.slot, &cell));
-        store.write_page(loc.page, &page.into_page()).unwrap();
+        store.write_page(loc.page, page.into_page()).unwrap();
 
         let (_, read) = get_record(&store, loc).unwrap();
         assert_eq!(
@@ -852,11 +852,11 @@ mod tests {
             .unwrap();
         let mut first_page = store.read_page(first).unwrap().to_vec();
         first_page[1..9].copy_from_slice(&first.to_le_bytes());
-        store.write_page(first, &first_page).unwrap();
+        store.write_page(first, first_page.into()).unwrap();
         let mut cell = page.get_cell(loc.slot).unwrap().to_vec();
         cell[CELL_HEADER_LEN..CELL_HEADER_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(page.update_cell(loc.slot, &cell));
-        store.write_page(loc.page, &page.into_page()).unwrap();
+        store.write_page(loc.page, page.into_page()).unwrap();
 
         let err = get_record(&store, loc).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

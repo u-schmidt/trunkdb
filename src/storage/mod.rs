@@ -94,6 +94,9 @@ pub trait PageStore {
     /// catalog, which is never freed) verify that separately, e.g. via the
     /// page's own type tag.
     fn try_read_page(&self, id: PageId) -> std::io::Result<Option<Page>>;
-    fn write_page(&mut self, id: PageId, data: &[u8]) -> std::io::Result<()>;
+    /// Takes the page itself (SPEC §67): a page changed through
+    /// `Page::make_mut` was copied once, on its first change, and is
+    /// stored as it is, not copied again.
+    fn write_page(&mut self, id: PageId, data: Page) -> std::io::Result<()>;
     fn free_page(&mut self, id: PageId) -> std::io::Result<()>;
 }

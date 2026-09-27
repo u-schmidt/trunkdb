@@ -76,3 +76,5 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 63. [A filter on the id, and ids parsed from text (`query.rs`, `document.rs`, `lib.rs`)](63-an-id-filter-and-parsing-ids.md)
 64. [Shared pages (`storage/page.rs`, `storage/cache.rs`, `storage/file.rs`, `storage/slotted.rs`)](64-shared-pages.md)
 65. [A read lock for the page cache (`storage/cache.rs`, `storage/file.rs`)](65-a-read-lock-for-the-page-cache.md)
+66. [A page checked once (`storage/page.rs`, `storage/slotted.rs`, `storage/file.rs`)](66-a-page-checked-once.md)
+67. [`write_page` takes the page (`storage/mod.rs`, `storage/file.rs`, `storage/memory.rs`)](67-write-page-takes-the-page.md)

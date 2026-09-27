@@ -50,8 +50,19 @@ impl SlottedPage {
     /// slotted page. Fails if the type byte is unknown or not a slotted page
     /// type, if the slot directory runs into the cells, or if a cell lies
     /// outside the page. Overlapping cells are not detected (SPEC §54).
+    ///
+    /// A page the cache marked as checked isn't checked again (SPEC §66).
     pub fn from_bytes(buf: impl Into<Page>) -> std::io::Result<Self> {
         let buf = buf.into();
+        if !buf.layout_checked() {
+            Self::check_layout(&buf)?;
+        }
+        Ok(Self { buf })
+    }
+
+    /// `from_bytes`'s check, on its own: for the store, which marks a
+    /// page that passes as it goes into the cache (SPEC §66).
+    pub(crate) fn check_layout(buf: &[u8]) -> std::io::Result<()> {
         if buf.len() != USABLE_PAGE_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -70,26 +81,23 @@ impl SlottedPage {
             ));
         }
 
-        let page = Self { buf }; // build it first, so you can call its methods
+        let field = |at: usize| u16::from_le_bytes([buf[at], buf[at + 1]]);
+        let slot_count = field(9);
+        let data_start = field(11) as usize;
 
         // The directory: slot_count and data_start are u16, so convert to usize.
-        let directory_end = HEADER_LEN + page.slot_count() as usize * SLOT_LEN;
-        if (page.data_start() as usize) < directory_end {
+        let directory_end = HEADER_LEN + slot_count as usize * SLOT_LEN;
+        if data_start < directory_end {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "slot directory ends at {directory_end}, past the cells at {}",
-                    page.data_start()
-                ),
+                format!("slot directory ends at {directory_end}, past the cells at {data_start}"),
             ));
         }
 
-        let data_start = page.data_start() as usize;
-
         // Every slot:
-        for slot in 0..page.slot_count() {
-            let (offset, length) = page.read_slot(slot);
-            let (offset, length) = (offset as usize, length as usize); // usize, no overflow
+        for slot in 0..slot_count {
+            let at = Self::slot_offset(slot);
+            let (offset, length) = (field(at) as usize, field(at + 2) as usize); // usize, no overflow
             if length == 0 {
                 continue; // a tombstone has no cell to check
             }
@@ -112,8 +120,7 @@ impl SlottedPage {
                 format!("cells start at {data_start}, past the page's end at {USABLE_PAGE_SIZE}"),
             ));
         }
-
-        Ok(page)
+        Ok(())
     }
 
     /// The page, to write back: `store.write_page(id, &page.into_page())`.
@@ -122,7 +129,8 @@ impl SlottedPage {
     }
 
     /// The bytes, to change: copied first if they're shared, as a page
-    /// just read from the cache is.
+    /// just read from the cache is. The page then counts as unchecked
+    /// (SPEC §66), until it goes into the cache again.
     fn bytes_mut(&mut self) -> &mut [u8] {
         self.buf.make_mut()
     }
@@ -364,6 +372,41 @@ impl SlottedPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC §66: a page marked checked isn't checked again, and a change
+    /// takes the mark away. Marked bytes that don't hold a valid page
+    /// show the check is skipped: only `Page::checked` marks a page, and
+    /// only a valid one, so they can't happen outside a test.
+    #[test]
+    fn a_checked_page_is_not_checked_again_until_it_changes() {
+        let mut page = SlottedPage::new(PageType::Data);
+        page.insert_cell(b"cell").unwrap();
+        let valid = page.into_page().checked();
+        assert!(valid.layout_checked());
+        let mut read = SlottedPage::from_bytes(valid.clone()).unwrap();
+        read.insert_cell(b"more").unwrap();
+        assert!(!read.into_page().layout_checked());
+        assert!(valid.layout_checked(), "the original kept its mark");
+
+        let mut damaged = vec![0u8; USABLE_PAGE_SIZE];
+        damaged[0] = PageType::Data as u8;
+        damaged[9..11].copy_from_slice(&5000u16.to_le_bytes()); // slots past the cells
+        let damaged = Page::from(damaged);
+        assert!(!damaged.clone().checked().layout_checked());
+        assert!(SlottedPage::from_bytes(damaged.clone()).is_err());
+        let marked = damaged.marked_unchecked();
+        assert!(SlottedPage::from_bytes(marked).is_ok(), "not checked again");
+
+        // Cells starting at the page's end: an empty page. One byte past
+        // it: damage (SPEC §55).
+        let mut empty = SlottedPage::new(PageType::Data).into_page().to_vec();
+        assert!(SlottedPage::check_layout(&empty).is_ok());
+        empty[11..13].copy_from_slice(&(USABLE_PAGE_SIZE as u16 + 1).to_le_bytes());
+        assert!(SlottedPage::check_layout(&empty).is_err());
+
+        let overflow = Page::from(vec![PageType::Overflow as u8; USABLE_PAGE_SIZE]);
+        assert!(!overflow.checked().layout_checked(), "not a slotted page");
+    }
 
     /// A page's bytes are shared until it changes (SPEC §64): changing a
     /// page made from another's bytes leaves those as they were.

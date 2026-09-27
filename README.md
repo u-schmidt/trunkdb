@@ -323,6 +323,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 39. **A read lock for the page cache** (§65): readers look pages up
     together. Four readers do 3.2 times the work of one; before §64,
     four did as much as one.
+40. **A page checked once** (§66): as it enters the cache or its batch
+    commits, not on every read; one reader 14% faster.
+41. **`write_page` takes the page** (§67): a changed page is copied
+    once, not twice; compaction 11% faster.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

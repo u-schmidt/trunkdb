@@ -46,10 +46,7 @@ impl BTreeIndex {
         for &page_id in &pages[1..] {
             store.free_page(page_id)?;
         }
-        store.write_page(
-            self.root,
-            &SlottedPage::new(PageType::IndexLeaf).into_page(),
-        )
+        store.write_page(self.root, SlottedPage::new(PageType::IndexLeaf).into_page())
     }
 
     /// Every page of the tree, root first. A page reached twice is an
@@ -124,7 +121,7 @@ impl Index for BTreeIndex {
             .map(|(slot, _cell)| slot);
         if let Some(slot) = found {
             page.remove_cell_at(slot);
-            store.write_page(page_id, &page.into_page())?;
+            store.write_page(page_id, page.into_page())?;
         }
         Ok(()) // not found anywhere is a no-op, matching InMemoryIndex
     }
@@ -418,7 +415,7 @@ fn insert_into_leaf(
         .find(|(_slot, cell)| decode_index_entry(cell).0 >= key)
         .map_or(page.slot_count(), |(slot, _cell)| slot);
     if page.insert_cell_at(slot, &encode_index_entry(key, loc)) {
-        store.write_page(page_id, &page.into_page())?;
+        store.write_page(page_id, page.into_page())?;
         return Ok(InsertOutcome::Done);
     }
 
@@ -437,7 +434,7 @@ fn insert_into_leaf(
     entries.insert(pos, (key.to_vec(), loc));
 
     if let Some(page) = build_leaf_page(&entries, next_page) {
-        store.write_page(page_id, &page.into_page())?;
+        store.write_page(page_id, page.into_page())?;
         return Ok(InsertOutcome::Done);
     }
 
@@ -459,8 +456,8 @@ fn insert_into_leaf(
     let new_right_id = store.allocate_page()?;
     let left = build_leaf_page(&entries, new_right_id).expect("each half of a split fits");
     let right = build_leaf_page(&right_entries, next_page).expect("each half of a split fits");
-    store.write_page(page_id, &left.into_page())?;
-    store.write_page(new_right_id, &right.into_page())?;
+    store.write_page(page_id, left.into_page())?;
+    store.write_page(new_right_id, right.into_page())?;
 
     Ok(InsertOutcome::Split {
         separator,
@@ -507,14 +504,14 @@ fn insert_into_branch(
             if page.insert_cell_at(slot, &routing) {
                 // The same length, so in place.
                 assert!(page.update_cell(slot + 1, &rerouted));
-                store.write_page(page_id, &page.into_page())?;
+                store.write_page(page_id, page.into_page())?;
                 return Ok(InsertOutcome::Done);
             }
         }
         None => {
             if page.insert_cell_at(page.slot_count(), &routing) {
                 page.set_next_page(new_right);
-                store.write_page(page_id, &page.into_page())?;
+                store.write_page(page_id, page.into_page())?;
                 return Ok(InsertOutcome::Done);
             }
         }
@@ -545,7 +542,7 @@ fn insert_into_branch(
     }
 
     if let Some(page) = build_branch_page(&entries, rightmost) {
-        store.write_page(page_id, &page.into_page())?;
+        store.write_page(page_id, page.into_page())?;
         return Ok(InsertOutcome::Done);
     }
 
@@ -561,8 +558,8 @@ fn insert_into_branch(
     let new_right_id = store.allocate_page()?;
     let left = build_branch_page(&entries, promoted_child).expect("each half of a split fits");
     let right = build_branch_page(&right_entries, rightmost).expect("each half of a split fits");
-    store.write_page(page_id, &left.into_page())?;
-    store.write_page(new_right_id, &right.into_page())?;
+    store.write_page(page_id, left.into_page())?;
+    store.write_page(new_right_id, right.into_page())?;
 
     Ok(InsertOutcome::Split {
         separator: promoted_key,
@@ -601,14 +598,17 @@ fn grow_new_root(
     new_right: PageId,
 ) -> std::io::Result<()> {
     let left_id = store.allocate_page()?;
-    store.write_page(left_id, &store.read_page(root)?)?;
+    // The root's page, shared, not copied (SPEC §67): the root itself
+    // gets a new page next.
+    let old_root = store.read_page(root)?;
+    store.write_page(left_id, old_root)?;
 
     let mut new_root = SlottedPage::new(PageType::IndexBranch);
     new_root.set_next_page(new_right);
     new_root
         .insert_cell(&encode_branch_entry(separator, left_id))
         .expect("a single entry always fits in a fresh page");
-    store.write_page(root, &new_root.into_page())
+    store.write_page(root, new_root.into_page())
 }
 
 fn build_leaf_page(
@@ -672,7 +672,7 @@ mod tests {
     fn fresh_index_root(store: &mut dyn PageStore) -> PageId {
         let root = store.allocate_page().unwrap();
         store
-            .write_page(root, &SlottedPage::new(PageType::IndexLeaf).into_page())
+            .write_page(root, SlottedPage::new(PageType::IndexLeaf).into_page())
             .unwrap();
         root
     }
@@ -716,7 +716,7 @@ mod tests {
             self.reads.set(self.reads.get() + 1);
             self.store.try_read_page(id)
         }
-        fn write_page(&mut self, _id: PageId, _data: &[u8]) -> std::io::Result<()> {
+        fn write_page(&mut self, _id: PageId, _data: crate::storage::Page) -> std::io::Result<()> {
             unreachable!("read only")
         }
         fn free_page(&mut self, _id: PageId) -> std::io::Result<()> {
@@ -1073,7 +1073,7 @@ mod tests {
             let mut page = SlottedPage::from_bytes(store.read_page(target).unwrap()).unwrap();
             page.remove_cell_at(0);
             assert!(page.insert_cell_at(0, &[1, 2, 3]));
-            store.write_page(target, &page.into_page()).unwrap();
+            store.write_page(target, page.into_page()).unwrap();
 
             let invalid = |e: std::io::Error| {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
@@ -1120,7 +1120,7 @@ mod tests {
         let mut root = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
         assert_eq!(root.page_type(), PageType::IndexBranch);
         root.set_next_page(index.root);
-        store.write_page(index.root, &root.into_page()).unwrap();
+        store.write_page(index.root, root.into_page()).unwrap();
         invalid(
             index.lookup(&store, &[0xFF; 16]).unwrap_err(),
             "levels down",
@@ -1143,7 +1143,7 @@ mod tests {
         let (last, mut page) = find_leaf(&store, index.root, &[0xFF; 16]).unwrap();
         assert_ne!(first, last);
         page.set_next_page(first);
-        store.write_page(last, &page.into_page()).unwrap();
+        store.write_page(last, page.into_page()).unwrap();
         let walked: std::io::Result<Vec<_>> = index.walk(&store, everything(), false).collect();
         invalid(walked.unwrap_err(), "comes twice along the leaves");
     }
@@ -1197,7 +1197,7 @@ mod tests {
         for slot in (0..page.slot_count()).step_by(3) {
             page.delete_cell(slot);
         }
-        store.write_page(index.root, &page.into_page()).unwrap();
+        store.write_page(index.root, page.into_page()).unwrap();
         let mut expected: std::collections::BTreeSet<Vec<u8>> = (0..100)
             .filter(|i| i % 3 != 0)
             .map(|i| key(i * 2))

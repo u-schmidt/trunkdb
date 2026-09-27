@@ -11,14 +11,15 @@ use std::io;
 /// error rather than a free list nobody would use.
 pub(crate) struct MemoryStore {
     /// Indexed by page id; `pages[0]` stands in for the header and is
-    /// never read or written.
-    pages: Vec<Vec<u8>>,
+    /// never read or written. Shared with whoever reads them, as a
+    /// `FileStore`'s cache is (SPEC §67).
+    pages: Vec<Page>,
 }
 
 impl MemoryStore {
     pub(crate) fn new() -> Self {
         MemoryStore {
-            pages: vec![Vec::new()],
+            pages: vec![Page::from(Vec::new())],
         }
     }
 
@@ -29,7 +30,7 @@ impl MemoryStore {
     }
 
     /// Every page but 0, with its id, in id order.
-    pub(crate) fn into_pages(self) -> impl Iterator<Item = (PageId, Vec<u8>)> {
+    pub(crate) fn into_pages(self) -> impl Iterator<Item = (PageId, Page)> {
         self.pages
             .into_iter()
             .enumerate()
@@ -57,14 +58,12 @@ impl MemoryStore {
 
 impl PageStore for MemoryStore {
     fn allocate_page(&mut self) -> io::Result<PageId> {
-        self.pages.push(vec![0u8; USABLE_PAGE_SIZE]);
+        self.pages.push(Page::from(vec![0u8; USABLE_PAGE_SIZE]));
         Ok(self.page_count() - 1)
     }
 
-    /// A copy: the image is built once and handed to the file whole,
-    /// so there's no cache here to share pages with.
     fn read_page(&self, id: PageId) -> io::Result<Page> {
-        Ok(Page::from(&self.pages[self.check_id(id)?][..]))
+        Ok(self.pages[self.check_id(id)?].clone())
     }
 
     fn try_read_page(&self, id: PageId) -> io::Result<Option<Page>> {
@@ -74,7 +73,7 @@ impl PageStore for MemoryStore {
         self.read_page(id).map(Some)
     }
 
-    fn write_page(&mut self, id: PageId, data: &[u8]) -> io::Result<()> {
+    fn write_page(&mut self, id: PageId, data: Page) -> io::Result<()> {
         let index = self.check_id(id)?;
         if data.len() != USABLE_PAGE_SIZE {
             return Err(io::Error::new(
@@ -85,7 +84,7 @@ impl PageStore for MemoryStore {
                 ),
             ));
         }
-        self.pages[index].copy_from_slice(data);
+        self.pages[index] = data;
         Ok(())
     }
 
@@ -106,13 +105,19 @@ mod tests {
         assert_eq!(store.try_read_page(1).unwrap(), None);
         assert_eq!(store.allocate_page().unwrap(), 1);
         assert_eq!(store.allocate_page().unwrap(), 2);
-        store.write_page(2, &[7u8; USABLE_PAGE_SIZE]).unwrap();
+        store
+            .write_page(2, vec![7u8; USABLE_PAGE_SIZE].into())
+            .unwrap();
         assert_eq!(store.read_page(1).unwrap(), vec![0u8; USABLE_PAGE_SIZE]);
         assert_eq!(
             store.try_read_page(2).unwrap().unwrap(),
             vec![7u8; USABLE_PAGE_SIZE]
         );
         assert_eq!(store.page_count(), 3);
+        // Kept as given, and read back shared (SPEC §67).
+        let page = Page::from(vec![5u8; USABLE_PAGE_SIZE]);
+        store.write_page(1, page.clone()).unwrap();
+        assert!(store.read_page(1).unwrap().shares(&page));
         let pages: Vec<PageId> = store.into_pages().map(|(id, _)| id).collect();
         assert_eq!(pages, vec![1, 2]);
     }
@@ -122,9 +127,13 @@ mod tests {
         let mut store = MemoryStore::new();
         store.allocate_page().unwrap();
         assert!(store.read_page(0).is_err());
-        assert!(store.write_page(0, &[0u8; USABLE_PAGE_SIZE]).is_err());
+        assert!(
+            store
+                .write_page(0, vec![0u8; USABLE_PAGE_SIZE].into())
+                .is_err()
+        );
         assert!(store.read_page(2).is_err());
-        assert!(store.write_page(1, &[0u8; 10]).is_err());
+        assert!(store.write_page(1, vec![0u8; 10].into()).is_err());
         assert!(store.free_page(1).is_err());
     }
 }
