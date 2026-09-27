@@ -365,6 +365,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     missing: "the latest seen"), `rename`, and `push`, `add_to_set` and
     `pull` on arrays.
 
+    Items 45–47 → 0.16.0: new API only, no breaking change; files and
+    exports as in 0.14.0.
+
 What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License
