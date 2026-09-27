@@ -5216,6 +5216,7 @@ mod tests {
         docs.ensure_index("v").unwrap();
         docs.ensure_index("w").unwrap();
         docs.ensure_index("o.x").unwrap();
+        docs.ensure_index("t[*]").unwrap();
         let mut rng = XorShift(0x005E_71BC_0FF5_E7A5);
         let text = |all: Vec<(DocId, Document)>| {
             let mut all: Vec<_> = all
@@ -5241,13 +5242,19 @@ mod tests {
             let mut update = Update::new();
             for _ in 0..1 + rng.below(3) {
                 let path = ["v", "w", "o.x"][rng.below(3)];
-                update = match rng.below(3) {
+                let other = ["v", "t", "o.y"][rng.below(3)];
+                let number = [Document::Int(1), Document::Float(0.5)][rng.below(2)].clone();
+                let element = Document::Int(rng.below(4) as i64);
+                update = match rng.below(9) {
                     0 => update.set(path, random_value(&mut rng)),
                     1 => update.unset(path),
-                    _ => update.inc(
-                        path,
-                        [Document::Int(1), Document::Float(0.5)][rng.below(2)].clone(),
-                    ),
+                    2 => update.inc(path, number),
+                    3 => update.min(path, number),
+                    4 => update.max(path, number),
+                    5 if path != other => update.rename(path, other),
+                    6 => update.push("t", element),
+                    7 => update.add_to_set("t", element),
+                    _ => update.pull("t", element),
                 };
             }
             let mut f = Filter::new().and(random_condition(&mut rng, 2));
@@ -5297,9 +5304,105 @@ mod tests {
             changed_any > 30 && failed_any > 3,
             "{changed_any} changed, {failed_any} failed"
         );
-        for path in ["v", "w", "o.x"] {
+        for path in ["v", "w", "o.x", "t[*]"] {
             assert_index_agrees_with_scan(&docs, &mut rng, path);
         }
+    }
+
+    /// SPEC §73 on typed devices: tags as a set, the latest time seen, a
+    /// best score, and a renamed field, found through their indexes.
+    #[test]
+    fn update_fields_changes_arrays_and_keeps_bounds() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Device {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            tags: Vec<String>,
+            last_seen: Option<crate::DateTime>,
+            best: i64,
+            label: Option<String>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let devices = db.collection::<Device>("devices");
+        devices.ensure_index("tags[*]").unwrap();
+        devices.ensure_index("last_seen").unwrap();
+        let at = |secs| crate::DateTime::from_unix(secs, 0).unwrap();
+        for n in 0..10 {
+            let device = Device {
+                id: None,
+                tags: vec!["new".to_string()],
+                last_seen: (n % 2 == 0).then(|| at(1_000 + n)),
+                best: n,
+                label: None,
+            };
+            devices.insert(device).unwrap();
+        }
+
+        let seen = Update::new()
+            .add_to_set("tags", "online")
+            .pull("tags", "new")
+            .max("last_seen", at(1_005))
+            .max("best", 5);
+        assert_eq!(devices.update_fields(Filter::new(), &seen).unwrap(), 10);
+        assert_eq!(
+            devices.update_fields(Filter::new(), &seen).unwrap(),
+            0,
+            "a set, a bound"
+        );
+        let all = devices.find(Filter::new().sort_asc("best")).unwrap();
+        assert!(all.iter().all(|d| d.tags == ["online"]));
+        let seen_at: Vec<i64> = all
+            .iter()
+            .map(|d| d.last_seen.unwrap().unix_seconds())
+            .collect();
+        assert_eq!(
+            seen_at,
+            [1005, 1005, 1005, 1005, 1005, 1005, 1006, 1005, 1008, 1005]
+        );
+        let best: Vec<i64> = all.iter().map(|d| d.best).collect();
+        assert_eq!(best, [5, 5, 5, 5, 5, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            devices.count(Filter::new().eq("tags[*]", "new")).unwrap(),
+            0
+        );
+        assert_eq!(
+            devices
+                .count(Filter::new().eq("tags[*]", "online"))
+                .unwrap(),
+            10
+        );
+        let later = Filter::new().gt("last_seen", at(1_005));
+        assert_eq!(
+            devices.count(later).unwrap(),
+            2,
+            "the index on last_seen follows"
+        );
+
+        // A rename, untyped, into a field the struct has.
+        let untyped = db.collection::<Document>("devices");
+        let named = Update::new().set("name", "sensor").rename("name", "label");
+        assert_eq!(
+            untyped
+                .update_fields(Filter::new().gte("best", 8), &named)
+                .unwrap(),
+            2
+        );
+        let labeled = devices.find(Filter::new().eq("label", "sensor")).unwrap();
+        assert_eq!(labeled.iter().map(|d| d.best).collect::<Vec<_>>(), [8, 9]);
+
+        // A push into a field `T` holds as a string fails the batch.
+        let wrong = Update::new().push("label", "x");
+        let Err(crate::Error::Update { message, .. }) =
+            devices.update_fields(Filter::new().gte("best", 8), &wrong)
+        else {
+            panic!("a push onto a string must fail");
+        };
+        assert!(
+            message.contains("`push` needs an array there, not a string"),
+            "{message}"
+        );
+        assert_consistent(&db);
     }
 
     // --- Date-times (SPEC §69) ---

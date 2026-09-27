@@ -330,7 +330,8 @@ more than four.
   `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md);
   `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);
   `update_fields` with operators, `Update::new().set(..).inc(..).unset(..)`
-  on dotted paths [§68](spec/68-update-operators.md);
+  on dotted paths [§68](spec/68-update-operators.md), and `min`, `max`, `rename`, and `push`,
+  `add_to_set` and `pull` on arrays [§73](spec/73-more-update-operators.md);
   `ensure_index` and `ensure_index_with` (`IndexOptions::new().unique()`,
   `.sparse()`), `indexes()` listing each index's fields and options
   [§28](spec/28-secondary-indexes.md) [§33](spec/33-unique-indexes.md) [§44](spec/44-sparse-indexes.md) [§60](spec/60-a-smaller-public-api.md).

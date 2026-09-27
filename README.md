@@ -122,6 +122,7 @@ struct User {
     team: String,
     age: i64,
     nick: Option<String>,
+    tags: Vec<String>,
 }
 
 let db = Database::open("app.trunkdb")?;
@@ -131,7 +132,7 @@ users.ensure_index("age")?;
 users.ensure_index(["team", "age"])?; // compound: by team, in age order
 users.ensure_index_with("nick", IndexOptions::new().sparse())?; // no entries for users without a nick
 
-let id = users.insert(User { id: None, name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36, nick: None })?;
+let id = users.insert(User { id: None, name: "Ada".into(), email: "ada@example.com".into(), team: "core".into(), age: 36, nick: None, tags: vec![] })?;
 let ada = users.get(&id)?.unwrap(); // ada.id == Some(id)
 let same = users.find_one(Filter::new().id(id))?; // a lookup, like get
 let parsed: DocId = id.to_string().parse()?; // ids go to text and back
@@ -142,6 +143,7 @@ let by_team_then_age = users.find(Filter::new().sort_asc("team").then_asc("age")
 let third_page = users.find(Filter::new().sort_asc("name").skip(40).limit(20))?;
 
 let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new().set("team", "platform").inc("age", 1))?;
+let tagged = users.update_fields(Filter::new().id(id), &Update::new().add_to_set("tags", "admin").pull("tags", "guest"))?;
 ```
 
 ## Building
@@ -359,6 +361,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 46. **Skip, for paging** (§72): `Filter::skip(n)`, after the sort and
     before the limit, in every call that takes a filter; through an
     index, the reading stops after skip plus limit.
+47. **More update operators** (§73): `min`, `max` (null counts as
+    missing: "the latest seen"), `rename`, and `push`, `add_to_set` and
+    `pull` on arrays.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

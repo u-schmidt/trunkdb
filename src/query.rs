@@ -1112,7 +1112,7 @@ pub(crate) fn equal(a: &Document, b: &Document) -> bool {
 /// `Eq`/`Lte`/`Gte` against null match null and missing fields, `Ne`
 /// everything else, and `Lt`/`Gt` nothing. Numbers compare by their exact
 /// value, `Int` against `Float` too (SPEC §34.1).
-fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> {
+pub(crate) fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> {
     use Document::*;
     match (a, b) {
         (Null, Null) => Some(std::cmp::Ordering::Equal),
