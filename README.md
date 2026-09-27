@@ -313,6 +313,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `Filter::new().id(id)` and `Condition::id(id)` instead of spelling
     `"_id"`; `"…".parse::<DocId>()`, with `ParseIdError`.
 
+    Items 35–37 → 0.13.0: file format 10 (still opens 6–9, and rebuilds
+    an older index that holds ids at the first open); no breaking API
+    change.
+
 What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License
