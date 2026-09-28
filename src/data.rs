@@ -1,5 +1,6 @@
 use crate::decode::{take_array, take_u8, take_u32, take_u64};
 use crate::document::{DocId, Document, decode_document, encode_stored, with_id};
+use crate::free_space::FreeSpace;
 use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage, USABLE_PAGE_SIZE};
 
 /// Flags byte value for a document stored entirely inside its cell.
@@ -13,6 +14,16 @@ const OVERFLOW: u8 = 1;
 const CELL_HEADER_LEN: usize = 1 + 16;
 /// An overflow cell: the header plus `[u32 length][u64 first page]`.
 const OVERFLOW_CELL_LEN: usize = CELL_HEADER_LEN + 4 + 8;
+
+/// A data page goes into its collection's free-space map once at least
+/// this much of it is free (SPEC §75): a quarter of a page. Most full
+/// pages have a little room left, which would fill the map with pages
+/// hardly anything fits into.
+const MIN_ROOM: usize = USABLE_PAGE_SIZE / 4;
+
+/// Once in the map, a page stays until less than this is left, so the
+/// inserts it gets fill it up rather than just back down to `MIN_ROOM`.
+const MIN_ROOM_TO_STAY: usize = 256;
 
 // Overflow page layout — deliberately not a `SlottedPage`: it holds one
 // run of bytes, and a slot directory would only cost space.
@@ -74,22 +85,23 @@ impl<'a> Cell<'a> {
 /// page, and the caller persists the change.
 ///
 /// Documents are packed: an insert goes into the current page if it has
-/// room (after compacting, if needed), and only allocates a new page —
-/// which becomes current — when it doesn't. Older, partly emptied pages
-/// aren't reused for inserts (no free-space map yet, see SPEC §20.4);
-/// their dead bytes are reclaimed when an update there needs them, and
-/// the whole page is freed once its last document is deleted.
+/// room (after compacting, if needed), else into the fullest older page
+/// in `free`, the collection's free-space map, that it fits in (SPEC
+/// §75), and only allocates a new page — which becomes current — when
+/// neither has room. Every write that changes a page's room tells `free`,
+/// and a page is freed once its last document is deleted.
 ///
 /// A document too large for an empty data page goes to overflow pages
 /// (`write_cell`); its cell is then small and packed like any other.
 pub fn insert_record(
     store: &mut dyn PageStore,
     current: &mut PageId,
+    free: &mut FreeSpace,
     id: DocId,
     doc: &Document,
 ) -> std::io::Result<RecordLocation> {
     let cell = write_cell(store, id, doc)?;
-    place_cell(store, current, &cell)
+    place_cell(store, current, free, &cell)
 }
 
 #[cfg(test)]
@@ -161,6 +173,7 @@ impl<'a> Records<'a> {
 pub fn update_record(
     store: &mut dyn PageStore,
     current: &mut PageId,
+    free: &mut FreeSpace,
     loc: RecordLocation,
     id: DocId,
     doc: &Document,
@@ -171,13 +184,14 @@ pub fn update_record(
     }
     let cell = write_cell(store, id, doc)?;
     if page.update_cell(loc.slot, &cell) {
+        note_room(free, *current, loc.page, &page);
         store.write_page(loc.page, page.into_page())?;
         return Ok(loc);
     }
 
     page.delete_cell(loc.slot);
-    write_or_free(store, *current, loc.page, page)?;
-    place_cell(store, current, &cell)
+    write_or_free(store, *current, free, loc.page, page)?;
+    place_cell(store, current, free, &cell)
 }
 
 /// Tombstones the document's cell and frees its overflow chain, if any.
@@ -188,6 +202,7 @@ pub fn update_record(
 pub fn delete_record(
     store: &mut dyn PageStore,
     current: PageId,
+    free: &mut FreeSpace,
     loc: RecordLocation,
 ) -> std::io::Result<()> {
     let mut page = read_data_page(store, loc.page)?;
@@ -195,7 +210,7 @@ pub fn delete_record(
         free_chain(store, first, len)?;
     }
     page.delete_cell(loc.slot);
-    write_or_free(store, current, loc.page, page)
+    write_or_free(store, current, free, loc.page, page)
 }
 
 /// Frees every page a dropped collection's documents use (SPEC §37): the
@@ -274,11 +289,13 @@ fn write_cell(store: &mut dyn PageStore, id: DocId, doc: &Document) -> std::io::
     Ok(cell)
 }
 
-/// Puts a new cell into the current page if it fits there, otherwise into
-/// a newly allocated page, which becomes current.
+/// Puts a new cell into the current page if it fits there, otherwise
+/// into the fullest older page it fits in (SPEC §75), otherwise into a
+/// newly allocated page, which becomes current.
 fn place_cell(
     store: &mut dyn PageStore,
     current: &mut PageId,
+    free: &mut FreeSpace,
     cell: &[u8],
 ) -> std::io::Result<RecordLocation> {
     if *current != 0 {
@@ -292,13 +309,31 @@ fn place_cell(
         }
     }
 
+    let needed = SlottedPage::space_needed(cell.len()) as u16;
+    if let Some(page_id) = free.find(needed) {
+        let mut page = read_data_page(store, page_id)?;
+        let slot = page.insert_cell_reusing_slot(cell);
+        note_room(free, *current, page_id, &page);
+        if let Some(slot) = slot {
+            store.write_page(page_id, page.into_page())?;
+            return Ok(RecordLocation {
+                page: page_id,
+                slot,
+            });
+        }
+    }
+
     let page_id = store.allocate_page()?;
     let mut page = SlottedPage::new(PageType::Data);
     let slot = page
         .insert_cell(cell)
         .expect("write_cell only makes cells that fit on an empty page");
     store.write_page(page_id, page.into_page())?;
-    *current = page_id;
+    let old = std::mem::replace(current, page_id);
+    if old != 0 {
+        // No longer current: whatever room it has left goes into the map.
+        note_room(free, *current, old, &read_data_page(store, old)?);
+    }
 
     Ok(RecordLocation {
         page: page_id,
@@ -392,12 +427,15 @@ fn decode(encoded: &[u8]) -> std::io::Result<Document> {
 fn write_or_free(
     store: &mut dyn PageStore,
     current: PageId,
+    free: &mut FreeSpace,
     page_id: PageId,
     page: SlottedPage,
 ) -> std::io::Result<()> {
     if page.is_empty() && page_id != current {
+        free.remove(page_id);
         store.free_page(page_id)
     } else {
+        note_room(free, current, page_id, &page);
         store.write_page(page_id, page.into_page())
     }
 }
@@ -423,6 +461,46 @@ fn live_cell(page: &SlottedPage, loc: RecordLocation) -> std::io::Result<&[u8]> 
             ),
         )
     })
+}
+
+/// Holds `free` against the pages it names (SPEC §75): each is one of the
+/// collection's data pages (`owned`), not its `current` one, with at
+/// least `MIN_ROOM` free and exactly the room recorded. For tests.
+#[cfg(test)]
+pub(crate) fn assert_free_space_is_true(
+    store: &dyn PageStore,
+    current: PageId,
+    owned: &std::collections::BTreeSet<PageId>,
+    free: &FreeSpace,
+) {
+    for (page_id, room) in free.entries() {
+        assert!(
+            owned.contains(&page_id),
+            "page {page_id} isn't the collection's"
+        );
+        assert_ne!(page_id, current, "the current page is in the map");
+        let page = read_data_page(store, page_id).unwrap();
+        assert_eq!(page.reclaimable_space(), room as usize, "page {page_id}");
+        assert!(
+            room as usize >= MIN_ROOM_TO_STAY,
+            "page {page_id} has too little room"
+        );
+    }
+}
+
+/// Tells `free` how much room `page_id` has now (SPEC §75). The current
+/// page stays out of it: inserts try that one first anyway.
+fn note_room(free: &mut FreeSpace, current: PageId, page_id: PageId, page: &SlottedPage) {
+    let room = page.reclaimable_space();
+    let enough = match free.contains(page_id) {
+        true => MIN_ROOM_TO_STAY,
+        false => MIN_ROOM,
+    };
+    if page_id != current && room >= enough {
+        free.set(page_id, room as u16);
+    } else {
+        free.remove(page_id);
+    }
 }
 
 #[cfg(test)]
@@ -492,8 +570,11 @@ mod tests {
     fn records_reads_a_page_once_for_the_documents_on_it_in_a_row() {
         let (_dir, mut store) = store();
         let mut current = 0;
+        let mut free = FreeSpace::default();
         let locs: Vec<RecordLocation> = (0..30u8)
-            .map(|n| insert_record(&mut store, &mut current, id(n), &blob(1000)).unwrap())
+            .map(|n| {
+                insert_record(&mut store, &mut current, &mut free, id(n), &blob(1000)).unwrap()
+            })
             .collect();
         let pages: Vec<PageId> = locs.iter().map(|loc| loc.page).collect();
         assert!(pages[0] == pages[1] && pages[0] != pages[29], "{pages:?}");
@@ -517,7 +598,9 @@ mod tests {
     fn unknown_flags_are_rejected() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let loc = insert_record(&mut store, &mut current, id(1), &Document::Null).unwrap();
+        let mut free = FreeSpace::default();
+        let loc =
+            insert_record(&mut store, &mut current, &mut free, id(1), &Document::Null).unwrap();
         let mut page = read_data_page(&store, loc.page).unwrap();
         let mut cell = page.get_cell(loc.slot).unwrap().to_vec();
         cell[0] = 0x7F;
@@ -534,9 +617,10 @@ mod tests {
     fn insert_then_get_roundtrips() {
         let (_dir, mut store) = store();
         let mut current = 0;
+        let mut free = FreeSpace::default();
 
         let doc = Document::String("Ada".to_string());
-        let loc = insert_record(&mut store, &mut current, id(1), &doc).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc).unwrap();
         assert_eq!(
             current, loc.page,
             "the first insert allocates the current page"
@@ -551,12 +635,15 @@ mod tests {
     fn small_documents_share_a_page_until_it_fills() {
         let (_dir, mut store) = store();
         let mut current = 0;
+        let mut free = FreeSpace::default();
 
-        let first = insert_record(&mut store, &mut current, id(0), &blob(1000)).unwrap();
+        let first = insert_record(&mut store, &mut current, &mut free, id(0), &blob(1000)).unwrap();
         let mut locs = vec![first];
         while current == first.page {
             let n = locs.len() as u8;
-            locs.push(insert_record(&mut store, &mut current, id(n), &blob(1000)).unwrap());
+            locs.push(
+                insert_record(&mut store, &mut current, &mut free, id(n), &blob(1000)).unwrap(),
+            );
         }
 
         // Seven ~1 KB documents fit in 8 KB; the eighth opened a new page.
@@ -580,10 +667,20 @@ mod tests {
     fn update_in_place_keeps_the_location() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let loc = insert_record(&mut store, &mut current, id(2), &Document::Int(1)).unwrap();
-        let neighbor = insert_record(&mut store, &mut current, id(3), &blob(500)).unwrap();
+        let mut free = FreeSpace::default();
+        let loc = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &Document::Int(1),
+        )
+        .unwrap();
+        let neighbor =
+            insert_record(&mut store, &mut current, &mut free, id(3), &blob(500)).unwrap();
 
-        let new_loc = update_record(&mut store, &mut current, loc, id(2), &blob(3000)).unwrap();
+        let new_loc =
+            update_record(&mut store, &mut current, &mut free, loc, id(2), &blob(3000)).unwrap();
 
         assert_eq!(new_loc, loc);
         assert_eq!(get_record(&store, loc).unwrap().1, blob(3000));
@@ -594,10 +691,12 @@ mod tests {
     fn update_that_outgrows_its_page_moves_the_document() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let a = insert_record(&mut store, &mut current, id(1), &blob(3000)).unwrap();
-        let b = insert_record(&mut store, &mut current, id(2), &blob(3000)).unwrap();
+        let mut free = FreeSpace::default();
+        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
+        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(3000)).unwrap();
 
-        let moved = update_record(&mut store, &mut current, a, id(1), &blob(6000)).unwrap();
+        let moved =
+            update_record(&mut store, &mut current, &mut free, a, id(1), &blob(6000)).unwrap();
 
         assert_ne!(moved.page, a.page);
         assert_eq!(current, moved.page, "the move allocated a new current page");
@@ -614,30 +713,111 @@ mod tests {
     fn delete_frees_a_page_once_it_is_empty_but_not_the_current_one() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let a = insert_record(&mut store, &mut current, id(1), &blob(5000)).unwrap();
-        let b = insert_record(&mut store, &mut current, id(2), &blob(5000)).unwrap();
+        let mut free = FreeSpace::default();
+        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(5000)).unwrap();
+        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(5000)).unwrap();
         assert_ne!(a.page, b.page);
         assert_eq!(current, b.page);
 
         // b's page is current: emptied, but kept for the next insert.
-        delete_record(&mut store, current, b).unwrap();
-        let c = insert_record(&mut store, &mut current, id(3), &Document::Null).unwrap();
+        delete_record(&mut store, current, &mut free, b).unwrap();
+        let c = insert_record(&mut store, &mut current, &mut free, id(3), &Document::Null).unwrap();
         assert_eq!(c.page, b.page);
 
         // a's page isn't: emptying it frees it for reuse.
-        delete_record(&mut store, current, a).unwrap();
+        delete_record(&mut store, current, &mut free, a).unwrap();
         assert_eq!(store.allocate_page().unwrap(), a.page);
+    }
+
+    #[test]
+    fn the_map_learns_what_a_delete_leaves_behind() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let mut free = FreeSpace::default();
+        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
+        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(3000)).unwrap();
+        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(3000)).unwrap();
+        assert_eq!(a.page, b.page);
+        assert_ne!(c.page, a.page, "the third didn't fit");
+
+        // More than half of a's page is free now: it's remembered.
+        delete_record(&mut store, current, &mut free, a).unwrap();
+        assert_eq!(free.find(3000), Some(a.page));
+
+        // The current page never is, however much it has free.
+        delete_record(&mut store, current, &mut free, c).unwrap();
+        assert_eq!(free.find(6000), None);
+
+        // Emptied, a's page is freed, and forgotten.
+        delete_record(&mut store, current, &mut free, b).unwrap();
+        assert_eq!(free.find(1), None);
+    }
+
+    /// A page that was never in the map needs `MIN_ROOM` to get in; the
+    /// little most full pages keep doesn't count.
+    #[test]
+    fn a_page_with_a_little_room_left_isnt_remembered() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let mut free = FreeSpace::default();
+        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
+        insert_record(&mut store, &mut current, &mut free, id(2), &blob(4000)).unwrap();
+        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(5000)).unwrap();
+        assert_ne!(c.page, a.page);
+
+        // About 1,100 bytes are left on a's page: more than a page needs
+        // to stay in the map, less than it needs to get in.
+        assert_eq!(free.find(1), None);
+    }
+
+    #[test]
+    fn an_insert_fills_a_remembered_page_before_allocating() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let mut free = FreeSpace::default();
+        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
+        insert_record(&mut store, &mut current, &mut free, id(2), &blob(3000)).unwrap();
+        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(5000)).unwrap();
+        delete_record(&mut store, current, &mut free, a).unwrap();
+
+        // Doesn't fit on the current page, does on a's.
+        let d = insert_record(&mut store, &mut current, &mut free, id(4), &blob(4000)).unwrap();
+        assert_eq!(d.page, a.page);
+        assert_eq!(current, c.page, "the current page stays current");
+        assert_eq!(
+            free.find(1000),
+            Some(a.page),
+            "a's page keeps its last room"
+        );
+        assert_eq!(free.find(1500), None);
+        assert_eq!(get_record(&store, d).unwrap(), (id(4), blob(4000)));
+    }
+
+    #[test]
+    fn a_page_that_stops_being_current_keeps_its_room() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let mut free = FreeSpace::default();
+        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(5000)).unwrap();
+        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(6000)).unwrap();
+        assert_ne!(a.page, b.page);
+
+        // About 3,000 bytes are left on a's page, no longer current, and
+        // 2,000 on b's, too few for c.
+        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(2500)).unwrap();
+        assert_eq!(c.page, a.page);
     }
 
     #[test]
     fn deleted_space_on_the_current_page_is_reused() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let a = insert_record(&mut store, &mut current, id(1), &blob(4000)).unwrap();
-        insert_record(&mut store, &mut current, id(2), &blob(4000)).unwrap();
+        let mut free = FreeSpace::default();
+        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(4000)).unwrap();
+        insert_record(&mut store, &mut current, &mut free, id(2), &blob(4000)).unwrap();
 
-        delete_record(&mut store, current, a).unwrap();
-        let c = insert_record(&mut store, &mut current, id(3), &blob(4000)).unwrap();
+        delete_record(&mut store, current, &mut free, a).unwrap();
+        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(4000)).unwrap();
 
         assert_eq!(c, a, "same page, same (reused) slot");
     }
@@ -646,10 +826,19 @@ mod tests {
     fn a_document_goes_to_overflow_pages_exactly_when_it_cannot_be_inline() {
         let (_dir, mut store) = store();
         let mut current = 0;
+        let mut free = FreeSpace::default();
         let largest = largest_inline_blob();
 
-        let inline = insert_record(&mut store, &mut current, id(1), &blob(largest)).unwrap();
-        let overflow = insert_record(&mut store, &mut current, id(2), &blob(largest + 1)).unwrap();
+        let inline =
+            insert_record(&mut store, &mut current, &mut free, id(1), &blob(largest)).unwrap();
+        let overflow = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(largest + 1),
+        )
+        .unwrap();
 
         assert_eq!(flags(&store, inline), INLINE);
         assert_eq!(flags(&store, overflow), OVERFLOW);
@@ -664,11 +853,12 @@ mod tests {
     fn a_large_document_spans_a_chain_and_its_cell_is_packed() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let small = insert_record(&mut store, &mut current, id(1), &blob(100)).unwrap();
+        let mut free = FreeSpace::default();
+        let small = insert_record(&mut store, &mut current, &mut free, id(1), &blob(100)).unwrap();
 
         // 3 × capacity, minus the tag and length: exactly three full pages.
         let big = blob(3 * OVERFLOW_CAPACITY - 5);
-        let loc = insert_record(&mut store, &mut current, id(2), &big).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(2), &big).unwrap();
 
         assert_eq!(
             loc.page, small.page,
@@ -683,9 +873,10 @@ mod tests {
     fn documents_past_64_kb_roundtrip() {
         let (_dir, mut store) = store();
         let mut current = 0;
+        let mut free = FreeSpace::default();
         let prose = Document::String("It was a dark and stormy night. ".repeat(10_000));
 
-        let loc = insert_record(&mut store, &mut current, id(1), &prose).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &prose).unwrap();
 
         assert_eq!(get_record(&store, loc).unwrap(), (id(1), prose));
     }
@@ -694,24 +885,42 @@ mod tests {
     fn updates_switch_between_inline_and_overflow_and_free_old_chains() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let loc = insert_record(&mut store, &mut current, id(1), &blob(10)).unwrap();
+        let mut free = FreeSpace::default();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &blob(10)).unwrap();
         let data_page = loc.page;
 
         // Inline → overflow: the cell shrinks to a pointer and stays put.
-        let loc = update_record(&mut store, &mut current, loc, id(1), &blob(20_000)).unwrap();
+        let loc = update_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            loc,
+            id(1),
+            &blob(20_000),
+        )
+        .unwrap();
         assert_eq!(loc.page, data_page);
         assert_eq!(flags(&store, loc), OVERFLOW);
         assert_eq!(get_record(&store, loc).unwrap().1, blob(20_000));
 
         // Overflow → larger overflow: the old three pages are reused.
-        let loc = update_record(&mut store, &mut current, loc, id(1), &blob(30_000)).unwrap();
+        let loc = update_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            loc,
+            id(1),
+            &blob(30_000),
+        )
+        .unwrap();
         assert_eq!(get_record(&store, loc).unwrap().1, blob(30_000));
         let high_water = store.allocate_page().unwrap();
         assert_eq!(high_water, data_page + 5, "data page + 4 overflow pages");
         store.free_page(high_water).unwrap();
 
         // Overflow → inline: the chain is freed.
-        let loc = update_record(&mut store, &mut current, loc, id(1), &blob(10)).unwrap();
+        let loc =
+            update_record(&mut store, &mut current, &mut free, loc, id(1), &blob(10)).unwrap();
         assert_eq!(flags(&store, loc), INLINE);
         assert_eq!(get_record(&store, loc).unwrap().1, blob(10));
         let mut freed: Vec<PageId> = (0..5).map(|_| store.allocate_page().unwrap()).collect();
@@ -723,10 +932,11 @@ mod tests {
     fn delete_frees_the_chain() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let keep = insert_record(&mut store, &mut current, id(1), &blob(10)).unwrap();
-        let big = insert_record(&mut store, &mut current, id(2), &blob(20_000)).unwrap();
+        let mut free = FreeSpace::default();
+        let keep = insert_record(&mut store, &mut current, &mut free, id(1), &blob(10)).unwrap();
+        let big = insert_record(&mut store, &mut current, &mut free, id(2), &blob(20_000)).unwrap();
 
-        delete_record(&mut store, current, big).unwrap();
+        delete_record(&mut store, current, &mut free, big).unwrap();
 
         let mut freed: Vec<PageId> = (0..3).map(|_| store.allocate_page().unwrap()).collect();
         freed.sort();
@@ -742,7 +952,8 @@ mod tests {
     fn a_broken_chain_is_a_corruption_error() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let loc = insert_record(&mut store, &mut current, id(1), &blob(20_000)).unwrap();
+        let mut free = FreeSpace::default();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &blob(20_000)).unwrap();
         let page = read_data_page(&store, loc.page).unwrap();
         let (_len, first) = Cell::parse(page.get_cell(loc.slot).unwrap())
             .unwrap()
@@ -765,7 +976,9 @@ mod tests {
         let err = get_record(&store, loc).unwrap_err();
         assert!(err.to_string().contains("isn't an overflow page"), "{err}");
         assert_eq!(
-            delete_record(&mut store, current, loc).unwrap_err().kind(),
+            delete_record(&mut store, current, &mut free, loc)
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::InvalidData,
             "a delete must not free pages of a chain it can't follow"
         );
@@ -787,11 +1000,12 @@ mod tests {
     fn the_id_is_stored_once_and_read_back_first() {
         let (_dir, mut store) = store();
         let mut current = 0;
+        let mut free = FreeSpace::default();
         let doc = object(&[
             ("color", Document::String("black".into())),
             ("_id", Document::Id(id(9))),
         ]);
-        let loc = insert_record(&mut store, &mut current, id(1), &doc).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc).unwrap();
 
         let page = read_data_page(&store, loc.page).unwrap();
         let cell = page.get_cell(loc.slot).unwrap();
@@ -822,7 +1036,9 @@ mod tests {
     fn a_stored_id_from_an_older_format_gives_way_to_the_cell() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let loc = insert_record(&mut store, &mut current, id(1), &Document::Null).unwrap();
+        let mut free = FreeSpace::default();
+        let loc =
+            insert_record(&mut store, &mut current, &mut free, id(1), &Document::Null).unwrap();
         let mut page = read_data_page(&store, loc.page).unwrap();
         let old = object(&[("_id", Document::Id(id(7))), ("n", Document::Int(5))]);
         let mut cell = vec![INLINE];
@@ -844,7 +1060,8 @@ mod tests {
     fn a_chain_that_loops_is_a_corruption_error() {
         let (_dir, mut store) = store();
         let mut current = 0;
-        let loc = insert_record(&mut store, &mut current, id(1), &blob(20_000)).unwrap();
+        let mut free = FreeSpace::default();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &blob(20_000)).unwrap();
         let mut page = read_data_page(&store, loc.page).unwrap();
         let (_len, first) = Cell::parse(page.get_cell(loc.slot).unwrap())
             .unwrap()
@@ -869,8 +1086,9 @@ mod tests {
     fn every_truncated_cell_is_an_error() {
         let (_dir, mut store) = store();
         let mut current = 0;
+        let mut free = FreeSpace::default();
         for doc in [Document::Int(5), blob(20_000)] {
-            let loc = insert_record(&mut store, &mut current, id(1), &doc).unwrap();
+            let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc).unwrap();
             let page = read_data_page(&store, loc.page).unwrap();
             let cell = page.get_cell(loc.slot).unwrap().to_vec();
             let shortest = match doc {

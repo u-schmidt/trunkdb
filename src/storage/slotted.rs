@@ -186,6 +186,12 @@ impl SlottedPage {
         (self.data_start() as usize).saturating_sub(slots_end)
     }
 
+    /// The room a new cell of `data_len` bytes takes: its bytes, and its
+    /// entry in the slot directory.
+    pub fn space_needed(data_len: usize) -> usize {
+        SLOT_LEN + data_len
+    }
+
     /// Whether a cell of `data_len` bytes would fit right now — accounts
     /// for the slot-directory entry it also needs, not just the cell
     /// payload, so this always agrees with what `insert_cell` will
@@ -316,7 +322,7 @@ impl SlottedPage {
 
     /// Bytes that would be free after `compact` — `free_space` plus every
     /// dead byte left behind by deleted or shrunk cells.
-    fn reclaimable_space(&self) -> usize {
+    pub fn reclaimable_space(&self) -> usize {
         let live: usize = self.iter_cells().map(|(_slot, cell)| cell.len()).sum();
         USABLE_PAGE_SIZE - HEADER_LEN - self.slot_count() as usize * SLOT_LEN - live
     }
@@ -487,6 +493,17 @@ mod tests {
         assert_eq!(restored.page_type(), PageType::Catalog);
         assert_eq!(restored.next_page(), 7);
         assert_eq!(restored.get_cell(0), Some(&b"trunk-collection"[..]));
+    }
+
+    /// `space_needed` is what `has_room_for` checks: a cell fits exactly
+    /// when that much is free (SPEC §75).
+    #[test]
+    fn space_needed_counts_the_slot_too() {
+        let page = SlottedPage::new(PageType::Data);
+        let largest = page.free_space() - SlottedPage::space_needed(0);
+        assert!(page.has_room_for(largest));
+        assert!(!page.has_room_for(largest + 1));
+        assert_eq!(SlottedPage::space_needed(largest), page.free_space());
     }
 
     #[test]

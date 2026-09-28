@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::decode::{take, take_u8, take_u64};
+use crate::free_space::FreeSpace;
 use crate::storage::{PageId, PageStore, PageType, SlottedPage};
 use std::collections::HashMap;
 
@@ -178,6 +179,10 @@ pub struct Catalog {
     /// Secondary indexes by collection name, in creation order. Separate
     /// from `CollectionMeta` so that stays a small `Copy` value.
     indexes: HashMap<String, Vec<IndexMeta>>,
+    /// Each collection's data pages with room left (SPEC §75). In memory
+    /// only, empty at open; restored with the rest on rollback, so it
+    /// never names a page a failed batch freed or never wrote.
+    free_space: HashMap<String, FreeSpace>,
 }
 
 impl Catalog {
@@ -257,6 +262,7 @@ impl Catalog {
         Ok(Catalog {
             collections,
             indexes,
+            free_space: HashMap::new(),
         })
     }
 
@@ -385,7 +391,30 @@ impl Catalog {
         store.write_page(page_id, page.into_page())?;
         self.collections.remove(name);
         self.indexes.remove(name);
+        self.free_space.remove(name);
         Ok(Some((meta, indexes)))
+    }
+
+    /// `collection`'s data pages with room left — an empty map for a
+    /// collection nothing has been learned about yet (SPEC §75).
+    pub fn free_space_mut(&mut self, collection: &str) -> &mut FreeSpace {
+        self.free_space.entry(collection.to_string()).or_default()
+    }
+
+    /// `collection`'s map, if anything has been learned about it — for
+    /// tests.
+    #[cfg(test)]
+    pub fn free_space(&self, collection: &str) -> Option<&FreeSpace> {
+        self.free_space.get(collection)
+    }
+
+    /// `indexes` and `free_space_mut` at once: a write reads the one while
+    /// it changes the other, which two calls on `self` can't lend out
+    /// together — one method borrowing two separate fields can.
+    pub fn indexes_and_free_space(&mut self, collection: &str) -> (&[IndexMeta], &mut FreeSpace) {
+        let indexes = self.indexes.get(collection).map_or(&[][..], Vec::as_slice);
+        let free = self.free_space.entry(collection.to_string()).or_default();
+        (indexes, free)
     }
 
     /// Records a collection's new current data page — in its catalog

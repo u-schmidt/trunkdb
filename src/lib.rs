@@ -16,6 +16,7 @@ mod decode;
 mod document;
 mod durability;
 mod export;
+mod free_space;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;

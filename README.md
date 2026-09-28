@@ -73,6 +73,7 @@ src/
 ├── id.rs              IdGenerator + UuidV7Generator
 ├── catalog.rs         collections and their indexes (page 1)
 ├── data.rs            documents on data pages, overflow chains
+├── free_space.rs      FreeSpace: data pages with room, by free bytes
 ├── storage/
 │   ├── mod.rs         PageStore, page types
 │   ├── file.rs        FileStore: the file, checksums, staged and
@@ -393,6 +394,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 48. **`find_with_ids` removed** (§74), and a `cursor` hands out `T`, as
     `find` does: a type that wants its id declares an `_id` field; one
     from another crate is wrapped, its fields flattened.
+49. **A free-space map** (§75): inserts refill the room deletes and
+    updates leave in older data pages, fullest page first, so a
+    collection deleting and inserting as much stops growing; in memory,
+    learned from writes, no format change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

@@ -1223,7 +1223,8 @@ pub(crate) fn apply_write_op(
             let doc = with_id(doc.clone(), *id);
             refuse_too_deep(collection, id, &doc)?;
             let mut current = meta.current_data_page;
-            let loc = data::insert_record(store, &mut current, *id, &doc)?;
+            let free = catalog.free_space_mut(collection);
+            let loc = data::insert_record(store, &mut current, free, *id, &doc)?;
             index.insert(store, &key::primary(*id), loc)?;
             let secondary = catalog.indexes(collection);
             update_secondary_indexes(collection, secondary, store, *id, None, Some((&doc, loc)))?;
@@ -1234,10 +1235,10 @@ pub(crate) fn apply_write_op(
             let mut index = BTreeIndex::new(meta.index_root);
             let doc = with_id(doc.clone(), *id);
             refuse_too_deep(collection, id, &doc)?;
-            let secondary = catalog.indexes(collection);
+            let (secondary, free) = catalog.indexes_and_free_space(collection);
             let old = old_document(secondary, store, loc)?;
             let mut current = meta.current_data_page;
-            let new_loc = data::update_record(store, &mut current, loc, *id, &doc)?;
+            let new_loc = data::update_record(store, &mut current, free, loc, *id, &doc)?;
             if new_loc != loc {
                 // The document outgrew its page and moved (SPEC §20.3).
                 index.remove(store, &key::primary(*id))?;
@@ -1257,9 +1258,9 @@ pub(crate) fn apply_write_op(
         WriteOp::Delete(collection, id) => {
             let (meta, loc) = locate(catalog, store, collection, id)?;
             let mut index = BTreeIndex::new(meta.index_root);
-            let secondary = catalog.indexes(collection);
+            let (secondary, free) = catalog.indexes_and_free_space(collection);
             let old = old_document(secondary, store, loc)?;
-            data::delete_record(store, meta.current_data_page, loc)?;
+            data::delete_record(store, meta.current_data_page, free, loc)?;
             index.remove(store, &key::primary(*id))?;
             let old = old.as_ref().map(|old| (old, loc));
             update_secondary_indexes(collection, secondary, store, *id, old, None)?;
@@ -2525,6 +2526,121 @@ mod tests {
         filter(conditions)
     }
 
+    /// Every collection's free-space map names only its own data pages,
+    /// with the room they really have (SPEC §75).
+    fn assert_free_space_is_true(db: &Database) {
+        let state = db.state();
+        for name in state.catalog.names() {
+            let Some(free) = state.catalog.free_space(name) else {
+                continue;
+            };
+            let meta = *state.catalog.get(name).unwrap();
+            let locs = BTreeIndex::new(meta.index_root).scan(&state.store).unwrap();
+            let current = meta.current_data_page;
+            let locs = locs.into_iter().map(|(_key, loc)| loc);
+            let (owned, _chains) = data::collection_pages(&state.store, current, locs).unwrap();
+            data::assert_free_space_is_true(&state.store, current, &owned, free);
+        }
+    }
+
+    /// A document of about `pad` bytes, numbered `n`.
+    fn padded(n: i64, pad: usize) -> Document {
+        object(vec![
+            ("n", Document::Int(n)),
+            ("pad", Document::String("x".repeat(pad))),
+        ])
+    }
+
+    /// SPEC §75: the space deletes leave behind in older pages is refilled
+    /// by later inserts, so a collection deleting and inserting as much
+    /// stays the size it was.
+    #[test]
+    fn inserts_refill_the_space_deletes_leave_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        // In batches of 100, each one commit: one flush, not one per document.
+        let mut ids = Vec::new();
+        for chunk in (0..2000).collect::<Vec<i64>>().chunks(100) {
+            let mut batch = db.batch();
+            for &n in chunk {
+                ids.push(batch.insert(&docs, padded(n, 400)).unwrap());
+            }
+            batch.commit().unwrap();
+        }
+        let mut batch = db.batch();
+        for id in ids.iter().step_by(2) {
+            batch.delete(&docs, id);
+        }
+        batch.commit().unwrap();
+        let before = db.file_info().unwrap().pages;
+
+        for chunk in (0..1000).collect::<Vec<i64>>().chunks(100) {
+            let mut batch = db.batch();
+            for &n in chunk {
+                batch.insert(&docs, padded(n, 400)).unwrap();
+            }
+            batch.commit().unwrap();
+        }
+        let after = db.file_info().unwrap().pages;
+        // The new ids' index entries need new pages; the documents don't.
+        let state = db.state();
+        let new_data_pages = (before..after)
+            .filter(|&page| {
+                state.store.read_page(page).unwrap()[0] == crate::storage::PageType::Data as u8
+            })
+            .count();
+        drop(state);
+        assert_eq!(new_data_pages, 0, "of {} new pages", after - before);
+        assert_consistent(&db);
+    }
+
+    /// SPEC §75: dropping a collection forgets its map, whose pages are
+    /// freed; a new collection of the same name starts without it.
+    #[test]
+    fn a_dropped_collection_takes_its_free_space_map_along() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let ids: Vec<DocId> = (0..8)
+            .map(|n| docs.insert(padded(n, 3000)).unwrap())
+            .collect();
+        docs.delete(&ids[0]).unwrap();
+        assert!(db.drop_collection("docs").unwrap());
+
+        docs.insert(padded(0, 3000)).unwrap();
+        assert_consistent(&db);
+    }
+
+    /// SPEC §75: a failed batch leaves the map as it was, so it names no
+    /// page the batch allocated or freed and the rollback took back.
+    #[test]
+    fn a_failed_batch_leaves_the_free_space_map_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let ids: Vec<DocId> = (0..8)
+            .map(|n| docs.insert(padded(n, 3000)).unwrap())
+            .collect();
+        docs.delete(&ids[0]).unwrap();
+        let map = |db: &Database| db.state().catalog.free_space("docs").unwrap().entries();
+        let before = map(&db);
+        assert!(!before.is_empty());
+
+        let mut batch = db.batch();
+        for id in &ids[1..6] {
+            batch.delete(&docs, id); // empties and frees pages
+        }
+        for n in 0..6 {
+            batch.insert(&docs, padded(n, 5000)).unwrap(); // allocates pages
+        }
+        batch.update(&docs, &DocId([7; 16]), padded(0, 1)).unwrap();
+        assert!(matches!(batch.commit(), Err(crate::Error::NotFound { .. })));
+
+        assert_eq!(map(&db), before);
+        assert_consistent(&db);
+    }
+
     fn sorted_ids(results: Vec<(DocId, Document)>) -> Vec<DocId> {
         let mut ids: Vec<DocId> = results.into_iter().map(|(id, _)| id).collect();
         ids.sort();
@@ -2538,6 +2654,7 @@ mod tests {
     fn assert_consistent(db: &Database) {
         let report = db.check().unwrap();
         assert!(report.is_ok(), "{:#?}", report.problems);
+        assert_free_space_is_true(db);
 
         let everything = |db: &Database| {
             let mut names = db.collections().unwrap();

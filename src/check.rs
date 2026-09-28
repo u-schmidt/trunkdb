@@ -555,8 +555,9 @@ mod tests {
                 .lookup(store, &key::primary(id))?
                 .unwrap();
             let mut current = meta.current_data_page;
+            let free = catalog.free_space_mut("users");
             assert_eq!(
-                data::update_record(store, &mut current, loc, id, &copy)?,
+                data::update_record(store, &mut current, free, loc, id, &copy)?,
                 loc
             );
             Ok(())
@@ -587,7 +588,8 @@ mod tests {
                 .lookup(store, &key::primary(id))?
                 .unwrap();
             let mut current = meta.current_data_page;
-            let new_loc = data::update_record(store, &mut current, loc, id, &copy)?;
+            let free = catalog.free_space_mut("people");
+            let new_loc = data::update_record(store, &mut current, free, loc, id, &copy)?;
             assert_eq!(new_loc, loc, "it shrank, so it stays in place");
             Ok(())
         })

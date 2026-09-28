@@ -71,10 +71,13 @@ fn rebuild(catalog: &Catalog, store: &FileStore) -> crate::Result<(Catalog, Memo
 
         let mut primary = BTreeIndex::new(new_meta.index_root);
         let mut current = 0;
+        // Filled in order, so no page is left with room behind: the map
+        // stays empty, and the rebuilt catalog's starts empty too.
+        let mut free = crate::free_space::FreeSpace::default();
         let mut records = data::Records::new(store);
         for (primary_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
             let (id, doc) = records.get(loc)?;
-            let new_loc = data::insert_record(&mut image, &mut current, id, &doc)?;
+            let new_loc = data::insert_record(&mut image, &mut current, &mut free, id, &doc)?;
             primary.insert(&mut image, &primary_key, new_loc)?;
             for (entries, index) in index_entries.iter_mut().zip(indexes) {
                 for key in index_keys(&doc, index, id) {
@@ -432,7 +435,14 @@ mod tests {
                 .unwrap();
             let mut current = meta.current_data_page;
             assert_eq!(
-                data::update_record(store, &mut current, loc, id, &copy)?,
+                data::update_record(
+                    store,
+                    &mut current,
+                    catalog.free_space_mut("people"),
+                    loc,
+                    id,
+                    &copy
+                )?,
                 loc
             );
             Ok(())

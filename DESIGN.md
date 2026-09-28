@@ -193,9 +193,13 @@ all over it [§4.2](spec/04-key-decisions-and-rationale.md).
 cell being `[flags][id][encoded document]` [§20](spec/20-several-documents-per-data-page.md). The id is stored in
 the cell because nothing else maps a location back to its document, and
 a scan or a rebuild needs that. A collection's next insert tries its
-current data page first and allocates a new one when that's full; there
-is no free-space map, so space freed in older pages is reused only
-within them, or by a compaction.
+current data page first, then the fullest of its older pages with room
+enough, and allocates a new one only when none has it. The pages with
+room are in a **free-space map** per collection, by their exact free
+bytes: in memory only, learned from writes (a page gets in with a
+quarter of it free, and stays until less than 256 bytes are left), and
+rolled back with the catalog it lives in. It starts empty at open, so
+space freed in an earlier session comes back by a compaction [§75](spec/75-a-free-space-map.md).
 
 **Large documents** keep only a pointer in their cell: the length and
 the first of a chain of overflow pages [§26](spec/26-overflow-pages-and-u32-lengths.md). Lengths are `u32`.
@@ -314,8 +318,8 @@ needed by anything measured yet, and they'd live below `PageStore`, so
 features above it don't make them harder. To keep them possible, the
 storage layer follows six rules. The one to know first: **a freed page
 isn't reused while a reader could still need its old contents**. It
-costs nothing today, since no reader overlaps a commit, but a
-free-space map or any other change to allocation must keep it.
+costs nothing today, since no reader overlaps a commit, but the
+free-space map [§75](spec/75-a-free-space-map.md) and any other change to allocation must keep it.
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
 once or ten times a second costs readers nothing measurable; one that
