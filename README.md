@@ -146,6 +146,28 @@ let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new
 let tagged = users.update_fields(Filter::new().id(id), &Update::new().add_to_set("tags", "admin").pull("tags", "guest"))?;
 ```
 
+### Reading only some fields
+
+A collection can be opened with a smaller type: serde ignores the
+fields it doesn't declare, so this hands back only names and teams, as
+LINQ's `Select` or a SQL column list would:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct UserSummary {
+    name: String,
+    team: String,
+}
+
+let summaries = db.collection::<UserSummary>("users").find(Filter::new().eq("team", "core"))?;
+```
+
+Read through it, never write: `update`, `upsert` and `insert` store the
+whole value, so a `UserSummary` written back replaces the user and
+drops every field it lacks. To change some fields, use `update_fields`.
+Each document is still read and decoded in full; only the result is
+smaller.
+
 ## Building
 
 ```

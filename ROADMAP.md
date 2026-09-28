@@ -85,9 +85,17 @@ limit is described.
 
 **Queries**
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
-- A skip that passes over index entries without reading their
-  documents, where the index answers the whole filter; now a deep page
-  reads every document it skips (§72.3).
+- Index-only reads, what SQL calls a covering index or an index-only
+  scan and MongoDB a covered query: where the index answers the whole
+  filter, every condition on its fields and exact, its entries alone
+  decide. Two places would gain: a skip that passes over index entries
+  without reading their documents, where now a deep page reads every
+  document it skips (§72.3); and `count` with conditions, which now
+  reads every candidate document even when the index already says it
+  matches. Not for returning documents: that needs projection (only
+  some fields back), which trunkdb doesn't have, and a `Collection<T>`
+  wants the whole `T` anyway. Multikey indexes can't answer this way
+  (an entry is one element, not the array), as in MongoDB.
 - An explain that runs the query, as MongoDB's `executionStats`: the
   results with the plan, index bounds, keys and documents examined,
   documents returned and time taken; now `explain` only names the kind
@@ -127,6 +135,16 @@ limit is described.
 - A document as `serde_json::Value`, beside its text form (§71), if a
   tool needs it: behind a feature named `serde_json-1`, so `serde_json`
   stays out of the default public API (§71.4).
+- Projection, a `select` of fields (`Filter::new().select(["name",
+  "team"])`), for `Collection<Document>` and the `trunkdb` command,
+  which have no smaller struct to read into (a typed collection already
+  can: the README's "Reading only some fields"). It saves decoding
+  and memory, not reads: a document is stored in one piece, overflow
+  pages included (§26), and its encoding records no byte sizes, so
+  reaching a field still walks those before it (§11.1), though without
+  allocating them. Projection is also what an index-only `find` would
+  need (see index-only reads under Queries). When a workload asks for
+  it.
 - Operators in a `Batch` and in `upsert` (§68.3).
 - More update operators, when asked for: `pull` by a condition on the
   element, `push` of several values at once, `mul`, `pop` (§73.3).
