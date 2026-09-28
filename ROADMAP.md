@@ -51,9 +51,10 @@ nothing lands in the meantime that makes it harder.
 **Format questions.** Index changes are cheap, since indexes are derived
 data and can be rebuilt from the documents at open. Changes to
 documents, data pages and the header are the expensive ones.
-- A free-space map: persisted (a new page type, a format change) or
-  rebuilt in memory at open (none, but a slower open). Either way it
-  keeps §57.3.
+- A free-space map: settled for now as in memory only, no format
+  change (see Open, "Storage and durability"). A persisted form can
+  come in 1.x if real use asks for it: a file using it is refused by an
+  older 1.x build, as 1.0 promises, so it needn't be decided before.
 - Done in §69: a date-time type, `Document::DateTime`, file format 11.
 - The WAL's format matters less: it's empty after a clean close, so a
   change needs only a checkpoint before upgrading.
@@ -104,9 +105,39 @@ limit is described.
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).
 - A free-space map, so inserts refill half-empty data pages between
-  compactions (§20.1, §41.5). It must keep the storage rules of §57.3:
-  above all, space freed by a commit isn't reused while a reader could
-  still need it.
+  compactions (§20.1, §41.5). Wholly free pages already have a list,
+  from the header and linked through them (§7), as LiteDB's; what's
+  missing is its lists of data pages with some room. The plan:
+  - **In memory, learned from writes:** per collection, each data page
+    other than the current one with room left, by its exact free bytes
+    (a `u16`), known anyway when a write has the page in hand: no extra
+    reads or page writes, no format change. Kept ordered by free space
+    (`(free, page)` in a `BTreeMap`), so an insert finds the fullest
+    page that still has room for it in one lookup, and the page it gets
+    always fits, which categories can't promise. A page's space is
+    usable as a whole, since an insert compacts the page first (§20.1).
+  - **The limit:** the map starts empty at open, so space freed in an
+    earlier session comes back only by `compact`. A long-running app
+    reuses what it frees itself.
+  - **Not LiteDB's lists:** five lists of data pages by fill, linked
+    through the pages, need a link both ways in every data page, and a
+    page changing category rewrites its neighbours and the collection's
+    heads: up to four pages, each a whole image in the WAL (§19), for
+    one insert.
+  - **Not rebuilt at open:** reading every data page's header makes
+    open as slow as the file is large.
+  - **Later, if restarts leave too much behind:** persisted as hints,
+    as PostgreSQL's free-space map: one byte per data page, its free
+    space rounded down to 32 bytes, in map pages of their own (8,000
+    data pages, 64 MB, each), read at open into the exact map. Rounded
+    down it never promises room that isn't there, and the page is
+    checked before use anyway. One byte, not the exact two: the map
+    then changes only when a page crosses a step, not with nearly
+    every insert, so most commits write no map page to the WAL.
+  - It must keep the storage rules of §57.3: above all, space freed by
+    a commit isn't reused while a reader could still need it. Today
+    that's at once; with snapshots, once no snapshot older than the
+    commit is open.
 - Compaction without holding the whole new file in memory: a streamed
   WAL record (§41.5). Leaves built from sorted entries instead of
   inserted one by one would make it faster still (§48.4), though 1 s for
