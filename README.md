@@ -399,6 +399,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     collection deleting and inserting as much stops growing; in memory,
     learned from writes, no format change.
 
+    Items 48–49 → 0.17.0: breaking for code that calls `find_with_ids`
+    or `find_one_with_id`, or takes `(id, doc)` from a cursor (§74.3
+    says how to migrate); files and exports as in 0.14.0.
+
 What's still open: [ROADMAP.md](ROADMAP.md).
 
 ## License
