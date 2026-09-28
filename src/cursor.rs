@@ -40,7 +40,7 @@ enum Source<T> {
         /// serde bridge for the typed one.
         convert: fn(Document) -> crate::Result<T>,
     },
-    Collected(std::vec::IntoIter<(DocId, T)>),
+    Collected(std::vec::IntoIter<T>),
 }
 
 impl<T> Cursor<T> {
@@ -63,7 +63,7 @@ impl<T> Cursor<T> {
         }
     }
 
-    pub(crate) fn collected(results: Vec<(DocId, T)>) -> Self {
+    pub(crate) fn collected(results: Vec<T>) -> Self {
         Cursor {
             source: Source::Collected(results.into_iter()),
         }
@@ -71,9 +71,10 @@ impl<T> Cursor<T> {
 }
 
 impl<T> Iterator for Cursor<T> {
-    /// A document and its id, or the error reading it. After an error the
-    /// cursor can go on with the next document.
-    type Item = crate::Result<(DocId, T)>;
+    /// A document, or the error reading it. After an error the cursor can
+    /// go on with the next document. A document carries its id as `_id`,
+    /// as `find` returns it (SPEC §59, §74).
+    type Item = crate::Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.source {
@@ -101,7 +102,7 @@ impl<T> Iterator for Cursor<T> {
                             if let Some(n) = remaining {
                                 *n -= 1;
                             }
-                            return Some(convert(doc).map(|t| (id, t)));
+                            return Some(convert(doc));
                         }
                         Ok(Some(_)) => continue, // a candidate that doesn't match (any more)
                     }

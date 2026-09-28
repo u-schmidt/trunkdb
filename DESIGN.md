@@ -175,8 +175,10 @@ into a `DocId` [§63](spec/63-an-id-filter-and-parsing-ids.md). A `Document` has
 it as the tagged JSON an export uses (`{:#}` indented), and
 `str::parse` reads it back, for tools that work in JSON rather than
 structs; text, not `serde_json::Value`, so `serde_json` stays out of the
-public API [§71](spec/71-documents-as-json-text.md). `find_with_ids` [§23](spec/23-find-with-ids.md) is deprecated, to be
-removed before 1.0.
+public API [§71](spec/71-documents-as-json-text.md). `find_with_ids` [§23](spec/23-find-with-ids.md) is gone, and a `cursor`
+hands out `T`, as `find` does: a type that wants its id declares the
+field; one from another crate is wrapped, its fields flattened; a
+document that isn't an object has the id its insert returned [§74](spec/74-find-with-ids-removed.md).
 
 **Nesting** is limited to 64 levels, counted as MongoDB counts (the
 document is the first, each object or array inside adds one): deeper

@@ -415,34 +415,8 @@ where
             .collect()
     }
 
-    /// `find`, plus each document's id. A `T` can carry its own id in a
-    /// `#[serde(rename = "_id")] id: Option<DocId>` field, which every
-    /// read fills in (SPEC §59); this is for a `T` without one, such as a
-    /// type from another crate.
-    #[allow(deprecated)] // on the untyped one it calls
-    #[deprecated(
-        since = "0.12.0",
-        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find`, which fills it in (SPEC §59); to be removed before 1.0"
-    )]
-    pub fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, T)>> {
-        self.as_document()
-            .find_with_ids(filter)?
-            .into_iter()
-            .map(|(id, document)| Ok((id, from_document(document)?)))
-            .collect()
-    }
-
     /// The first match — see the untyped `find_one`.
     pub fn find_one(&self, filter: Filter) -> crate::Result<Option<T>> {
-        let first = self.cursor(first_only(filter))?.next().transpose()?;
-        Ok(first.map(|(_id, doc)| doc))
-    }
-
-    #[deprecated(
-        since = "0.12.0",
-        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find_one`, which fills it in (SPEC §59); to be removed before 1.0"
-    )]
-    pub fn find_one_with_id(&self, filter: Filter) -> crate::Result<Option<(DocId, T)>> {
         self.cursor(first_only(filter))?.next().transpose()
     }
 
@@ -661,24 +635,16 @@ impl Collection<Document> {
         })
     }
 
-    pub fn find(&self, filter: Filter) -> crate::Result<Vec<Document>> {
-        Ok(self
-            .matches_with_ids(&filter)?
-            .into_iter()
-            .map(|(_id, doc)| doc)
-            .collect())
-    }
-
-    /// Every match with the id of its cell: what `find`, a sorted `cursor`
-    /// and `find_with_ids` read.
+    /// Every match with the id of its cell: what `find` and a sorted
+    /// `cursor` read.
     fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
         let state = self.db.read()?;
         find_in(&state.catalog, &state.store, &self.name, filter)
     }
 
-    /// `find`, plus each document's id. An `Object` document already
-    /// carries it as `_id` (SPEC §18); this also covers the others, and
-    /// is what the typed `find_with_ids` builds on.
+    /// Every document matching `filter`. An `Object` document carries its
+    /// id as `_id` (SPEC §18, §59); a document of another kind has no
+    /// field to carry it, so its id is only what `insert` returned (§74).
     ///
     /// Reads only the documents in one secondary index's range if the
     /// filter has a condition an index can answer (see `explain`), every
@@ -691,12 +657,12 @@ impl Collection<Document> {
     /// reads that index in order instead and stops after `skip` plus
     /// `limit` matches (SPEC §34.2, §72). Equal sort values come in id
     /// order either way.
-    #[deprecated(
-        since = "0.12.0",
-        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find`, which fills it in (SPEC §59); to be removed before 1.0"
-    )]
-    pub fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, Document)>> {
-        self.matches_with_ids(&filter)
+    pub fn find(&self, filter: Filter) -> crate::Result<Vec<Document>> {
+        Ok(self
+            .matches_with_ids(&filter)?
+            .into_iter()
+            .map(|(_id, doc)| doc)
+            .collect())
     }
 
     /// The first match, reading no further than it: the first in `sort`
@@ -704,15 +670,6 @@ impl Collection<Document> {
     /// matches. With a `sort` on an indexed field this reads one index
     /// entry's worth of documents, not every match (SPEC §34.2).
     pub fn find_one(&self, filter: Filter) -> crate::Result<Option<Document>> {
-        let first = self.cursor(first_only(filter))?.next().transpose()?;
-        Ok(first.map(|(_id, doc)| doc))
-    }
-
-    #[deprecated(
-        since = "0.12.0",
-        note = "give the type a `#[serde(rename = \"_id\")] id: Option<DocId>` field and use `find_one`, which fills it in (SPEC §59); to be removed before 1.0"
-    )]
-    pub fn find_one_with_id(&self, filter: Filter) -> crate::Result<Option<(DocId, Document)>> {
         self.cursor(first_only(filter))?.next().transpose()
     }
 
@@ -753,7 +710,7 @@ impl Collection<Document> {
             let results = self.matches_with_ids(&filter)?;
             let converted = results
                 .into_iter()
-                .map(|(id, doc)| Ok((id, convert(doc)?)))
+                .map(|(_id, doc)| convert(doc))
                 .collect::<crate::Result<Vec<_>>>()?;
             return Ok(Cursor::collected(converted));
         }
@@ -801,7 +758,39 @@ impl Collection<Document> {
     }
 }
 
-/// What `find_with_ids` returns, against a catalog and store the caller
+// Each match with its id, for tests that need the id of a document they
+// didn't insert themselves, or of one that isn't an object. The public
+// `find_with_ids` and `find_one_with_id` were removed before 1.0 (SPEC §74).
+#[cfg(test)]
+impl<T: Serialize + DeserializeOwned> Collection<T> {
+    pub(crate) fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, T)>> {
+        self.as_document()
+            .matches_with_ids(&filter)?
+            .into_iter()
+            .map(|(id, document)| Ok((id, from_document(document)?)))
+            .collect()
+    }
+
+    pub(crate) fn find_one_with_id(&self, filter: Filter) -> crate::Result<Option<(DocId, T)>> {
+        Ok(self.find_with_ids(first_only(filter))?.into_iter().next())
+    }
+}
+
+#[cfg(test)]
+impl Collection<Document> {
+    pub(crate) fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, Document)>> {
+        self.matches_with_ids(&filter)
+    }
+
+    pub(crate) fn find_one_with_id(
+        &self,
+        filter: Filter,
+    ) -> crate::Result<Option<(DocId, Document)>> {
+        Ok(self.find_with_ids(first_only(filter))?.into_iter().next())
+    }
+}
+
+/// Every match with its id, against a catalog and store the caller
 /// has locked — for a read, or inside a write batch (`delete_many`).
 fn find_in(
     catalog: &Catalog,
@@ -1631,9 +1620,6 @@ fn save_current_data_page(
 }
 
 #[cfg(test)]
-// `find_with_ids` and `find_one_with_id` are deprecated (SPEC §59) but
-// work until they're removed before 1.0; these tests keep them covered.
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::database::Database;
@@ -2005,41 +1991,38 @@ mod tests {
 
     /// The sync workload prototype's blocker (SPEC §5.3): find by a field,
     /// then update by id — after a restart, with no id kept from
-    /// `insert`.
+    /// `insert`. The struct carries its id (§59), the way that replaced
+    /// `find_with_ids` (§74).
     #[test]
-    fn typed_find_with_ids_finds_updatable_ids_after_reopen() {
+    fn a_found_struct_carries_an_updatable_id_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         {
             let db = Database::open(&path).unwrap();
-            let users = db.collection::<User>("users");
-            for (name, age) in [("Ada", 36), ("Grace", 45), ("Linus", 21)] {
-                users
-                    .insert(User {
-                        name: name.to_string(),
-                        age,
-                    })
-                    .unwrap();
+            let tasks = db.collection::<Todo>("tasks");
+            for title in ["write", "test", "ship"] {
+                tasks.insert(todo(title)).unwrap();
             }
         }
 
         let db = Database::open(&path).unwrap();
-        let users = db.collection::<User>("users");
-        let found = users
-            .find_with_ids(age_filter(crate::query::Op::Gt, 30))
+        let tasks = db.collection::<Todo>("tasks");
+        let found = tasks
+            .find(Filter::new().any_of([
+                Condition::eq("title", "test"),
+                Condition::eq("title", "ship"),
+            ]))
             .unwrap();
         assert_eq!(found.len(), 2);
-        for (id, user) in &found {
-            assert_eq!(users.get(id).unwrap().as_ref(), Some(user));
+        for task in &found {
+            assert_eq!(tasks.get(&task.id.unwrap()).unwrap().as_ref(), Some(task));
         }
 
-        let (grace_id, mut grace) = found
-            .into_iter()
-            .find(|(_id, user)| user.name == "Grace")
-            .unwrap();
-        grace.age = 46;
-        assert!(users.update(&grace_id, grace.clone()).unwrap());
-        assert_eq!(users.get(&grace_id).unwrap(), Some(grace));
+        let mut ship = found.into_iter().find(|t| t.title == "ship").unwrap();
+        ship.owner = Some(DocId([7; 16]));
+        let id = ship.id.unwrap();
+        assert!(tasks.update(&id, ship.clone()).unwrap());
+        assert_eq!(tasks.get(&id).unwrap(), Some(ship));
     }
 
     /// SPEC §60: `indexes` says what each index is — its fields and
@@ -2119,6 +2102,46 @@ mod tests {
         }
     }
 
+    /// SPEC §74: a type without an id field, say from another crate, gets
+    /// one by being wrapped, its fields flattened into the wrapper's; the
+    /// stored document is the same, so the bare type still reads it.
+    #[test]
+    fn a_wrapper_gives_a_type_without_an_id_field_its_id() {
+        #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+        struct WithId {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            #[serde(flatten)]
+            user: User,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<WithId>("users");
+        users.ensure_index("age").unwrap();
+        let ada = User {
+            name: "Ada".to_string(),
+            age: 36,
+        };
+        let id = users
+            .insert(WithId {
+                id: None,
+                user: ada.clone(),
+            })
+            .unwrap();
+
+        let by_age = Filter::new().eq("age", 36);
+        let found = users.find(by_age.clone()).unwrap();
+        let streamed: Vec<WithId> = users.cursor(by_age).unwrap().map(Result::unwrap).collect();
+        let expected = WithId {
+            id: Some(id),
+            user: ada.clone(),
+        };
+        assert_eq!((found, streamed), (vec![expected.clone()], vec![expected]));
+        let bare = db.collection::<User>("users").find(Filter::new()).unwrap();
+        assert_eq!(bare, [ada]);
+    }
+
     /// Every way of reading fills the id in; `None` on insert makes one,
     /// `Some` is used; an update's id argument wins over the field.
     #[test]
@@ -2149,26 +2172,12 @@ mod tests {
             .map(|t| t.id)
             .collect();
         assert_eq!(found, [Some(chosen), Some(made)]);
-        let with_ids: Vec<Option<DocId>> = tasks
-            .find_with_ids(everything())
-            .unwrap()
-            .into_iter()
-            .map(|(id, t)| {
-                assert_eq!(t.id, Some(id));
-                t.id
-            })
-            .collect();
-        assert_eq!(with_ids, found);
         let one = tasks.find_one(Filter::new().eq("title", "made")).unwrap();
         assert_eq!(one.unwrap().id, Some(made));
         let streamed: Vec<Option<DocId>> = tasks
             .cursor(Filter::new())
             .unwrap()
-            .map(|item| {
-                let (id, todo) = item.unwrap();
-                assert_eq!(todo.id, Some(id));
-                todo.id
-            })
+            .map(|item| item.unwrap().id)
             .collect();
         assert_eq!(streamed.len(), 2);
         assert!(streamed.iter().all(Option::is_some));
@@ -2257,9 +2266,10 @@ mod tests {
     }
 
     /// Sort and limit act on the documents, and each id stays with its
-    /// own document through both.
+    /// own document through both — what `delete_many` and `update_many`
+    /// rely on to write the right ones.
     #[test]
-    fn find_with_ids_keeps_ids_paired_through_sort_and_limit() {
+    fn ids_stay_paired_through_sort_and_limit() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<User>("users");
@@ -2291,8 +2301,6 @@ mod tests {
         }
     }
 
-    /// Non-`Object` documents have no `_id` field (SPEC §18) — their ids
-    /// are only available this way.
     /// SPEC §71: a tool that only speaks JSON text — inserts it, reads
     /// it, edits it, writes it back — through `Collection<Document>`.
     #[test]
@@ -2332,26 +2340,28 @@ mod tests {
         assert_eq!(got.to_string(), text);
     }
 
+    /// Non-`Object` documents have no `_id` field (SPEC §18): `find`
+    /// returns them as stored, and their ids are what `insert` returned,
+    /// for `get`, `update` and `delete` (§74).
     #[test]
-    fn untyped_find_with_ids_covers_non_object_documents() {
+    fn non_object_documents_are_found_without_ids() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let values = db.collection::<Document>("values");
         let a = values.insert(Document::Int(1)).unwrap();
         let b = values.insert(Document::String("two".to_string())).unwrap();
 
-        let mut found = values.find_with_ids(Filter::default()).unwrap();
-        found.sort_by_key(|(id, _doc)| *id);
-        let mut expected = vec![
-            (a, Document::Int(1)),
-            (b, Document::String("two".to_string())),
-        ];
-        expected.sort_by_key(|(id, _doc)| *id);
-        assert_eq!(found, expected);
+        let found = values.find(Filter::new()).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&Document::Int(1)));
+        assert!(found.contains(&Document::String("two".to_string())));
+        assert_eq!(values.get(&a).unwrap(), Some(Document::Int(1)));
+        assert!(values.update(&b, Document::Bool(true)).unwrap());
+        assert_eq!(values.get(&b).unwrap(), Some(Document::Bool(true)));
 
         assert!(
             db.collection::<Document>("never_created")
-                .find_with_ids(Filter::default())
+                .find(Filter::new())
                 .unwrap()
                 .is_empty()
         );
@@ -4087,15 +4097,15 @@ mod tests {
         assert_eq!(seventh.map(|u| u.age), Some(7));
 
         // An unsorted cursor streams, and passes over the first matches.
-        let all: Vec<DocId> = users
+        let all: Vec<i64> = users
             .cursor(under_ten.clone())
             .unwrap()
-            .map(|r| r.unwrap().0)
+            .map(|r| r.unwrap().age)
             .collect();
-        let rest: Vec<DocId> = users
+        let rest: Vec<i64> = users
             .cursor(under_ten.clone().skip(3).limit(4))
             .unwrap()
-            .map(|r| r.unwrap().0)
+            .map(|r| r.unwrap().age)
             .collect();
         assert_eq!((all.len(), &rest[..]), (10, &all[3..7]));
 
@@ -4317,7 +4327,18 @@ mod tests {
                 .cursor(f.clone())
                 .unwrap()
                 .collect::<crate::Result<Vec<_>>>();
-            let mut streamed = ids(streamed.unwrap());
+            // A cursor hands out documents, each with its `_id` (SPEC §74).
+            let mut streamed: Vec<DocId> = streamed
+                .unwrap()
+                .iter()
+                .map(|doc| match doc {
+                    Document::Object(fields) => match fields["_id"] {
+                        Document::Id(id) => id,
+                        _ => panic!("no id in {doc}"),
+                    },
+                    _ => panic!("not an object: {doc}"),
+                })
+                .collect();
             if f.sort.is_empty() {
                 expected.sort();
                 found.sort();
@@ -4704,7 +4725,7 @@ mod tests {
         let reads = records_read(|| found = cars.find(some.clone()).unwrap());
         assert_eq!((&found[..], reads), (&[car(250), car(7)][..], 2));
         let streamed = cars.cursor(some.clone()).unwrap();
-        let streamed = streamed.map(|r| r.map(|(_id, car)| car.seats));
+        let streamed = streamed.map(|r| r.map(|car| car.seats));
         assert_eq!(
             streamed.collect::<crate::Result<Vec<_>>>().unwrap(),
             [250, 7]
@@ -6204,7 +6225,7 @@ mod tests {
             .collect(); // _id order: Ada, Grace, Alan, Edsger
 
         let mut cursor = users.cursor(over_40.clone()).unwrap();
-        assert_eq!(cursor.next().unwrap().unwrap(), (ids[1], user("Grace", 45)));
+        assert_eq!(cursor.next().unwrap().unwrap(), user("Grace", 45));
 
         assert!(users.delete(&ids[2]).unwrap()); // Alan: gone before he's read
         assert!(users.update(&ids[3], user("Edsger", 39)).unwrap()); // no longer matches
@@ -6226,7 +6247,7 @@ mod tests {
         let ages: Vec<i64> = users
             .cursor(by_age(SortOrder::Desc))
             .unwrap()
-            .map(|result| result.unwrap().1.age)
+            .map(|result| result.unwrap().age)
             .collect();
         assert_eq!(ages, [72, 45, 41, 36]);
     }

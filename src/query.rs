@@ -447,7 +447,7 @@ impl Filter {
     }
 
     /// `apply` for items that carry a document rather than being one —
-    /// e.g. `(DocId, Document)` pairs, so `find_with_ids` keeps each id
+    /// e.g. `(DocId, Document)` pairs, so `delete_many` keeps each id
     /// with its document through filtering, sorting and limiting.
     pub fn apply_to<T>(
         &self,

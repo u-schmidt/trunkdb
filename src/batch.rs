@@ -128,9 +128,6 @@ impl Batch {
 }
 
 #[cfg(test)]
-// `find_with_ids` and `find_one_with_id` are deprecated (SPEC §59) but
-// work until they're removed before 1.0; these tests keep them covered.
-#[allow(deprecated)]
 mod tests {
     use crate::query::{Condition, Filter, Op};
     use crate::{Database, DocId, Document, Error};

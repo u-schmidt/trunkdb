@@ -34,6 +34,7 @@ All of it is done:
 | 0.14.0 | Shared pages: the page cache hands out its page (`Page`, an `Arc`) instead of a copy, and a change copies it first; the cache behind an `RwLock`, looked up under its read lock; one reader 30% faster, four 3.2 times one; a page's layout checked once, as it enters the cache or its batch commits; `write_page` takes the `Page`, so a change copies a page once, and compaction is 11% faster; update operators, `update_fields` with `Update::new().set(..).inc(..).unset(..)` on dotted paths, and `Error::Update`; a date-time type, `Document::DateTime`, what a `SystemTime` field stores, to the nanosecond, compared, sorted and indexed in time order, `{"$date": ...}` in export format 2 — file format 11, which still opens 6–10 | §64–§69 |
 | 0.15.0 | `Document::DateTime` holds `trunkdb::DateTime` instead of a `SystemTime` (breaking), the same on every platform over an `i64` of seconds; `DateTime` fields, times before 1970 included; `ParseDateTimeError` | §70 |
 | 0.16.0 | Documents as JSON text: `Display` and `FromStr` for `Document`, tagged JSON as an export writes it, and `ParseDocumentError`; `Filter::skip`, for paging with `limit`, read through an index only as far as skip plus limit; more update operators, `min`, `max`, `rename`, and `push`, `add_to_set` and `pull` on arrays | §71–§73 |
+| next | `find_with_ids` and `find_one_with_id` removed, typed and untyped, and a `cursor` handing out `T` instead of `(DocId, T)` (breaking); the id from the type's `_id` field, a wrapper with `#[serde(flatten)]` for a type from another crate | §74 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -61,10 +62,9 @@ documents, data pages and the header are the expensive ones.
   touch the file.
 
 **API questions: cheap now, breaking after 1.0**
-- **Remove `find_with_ids` and `find_one_with_id`**, deprecated since
-  0.12.0 (§59.4), and let `cursor` hand out `T` instead of `(DocId, T)`,
-  like `find`. Document how a type without an id field, or a document
-  that isn't an object, gets its id then (a wrapping struct; `get`).
+- Done in §74: `find_with_ids` and `find_one_with_id` removed, and
+  `cursor` handing out `T`, like `find`; a type without an id field
+  wrapped, a document that isn't an object read by `get`.
 - Done in §60: the internals private, `Error`, `Document` and the
   reports `#[non_exhaustive]`, `IndexOptions` with builder methods.
 

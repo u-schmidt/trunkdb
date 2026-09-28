@@ -84,3 +84,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 71. [Documents as JSON text (`document.rs`, `json.rs`)](71-documents-as-json-text.md)
 72. [Skip, for paging (`query.rs`, `collection.rs`, `cursor.rs`)](72-skip-for-paging.md)
 73. [More update operators (`update.rs`)](73-more-update-operators.md)
+74. [`find_with_ids` removed, and a cursor of `T` (`collection.rs`, `cursor.rs`)](74-find-with-ids-removed.md)

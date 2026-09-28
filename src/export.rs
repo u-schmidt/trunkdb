@@ -355,9 +355,6 @@ fn write_line(out: &mut impl Write, value: &Value) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-// `find_with_ids` and `find_one_with_id` are deprecated (SPEC §59) but
-// work until they're removed before 1.0; these tests keep them covered.
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::document::{DocId, Document};
