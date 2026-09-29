@@ -22,4 +22,7 @@ pub trait Durability {
     /// Marks every batch logged so far as durably reflected in the main
     /// file — safe to forget, since replaying it is no longer necessary.
     fn checkpoint(&mut self) -> std::io::Result<()>;
+    /// How many bytes the log holds now, header included: what `open`
+    /// would have to read back after a crash (SPEC §76).
+    fn len(&self) -> u64;
 }
