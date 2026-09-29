@@ -398,6 +398,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     updates leave in older data pages, fullest page first, so a
     collection deleting and inserting as much stops growing; in memory,
     learned from writes, no format change.
+50. **A WAL size limit** (§76): `OpenOptions::checkpoint_wal_bytes`
+    writes back once the WAL is that long, twice `checkpoint_pages`
+    pages' bytes unless set, so commits that keep changing the same few
+    pages cannot grow it without bound; no format change.
 
     Items 48–49 → 0.17.0: breaking for code that calls `find_with_ids`
     or `find_one_with_id`, or takes `(id, doc)` from a cursor (§74.3

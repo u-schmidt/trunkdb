@@ -77,6 +77,11 @@ impl Trunk {
         if let Ok(pages) = std::env::var("BENCH_TRUNKDB_CHECKPOINT_PAGES") {
             options = options.checkpoint_pages(pages.parse().unwrap());
         }
+        // And twice that many pages' bytes of WAL unless
+        // `BENCH_TRUNKDB_CHECKPOINT_WAL_MB` says.
+        if let Ok(mb) = std::env::var("BENCH_TRUNKDB_CHECKPOINT_WAL_MB") {
+            options = options.checkpoint_wal_bytes(mb.parse::<u64>().unwrap() << 20);
+        }
         let db = Database::open_with(&path, options).unwrap();
         let tasks = db.collection::<Task>("tasks");
         tasks.ensure_index("tenant").unwrap();

@@ -57,6 +57,9 @@ pub(crate) struct State {
     /// `OpenOptions::checkpoint_pages`, as of `open_with`: how many
     /// committed pages may wait before a commit writes them back.
     checkpoint_pages: usize,
+    /// `OpenOptions::checkpoint_wal_bytes`, with its default worked out:
+    /// how long the WAL may grow before a commit writes back.
+    checkpoint_wal_bytes: u64,
 }
 
 /// How `Database::open_with` opens a database. Made with
@@ -67,6 +70,7 @@ pub(crate) struct State {
 pub struct OpenOptions {
     cache_size: usize,
     checkpoint_pages: usize,
+    checkpoint_wal_bytes: Option<u64>,
 }
 
 impl Default for OpenOptions {
@@ -74,6 +78,7 @@ impl Default for OpenOptions {
         OpenOptions {
             cache_size: crate::storage::DEFAULT_CACHE_SIZE,
             checkpoint_pages: DEFAULT_CHECKPOINT_PAGES,
+            checkpoint_wal_bytes: None,
         }
     }
 }
@@ -90,10 +95,22 @@ impl OpenOptions {
     /// Once this many committed pages wait, a commit writes them back to
     /// the file (SPEC §51, §53); 0 or 1 writes them back after every
     /// commit. More: fewer writes, but more memory (8 KB a page) and a
-    /// WAL that grows with every commit, not with this number, which the
-    /// next open after a crash reads back whole (§53.3). Default: 1,000.
+    /// WAL that grows with every commit, not with this number (§53.3);
+    /// `checkpoint_wal_bytes` bounds that. Default: 1,000.
     pub fn checkpoint_pages(mut self, pages: usize) -> Self {
         self.checkpoint_pages = pages;
+        self
+    }
+
+    /// Once the WAL is this many bytes long, a commit writes the waiting
+    /// pages back and empties it, even if fewer than `checkpoint_pages`
+    /// wait (SPEC §76): commits that change the same few pages again and
+    /// again add a page image to the WAL each time, and the next open
+    /// after a crash reads all of it back. Checked after a commit, so one
+    /// large commit can take the WAL past it. Default: twice the bytes of
+    /// `checkpoint_pages` pages, 16 MB at 1,000; raise both together.
+    pub fn checkpoint_wal_bytes(mut self, bytes: u64) -> Self {
+        self.checkpoint_wal_bytes = Some(bytes);
         self
     }
 }
@@ -221,6 +238,9 @@ impl Database {
                     durability,
                     poisoned: false,
                     checkpoint_pages: options.checkpoint_pages,
+                    checkpoint_wal_bytes: options.checkpoint_wal_bytes.unwrap_or(
+                        2 * options.checkpoint_pages as u64 * crate::storage::PAGE_SIZE as u64,
+                    ),
                 }),
                 id_gen: UuidV7Generator,
                 txn: GlobalLockTxnManager::default(),
@@ -338,7 +358,8 @@ impl Database {
     /// 4. **commit** — the pages become the newest committed ones, read
     ///    from memory; the main file isn't touched.
     /// 5. **checkpoint**, once `OpenOptions::checkpoint_pages` or more are
-    ///    waiting (default 1,000): write them back to the main file,
+    ///    waiting (default 1,000) or the WAL has reached
+    ///    `OpenOptions::checkpoint_wal_bytes` (SPEC §76): write them back to the main file,
     ///    `fsync`, truncate the WAL.
     ///
     /// A crash before 3 completes leaves the state before; a crash after
@@ -391,7 +412,9 @@ impl Database {
 
         // The batch is durable from here on: the WAL holds all its pages.
         state.store.commit();
-        if state.store.unwritten_pages() >= state.checkpoint_pages {
+        if state.store.unwritten_pages() >= state.checkpoint_pages
+            || state.durability.len() >= state.checkpoint_wal_bytes
+        {
             // Not an error for this batch if it fails: it's durable, and
             // reads find its pages in memory. The next one tries again.
             let _ = state.checkpoint();
@@ -420,7 +443,7 @@ mod tests {
     use super::*;
     use crate::document::{DocId, Document};
     use crate::query::Filter;
-    use crate::storage::PageType;
+    use crate::storage::{PAGE_SIZE, PageType};
     use crate::txn::WriteOp;
     use serde::{Deserialize, Serialize};
 
@@ -778,7 +801,6 @@ mod tests {
     /// §40.4). The same mismatch with nothing to recover is damage.
     #[test]
     fn a_header_torn_by_a_crash_is_recovered_from_the_wal() {
-        use crate::storage::PAGE_SIZE;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         drop(Database::open(&path).unwrap());
@@ -984,6 +1006,57 @@ mod tests {
         assert_eq!(pages_waiting_after_one_commit(just_enough), 0);
         let one_short = options.checkpoint_pages(waiting + 1);
         assert_eq!(pages_waiting_after_one_commit(one_short), waiting);
+    }
+
+    /// Commits that keep changing the same few pages leave few distinct
+    /// pages waiting but a WAL that grows with every commit. Returns the
+    /// WAL's longest length over 200 such commits, and how many pages
+    /// waited at the end.
+    fn hot_page_wal_peak(options: OpenOptions) -> (u64, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open_with(&path, options).unwrap();
+        let first = Document::String("first".into());
+        db.write_batch(vec![WriteOp::Insert("docs".into(), DocId([1; 16]), first)])
+            .unwrap();
+        let mut peak = 0;
+        for i in 0..200u32 {
+            let doc = Document::String(format!("value {i}"));
+            db.write_batch(vec![WriteOp::Update("docs".into(), DocId([1; 16]), doc)])
+                .unwrap();
+            peak = peak.max(wal_len(&path));
+        }
+        let waiting = db.state().store.unwritten_pages();
+        (peak, waiting)
+    }
+
+    /// `OpenOptions::checkpoint_wal_bytes` bounds the WAL when the page
+    /// threshold never fires (SPEC §76).
+    #[test]
+    fn checkpoint_wal_bytes_bounds_the_wal_when_few_pages_change() {
+        let many_pages = OpenOptions::default().checkpoint_pages(1_000_000);
+        // Without the guard, 200 commits of the same page: 200 images.
+        let (unbounded, waiting) = hot_page_wal_peak(many_pages.checkpoint_wal_bytes(u64::MAX));
+        assert!(unbounded > 200 * PAGE_SIZE as u64, "{unbounded}");
+        assert!(waiting > 0);
+
+        // A limit of 20 page images: the commit that reaches it empties
+        // the WAL, so it is seen only just under the limit.
+        let limit = 20 * PAGE_SIZE as u64;
+        let (peak, _) = hot_page_wal_peak(many_pages.checkpoint_wal_bytes(limit));
+        assert!(peak < limit, "{peak}");
+        assert!(peak > limit / 2, "{peak}");
+    }
+
+    /// Unset, the limit is twice the bytes of `checkpoint_pages` pages: at
+    /// 5 pages, 10 page images, so 200 commits of one page checkpoint.
+    #[test]
+    fn checkpoint_wal_bytes_defaults_to_twice_the_page_threshold() {
+        let options = OpenOptions::default().checkpoint_pages(5);
+        let (peak, _) = hot_page_wal_peak(options);
+        assert!(peak < 40 * PAGE_SIZE as u64, "{peak}");
+        let explicit = options.checkpoint_wal_bytes(u64::MAX);
+        assert!(hot_page_wal_peak(explicit).0 > 200 * PAGE_SIZE as u64);
     }
 
     /// Enough waiting pages, and the commit writes them back itself.

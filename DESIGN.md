@@ -128,7 +128,8 @@ A write batch goes through five steps under the write lock
 4. **Commit.** The pages become the newest committed ones. Reads find
    them in memory; the main file isn't touched.
 5. **Checkpoint**, once `checkpoint_pages` or more committed pages
-   wait (default 1,000, an `OpenOptions` setting) [§53](spec/53-a-configurable-checkpoint-threshold.md): write them to
+   wait (default 1,000, an `OpenOptions` setting) [§53](spec/53-a-configurable-checkpoint-threshold.md), or the WAL
+   reaches `checkpoint_wal_bytes` (default twice that many pages' bytes) [§76](spec/76-a-wal-size-limit.md): write them to
    the main file, `fsync`, truncate the WAL.
 
 A crash before step 3 finishes leaves the state before the batch; a
@@ -331,7 +332,7 @@ more than four.
 ## 10. The API
 
 - `Database::open(path)`, or `open_with(path, OpenOptions)` with
-  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md).
+  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) and `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md).
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
   `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md);
   `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);

@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 /// only some of its pages on disk (SPEC §19.1).
 pub struct WalDurability {
     file: File,
+    /// The file's length as of the last `log` or `checkpoint`.
+    len: u64,
 }
 
 /// Every non-empty WAL file starts with this: magic, then a `u32` format
@@ -180,7 +182,8 @@ impl WalDurability {
         file.read_to_end(&mut bytes)?;
         let pending = decode_pending(&bytes)?;
 
-        Ok((Self { file }, pending))
+        let len = bytes.len() as u64;
+        Ok((Self { file, len }, pending))
     }
 }
 
@@ -196,13 +199,21 @@ impl Durability for WalDurability {
         }
         bytes.extend_from_slice(&encode_record(pages));
         self.file.write_all(&bytes)?;
-        crate::storage::sync(&self.file)
+        crate::storage::sync(&self.file)?;
+        self.len = end + bytes.len() as u64;
+        Ok(())
     }
 
     fn checkpoint(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
-        crate::storage::sync(&self.file)
+        crate::storage::sync(&self.file)?;
+        self.len = 0;
+        Ok(())
+    }
+
+    fn len(&self) -> u64 {
+        self.len
     }
 }
 

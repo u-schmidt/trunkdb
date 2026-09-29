@@ -116,9 +116,10 @@ limit is described.
   100,000 documents (§52.3) makes that less pressing.
 - Batched writes, still about 2× behind: nearly every batch of 1,000
   crosses the default checkpoint threshold once the indexes are large.
-  `OpenOptions::checkpoint_pages` can raise it (§53), but the WAL then
-  grows with every commit, not with the threshold: a second trigger, on
-  the WAL's size, would make a large value reasonable (§53.3).
+  `OpenOptions::checkpoint_pages` can raise it (§53); the WAL's size
+  is bounded by `checkpoint_wal_bytes` (§76), so a large value is now
+  reasonable. Its default is still 1,000 pages, to be raised only with
+  a benchmark of more workloads than one.
 
 **Concurrency**
 - Readers that run in parallel past four: four do 3.2 times the work
