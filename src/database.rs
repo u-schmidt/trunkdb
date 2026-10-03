@@ -637,8 +637,8 @@ mod tests {
             CrashPoint::DuringApply | CrashPoint::AfterLog => {}
             CrashPoint::MidWriteBack { pages_written } => {
                 assert!(pages_written < page_count, "that's not mid-write-back");
-                store.failing_write_backs = 1;
-                store.write_back_fails_after = pages_written;
+                store.pages.failing_write_backs = 1;
+                store.pages.write_back_fails_after = pages_written;
                 store.write_back().unwrap_err();
             }
             CrashPoint::BeforeCheckpoint => store.write_back().unwrap(),
@@ -1117,7 +1117,7 @@ mod tests {
         let db = Database::open(&path).unwrap();
 
         db.write_batch(two_collection_batch()).unwrap();
-        db.state().store.failing_write_backs = 1;
+        db.state().store.pages.failing_write_backs = 1;
         assert!(db.checkpoint().is_err());
         assert_two_collection_batch_present(&db);
         assert!(wal_len(&path) > 0, "the WAL still holds the batch");
@@ -1155,8 +1155,8 @@ mod tests {
             {
                 let mut state = db.state();
                 assert!(state.store.unwritten_pages() > fails_after);
-                state.store.failing_write_backs = 2;
-                state.store.write_back_fails_after = fails_after;
+                state.store.pages.failing_write_backs = 2;
+                state.store.pages.write_back_fails_after = fails_after;
             }
             assert!(db.checkpoint().is_err());
             drop(db);
@@ -1182,7 +1182,7 @@ mod tests {
         let db = Database::open(&path).unwrap();
 
         db.write_batch(two_collection_batch()).unwrap();
-        db.state().store.failing_write_backs = 2;
+        db.state().store.pages.failing_write_backs = 2;
         assert!(db.checkpoint().is_err());
         assert_two_collection_batch_present(&db);
         drop(db);
@@ -1235,8 +1235,8 @@ mod tests {
                 wal.log(&pages).unwrap();
                 drop(pages);
                 if pages_written < page_count {
-                    store.failing_write_backs = 1;
-                    store.write_back_fails_after = pages_written;
+                    store.pages.failing_write_backs = 1;
+                    store.pages.write_back_fails_after = pages_written;
                     store.write_back().unwrap_err();
                 } else {
                     store.write_back().unwrap();

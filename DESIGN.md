@@ -34,7 +34,7 @@ them are real now; `InMemoryIndex` remains, for tests.
 
 | Layer | Trait | Implementation | Code |
 |---|---|---|---|
-| Pages | `PageStore` | `FileStore`: the file, checksums, the page cache, staged and committed pages | `storage/` |
+| Pages | `PageStore` | `FileStore`: the writer's staged pages and header, over `Pages`: the file, checksums, the page cache and the committed pages [§77](spec/77-the-committed-pages-apart-from-the-writers.md) | `storage/` |
 | Documents | — | the `Document` enum, its byte encoding, the serde bridge, tagged JSON | `document.rs`, `serde_bridge.rs`, `json.rs`, `decode.rs` |
 | Ids | `IdGenerator` | `UuidV7Generator` | `id.rs` |
 | Indexes | `Index` | `BTreeIndex`, for the primary index and every secondary one | `index/` |
@@ -313,14 +313,20 @@ shared, not copied: a read gets the cache's page (`Page`, an `Arc`),
 and a change copies it first, so the cache's stays as it was [§64](spec/64-shared-pages.md). There is
 one writer at a time, and one process per file.
 
-**Snapshot reads are deferred, not rejected** [§57](spec/57-concurrency.md). Readers that
-don't wait for writers (as in SQLite's WAL mode, LiteDB 5 or redb) aren't
-needed by anything measured yet, and they'd live below `PageStore`, so
-features above it don't make them harder. To keep them possible, the
-storage layer follows six rules. The one to know first: **a freed page
-isn't reused while a reader could still need its old contents**. It
-costs nothing today, since no reader overlaps a commit, but the
-free-space map [§75](spec/75-a-free-space-map.md) and any other change to allocation must keep it.
+**Snapshot reads are planned** [§77](spec/77-the-committed-pages-apart-from-the-writers.md), in six steps, the
+first done. §57 deferred them until a workload asked: many small writes
+beside reads of up to 15 seconds, and one state across several calls,
+now do. They live below `PageStore` and in memory only: a reader pins
+the commit it started at, and a page read takes the newest version at
+or before it. So far the committed pages are apart from the writer's
+(`Pages`, and `FileStore`'s staging), and commits are numbered; readers
+still wait for a write, as above.
+
+The six rules of [§57.3](spec/57-concurrency.md) still bind every change to storage, with two
+notes from §77: a freed page needs no tag, since freeing and reusing it
+are just newer versions of that page; and a checkpoint will write the
+newest version always, older ones staying in memory for the readers
+that need them, instead of waiting for those readers.
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
 once or ten times a second costs readers nothing measurable; one that
