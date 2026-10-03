@@ -78,21 +78,67 @@ impl Pages {
         &self.file
     }
 
-    /// A committed page's bytes: from the pages not written back, then
-    /// the cache, then the file — and keeps a page read from the file in
-    /// the cache, its layout checked (SPEC §66). Shared wherever it comes
-    /// from, never copied (SPEC §64): the cache's lock is held for the
-    /// lookup only. No bounds check — callers do that.
+    /// The newest committed version of a page: from the pages not
+    /// written back, then the cache, then the file. What the writer
+    /// reads where its batch hasn't changed a page. Shared wherever it
+    /// comes from, never copied (SPEC §64). No bounds check — callers do
+    /// that.
     pub(super) fn read(&self, id: PageId) -> io::Result<Page> {
-        if let Some(version) = self.versions.get(&id) {
-            return Ok(version.page.clone());
+        match self.versions.get(&id) {
+            Some(version) => Ok(version.page.clone()),
+            None => self.read_written(id),
         }
+    }
+
+    /// A page as of commit `seq` (SPEC §78): what a snapshot reads. The
+    /// version waiting for a checkpoint if that commit or an earlier one
+    /// wrote it, otherwise the file's.
+    ///
+    /// A version from a later commit is an error: the one before it is
+    /// gone, since only the newest is kept. No reader meets that while
+    /// reads and commits exclude each other (§27); §80 keeps the older
+    /// versions a snapshot still needs. No bounds check — callers do
+    /// that.
+    pub(super) fn read_at(&self, id: PageId, seq: u64) -> io::Result<Page> {
+        match self.versions.get(&id) {
+            Some(version) if version.seq <= seq => Ok(version.page.clone()),
+            Some(version) => Err(io::Error::other(format!(
+                "snapshot too old: page {id} as of commit {seq} is gone, commit {} changed it",
+                version.seq
+            ))),
+            None => self.read_written(id),
+        }
+    }
+
+    /// A page the file holds the newest version of: from the cache, or
+    /// the file — and keeps a page read from the file in the cache, its
+    /// layout checked (SPEC §66). The cache's lock is held for the lookup
+    /// only.
+    fn read_written(&self, id: PageId) -> io::Result<Page> {
         if let Some(page) = self.cache().get(id) {
             return Ok(page);
         }
         let page = read_page_at(&self.file, id)?.checked();
         self.cache_mut().put(id, page.clone());
         Ok(page)
+    }
+
+    /// The pages among the first `page_count` whose checksum doesn't
+    /// match their bytes on disk, in id order — what a disk error or a
+    /// change from outside trunkdb leaves. Reads the file itself. Pages
+    /// not written back yet are skipped: the WAL holds them, and the
+    /// file's copy is older or missing (SPEC §51).
+    pub(super) fn damaged(&self, page_count: u64) -> io::Result<Vec<PageId>> {
+        let mut damaged = Vec::new();
+        for id in 0..page_count {
+            if self.versions.contains_key(&id) {
+                continue;
+            }
+            if !checksum_matches(id, &read_disk_page(&self.file, id)?) {
+                damaged.push(id);
+            }
+        }
+        Ok(damaged)
     }
 
     /// Writes a page straight to the file, and the cache: for a store
@@ -122,7 +168,6 @@ impl Pages {
     }
 
     /// The number of the last commit.
-    #[cfg(test)]
     pub(super) fn seq(&self) -> u64 {
         self.seq
     }
@@ -137,12 +182,6 @@ impl Pages {
     /// How many committed pages wait for `checkpoint`.
     pub(super) fn unwritten(&self) -> usize {
         self.versions.len()
-    }
-
-    /// Whether page `id` waits for `checkpoint`: the WAL holds it, and
-    /// the file's copy is older or missing.
-    pub(super) fn is_unwritten(&self, id: PageId) -> bool {
-        self.versions.contains_key(&id)
     }
 
     /// Writes every committed page not written back yet to the file,

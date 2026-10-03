@@ -208,8 +208,9 @@ the first of a chain of overflow pages [§26](spec/26-overflow-pages-and-u32-len
 **The catalog** (page 1) holds a cell per collection (its primary
 index root, its current data page, its name) and one per index (its
 fields, root and flags: unique, sparse) [§9](spec/09-catalog.md) [§28](spec/28-secondary-indexes.md) [§44](spec/44-sparse-indexes.md). It's read at
-open and kept in memory; a batch that fails restores the copy it
-started with.
+open and kept in memory, one per commit: a batch works on a copy of
+its own, which becomes the readers' at commit and is dropped if the
+batch fails [§78](spec/78-reads-through-a-snapshot.md).
 
 ## 7. Indexes
 
@@ -318,9 +319,17 @@ first done. §57 deferred them until a workload asked: many small writes
 beside reads of up to 15 seconds, and one state across several calls,
 now do. They live below `PageStore` and in memory only: a reader pins
 the commit it started at, and a page read takes the newest version at
-or before it. So far the committed pages are apart from the writer's
-(`Pages`, and `FileStore`'s staging), and commits are numbered; readers
-still wait for a write, as above.
+or before it. So far:
+
+- the committed pages are apart from the writer's (`Pages`, and
+  `FileStore`'s staging), and commits are numbered [§77](spec/77-the-committed-pages-apart-from-the-writers.md);
+- every read goes through a snapshot: the last commit's catalog, and
+  its pages through a read-only `PageStore` (`SnapshotStore`). The read
+  lock's guard gives out nothing else, so a read can't reach the store
+  where a batch is staged [§78](spec/78-reads-through-a-snapshot.md).
+
+Readers still wait for a write, as above, and the snapshot is always
+the last commit: one version per page is kept.
 
 The six rules of [§57.3](spec/57-concurrency.md) still bind every change to storage, with two
 notes from §77: a freed page needs no tag, since freeing and reusing it

@@ -133,9 +133,10 @@ limit is described.
   §77's plan.
 - Snapshot reads (MVCC): reopened and planned in §77, for many small
   writes beside long reads, and one state across several calls. Six
-  steps, §77 to §82; §77 is done (the committed pages apart from the
-  writer's, commits numbered, nothing visible). Next, §78: every read
-  through a snapshot, still under the one lock. They also stop an
+  steps, §77 to §82. Done, with nothing visible yet: §77 (the committed
+  pages apart from the writer's, commits numbered) and §78 (every read
+  through a snapshot, under the one lock). Next, §79: a lock for
+  writers only, so readers stop waiting for commits. They also stop an
   export from blocking writers (§30.6).
 
 **API**

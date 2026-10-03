@@ -5,7 +5,7 @@ use crate::data;
 use crate::durability::{Durability, WalDurability};
 use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
-use crate::storage::{FileStore, PageId};
+use crate::storage::{Commit, FileStore, PageId, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
 use std::path::Path;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -48,7 +48,9 @@ struct Shared {
 /// come from.
 pub(crate) struct State {
     pub(crate) store: FileStore,
-    pub(crate) catalog: Catalog,
+    /// The last commit, as readers see it (SPEC §78): its pages and its
+    /// catalog. Replaced by every commit, never changed.
+    current: Snapshot,
     durability: WalDurability,
     /// Set when a batch was durably logged but couldn't be written to the
     /// main file, even on retry — see `write_batch`. From then on every
@@ -60,6 +62,53 @@ pub(crate) struct State {
     /// `OpenOptions::checkpoint_wal_bytes`, with its default worked out:
     /// how long the WAL may grow before a commit writes back.
     checkpoint_wal_bytes: u64,
+}
+
+/// One committed state of the database (SPEC §78): a commit of the
+/// pages, and the catalog as that commit left it. Shared, not copied: a
+/// clone is the same snapshot.
+#[derive(Clone)]
+pub(crate) struct Snapshot(Arc<SnapshotInner>);
+
+struct SnapshotInner {
+    commit: Commit,
+    catalog: Catalog,
+}
+
+impl Snapshot {
+    fn new(commit: Commit, catalog: Catalog) -> Self {
+        Snapshot(Arc::new(SnapshotInner { commit, catalog }))
+    }
+
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.0.catalog
+    }
+}
+
+/// What a read works with (SPEC §78): a snapshot's catalog, and the
+/// pages as of its commit. Everything a reader sees comes through these
+/// two (rule 4 of §57.3).
+pub(crate) struct Reading<'a> {
+    pub(crate) catalog: &'a Catalog,
+    pub(crate) store: SnapshotStore<'a>,
+}
+
+/// The read lock, held (SPEC §27), giving out the last commit only:
+/// `State`'s store is the writer's, and private to it here, so no read
+/// path can go past the snapshot by mistake (SPEC §78).
+pub(crate) struct ReadGuard<'a>(RwLockReadGuard<'a, State>);
+
+impl ReadGuard<'_> {
+    /// The last commit, to read: its catalog and its pages.
+    pub(crate) fn snapshot(&self) -> Reading<'_> {
+        self.0.snapshot()
+    }
+
+    /// The catalog as of the last commit: `snapshot`'s, for a read that
+    /// needs no pages.
+    pub(crate) fn catalog(&self) -> &Catalog {
+        self.0.current.catalog()
+    }
 }
 
 /// How `Database::open_with` opens a database. Made with
@@ -121,6 +170,21 @@ impl OpenOptions {
 const DEFAULT_CHECKPOINT_PAGES: usize = 1000;
 
 impl State {
+    /// The last commit, to read: its catalog and its pages. A batch being
+    /// staged is not in it.
+    pub(crate) fn snapshot(&self) -> Reading<'_> {
+        Reading {
+            catalog: self.current.catalog(),
+            store: self.store.at(self.current.0.commit),
+        }
+    }
+
+    /// The catalog as of the last commit.
+    #[cfg(test)]
+    pub(crate) fn catalog(&self) -> &Catalog {
+        self.current.catalog()
+    }
+
     /// `Database::checkpoint`: the pages to the file, then the WAL
     /// emptied — only after they're durably in the file. If the WAL can't
     /// be emptied, its records are written back once more at the next
@@ -229,12 +293,13 @@ impl Database {
             store.write_back()?;
             durability.checkpoint()?;
         }
+        let current = Snapshot::new(store.last_commit(), catalog);
 
         Ok(Self {
             inner: Arc::new(Shared {
                 state: RwLock::new(State {
                     store,
-                    catalog,
+                    current,
                     durability,
                     poisoned: false,
                     checkpoint_pages: options.checkpoint_pages,
@@ -299,7 +364,10 @@ impl Database {
     /// `write_batch`), or a thread panicked in the middle of one — which
     /// poisons the lock and may have left the store staging (SPEC §27.3).
     /// Every public entry point goes through this or `write`.
-    pub(crate) fn read(&self) -> crate::Result<RwLockReadGuard<'_, State>> {
+    ///
+    /// What comes back is the last commit and nothing else (SPEC §78):
+    /// a read can't reach the store, where a batch may be staged.
+    pub(crate) fn read(&self) -> crate::Result<ReadGuard<'_>> {
         let state = self
             .inner
             .state
@@ -308,7 +376,7 @@ impl Database {
         if state.poisoned {
             return Err(crate::Error::Poisoned);
         }
-        Ok(state)
+        Ok(ReadGuard(state))
     }
 
     /// Exclusive access for a write batch; poisoned as for `read`.
@@ -350,13 +418,14 @@ impl Database {
     /// The protocol (SPEC §19.3):
     /// 1. **stage** — `FileStore::begin`; every page write from here on
     ///    stays in memory.
-    /// 2. **apply**. On error: roll back the staged pages *and* the
-    ///    catalog cache, and return the error — nothing of it ever
-    ///    reached the file, so there's nothing else to undo.
+    /// 2. **apply**, to the staged pages and a catalog of the batch's
+    ///    own. On error: drop both, and return the error — nothing of it
+    ///    ever reached the file or a reader, so there's nothing to undo.
     /// 3. **log** every changed page to the WAL as one record, `fsync` —
     ///    the one flush a commit waits for (SPEC §51).
     /// 4. **commit** — the pages become the newest committed ones, read
-    ///    from memory; the main file isn't touched.
+    ///    from memory, and with the batch's catalog the snapshot readers
+    ///    get (SPEC §78); the main file isn't touched.
     /// 5. **checkpoint**, once `OpenOptions::checkpoint_pages` or more are
     ///    waiting (default 1,000) or the WAL has reached
     ///    `OpenOptions::checkpoint_wal_bytes` (SPEC §76): write them back to the main file,
@@ -374,14 +443,16 @@ impl Database {
         // checker can see that `store`, `catalog` and `durability` below
         // are separate fields, each borrowable on its own.
         let state = &mut *guard;
-        let catalog_before = state.catalog.clone();
+        // The batch's own catalog, as the staged pages are its own: the
+        // snapshot's becomes this one at commit, and stays as it is if
+        // the batch fails (SPEC §19.5, §78).
+        let mut catalog = state.current.catalog().clone();
 
         state.store.begin();
-        let result = match apply(&mut state.catalog, &mut state.store) {
+        let result = match apply(&mut catalog, &mut state.store) {
             Ok(result) => result,
             Err(e) => {
                 state.store.rollback();
-                state.catalog = catalog_before;
                 return Err(e);
             }
         };
@@ -398,7 +469,6 @@ impl Database {
         drop(pages);
         if let Err(e) = logged {
             state.store.rollback();
-            state.catalog = catalog_before;
             // A failed `log` may still have left a complete record behind
             // (say the write landed but the fsync failed), which the next
             // `open` would restore — for a batch this call reports as
@@ -412,6 +482,7 @@ impl Database {
 
         // The batch is durable from here on: the WAL holds all its pages.
         state.store.commit();
+        state.current = Snapshot::new(state.store.last_commit(), catalog);
         if state.store.unwritten_pages() >= state.checkpoint_pages
             || state.durability.len() >= state.checkpoint_wal_bytes
         {
@@ -529,7 +600,7 @@ mod tests {
                     assert_eq!(docs.get(id).unwrap(), Some(crate::Document::Int(i as i64)));
                 }
             }
-            assert_eq!(db.read().unwrap().store.cache_size(), size / 8192);
+            assert_eq!(db.state().store.cache_size(), size / 8192);
         }
     }
 
@@ -926,7 +997,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), file_len);
         assert!(result.is_err());
         assert_eq!(get(&db, "posts", 2), None);
-        assert!(db.state().catalog.get("posts").is_none());
+        assert!(db.state().catalog().get("posts").is_none());
 
         // The database keeps working, and the next batch that does create
         // "posts" gets a consistent collection, also after a reopen.
@@ -1201,7 +1272,7 @@ mod tests {
 
         let db = Database::open(&path).unwrap();
         assert_eq!(get(&db, "posts", 1), None);
-        assert!(db.state().catalog.get("posts").is_none());
+        assert!(db.state().catalog().get("posts").is_none());
     }
 
     /// A fresh file's first write is the catalog bootstrap. A crash at any
@@ -1285,10 +1356,10 @@ mod tests {
         fn first_splitting_insert(db: &Database, from: u32) -> u32 {
             let mut state = db.state();
             // Destructuring borrows both fields mutably at once, which
-            // two separate `state.catalog`/`state.store` borrows through
+            // two separate `state.catalog()`/`state.store` borrows through
             // the guard couldn't.
-            let State { catalog, store, .. } = &mut *state;
-            let snapshot = catalog.clone();
+            let mut catalog = state.catalog().clone();
+            let (catalog, store) = (&mut catalog, &mut state.store);
             store.begin();
             let mut leaves = None;
             for i in from..from + 1000 {
@@ -1299,7 +1370,6 @@ mod tests {
                     .count();
                 if leaves.is_some_and(|before| now > before) {
                     store.rollback();
-                    *catalog = snapshot;
                     return i;
                 }
                 leaves = Some(now);
@@ -1532,5 +1602,68 @@ mod tests {
         let db = Database::open(&path).unwrap();
         let numbers = db.collection::<i64>("numbers");
         assert_eq!(numbers.find(Filter::default()).unwrap(), vec![1]);
+    }
+
+    // --- Reads through a snapshot (SPEC §78) ---
+
+    /// While a batch is staged, the snapshot is the commit before it:
+    /// a read finds none of the batch, not its documents and not the
+    /// collection it made. What the write lock hides today (§27), and
+    /// what §79 relies on.
+    #[test]
+    fn a_snapshot_shows_nothing_of_a_staged_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+
+        let mut state = db.state();
+        let mut catalog = state.catalog().clone();
+        state.store.begin();
+        for op in [insert("posts", 2, 20), insert("authors", 3, 30)] {
+            apply_write_op(&mut catalog, &mut state.store, &op).unwrap();
+        }
+        assert!(catalog.get("authors").is_some(), "the batch's own catalog");
+
+        let at = state.snapshot();
+        assert!(at.catalog.get("authors").is_none());
+        let posts = at.catalog.get("posts").unwrap();
+        let entries = BTreeIndex::new(posts.index_root).scan(&at.store).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, DocId([1; 16]).0);
+        // The writer's own view has both.
+        let staged = catalog.get("posts").unwrap();
+        let entries = BTreeIndex::new(staged.index_root).scan(&state.store);
+        assert_eq!(entries.unwrap().len(), 2);
+        state.store.rollback();
+    }
+
+    /// A commit replaces the snapshot; a batch that fails, or changes
+    /// nothing, leaves the one there was.
+    #[test]
+    fn only_a_commit_replaces_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let current = |db: &Database| db.state().current.clone();
+        let same = |a: &Snapshot, b: &Snapshot| Arc::ptr_eq(&a.0, &b.0);
+        let opened = current(&db);
+
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        let first = current(&db);
+        assert!(!same(&opened, &first));
+        assert_eq!(first.0.commit.seq(), opened.0.commit.seq() + 1);
+        // The one from before is as it was: no such collection.
+        assert!(opened.catalog().get("posts").is_none());
+        assert!(first.catalog().get("posts").is_some());
+
+        db.write_batch(vec![insert("authors", 2, 20), insert("posts", 1, 11)])
+            .unwrap_err();
+        assert!(same(&first, &current(&db)), "a failed batch");
+
+        let docs = db.collection::<Document>("posts");
+        docs.ensure_index("n").unwrap();
+        let indexed = current(&db);
+        assert!(!same(&first, &indexed));
+        assert!(!docs.ensure_index("n").unwrap(), "it exists");
+        assert!(same(&indexed, &current(&db)), "a batch changing nothing");
     }
 }
