@@ -4,6 +4,7 @@ mod memory;
 mod page;
 mod pages;
 mod slotted;
+mod snapshot;
 
 #[cfg(test)]
 pub(crate) use file::rewrite_format_version;
@@ -14,6 +15,7 @@ pub use page::Page;
 pub(crate) use pages::checksum;
 pub use pages::{PAGE_SIZE, USABLE_PAGE_SIZE};
 pub use slotted::SlottedPage;
+pub(crate) use snapshot::{Commit, SnapshotStore};
 
 pub type PageId = u64;
 

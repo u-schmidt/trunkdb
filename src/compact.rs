@@ -383,12 +383,13 @@ mod tests {
         db.compact().unwrap();
 
         let state = db.read().unwrap();
-        let root = state.catalog.indexes("docs")[0].root;
+        let at = state.snapshot();
+        let root = at.catalog.indexes("docs")[0].root;
         let mut leaves: Vec<usize> = BTreeIndex::new(root)
-            .pages(&state.store)
+            .pages(&at.store)
             .unwrap()
             .into_iter()
-            .map(|page| SlottedPage::from_bytes(state.store.read_page(page).unwrap()).unwrap())
+            .map(|page| SlottedPage::from_bytes(at.store.read_page(page).unwrap()).unwrap())
             .filter(|page| page.page_type() == PageType::IndexLeaf)
             .map(|page| page.iter_cells().count())
             .collect();

@@ -1,6 +1,7 @@
 use super::pages::{
     PAGE_SIZE, Pages, USABLE_PAGE_SIZE, checksum_matches, damaged, read_disk_page, read_exact_at,
 };
+use super::snapshot::{Commit, SnapshotStore};
 use super::{Page, PageId, PageImage, PageStore, PageType};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -43,7 +44,7 @@ const FORMAT_VERSION: u32 = 11;
 /// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
 /// the checksum (6), and uses the bytes where it now goes.
 const COMPATIBLE_OLDER_FORMATS: [u32; 5] = [6, 7, 8, 9, 10];
-const HEADER_PAGE: PageId = 0;
+pub(super) const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
 const NO_FREE_PAGE: PageId = 0;
@@ -56,10 +57,10 @@ const NO_FREE_PAGE: PageId = 0;
 //   [20..28) free_list_head: u64 (PageId, 0 = none)
 //   [28..32) format_version: u32 (FORMAT_VERSION)
 #[derive(Clone, Copy)]
-struct Header {
+pub(super) struct Header {
     page_size: u32,
-    page_count: u64,
-    free_list_head: PageId,
+    pub(super) page_count: u64,
+    pub(super) free_list_head: PageId,
     /// What the file on disk says: `FORMAT_VERSION`, or an older one this
     /// build reads as it is, until the next header write stamps the
     /// current one. `encode` always writes `FORMAT_VERSION`.
@@ -318,47 +319,33 @@ impl FileStore {
         Ok(())
     }
 
-    /// The pages on the free list, in list order. An error if the list
-    /// runs past the file's end, visits a page that isn't tagged free, or
-    /// loops — each would make allocation hand out a page twice.
+    /// The pages on the free list, in list order, as the batch in the
+    /// making has it (`free_list`).
+    #[cfg(test)]
     pub(crate) fn free_pages(&self) -> io::Result<Vec<PageId>> {
-        let corrupt =
-            |what: String| io::Error::new(io::ErrorKind::InvalidData, format!("free list: {what}"));
-        let mut pages = Vec::new();
-        let mut next = self.header.free_list_head;
-        while next != NO_FREE_PAGE {
-            if next >= self.header.page_count {
-                return Err(corrupt(format!("page {next} is past the end")));
-            }
-            if pages.len() as u64 >= self.header.page_count {
-                return Err(corrupt("it loops".to_string()));
-            }
-            let buf = self.read_current(next)?;
-            if buf[0] != PageType::Free as u8 {
-                return Err(corrupt(format!("page {next} isn't tagged free")));
-            }
-            pages.push(next);
-            next = PageId::from_le_bytes(buf[1..9].try_into().unwrap());
-        }
-        Ok(pages)
+        free_list(&self.header, |id| self.read_current(id))
     }
 
-    /// The pages whose checksum doesn't match their bytes on disk, in id
-    /// order — what a disk error or a change from outside trunkdb leaves.
-    /// Reads the file itself, past any staged changes. Pages not written
-    /// back yet are skipped: the WAL holds them, and the file's copy is
-    /// older or missing (SPEC §51).
+    /// The pages whose checksum doesn't match their bytes on disk
+    /// (`Pages::damaged`).
+    #[cfg(test)]
     pub(crate) fn damaged_pages(&self) -> io::Result<Vec<PageId>> {
-        let mut damaged = Vec::new();
-        for id in 0..self.header.page_count {
-            if self.pages.is_unwritten(id) {
-                continue;
-            }
-            if !checksum_matches(id, &read_disk_page(self.pages.file(), id)?) {
-                damaged.push(id);
-            }
-        }
-        Ok(damaged)
+        self.pages.damaged(self.header.page_count)
+    }
+
+    /// The last commit: its number and its header. Not while staging,
+    /// when `header` is the batch's.
+    pub(crate) fn last_commit(&self) -> Commit {
+        assert!(
+            self.staging.is_none(),
+            "FileStore::last_commit while staging"
+        );
+        Commit::new(self.pages.seq(), self.header)
+    }
+
+    /// The pages as of `commit`, to read (SPEC §78).
+    pub(crate) fn at(&self, commit: Commit) -> SnapshotStore<'_> {
+        SnapshotStore::new(&self.pages, commit)
     }
 
     fn write_header(&mut self) -> io::Result<()> {
@@ -683,6 +670,35 @@ impl PageStore for FileStore {
         self.header.free_list_head = id;
         self.write_header()
     }
+}
+
+/// The pages on the free list that starts at `header`'s head, in list
+/// order, each read through `read`. An error if the list runs past the
+/// file's end, visits a page that isn't tagged free, or loops — each
+/// would make allocation hand out a page twice.
+pub(super) fn free_list(
+    header: &Header,
+    read: impl Fn(PageId) -> io::Result<Page>,
+) -> io::Result<Vec<PageId>> {
+    let corrupt =
+        |what: String| io::Error::new(io::ErrorKind::InvalidData, format!("free list: {what}"));
+    let mut pages = Vec::new();
+    let mut next = header.free_list_head;
+    while next != NO_FREE_PAGE {
+        if next >= header.page_count {
+            return Err(corrupt(format!("page {next} is past the end")));
+        }
+        if pages.len() as u64 >= header.page_count {
+            return Err(corrupt("it loops".to_string()));
+        }
+        let buf = read(next)?;
+        if buf[0] != PageType::Free as u8 {
+            return Err(corrupt(format!("page {next} isn't tagged free")));
+        }
+        pages.push(next);
+        next = PageId::from_le_bytes(buf[1..9].try_into().unwrap());
+    }
+    Ok(pages)
 }
 
 /// The header, from the file. Magic and format version come before the
@@ -1831,5 +1847,90 @@ mod tests {
         // In memory only: a new open counts from 0 again.
         drop(store);
         assert_eq!(FileStore::open(&path).unwrap().pages.seq(), 0);
+    }
+
+    // --- Reading as of a commit (SPEC §78) ---
+
+    /// A snapshot store reads its commit's pages, page count and free
+    /// list, and none of a batch being staged.
+    #[test]
+    fn a_snapshot_reads_its_commit_and_no_staged_batch() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let commit = store.last_commit();
+
+        store.begin();
+        store.write_page(2, filled(9).into()).unwrap();
+        assert_eq!(store.allocate_page().unwrap(), 4, "the free page");
+        let grown = store.allocate_page().unwrap();
+        store.write_page(grown, filled(8).into()).unwrap();
+
+        let at = store.at(commit);
+        assert_eq!(at.read_page(2).unwrap(), filled(2));
+        assert_eq!(at.page_count(), 6);
+        assert_eq!(at.free_pages().unwrap(), [4]);
+        assert_eq!(at.try_read_page(grown).unwrap(), None);
+        assert_eq!(
+            at.read_page(grown).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(at.format_version().unwrap(), FORMAT_VERSION);
+        // The writer sees its own batch.
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        assert_eq!(store.page_count(), 7);
+        assert_eq!(store.free_pages().unwrap(), Vec::<PageId>::new());
+
+        store.commit();
+        let at = store.at(store.last_commit());
+        assert_eq!(at.read_page(2).unwrap(), filled(9));
+        assert_eq!(at.read_page(grown).unwrap(), filled(8));
+        assert_eq!(at.page_count(), 7);
+        assert_eq!(at.free_pages().unwrap(), Vec::<PageId>::new());
+    }
+
+    /// A page waiting for a checkpoint is read by the snapshot of the
+    /// commit that wrote it and of every later one. For an earlier one
+    /// its older version is gone, and the read says so instead of
+    /// handing out the newer page: until §80 keeps it.
+    #[test]
+    fn a_snapshot_reads_no_page_from_a_later_commit() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let commit_page = |store: &mut FileStore, id: PageId, fill: u8| {
+            store.begin();
+            store.write_page(id, filled(fill).into()).unwrap();
+            store.commit();
+            store.last_commit()
+        };
+        let first = commit_page(&mut store, 1, 7);
+        let second = commit_page(&mut store, 2, 8);
+        assert_eq!((first.seq(), second.seq()), (1, 2));
+
+        // Page 1: written by the first commit, read by both.
+        assert_eq!(store.at(first).read_page(1).unwrap(), filled(7));
+        assert_eq!(store.at(second).read_page(1).unwrap(), filled(7));
+        // Page 3: written by neither, the file's.
+        assert_eq!(store.at(first).read_page(3).unwrap(), filled(3));
+        // Page 2: written by the second.
+        assert_eq!(store.at(second).read_page(2).unwrap(), filled(8));
+        let err = store.at(first).read_page(2).unwrap_err();
+        assert!(err.to_string().contains("snapshot too old"), "{err}");
+        let err = store.at(first).try_read_page(2).unwrap_err();
+        assert!(err.to_string().contains("snapshot too old"), "{err}");
+    }
+
+    #[test]
+    fn a_snapshot_cannot_write() {
+        let (_dir, path) = open_temp();
+        let store = five_page_file(&path);
+        let mut at = store.at(store.last_commit());
+        let denied = |result: io::Result<()>| {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        };
+        denied(at.allocate_page().map(|_| ()));
+        denied(at.write_page(1, filled(9).into()));
+        denied(at.free_page(1));
+        assert_eq!(store.read_page(1).unwrap(), filled(1));
+        assert_eq!(store.free_pages().unwrap(), [4]);
     }
 }

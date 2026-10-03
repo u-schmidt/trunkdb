@@ -280,7 +280,7 @@ impl<T> Collection<T> {
     pub fn indexes(&self) -> crate::Result<Vec<IndexInfo>> {
         let state = self.db.read()?;
         Ok(state
-            .catalog
+            .catalog()
             .indexes(&self.name)
             .iter()
             .map(IndexMeta::info)
@@ -308,7 +308,7 @@ impl<T> Collection<T> {
     fn index_names_where(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
         let state = self.db.read()?;
         Ok(state
-            .catalog
+            .catalog()
             .indexes(&self.name)
             .iter()
             .filter(|index| keep(index))
@@ -323,7 +323,7 @@ impl<T> Collection<T> {
             return Ok(QueryPlan::ById);
         }
         let state = self.db.read()?;
-        let indexes = state.catalog.indexes(&self.name);
+        let indexes = state.catalog().indexes(&self.name);
         if let Some(order) = filter.index_order(indexes) {
             return Ok(QueryPlan::IndexOrder {
                 field: order.index.name(),
@@ -493,15 +493,16 @@ impl Collection<Document> {
 
     pub fn get(&self, id: &DocId) -> crate::Result<Option<Document>> {
         let state = self.db.read()?;
-        let Some(meta) = state.catalog.get(&self.name) else {
+        let at = state.snapshot();
+        let Some(meta) = at.catalog.get(&self.name) else {
             return Ok(None); // collection doesn't exist yet, so neither does the document
         };
 
         let index = BTreeIndex::new(meta.index_root);
-        let Some(loc) = index.lookup(&state.store, &key::primary(*id))? else {
+        let Some(loc) = index.lookup(&at.store, &key::primary(*id))? else {
             return Ok(None);
         };
-        let (_id, doc) = data::get_record(&state.store, loc)?;
+        let (_id, doc) = data::get_record(&at.store, loc)?;
         Ok(Some(doc))
     }
 
@@ -639,7 +640,8 @@ impl Collection<Document> {
     /// `cursor` read.
     fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
         let state = self.db.read()?;
-        find_in(&state.catalog, &state.store, &self.name, filter)
+        let at = state.snapshot();
+        find_in(at.catalog, &at.store, &self.name, filter)
     }
 
     /// Every document matching `filter`. An `Object` document carries its
@@ -680,10 +682,11 @@ impl Collection<Document> {
     /// index's entries — no document is read.
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
         let state = self.db.read()?;
+        let at = state.snapshot();
         let count = if filter.conditions.is_empty() {
-            candidate_entries(&state.catalog, &state.store, &self.name, &filter)?.len()
+            candidate_entries(at.catalog, &at.store, &self.name, &filter)?.len()
         } else {
-            read_candidates(&state.catalog, &state.store, &self.name, &filter)?
+            read_candidates(at.catalog, &at.store, &self.name, &filter)?
                 .iter()
                 .filter(|(_id, doc)| filter.matches(doc))
                 .count()
@@ -715,7 +718,8 @@ impl Collection<Document> {
             return Ok(Cursor::collected(converted));
         }
         let state = self.db.read()?;
-        let entries = candidate_entries(&state.catalog, &state.store, &self.name, &filter)?;
+        let at = state.snapshot();
+        let entries = candidate_entries(at.catalog, &at.store, &self.name, &filter)?;
         drop(state);
         let ids = entries.iter().map(|(key, _loc)| key::doc_id(key)).collect();
         Ok(Cursor::streaming(self.clone(), ids, filter, convert))
@@ -2530,11 +2534,11 @@ mod tests {
     /// with the room they really have (SPEC §75).
     fn assert_free_space_is_true(db: &Database) {
         let state = db.state();
-        for name in state.catalog.names() {
-            let Some(free) = state.catalog.free_space(name) else {
+        for name in state.catalog().names() {
+            let Some(free) = state.catalog().free_space(name) else {
                 continue;
             };
-            let meta = *state.catalog.get(name).unwrap();
+            let meta = *state.catalog().get(name).unwrap();
             let locs = BTreeIndex::new(meta.index_root).scan(&state.store).unwrap();
             let current = meta.current_data_page;
             let locs = locs.into_iter().map(|(_key, loc)| loc);
@@ -2623,7 +2627,7 @@ mod tests {
             .map(|n| docs.insert(padded(n, 3000)).unwrap())
             .collect();
         docs.delete(&ids[0]).unwrap();
-        let map = |db: &Database| db.state().catalog.free_space("docs").unwrap().entries();
+        let map = |db: &Database| db.state().catalog().free_space("docs").unwrap().entries();
         let before = map(&db);
         assert!(!before.is_empty());
 
@@ -4680,8 +4684,8 @@ mod tests {
             assert!(!db.check().unwrap().is_ok());
 
             let state = db.read().unwrap();
-            let (documents, stale) =
-                indexes_lacking_ids(&state.catalog, &state.store, "cars").unwrap();
+            let at = state.snapshot();
+            let (documents, stale) = indexes_lacking_ids(at.catalog, &at.store, "cars").unwrap();
             let stale = stale.iter().map(|index| index.name()).collect::<Vec<_>>();
             assert_eq!(
                 (documents.len(), stale),
@@ -5786,14 +5790,14 @@ mod tests {
     fn entries(db: &Database, collection: &str, name: &str) -> usize {
         let state = db.read().unwrap();
         let index = state
-            .catalog
+            .catalog()
             .indexes(collection)
             .iter()
             .find(|index| index.name() == name)
             .unwrap()
             .clone();
         BTreeIndex::new(index.root)
-            .scan(&state.store)
+            .scan(&state.snapshot().store)
             .unwrap()
             .len()
     }
