@@ -352,7 +352,7 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
 
         let db = Database::open(&path).unwrap();
-        db.state().store.failing_write_backs = 2;
+        db.state().store.pages.failing_write_backs = 2;
         let again = db.compact().unwrap();
         assert_eq!(
             (again.pages_before, again.pages_after),
@@ -477,8 +477,8 @@ mod tests {
         assert_eq!(file_pages(&path), pages_before);
         {
             let mut state = db.state();
-            state.store.failing_write_backs = 2;
-            state.store.write_back_fails_after = 5;
+            state.store.pages.failing_write_backs = 2;
+            state.store.pages.write_back_fails_after = 5;
         }
         let compacted = db.compact().unwrap();
         assert!(compacted.pages_after < compacted.pages_before);

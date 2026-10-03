@@ -1,25 +1,12 @@
-use super::cache::PageCache;
+use super::pages::{
+    PAGE_SIZE, Pages, USABLE_PAGE_SIZE, checksum_matches, damaged, read_disk_page, read_exact_at,
+};
 use super::{Page, PageId, PageImage, PageStore, PageType};
-use crate::crc32::Crc32;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// A page's size in the file. Matches LiteDB's page size, partly so
-/// numbers stay comparable to it later, and because a document DB's
-/// records (whole JSON-ish objects) benefit more from fewer, larger pages
-/// than a fixed-page-size OS-I/O alignment argument for 4096 would buy
-/// back.
-pub const PAGE_SIZE: usize = 8192;
-/// Each page's last bytes: a CRC-32 of the page's id and the rest of its
-/// bytes (SPEC §40).
-const CHECKSUM_LEN: usize = 4;
-/// A page's size above this file: what `read_page` returns and
-/// `write_page` takes — `PAGE_SIZE` without the checksum, which only this
-/// file ever sees. The WAL logs pages of this size too.
-pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - CHECKSUM_LEN;
 /// How much of the file `FileStore` keeps in memory unless told
 /// otherwise (`OpenOptions::cache_size`, SPEC §50): 256 MiB, 32,768
 /// pages. It fills only as pages are read, so a small file costs its own
@@ -174,29 +161,18 @@ impl Header {
 /// because the header is managed internally, bypassing `write_page` — a
 /// wrapper would have to duplicate the allocation logic to see it.
 pub struct FileStore {
-    file: File,
+    /// The committed pages: the file, the cache, and the pages waiting
+    /// for a checkpoint (SPEC §77). What a reader reads.
+    pub(crate) pages: Pages,
+    /// The header as the batch in the making has it; as of the last
+    /// commit when none is staged. The writer's, like `staging`.
     header: Header,
-    /// Checked pages as they are in the file (SPEC §50). Behind a lock
-    /// because reads take `&self` and run in parallel (§27): a read lock
-    /// to look a page up, which readers share, and the write lock to put
-    /// one in (SPEC §65).
-    cache: RwLock<PageCache>,
-    /// Pages of committed batches — durable in the WAL — not yet written
-    /// back to the file (SPEC §51): the newest image of each. Reads look
-    /// here before the cache and the file; `checkpoint` writes them back.
-    unwritten: BTreeMap<PageId, Page>,
     /// Whether the header's checksum has been checked — not yet between
     /// `open_before_recovery` and `check_header` (SPEC §40.4).
     header_checked: bool,
+    /// The batch in the making: the writer's alone (SPEC §77). Nothing
+    /// of it is in `pages` before `commit`.
     staging: Option<Staging>,
-    /// Test-only fault injection: while non-zero, each `write_back` call
-    /// writes `write_back_fails_after` pages, then fails (and decrements
-    /// this) — leaving the file genuinely half-written, like a crash or a
-    /// full disk would. Pages go out in ascending id order.
-    #[cfg(test)]
-    pub(crate) failing_write_backs: u32,
-    #[cfg(test)]
-    pub(crate) write_back_fails_after: usize,
 }
 
 struct Staging {
@@ -291,17 +267,11 @@ impl FileStore {
         };
 
         Ok(Self {
-            file,
+            pages: Pages::new(file, DEFAULT_CACHE_SIZE / PAGE_SIZE),
             header,
-            cache: RwLock::new(PageCache::new(DEFAULT_CACHE_SIZE / PAGE_SIZE)),
-            unwritten: BTreeMap::new(),
             // A fresh file's header isn't on disk yet: nothing to check.
             header_checked: is_fresh,
             staging: None,
-            #[cfg(test)]
-            failing_write_backs: 0,
-            #[cfg(test)]
-            write_back_fails_after: 1,
         })
     }
 
@@ -309,7 +279,10 @@ impl FileStore {
     /// unchecked.
     pub(crate) fn check_header(&mut self) -> io::Result<()> {
         if !self.header_checked {
-            if !checksum_matches(HEADER_PAGE, &read_disk_page(&self.file, HEADER_PAGE)?) {
+            if !checksum_matches(
+                HEADER_PAGE,
+                &read_disk_page(self.pages.file(), HEADER_PAGE)?,
+            ) {
                 return Err(damaged(HEADER_PAGE));
             }
             self.header_checked = true;
@@ -378,10 +351,10 @@ impl FileStore {
     pub(crate) fn damaged_pages(&self) -> io::Result<Vec<PageId>> {
         let mut damaged = Vec::new();
         for id in 0..self.header.page_count {
-            if self.unwritten.contains_key(&id) {
+            if self.pages.is_unwritten(id) {
                 continue;
             }
-            if !checksum_matches(id, &read_disk_page(&self.file, id)?) {
+            if !checksum_matches(id, &read_disk_page(self.pages.file(), id)?) {
                 damaged.push(id);
             }
         }
@@ -395,27 +368,17 @@ impl FileStore {
         Ok(())
     }
 
-    /// A page's current bytes: from the dirty set if it's there, then
-    /// the committed pages not written back, then the cache, then the
-    /// file — and keeps a page read from the file in the cache, its
-    /// layout checked (SPEC §66). Shared
-    /// wherever it comes from, never copied (SPEC §64): the cache's lock
-    /// is held for the lookup only. No bounds check — callers do that.
+    /// A page's current bytes: from the dirty set if it's there, the
+    /// writer's own view; otherwise the committed page (`Pages::read`).
+    /// Shared wherever it comes from, never copied (SPEC §64). No bounds
+    /// check — callers do that.
     fn read_current(&self, id: PageId) -> io::Result<Page> {
         if let Some(staging) = &self.staging
             && let Some(page) = staging.dirty.get(&id)
         {
             return Ok(page.clone());
         }
-        if let Some(page) = self.unwritten.get(&id) {
-            return Ok(page.clone());
-        }
-        if let Some(page) = self.cache().get(id) {
-            return Ok(page);
-        }
-        let page = read_page_at(&self.file, id)?.checked();
-        self.cache_mut().put(id, page.clone());
-        Ok(page)
+        self.pages.read(id)
     }
 
     /// Writes a page: into the dirty set while staging, otherwise
@@ -427,41 +390,19 @@ impl FileStore {
                 staging.dirty.insert(id, data);
                 Ok(())
             }
-            None => {
-                write_page_at(&self.file, id, &data)?;
-                self.cache_mut().put(id, data.checked());
-                Ok(())
-            }
+            None => self.pages.write_through(id, data),
         }
-    }
-
-    /// The page cache, to look pages up: readers share it (SPEC §65).
-    /// A panic while it was held can't have left it half-changed in a way
-    /// that matters — at worst a page is missing — so a poisoned lock is
-    /// taken over, not passed on.
-    fn cache(&self) -> RwLockReadGuard<'_, PageCache> {
-        self.cache
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// The page cache, to change: one thread at a time, and no reader
-    /// meanwhile. A read that misses takes it to put the page in.
-    fn cache_mut(&self) -> RwLockWriteGuard<'_, PageCache> {
-        self.cache
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// How many bytes of pages the cache holds at most (SPEC §50); 0
     /// turns it off. Pages over the new size are forgotten.
     pub fn set_cache_size(&mut self, bytes: usize) {
-        self.cache_mut().resize(bytes / PAGE_SIZE);
+        self.pages.set_cache_pages(bytes / PAGE_SIZE);
     }
 
     #[cfg(test)]
     pub(crate) fn cache_size(&self) -> usize {
-        self.cache().capacity()
+        self.pages.cache().capacity()
     }
 
     /// The whole file as it is on disk, read through the store's own
@@ -469,15 +410,16 @@ impl FileStore {
     /// handle can't read the file while this one holds it.
     #[cfg(test)]
     pub(crate) fn file_bytes(&self) -> Vec<u8> {
-        let mut bytes = vec![0u8; self.file.metadata().unwrap().len() as usize];
-        read_exact_at(&self.file, &mut bytes, 0).unwrap();
+        let file = self.pages.file();
+        let mut bytes = vec![0u8; file.metadata().unwrap().len() as usize];
+        read_exact_at(file, &mut bytes, 0).unwrap();
         bytes
     }
 
     /// Hits and misses so far.
     #[cfg(test)]
     pub(crate) fn cache_stats(&self) -> (usize, usize) {
-        let cache = self.cache();
+        let cache = self.pages.cache();
         let count =
             |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::Relaxed);
         (count(&cache.hits), count(&cache.misses))
@@ -485,7 +427,7 @@ impl FileStore {
 
     #[cfg(test)]
     fn cached(&self, id: PageId) -> Option<Page> {
-        self.cache().get(id)
+        self.pages.cache().get(id)
     }
 
     fn check_bounds(&self, id: PageId) -> io::Result<()> {
@@ -568,63 +510,29 @@ impl FileStore {
         self.write_header()
     }
 
-    /// Cuts the file to the header's page count, if it's longer — after
-    /// a batch that shrank it (SPEC §41). Nothing past the page count is
-    /// ever read, so the cut loses nothing.
-    fn truncate_to_page_count(&self) -> io::Result<()> {
-        let len = self.header.page_count * PAGE_SIZE as u64;
-        if self.file.metadata()?.len() > len {
-            self.file.set_len(len)?;
-            let page_count = self.header.page_count;
-            self.cache_mut().retain(|id| id < page_count);
-        }
-        Ok(())
-    }
-
     /// Ends staging for a batch the WAL now holds (SPEC §51): its pages
-    /// become the newest committed ones, read from memory until
-    /// `checkpoint` writes them back. Nothing is written to the file.
-    /// Their layout is checked here, once, so reads until then skip it
-    /// (SPEC §66), as reads of the cache do.
+    /// become the newest committed ones (`Pages::commit`), read from
+    /// memory until `checkpoint` writes them back. Nothing is written to
+    /// the file.
     pub fn commit(&mut self) {
         let staging = self
             .staging
             .take()
             .expect("FileStore::commit without begin");
-        let checked = staging
-            .dirty
-            .into_iter()
-            .map(|(id, page)| (id, page.checked()));
-        self.unwritten.extend(checked);
+        self.pages.commit(staging.dirty);
     }
 
     /// How many committed pages wait for `checkpoint`.
     pub fn unwritten_pages(&self) -> usize {
-        self.unwritten.len()
+        self.pages.unwritten()
     }
 
     /// Writes every committed page not written back yet to the file,
-    /// cuts it to the page count, and `fsync`s; then they're read from
-    /// the cache like any other page. On error they stay where they were,
-    /// and reads still find them there — the file may now be half
-    /// written, but none of the pages it's half-written with is read from
-    /// it. A later call writes them all again.
+    /// cuts it to the page count, and `fsync`s (`Pages::checkpoint`). On
+    /// error they stay where they were, and a later call writes them all
+    /// again.
     pub fn checkpoint(&mut self) -> io::Result<()> {
-        if self.unwritten.is_empty() {
-            return Ok(());
-        }
-        self.write_unwritten_pages()?;
-        self.truncate_to_page_count()?;
-        super::sync(&self.file)?;
-        let written = std::mem::take(&mut self.unwritten);
-        let page_count = self.header.page_count;
-        let mut cache = self.cache_mut();
-        // Not pages a later batch cut off the end: they're gone. Moved,
-        // not copied: the cache takes the pages the batch staged.
-        for (id, page) in written.into_iter().filter(|(id, _)| *id < page_count) {
-            cache.put(id, page);
-        }
-        Ok(())
+        self.pages.checkpoint(self.header.page_count)
     }
 
     /// `commit`, then `checkpoint`: the batch in the file at once — for
@@ -632,27 +540,6 @@ impl FileStore {
     pub fn write_back(&mut self) -> io::Result<()> {
         self.commit();
         self.checkpoint()
-    }
-
-    /// `checkpoint`'s writes: every unwritten page, in ascending id order.
-    fn write_unwritten_pages(&mut self) -> io::Result<()> {
-        #[cfg(test)]
-        let mut written = 0;
-        // The counter only exists in test builds, so `enumerate` would be
-        // an unused index everywhere else.
-        #[allow(clippy::explicit_counter_loop)]
-        for (&id, page) in &self.unwritten {
-            #[cfg(test)]
-            {
-                if self.failing_write_backs > 0 && written == self.write_back_fails_after {
-                    self.failing_write_backs -= 1;
-                    return Err(io::Error::other("injected write-back failure"));
-                }
-                written += 1;
-            }
-            write_page_at(&self.file, id, page)?;
-        }
-        Ok(())
     }
 
     /// Crash recovery: writes page images recovered from the WAL straight
@@ -663,14 +550,14 @@ impl FileStore {
     /// on-disk header says, and its header image is what makes them valid.
     pub fn restore_pages(&mut self, pages: &[PageImage]) -> io::Result<()> {
         assert!(
-            self.staging.is_none() && self.unwritten.is_empty(),
-            "FileStore::restore_pages while staging, or with pages to write back"
+            self.staging.is_none(),
+            "FileStore::restore_pages while staging"
         );
         // A page past the end of the file, as the header before it has
         // it, is damage (SPEC §55): a batch that grows the file logs its
         // header too, and first, as page 0. Checked before anything is
         // written, so a damaged WAL leaves the file as it was.
-        let mut page_count = read_header(&self.file).ok().map(|h| h.page_count);
+        let mut page_count = read_header(self.pages.file()).ok().map(|h| h.page_count);
         for (id, page) in pages {
             if *id == HEADER_PAGE {
                 page_count = Some(Header::decode(page)?.page_count);
@@ -683,17 +570,13 @@ impl FileStore {
                 ));
             }
         }
-        // Pages are about to change under it.
-        self.cache_mut().clear();
-        for (id, page) in pages {
-            write_page_at(&self.file, *id, page)?;
-        }
-        self.header = read_header(&self.file)?;
+        self.pages.restore(pages)?;
+        self.header = read_header(self.pages.file())?;
         self.header_checked = true;
         // A crash can come between a shrinking batch's write-back and
         // its cut.
-        self.truncate_to_page_count()?;
-        super::sync(&self.file)
+        self.pages.truncate(self.header.page_count)?;
+        self.pages.sync()
     }
 }
 
@@ -815,34 +698,11 @@ fn read_header(file: &File) -> io::Result<Header> {
     Ok(header)
 }
 
-/// The page's id is part of what's summed, so a page written to the
-/// wrong place, or copied onto another, fails the check too.
-pub(crate) fn checksum(id: PageId, usable: &[u8]) -> [u8; CHECKSUM_LEN] {
-    let mut crc = Crc32::new();
-    crc.update(&id.to_le_bytes());
-    crc.update(usable);
-    crc.finish().to_le_bytes()
-}
-
-fn checksum_matches(id: PageId, disk: &[u8; PAGE_SIZE]) -> bool {
-    let (usable, stored) = disk.split_at(USABLE_PAGE_SIZE);
-    checksum(id, usable) == stored
-}
-
-fn damaged(id: PageId) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "page {id} is damaged: its checksum doesn't match its bytes \
-             (a disk error, or a change from outside trunkdb)"
-        ),
-    )
-}
-
 /// Rewrites a closed file's format version, with the header's checksum
 /// to match: a file from an older build, for tests above this module.
 #[cfg(test)]
 pub(crate) fn rewrite_format_version(path: &Path, version: u32) {
+    use super::pages::{read_page_at, write_page_at};
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -853,78 +713,11 @@ pub(crate) fn rewrite_format_version(path: &Path, version: u32) {
     write_page_at(&file, HEADER_PAGE, &header).unwrap();
 }
 
-/// A page's bytes above this file, checksum verified and cut off.
-fn read_page_at(file: &File, id: PageId) -> io::Result<Page> {
-    let disk = read_disk_page(file, id)?;
-    if !checksum_matches(id, &disk) {
-        return Err(damaged(id));
-    }
-    Ok(Page::from(&disk[..USABLE_PAGE_SIZE]))
-}
-
-/// Writes a page's bytes with their checksum appended.
-fn write_page_at(file: &File, id: PageId, data: &[u8]) -> io::Result<()> {
-    let mut disk = [0u8; PAGE_SIZE];
-    disk[..USABLE_PAGE_SIZE].copy_from_slice(data);
-    disk[USABLE_PAGE_SIZE..].copy_from_slice(&checksum(id, data));
-    write_all_at(file, &disk, id * PAGE_SIZE as u64)
-}
-
-/// A page as it is in the file, checksum included, unchecked.
-fn read_disk_page(file: &File, id: PageId) -> io::Result<[u8; PAGE_SIZE]> {
-    let mut disk = [0u8; PAGE_SIZE];
-    read_exact_at(file, &mut disk, id * PAGE_SIZE as u64)?;
-    Ok(disk)
-}
-
-// Positional I/O (pread/pwrite-style) so reads only ever need `&File` — no
-// shared mutable seek cursor to coordinate, matching `PageStore::read_page`
-// taking `&self`.
-#[cfg(unix)]
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
-}
-
-#[cfg(unix)]
-fn write_all_at(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.write_all_at(data, offset)
-}
-
-#[cfg(windows)]
-fn read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut read = 0;
-    while read < buf.len() {
-        let n = file.seek_read(&mut buf[read..], offset)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unexpected EOF reading the file",
-            ));
-        }
-        read += n;
-        offset += n as u64;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn write_all_at(file: &File, data: &[u8], mut offset: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut written = 0;
-    while written < data.len() {
-        let n = file.seek_write(&data[written..], offset)?;
-        written += n;
-        offset += n as u64;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crc32::Crc32;
+    use crate::storage::pages::{write_all_at, write_page_at};
 
     fn open_temp() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1516,7 +1309,7 @@ mod tests {
     /// the lock is mandatory, so a separately opened handle couldn't read
     /// the locked file at all.
     fn on_disk(store: &FileStore) -> FileStore {
-        FileStore::from_file(store.file.try_clone().unwrap(), false).unwrap()
+        FileStore::from_file(store.pages.file().try_clone().unwrap(), false).unwrap()
     }
 
     #[test]
@@ -1792,7 +1585,7 @@ mod tests {
         let (_dir, path) = open_temp();
         let store = five_page_file(&path);
         store.read_page(1).unwrap();
-        let held = store.cache();
+        let held = store.pages.cache();
         let (sent, received) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| sent.send(store.read_page(1).unwrap()).unwrap());
@@ -1840,8 +1633,8 @@ mod tests {
             store.write_page(id, filled(7).into()).unwrap();
         }
         store.commit();
-        store.failing_write_backs = 1;
-        store.write_back_fails_after = 1;
+        store.pages.failing_write_backs = 1;
+        store.pages.write_back_fails_after = 1;
         assert!(store.checkpoint().is_err());
         let disk = on_disk(&store);
         assert_eq!(disk.read_page(1).unwrap(), filled(7));
@@ -1940,12 +1733,103 @@ mod tests {
         assert_eq!(store.read_page(1).unwrap(), filled(1));
         // Through the store's own handle: Windows' file lock is
         // mandatory, so another handle couldn't write while it's held.
-        let mut disk = read_disk_page(&store.file, 1).unwrap();
+        let mut disk = read_disk_page(store.pages.file(), 1).unwrap();
         disk[100] ^= 1;
-        write_all_at(&store.file, &disk, PAGE_SIZE as u64).unwrap();
+        write_all_at(store.pages.file(), &disk, PAGE_SIZE as u64).unwrap();
         assert_eq!(store.read_page(1).unwrap(), filled(1));
         assert_eq!(store.damaged_pages().unwrap(), [1]);
         drop(store);
         assert_damaged(FileStore::open(&path).unwrap().read_page(1), 1);
+    }
+
+    // --- The committed pages apart from the writer's (SPEC §77) ---
+
+    /// A staged batch is the writer's alone: the store reads its own
+    /// changes, the committed pages show none of them, the header's page
+    /// included, until `commit`.
+    #[test]
+    fn a_staged_batch_is_not_among_the_committed_pages() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let header_before = store.pages.read(HEADER_PAGE).unwrap();
+
+        store.begin();
+        store.write_page(2, filled(9).into()).unwrap();
+        let new = store.allocate_page().unwrap();
+        assert_eq!(new, 4, "the free page");
+        store.write_page(new, filled(8).into()).unwrap();
+
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        assert_eq!(store.read_page(new).unwrap(), filled(8));
+        assert_eq!(store.pages.read(2).unwrap(), filled(2));
+        assert_eq!(store.pages.read(new).unwrap()[0], PageType::Free as u8);
+        assert_eq!(store.pages.read(HEADER_PAGE).unwrap(), header_before);
+        assert_eq!(store.pages.unwritten(), 0);
+
+        store.commit();
+        assert_eq!(store.pages.read(2).unwrap(), filled(9));
+        assert_eq!(store.pages.read(new).unwrap(), filled(8));
+        assert_ne!(store.pages.read(HEADER_PAGE).unwrap(), header_before);
+    }
+
+    /// A batch rolled back leaves the committed pages as they were, and
+    /// takes no commit number.
+    #[test]
+    fn a_rollback_leaves_the_committed_pages_alone() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store.write_page(1, filled(7).into()).unwrap();
+        store.commit();
+        let seq = store.pages.seq();
+
+        store.begin();
+        store.write_page(1, filled(9).into()).unwrap();
+        store.free_page(2).unwrap();
+        store.rollback();
+
+        assert_eq!(store.pages.seq(), seq);
+        assert_eq!(store.pages.unwritten(), 1);
+        assert_eq!(store.pages.version_seq(1), Some(seq));
+        assert_eq!(store.pages.read(1).unwrap(), filled(7));
+        assert_eq!(store.pages.read(2).unwrap(), filled(2));
+    }
+
+    /// Commits are numbered from 1, in memory; a page waiting for a
+    /// checkpoint carries the number of the last commit that changed it,
+    /// and a checkpoint doesn't start the count again.
+    #[test]
+    fn a_committed_page_carries_its_commits_number() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        assert_eq!(store.pages.seq(), 0);
+
+        store.begin();
+        store.write_page(1, filled(7).into()).unwrap();
+        store.write_page(2, filled(7).into()).unwrap();
+        store.commit();
+        assert_eq!(store.pages.seq(), 1);
+
+        store.begin();
+        store.write_page(2, filled(8).into()).unwrap();
+        store.commit();
+        assert_eq!(store.pages.seq(), 2);
+        assert_eq!(store.pages.version_seq(1), Some(1));
+        assert_eq!(store.pages.version_seq(2), Some(2));
+        assert_eq!(store.pages.version_seq(3), None, "never changed");
+        assert_eq!(store.pages.read(2).unwrap(), filled(8));
+
+        store.checkpoint().unwrap();
+        assert_eq!(store.pages.version_seq(2), None, "in the file now");
+        assert_eq!(store.pages.read(2).unwrap(), filled(8));
+        store.begin();
+        store.write_page(3, filled(9).into()).unwrap();
+        store.commit();
+        assert_eq!(store.pages.seq(), 3);
+        assert_eq!(store.pages.version_seq(3), Some(3));
+
+        // In memory only: a new open counts from 0 again.
+        drop(store);
+        assert_eq!(FileStore::open(&path).unwrap().pages.seq(), 0);
     }
 }
