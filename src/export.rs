@@ -56,7 +56,7 @@ impl Database {
     /// The names of all collections, sorted.
     pub fn collections(&self) -> crate::Result<Vec<String>> {
         let state = self.read()?;
-        let mut names: Vec<String> = state.catalog.names().map(str::to_string).collect();
+        let mut names: Vec<String> = state.catalog().names().map(str::to_string).collect();
         names.sort();
         Ok(names)
     }
@@ -73,12 +73,13 @@ impl Database {
         let mut out = BufWriter::new(out);
         let mut summary = Summary::default();
         let state = self.read()?;
+        let at = state.snapshot();
 
         write_line(&mut out, &object([(HEADER_KEY, EXPORT_VERSION.into())]))?;
-        let mut names: Vec<&str> = state.catalog.names().collect();
+        let mut names: Vec<&str> = at.catalog.names().collect();
         names.sort();
         for name in names {
-            let indexes = state
+            let indexes = at
                 .catalog
                 .indexes(name)
                 .iter()
@@ -110,9 +111,9 @@ impl Database {
             write_line(&mut out, &header)?;
             summary.collections += 1;
 
-            let meta = state.catalog.get(name).expect("a listed collection");
-            let mut records = data::Records::new(&state.store);
-            for (_key, loc) in BTreeIndex::new(meta.index_root).scan(&state.store)? {
+            let meta = at.catalog.get(name).expect("a listed collection");
+            let mut records = data::Records::new(&at.store);
+            for (_key, loc) in BTreeIndex::new(meta.index_root).scan(&at.store)? {
                 let (id, doc) = records.get(loc)?;
                 write_line(&mut out, &document_line(id, &doc))?;
                 summary.documents += 1;

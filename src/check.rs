@@ -9,7 +9,7 @@ use crate::data;
 use crate::database::Database;
 use crate::document::{DocId, Document};
 use crate::index::{BTreeIndex, Index, key};
-use crate::storage::{FileStore, PAGE_SIZE, PageId, RecordLocation};
+use crate::storage::{PAGE_SIZE, PageId, RecordLocation, SnapshotStore};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the file is, from its header.
@@ -47,11 +47,12 @@ impl Database {
     /// of them free.
     pub fn file_info(&self) -> crate::Result<FileInfo> {
         let state = self.read()?;
+        let store = state.snapshot().store;
         Ok(FileInfo {
-            format_version: state.store.format_version()?,
+            format_version: store.format_version()?,
             page_size: PAGE_SIZE,
-            pages: state.store.page_count(),
-            free_pages: state.store.free_pages()?.len(),
+            pages: store.page_count(),
+            free_pages: store.free_pages()?.len(),
         })
     }
 
@@ -69,7 +70,8 @@ impl Database {
     /// writers wait, readers don't.
     pub fn check(&self) -> crate::Result<CheckReport> {
         let state = self.read()?;
-        let (catalog, store) = (&state.catalog, &state.store);
+        let at = state.snapshot();
+        let (catalog, store) = (at.catalog, &at.store);
         let mut check = Check {
             owners: BTreeMap::new(),
             page_count: store.page_count(),
@@ -172,7 +174,7 @@ impl Check {
 fn check_collection(
     check: &mut Check,
     catalog: &Catalog,
-    store: &FileStore,
+    store: &SnapshotStore,
     name: &str,
     damaged: &BTreeSet<PageId>,
 ) -> std::io::Result<usize> {
@@ -248,7 +250,7 @@ fn check_collection(
 /// documents are skipped: there's nothing to compare them with.
 fn check_index(
     check: &mut Check,
-    store: &FileStore,
+    store: &SnapshotStore,
     name: &str,
     index: &IndexMeta,
     documents: &[(DocId, Document, RecordLocation)],
@@ -400,7 +402,7 @@ mod tests {
         let current = db
             .read()
             .unwrap()
-            .catalog
+            .catalog()
             .get("notes")
             .unwrap()
             .current_data_page;
