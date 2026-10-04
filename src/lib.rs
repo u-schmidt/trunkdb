@@ -105,6 +105,12 @@ pub enum Error {
         id: document::DocId,
         message: String,
     },
+    /// `Database::compact` was called while a snapshot was open (SPEC
+    /// §80.5). A compaction rewrites every page, and keeping each as it
+    /// was for the snapshot would be keeping the whole file in memory.
+    /// Nothing was changed; compact again when the snapshot is gone.
+    #[error("a snapshot is open: the database can't be compacted until it is closed")]
+    SnapshotOpen,
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
     #[non_exhaustive]

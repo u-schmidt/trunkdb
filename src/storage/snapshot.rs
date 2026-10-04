@@ -18,7 +18,6 @@ impl Commit {
     }
 
     /// The commit's number, counted from 0 at open (SPEC §77.4).
-    #[cfg(test)]
     pub(crate) fn seq(&self) -> u64 {
         self.seq
     }

@@ -23,7 +23,7 @@ every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
 cloneable, thread-safe handle; reads run together, writes one at a
-time beside them, SPEC §79). See [DESIGN.md](DESIGN.md) for how it works,
+time beside them, and neither waits for the other, SPEC §80). See [DESIGN.md](DESIGN.md) for how it works,
 [the spec](spec/README.md) for why, and [ROADMAP.md](ROADMAP.md) for progress.
 
 ## Why
@@ -420,8 +420,13 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     only while it is published. Beside a writer committing back to
     back, readers do 18 to 31 times the reads. A commit still waits for
     the reads under way.
+54. **Older versions kept for open snapshots** (§80): a read keeps
+    reading its own commit, and commits don't wait for it. A writer
+    beside an export that never stops: from 132 s for one commit to
+    24 ms. `compact` waits for the reads under way; a new error,
+    `Error::SnapshotOpen`, for one refused by a kept snapshot.
 
-    Items 50–53: not released yet; no format change, no API change.
+    Items 50–54: not released yet; no format change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

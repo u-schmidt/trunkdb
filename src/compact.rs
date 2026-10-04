@@ -30,8 +30,11 @@ impl Database {
     /// through the WAL, so a crash leaves the old file or the new one,
     /// never a mix. That needs memory for the whole new file, twice (the
     /// pages, and the WAL record of them). Other writes wait for
-    /// all of it; reads go on, on the file as it was, and wait only while
-    /// the new one is published (SPEC §79).
+    /// all of it. Reads go on while the new file is built; then it waits
+    /// for the reads under way, and new ones wait until it is committed.
+    ///
+    /// `Error::SnapshotOpen` if a snapshot is kept open: every page
+    /// changes, and none can be kept as it was (SPEC §80.5).
     pub fn compact(&self) -> crate::Result<Compacted> {
         self.transact(|catalog, store| {
             let pages_before = store.page_count();
