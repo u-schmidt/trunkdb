@@ -40,7 +40,8 @@ before them. No tags on freed pages, no change to the free list or the
 free-space map (§75). That answers the format question ROADMAP.md left
 open.
 
-Six steps, a section each:
+Six steps, a section each (§81 is not one of them: a fix found on the
+way):
 
 | Section | What | Seen from outside |
 |---|---|---|
@@ -48,8 +49,8 @@ Six steps, a section each:
 | §78 | every read through a snapshot, inside, under the one lock | nothing |
 | §79 | option B of §57.2: a lock for writers only; readers take a snapshot per call; log, flush and checkpoint beside them | readers don't wait for commits |
 | §80 | older versions kept while a snapshot needs them, and dropped after | nothing |
-| §81 | `Database::snapshot`, `Snapshot`, `View<T>`; `export`, `check` and `cursor` on a snapshot | the feature |
-| §82 | a limit on the memory versions take, counters, a benchmark of the workload above | a forgotten snapshot can't take all memory |
+| §82 | `Database::snapshot`, `Snapshot`, `View<T>`; `export`, `check` and `cursor` on a snapshot | the feature |
+| §83 | a limit on the memory versions take, counters, a benchmark of the workload above | a forgotten snapshot can't take all memory |
 
 Decided with it:
 - **A version is kept only if an open snapshot would read it**, or it's

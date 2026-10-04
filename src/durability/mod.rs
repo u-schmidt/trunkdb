@@ -22,6 +22,13 @@ pub trait Durability {
     /// Marks every batch logged so far as durably reflected in the main
     /// file — safe to forget, since replaying it is no longer necessary.
     fn checkpoint(&mut self) -> std::io::Result<()>;
+    /// Takes a failed `log` back (SPEC §81): cuts the log to what it held
+    /// before that call, so a record the call left behind — written, but
+    /// its flush failed — isn't restored by the next `open`, for a batch
+    /// reported as failed. The batches logged before it stay: they are
+    /// committed, and until a checkpoint the log is the only durable
+    /// place they are in.
+    fn undo_failed_log(&mut self) -> std::io::Result<()>;
     /// How many bytes the log holds now, header included: what `open`
     /// would have to read back after a crash (SPEC §76).
     fn len(&self) -> u64;

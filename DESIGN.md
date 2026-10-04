@@ -140,7 +140,9 @@ past the file's end, as the header before it has it, is refused before
 anything is written [§55](spec/55-fuzzing.md). A checkpoint
 that fails keeps its pages waiting, and the next one tries again.
 
-Only if the WAL can't be written *and* can't be truncated is the
+A batch whose log fails is taken back alone: the WAL is cut to where
+it was before, which keeps the batches committed earlier and not yet
+written back [§81](spec/81-a-failed-log-taken-back-alone.md). Only if that fails too is the
 batch's fate unknown; the database then refuses every call with
 `Error::Poisoned` until it's reopened, which recovers from the WAL
 [§19](spec/19-durability-take-two-a-page-image-wal.md) [§27](spec/27-a-thread-safe-cloneable-database-handle.md).
@@ -351,8 +353,8 @@ begin until it is committed, and fails with `Error::SnapshotOpen` if a
 snapshot is kept open beyond a read.
 
 **Still to come** [§77](spec/77-the-committed-pages-apart-from-the-writers.md): a snapshot a caller can keep, for one state
-across several calls, and a cursor on one (§81); a limit on the memory
-versions take (§82). §57 deferred snapshots until a workload asked;
+across several calls, and a cursor on one (§82); a limit on the memory
+versions take (§83). §57 deferred snapshots until a workload asked;
 many small writes beside reads of up to 15 seconds now do.
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing

@@ -35,7 +35,7 @@ that needs an older one finds a version with a higher number than its
 own, and gets an error, "snapshot too old", not the newer page. Under
 the lock no read meets it: a reader's commit is the last one. §80
 keeps the versions a snapshot needs, and the error then stays for the
-snapshot that §82's memory limit ends.
+snapshot that §83's memory limit ends.
 
 What this can't catch yet: a checkpoint moves a page into the file and
 forgets its number, so an older snapshot reading it afterwards would

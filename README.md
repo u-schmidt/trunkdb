@@ -426,7 +426,12 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     24 ms. `compact` waits for the reads under way; a new error,
     `Error::SnapshotOpen`, for one refused by a kept snapshot.
 
-    Items 50–54: not released yet; no format change.
+55. **A failed log, taken back alone** (§81): a batch whose write to the
+    WAL fails no longer empties the WAL, which also held the batches
+    committed before it and not yet written back; a crash soon after
+    lost those. A fix to §51.
+
+    Items 50–55: not released yet; no format change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
