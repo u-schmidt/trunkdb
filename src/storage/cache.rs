@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// goes. That approximates least-recently-used without keeping an order
 /// on every read — a read only sets a flag. The flag is atomic, so a
 /// read changes nothing else and needs only `&self`: readers share the
-/// cache behind a read lock, and only `put` and the others take the
-/// write lock (SPEC §65).
+/// cache behind `Pages`' read lock, and only `put` and the others need
+/// the write lock (SPEC §65, §79).
 pub(crate) struct PageCache {
     /// At most this many pages; 0 keeps nothing.
     capacity: usize,

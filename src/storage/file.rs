@@ -1,12 +1,15 @@
 use super::pages::{
     PAGE_SIZE, Pages, USABLE_PAGE_SIZE, checksum_matches, damaged, read_disk_page, read_exact_at,
 };
-use super::snapshot::{Commit, SnapshotStore};
+use super::snapshot::Commit;
+#[cfg(test)]
+use super::snapshot::SnapshotStore;
 use super::{Page, PageId, PageImage, PageStore, PageType};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 /// How much of the file `FileStore` keeps in memory unless told
 /// otherwise (`OpenOptions::cache_size`, SPEC §50): 256 MiB, 32,768
@@ -163,8 +166,9 @@ impl Header {
 /// wrapper would have to duplicate the allocation logic to see it.
 pub struct FileStore {
     /// The committed pages: the file, the cache, and the pages waiting
-    /// for a checkpoint (SPEC §77). What a reader reads.
-    pub(crate) pages: Pages,
+    /// for a checkpoint (SPEC §77). What a reader reads, and shared with
+    /// the readers (SPEC §79): `Database` holds it too.
+    pub(crate) pages: Arc<Pages>,
     /// The header as the batch in the making has it; as of the last
     /// commit when none is staged. The writer's, like `staging`.
     header: Header,
@@ -268,7 +272,7 @@ impl FileStore {
         };
 
         Ok(Self {
-            pages: Pages::new(file, DEFAULT_CACHE_SIZE / PAGE_SIZE),
+            pages: Arc::new(Pages::new(file, DEFAULT_CACHE_SIZE / PAGE_SIZE)),
             header,
             // A fresh file's header isn't on disk yet: nothing to check.
             header_checked: is_fresh,
@@ -344,8 +348,9 @@ impl FileStore {
     }
 
     /// The pages as of `commit`, to read (SPEC §78).
+    #[cfg(test)]
     pub(crate) fn at(&self, commit: Commit) -> SnapshotStore<'_> {
-        SnapshotStore::new(&self.pages, commit)
+        self.pages.at(commit)
     }
 
     fn write_header(&mut self) -> io::Result<()> {
@@ -383,13 +388,13 @@ impl FileStore {
 
     /// How many bytes of pages the cache holds at most (SPEC §50); 0
     /// turns it off. Pages over the new size are forgotten.
-    pub fn set_cache_size(&mut self, bytes: usize) {
+    pub fn set_cache_size(&self, bytes: usize) {
         self.pages.set_cache_pages(bytes / PAGE_SIZE);
     }
 
     #[cfg(test)]
     pub(crate) fn cache_size(&self) -> usize {
-        self.pages.cache().capacity()
+        self.pages.memory().cache.capacity()
     }
 
     /// The whole file as it is on disk, read through the store's own
@@ -406,7 +411,7 @@ impl FileStore {
     /// Hits and misses so far.
     #[cfg(test)]
     pub(crate) fn cache_stats(&self) -> (usize, usize) {
-        let cache = self.pages.cache();
+        let cache = &self.pages.memory().cache;
         let count =
             |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::Relaxed);
         (count(&cache.hits), count(&cache.misses))
@@ -414,7 +419,7 @@ impl FileStore {
 
     #[cfg(test)]
     fn cached(&self, id: PageId) -> Option<Page> {
-        self.pages.cache().get(id)
+        self.pages.memory().cache.get(id)
     }
 
     fn check_bounds(&self, id: PageId) -> io::Result<()> {
@@ -495,6 +500,16 @@ impl FileStore {
         self.header.page_count = page_count;
         self.header.free_list_head = NO_FREE_PAGE;
         self.write_header()
+    }
+
+    /// Checks the staged pages' layout (SPEC §66), ahead of `commit`,
+    /// which would check them where readers wait for it (SPEC §79).
+    pub(crate) fn check_staged(&mut self) {
+        if let Some(staging) = &mut self.staging {
+            for page in staging.dirty.values_mut() {
+                *page = page.clone().checked();
+            }
+        }
     }
 
     /// Ends staging for a batch the WAL now holds (SPEC §51): its pages
@@ -1513,7 +1528,7 @@ mod tests {
     fn a_cache_of_size_zero_reads_the_file_every_time() {
         let (_dir, path) = open_temp();
         two_page_file(&path);
-        let mut store = FileStore::open(&path).unwrap();
+        let store = FileStore::open(&path).unwrap();
         store.set_cache_size(0);
         let before = store.cache_stats();
         store.read_page(1).unwrap();
@@ -1601,7 +1616,7 @@ mod tests {
         let (_dir, path) = open_temp();
         let store = five_page_file(&path);
         store.read_page(1).unwrap();
-        let held = store.pages.cache();
+        let held = store.pages.memory();
         let (sent, received) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| sent.send(store.read_page(1).unwrap()).unwrap());
@@ -1649,8 +1664,7 @@ mod tests {
             store.write_page(id, filled(7).into()).unwrap();
         }
         store.commit();
-        store.pages.failing_write_backs = 1;
-        store.pages.write_back_fails_after = 1;
+        store.pages.fail_write_backs(1, 1);
         assert!(store.checkpoint().is_err());
         let disk = on_disk(&store);
         assert_eq!(disk.read_page(1).unwrap(), filled(7));

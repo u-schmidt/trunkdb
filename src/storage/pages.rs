@@ -4,6 +4,8 @@ use crate::crc32::Crc32;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A page's size in the file. Matches LiteDB's page size, partly so
@@ -25,15 +27,35 @@ pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - CHECKSUM_LEN;
 /// reader reads, and all a reader reads; a batch in the making is not
 /// here but in `FileStore`'s staging, the writer's alone.
 ///
-/// Nothing in here changes while a batch is staged or applied. It
-/// changes at three moments: `commit`, `checkpoint` and `restore`.
+/// Shared between the writer and the readers (SPEC §79), so everything
+/// takes `&self`. What's in memory sits behind one lock: a page read
+/// takes it once, shared; `commit`, the end of a `checkpoint` and a
+/// page coming in from the file take it alone, briefly. The file is
+/// written by `checkpoint` and `restore` only, and never where a reader
+/// reads it: a page is read from the file only while it has no version
+/// waiting, and only pages with one are written.
+///
+/// One thread at a time may call `commit`, `checkpoint`, `restore` and
+/// `write_through`: the writer, which `Database` makes sure of.
 pub(crate) struct Pages {
     file: File,
-    /// Checked pages as they are in the file (SPEC §50). Behind a lock
-    /// because reads take `&self` and run in parallel (§27): a read lock
-    /// to look a page up, which readers share, and the write lock to put
-    /// one in (SPEC §65).
-    cache: RwLock<PageCache>,
+    memory: RwLock<Memory>,
+    /// Test-only fault injection: while non-zero, each `checkpoint`
+    /// writes `write_back_fails_after` pages, then fails (and decrements
+    /// this) — leaving the file genuinely half-written, like a crash or a
+    /// full disk would. Pages go out in ascending id order.
+    #[cfg(test)]
+    failing_write_backs: AtomicUsize,
+    #[cfg(test)]
+    write_back_fails_after: AtomicUsize,
+}
+
+/// The pages in memory, behind `Pages`' lock.
+pub(super) struct Memory {
+    /// Checked pages as they are in the file (SPEC §50). A lookup
+    /// changes only an atomic flag, so readers look pages up together
+    /// under the read lock (SPEC §65).
+    pub(super) cache: PageCache,
     /// Pages of committed batches — durable in the WAL — not yet written
     /// back to the file (SPEC §51): the newest version of each, with the
     /// number of the commit that wrote it. Reads look here before the
@@ -42,14 +64,6 @@ pub(crate) struct Pages {
     /// The number of the last commit, counted from 0 at open: in memory
     /// only, the file knows nothing of it (SPEC §77).
     seq: u64,
-    /// Test-only fault injection: while non-zero, each `checkpoint`
-    /// writes `write_back_fails_after` pages, then fails (and decrements
-    /// this) — leaving the file genuinely half-written, like a crash or a
-    /// full disk would. Pages go out in ascending id order.
-    #[cfg(test)]
-    pub(crate) failing_write_backs: u32,
-    #[cfg(test)]
-    pub(crate) write_back_fails_after: usize,
 }
 
 /// A committed page, and the commit that made it what it is.
@@ -62,13 +76,15 @@ impl Pages {
     pub(super) fn new(file: File, cache_pages: usize) -> Self {
         Pages {
             file,
-            cache: RwLock::new(PageCache::new(cache_pages)),
-            versions: BTreeMap::new(),
-            seq: 0,
+            memory: RwLock::new(Memory {
+                cache: PageCache::new(cache_pages),
+                versions: BTreeMap::new(),
+                seq: 0,
+            }),
             #[cfg(test)]
-            failing_write_backs: 0,
+            failing_write_backs: AtomicUsize::new(0),
             #[cfg(test)]
-            write_back_fails_after: 1,
+            write_back_fails_after: AtomicUsize::new(1),
         }
     }
 
@@ -78,48 +94,68 @@ impl Pages {
         &self.file
     }
 
+    /// The pages in memory, to look one up: readers share it (SPEC §65).
+    /// A panic while the lock was held can't have left them half-changed
+    /// in a way that matters — at worst a page is missing from the cache
+    /// — so a poisoned lock is taken over, not passed on.
+    pub(super) fn memory(&self) -> RwLockReadGuard<'_, Memory> {
+        self.memory
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The pages in memory, to change: one thread at a time, and no
+    /// reader meanwhile. A read that misses the cache takes it to put
+    /// the page in.
+    fn memory_mut(&self) -> RwLockWriteGuard<'_, Memory> {
+        self.memory
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The newest committed version of a page: from the pages not
     /// written back, then the cache, then the file. What the writer
     /// reads where its batch hasn't changed a page. Shared wherever it
     /// comes from, never copied (SPEC §64). No bounds check — callers do
     /// that.
     pub(super) fn read(&self, id: PageId) -> io::Result<Page> {
-        match self.versions.get(&id) {
-            Some(version) => Ok(version.page.clone()),
-            None => self.read_written(id),
-        }
+        self.read_at(id, u64::MAX)
     }
 
     /// A page as of commit `seq` (SPEC §78): what a snapshot reads. The
     /// version waiting for a checkpoint if that commit or an earlier one
-    /// wrote it, otherwise the file's.
+    /// wrote it, otherwise the file's: from the cache, or the file — and
+    /// a page read from the file is kept in the cache, its layout checked
+    /// (SPEC §66). The lock is held for the lookup only, not for reading
+    /// the file.
     ///
     /// A version from a later commit is an error: the one before it is
-    /// gone, since only the newest is kept. No reader meets that while
-    /// reads and commits exclude each other (§27); §80 keeps the older
-    /// versions a snapshot still needs. No bounds check — callers do
-    /// that.
+    /// gone, since only the newest is kept. No reader meets that while a
+    /// commit waits for the readers before it (SPEC §79); §80 keeps the
+    /// older versions a snapshot still needs. No bounds check — callers
+    /// do that.
     pub(super) fn read_at(&self, id: PageId, seq: u64) -> io::Result<Page> {
-        match self.versions.get(&id) {
-            Some(version) if version.seq <= seq => Ok(version.page.clone()),
-            Some(version) => Err(io::Error::other(format!(
-                "snapshot too old: page {id} as of commit {seq} is gone, commit {} changed it",
-                version.seq
-            ))),
-            None => self.read_written(id),
+        {
+            let memory = self.memory();
+            match memory.versions.get(&id) {
+                Some(version) if version.seq <= seq => return Ok(version.page.clone()),
+                Some(version) => {
+                    return Err(io::Error::other(format!(
+                        "snapshot too old: page {id} as of commit {seq} is gone, commit {} changed it",
+                        version.seq
+                    )));
+                }
+                None => {}
+            }
+            if let Some(page) = memory.cache.get(id) {
+                return Ok(page);
+            }
         }
-    }
-
-    /// A page the file holds the newest version of: from the cache, or
-    /// the file — and keeps a page read from the file in the cache, its
-    /// layout checked (SPEC §66). The cache's lock is held for the lookup
-    /// only.
-    fn read_written(&self, id: PageId) -> io::Result<Page> {
-        if let Some(page) = self.cache().get(id) {
-            return Ok(page);
-        }
+        // Not written meanwhile: a checkpoint writes only pages with a
+        // version waiting, this one had none, and gets one only by a
+        // commit, which waits for this reader (SPEC §79.3).
         let page = read_page_at(&self.file, id)?.checked();
-        self.cache_mut().put(id, page.clone());
+        self.memory_mut().cache.put(id, page.clone());
         Ok(page)
     }
 
@@ -131,7 +167,7 @@ impl Pages {
     pub(super) fn damaged(&self, page_count: u64) -> io::Result<Vec<PageId>> {
         let mut damaged = Vec::new();
         for id in 0..page_count {
-            if self.versions.contains_key(&id) {
+            if self.memory().versions.contains_key(&id) {
                 continue;
             }
             if !checksum_matches(id, &read_disk_page(&self.file, id)?) {
@@ -145,21 +181,26 @@ impl Pages {
     /// that isn't staging.
     pub(super) fn write_through(&self, id: PageId, data: Page) -> io::Result<()> {
         write_page_at(&self.file, id, &data)?;
-        self.cache_mut().put(id, data.checked());
+        self.memory_mut().cache.put(id, data.checked());
         Ok(())
     }
 
     /// Makes a batch's pages, which the WAL now holds (SPEC §51), the
     /// newest committed ones, under the next commit number: read from
     /// memory until `checkpoint` writes them back. Nothing is written to
-    /// the file. Their layout is checked here, once, so reads until then
-    /// skip it (SPEC §66), as reads of the cache do.
-    pub(super) fn commit(&mut self, dirty: BTreeMap<PageId, Page>) {
-        self.seq += 1;
-        let seq = self.seq;
-        for (id, page) in dirty {
-            let page = page.checked();
-            let replaced = self.versions.insert(id, Version { seq, page });
+    /// the file. Their layout is checked first, once, so reads until then
+    /// skip it (SPEC §66), as reads of the cache do — and outside the
+    /// lock, which is held only to put the pages in.
+    pub(super) fn commit(&self, dirty: BTreeMap<PageId, Page>) {
+        let checked: Vec<(PageId, Page)> = dirty
+            .into_iter()
+            .map(|(id, page)| (id, page.checked()))
+            .collect();
+        let mut memory = self.memory_mut();
+        memory.seq += 1;
+        let seq = memory.seq;
+        for (id, page) in checked {
+            let replaced = memory.versions.insert(id, Version { seq, page });
             debug_assert!(
                 replaced.is_none_or(|older| older.seq < seq),
                 "page {id} had a version from a later commit"
@@ -169,19 +210,19 @@ impl Pages {
 
     /// The number of the last commit.
     pub(super) fn seq(&self) -> u64 {
-        self.seq
+        self.memory().seq
     }
 
     /// The number of the commit that wrote page `id`, while it waits for
     /// `checkpoint`.
     #[cfg(test)]
     pub(super) fn version_seq(&self, id: PageId) -> Option<u64> {
-        self.versions.get(&id).map(|version| version.seq)
+        self.memory().versions.get(&id).map(|version| version.seq)
     }
 
     /// How many committed pages wait for `checkpoint`.
     pub(super) fn unwritten(&self) -> usize {
-        self.versions.len()
+        self.memory().versions.len()
     }
 
     /// Writes every committed page not written back yet to the file,
@@ -190,54 +231,81 @@ impl Pages {
     /// were, and reads still find them there — the file may now be half
     /// written, but none of the pages it's half-written with is read from
     /// it. A later call writes them all again.
-    pub(super) fn checkpoint(&mut self, page_count: u64) -> io::Result<()> {
-        if self.versions.is_empty() {
+    ///
+    /// Beside the readers (SPEC §79): the writes and the flush hold no
+    /// lock. A page being written still has its version, which is what a
+    /// reader gets, so nobody reads the file where it changes. Only then,
+    /// under the lock, do the pages move from the versions to the cache,
+    /// at once: a reader finds each in one or the other.
+    pub(super) fn checkpoint(&self, page_count: u64) -> io::Result<()> {
+        // No commit comes between this and the end: the writer is here.
+        let waiting: Vec<(PageId, Page)> = self
+            .memory()
+            .versions
+            .iter()
+            .map(|(&id, version)| (id, version.page.clone()))
+            .collect();
+        if waiting.is_empty() {
             return Ok(());
         }
-        self.write_versions()?;
+        self.write_back(&waiting)?;
         self.truncate(page_count)?;
         self.sync()?;
-        let written = std::mem::take(&mut self.versions);
-        let mut cache = self.cache_mut();
+        let mut memory = self.memory_mut();
+        memory.versions.clear();
         // Not pages a later batch cut off the end: they're gone. Moved,
         // not copied: the cache takes the pages the batch staged.
-        for (id, version) in written.into_iter().filter(|(id, _)| *id < page_count) {
-            cache.put(id, version.page);
+        for (id, page) in waiting.into_iter().filter(|(id, _)| *id < page_count) {
+            memory.cache.put(id, page);
         }
         Ok(())
     }
 
-    /// `checkpoint`'s writes: every unwritten page, in ascending id order.
-    fn write_versions(&mut self) -> io::Result<()> {
+    /// `checkpoint`'s writes: every waiting page, in ascending id order.
+    fn write_back(&self, waiting: &[(PageId, Page)]) -> io::Result<()> {
         #[cfg(test)]
         let mut written = 0;
         // The counter only exists in test builds, so `enumerate` would be
         // an unused index everywhere else.
         #[allow(clippy::explicit_counter_loop)]
-        for (&id, version) in &self.versions {
+        for (id, page) in waiting {
             #[cfg(test)]
             {
-                if self.failing_write_backs > 0 && written == self.write_back_fails_after {
-                    self.failing_write_backs -= 1;
+                let failing = self.failing_write_backs.load(Ordering::Relaxed);
+                if failing > 0 && written == self.write_back_fails_after.load(Ordering::Relaxed) {
+                    self.failing_write_backs
+                        .store(failing - 1, Ordering::Relaxed);
                     return Err(io::Error::other("injected write-back failure"));
                 }
                 written += 1;
             }
-            write_page_at(&self.file, id, &version.page)?;
+            write_page_at(&self.file, *id, page)?;
         }
         Ok(())
+    }
+
+    /// Test-only: makes the next `times` checkpoints fail, each after
+    /// writing `after` pages.
+    #[cfg(test)]
+    pub(crate) fn fail_write_backs(&self, times: usize, after: usize) {
+        self.failing_write_backs.store(times, Ordering::Relaxed);
+        self.write_back_fails_after.store(after, Ordering::Relaxed);
     }
 
     /// Crash recovery's writes: page images straight to the file, in the
     /// order given, so a page logged more than once ends at its latest
     /// image. The cache is emptied first: pages are about to change under
-    /// it. No bounds check, no flush: `FileStore::restore_pages` does both.
-    pub(super) fn restore(&mut self, pages: &[super::PageImage]) -> io::Result<()> {
-        assert!(
-            self.versions.is_empty(),
-            "Pages::restore with pages to write back"
-        );
-        self.cache_mut().clear();
+    /// it. No bounds check, no flush: `FileStore::restore_pages` does
+    /// both. At open only, before there is a reader.
+    pub(super) fn restore(&self, pages: &[super::PageImage]) -> io::Result<()> {
+        {
+            let mut memory = self.memory_mut();
+            assert!(
+                memory.versions.is_empty(),
+                "Pages::restore with pages to write back"
+            );
+            memory.cache.clear();
+        }
         for (id, page) in pages {
             write_page_at(&self.file, *id, page)?;
         }
@@ -251,7 +319,7 @@ impl Pages {
         let len = page_count * PAGE_SIZE as u64;
         if self.file.metadata()?.len() > len {
             self.file.set_len(len)?;
-            self.cache_mut().retain(|id| id < page_count);
+            self.memory_mut().cache.retain(|id| id < page_count);
         }
         Ok(())
     }
@@ -260,28 +328,10 @@ impl Pages {
         super::sync(&self.file)
     }
 
-    /// The page cache, to look pages up: readers share it (SPEC §65).
-    /// A panic while it was held can't have left it half-changed in a way
-    /// that matters — at worst a page is missing — so a poisoned lock is
-    /// taken over, not passed on.
-    pub(super) fn cache(&self) -> RwLockReadGuard<'_, PageCache> {
-        self.cache
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// The page cache, to change: one thread at a time, and no reader
-    /// meanwhile. A read that misses takes it to put the page in.
-    fn cache_mut(&self) -> RwLockWriteGuard<'_, PageCache> {
-        self.cache
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// How many pages the cache holds at most (SPEC §50); 0 turns it
     /// off. Pages over the new size are forgotten.
-    pub(super) fn set_cache_pages(&mut self, pages: usize) {
-        self.cache_mut().resize(pages);
+    pub(super) fn set_cache_pages(&self, pages: usize) {
+        self.memory_mut().cache.resize(pages);
     }
 }
 

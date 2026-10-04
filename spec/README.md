@@ -89,3 +89,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 76. [A WAL size limit (`database.rs`, `durability/`)](76-a-wal-size-limit.md)
 77. [The committed pages, apart from the writer's (`storage/pages.rs`, `storage/file.rs`)](77-the-committed-pages-apart-from-the-writers.md)
 78. [Reads through a snapshot (`storage/snapshot.rs`, `storage/pages.rs`, `database.rs`)](78-reads-through-a-snapshot.md)
+79. [Writers beside the readers (`database.rs`, `storage/pages.rs`)](79-writers-beside-the-readers.md)

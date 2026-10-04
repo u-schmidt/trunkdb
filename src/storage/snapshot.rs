@@ -33,11 +33,17 @@ pub(crate) struct SnapshotStore<'a> {
     commit: Commit,
 }
 
-impl<'a> SnapshotStore<'a> {
-    pub(super) fn new(pages: &'a Pages, commit: Commit) -> Self {
-        SnapshotStore { pages, commit }
+impl Pages {
+    /// The pages as of `commit`, to read.
+    pub(crate) fn at(&self, commit: Commit) -> SnapshotStore<'_> {
+        SnapshotStore {
+            pages: self,
+            commit,
+        }
     }
+}
 
+impl SnapshotStore<'_> {
     /// How many pages the file had, the header included.
     pub(crate) fn page_count(&self) -> u64 {
         self.commit.header.page_count
