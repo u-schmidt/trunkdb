@@ -29,11 +29,13 @@ pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - CHECKSUM_LEN;
 ///
 /// Shared between the writer and the readers (SPEC §79), so everything
 /// takes `&self`. What's in memory sits behind one lock: a page read
-/// takes it once, shared; `commit`, the end of a `checkpoint` and a
-/// page coming in from the file take it alone, briefly. The file is
-/// written by `checkpoint` and `restore` only, and never where a reader
-/// reads it: a page is read from the file only while it has no version
-/// waiting, and only pages with one are written.
+/// takes it once, shared; `commit`, the two ends of a `checkpoint` and a
+/// page coming in from the file take it alone, briefly.
+///
+/// A page may have several versions here (SPEC §80): the newest, and
+/// older ones for as long as a snapshot would read them. A reader names
+/// its commit and gets the newest version at or before it, whatever has
+/// been committed or written to the file since.
 ///
 /// One thread at a time may call `commit`, `checkpoint`, `restore` and
 /// `write_through`: the writer, which `Database` makes sure of.
@@ -48,6 +50,12 @@ pub(crate) struct Pages {
     failing_write_backs: AtomicUsize,
     #[cfg(test)]
     write_back_fails_after: AtomicUsize,
+    /// Test-only: called by a read once it has found a page in neither
+    /// the versions nor the cache, before it reads the file — to let a
+    /// commit and a checkpoint of that very page pass in between.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    before_file_read: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The pages in memory, behind `Pages`' lock.
@@ -56,20 +64,61 @@ pub(super) struct Memory {
     /// changes only an atomic flag, so readers look pages up together
     /// under the read lock (SPEC §65).
     pub(super) cache: PageCache,
-    /// Pages of committed batches — durable in the WAL — not yet written
-    /// back to the file (SPEC §51): the newest version of each, with the
-    /// number of the commit that wrote it. Reads look here before the
-    /// cache and the file; `checkpoint` writes them back.
-    versions: BTreeMap<PageId, Version>,
+    /// The versions of pages kept in memory (SPEC §80), oldest first:
+    /// - the newest, from its commit until a checkpoint has written it
+    ///   back (SPEC §51) — durable in the WAL meanwhile;
+    /// - older ones, and a newest one already written back, for as long
+    ///   as a snapshot open at their commit would read one of them.
+    ///
+    /// A page with no entry has one version, the file's, and every
+    /// reader reads that. So a page keeps its entry as long as the file
+    /// holds anything but what every open snapshot should see.
+    versions: BTreeMap<PageId, Vec<Version>>,
+    /// How many pages' newest version waits for `checkpoint`.
+    unwritten: usize,
     /// The number of the last commit, counted from 0 at open: in memory
     /// only, the file knows nothing of it (SPEC §77).
     seq: u64,
+    /// Counts the checkpoints begun. A page read from the file while
+    /// one began may be a page half written, or one newer than its
+    /// reader's commit: the reader sees the count has moved, and looks
+    /// again (SPEC §80.4).
+    file_epoch: u64,
 }
 
 /// A committed page, and the commit that made it what it is.
 struct Version {
+    /// The commit that wrote it. 0 for a page as it was before the
+    /// first commit that changed it since it was last without versions:
+    /// kept for the snapshots open then, all of them older than that
+    /// commit (SPEC §80.2).
     seq: u64,
     page: Page,
+    /// Whether the file holds this version: a checkpoint wrote it, or it
+    /// was read from there.
+    written: bool,
+}
+
+/// The versions in `chain` no open snapshot would read, dropped: all but
+/// the newest, and those an open snapshot's commit falls on — at or
+/// after the version's, and before the next one's. `live` is the open
+/// snapshots' commit numbers, ascending.
+fn prune(chain: &mut Vec<Version>, live: &[u64]) {
+    if chain.len() < 2 {
+        return;
+    }
+    let mut next_seq = u64::MAX;
+    let mut keep = vec![false; chain.len()];
+    for (at, version) in chain.iter().enumerate().rev() {
+        let first_at_or_after = live.partition_point(|&seq| seq < version.seq);
+        let read = live
+            .get(first_at_or_after)
+            .is_some_and(|&seq| seq < next_seq);
+        keep[at] = read || at == chain.len() - 1;
+        next_seq = version.seq;
+    }
+    let mut keep = keep.into_iter();
+    chain.retain(|_| keep.next().unwrap());
 }
 
 impl Pages {
@@ -79,12 +128,16 @@ impl Pages {
             memory: RwLock::new(Memory {
                 cache: PageCache::new(cache_pages),
                 versions: BTreeMap::new(),
+                unwritten: 0,
                 seq: 0,
+                file_epoch: 0,
             }),
             #[cfg(test)]
             failing_write_backs: AtomicUsize::new(0),
             #[cfg(test)]
             write_back_fails_after: AtomicUsize::new(1),
+            #[cfg(test)]
+            before_file_read: std::sync::Mutex::new(None),
         }
     }
 
@@ -113,65 +166,106 @@ impl Pages {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The newest committed version of a page: from the pages not
-    /// written back, then the cache, then the file. What the writer
-    /// reads where its batch hasn't changed a page. Shared wherever it
-    /// comes from, never copied (SPEC §64). No bounds check — callers do
-    /// that.
+    /// The newest committed version of a page: from the versions in
+    /// memory, then the cache, then the file. What the writer reads where
+    /// its batch hasn't changed a page. Shared wherever it comes from,
+    /// never copied (SPEC §64). No bounds check — callers do that.
     pub(super) fn read(&self, id: PageId) -> io::Result<Page> {
         self.read_at(id, u64::MAX)
     }
 
-    /// A page as of commit `seq` (SPEC §78): what a snapshot reads. The
-    /// version waiting for a checkpoint if that commit or an earlier one
-    /// wrote it, otherwise the file's: from the cache, or the file — and
-    /// a page read from the file is kept in the cache, its layout checked
-    /// (SPEC §66). The lock is held for the lookup only, not for reading
-    /// the file.
+    /// A page as of commit `seq` (SPEC §78): what a snapshot reads. Of
+    /// the versions in memory, the newest at or before `seq`; without
+    /// any, the file's: from the cache, or the file — and a page read
+    /// from the file is kept in the cache, its layout checked (SPEC
+    /// §66). The lock is held for the lookup only, not for reading the
+    /// file.
     ///
-    /// A version from a later commit is an error: the one before it is
-    /// gone, since only the newest is kept. No reader meets that while a
-    /// commit waits for the readers before it (SPEC §79); §80 keeps the
-    /// older versions a snapshot still needs. No bounds check — callers
-    /// do that.
+    /// Versions, but none at or before `seq`, is an error, "snapshot too
+    /// old": the one this reader needs wasn't kept. Not for a snapshot
+    /// the writer was told is open (`commit`, `checkpoint`). No bounds
+    /// check — callers do that.
     pub(super) fn read_at(&self, id: PageId, seq: u64) -> io::Result<Page> {
-        {
-            let memory = self.memory();
-            match memory.versions.get(&id) {
-                Some(version) if version.seq <= seq => return Ok(version.page.clone()),
-                Some(version) => {
-                    return Err(io::Error::other(format!(
-                        "snapshot too old: page {id} as of commit {seq} is gone, commit {} changed it",
-                        version.seq
-                    )));
+        loop {
+            let epoch = {
+                let memory = self.memory();
+                if let Some(chain) = memory.versions.get(&id) {
+                    return match chain.iter().rev().find(|version| version.seq <= seq) {
+                        Some(version) => Ok(version.page.clone()),
+                        None => Err(io::Error::other(format!(
+                            "snapshot too old: page {id} as of commit {seq} is gone, commit {} changed it",
+                            chain[0].seq
+                        ))),
+                    };
                 }
-                None => {}
+                if let Some(page) = memory.cache.get(id) {
+                    return Ok(page);
+                }
+                memory.file_epoch
+            };
+            #[cfg(test)]
+            {
+                // Taken first, so the hook runs without the hook's lock.
+                let hook = self.before_file_read.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
-            if let Some(page) = memory.cache.get(id) {
-                return Ok(page);
+            // No version, so the file's page is this reader's — as it was
+            // at the lookup. Since then a commit may have changed the
+            // page and a checkpoint written it: only a checkpoint begun
+            // since can have, and that shows in the count.
+            let read = read_page_at(&self.file, id);
+            let mut memory = self.memory_mut();
+            if memory.file_epoch != epoch {
+                // Maybe half written, maybe too new: look again. The
+                // version this reader needs is in memory by now.
+                continue;
             }
+            let page = read?.checked();
+            // Still what the file holds: no checkpoint began.
+            memory.cache.put(id, page.clone());
+            return Ok(page);
         }
-        // Not written meanwhile: a checkpoint writes only pages with a
-        // version waiting, this one had none, and gets one only by a
-        // commit, which waits for this reader (SPEC §79.3).
-        let page = read_page_at(&self.file, id)?.checked();
-        self.memory_mut().cache.put(id, page.clone());
-        Ok(page)
+    }
+
+    /// Test-only: `hook` runs once, in the next read that goes to the
+    /// file, just before it does.
+    #[cfg(test)]
+    pub(crate) fn before_next_file_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_file_read.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// The pages among the first `page_count` whose checksum doesn't
     /// match their bytes on disk, in id order — what a disk error or a
     /// change from outside trunkdb leaves. Reads the file itself. Pages
     /// not written back yet are skipped: the WAL holds them, and the
-    /// file's copy is older or missing (SPEC §51).
+    /// file's copy is older or missing (SPEC §51). A page read while a
+    /// checkpoint began is read again, as in `read_at`.
     pub(super) fn damaged(&self, page_count: u64) -> io::Result<Vec<PageId>> {
         let mut damaged = Vec::new();
         for id in 0..page_count {
-            if self.memory().versions.contains_key(&id) {
-                continue;
-            }
-            if !checksum_matches(id, &read_disk_page(&self.file, id)?) {
-                damaged.push(id);
+            loop {
+                let epoch = {
+                    let memory = self.memory();
+                    let waiting = memory
+                        .versions
+                        .get(&id)
+                        .and_then(|chain| chain.last())
+                        .is_some_and(|newest| !newest.written);
+                    if waiting {
+                        break;
+                    }
+                    memory.file_epoch
+                };
+                let disk = read_disk_page(&self.file, id);
+                if self.memory().file_epoch != epoch {
+                    continue;
+                }
+                if !checksum_matches(id, &disk?) {
+                    damaged.push(id);
+                }
+                break;
             }
         }
         Ok(damaged)
@@ -191,21 +285,70 @@ impl Pages {
     /// the file. Their layout is checked first, once, so reads until then
     /// skip it (SPEC §66), as reads of the cache do — and outside the
     /// lock, which is held only to put the pages in.
-    pub(super) fn commit(&self, dirty: BTreeMap<PageId, Page>) {
+    ///
+    /// `live` is the commit numbers of the snapshots open, ascending, all
+    /// of them before this commit (SPEC §80). For them the older versions
+    /// stay: a page that had none in memory keeps the one from `before`,
+    /// the page as this batch found it. Without a snapshot open nothing
+    /// older is kept, and a commit costs what it did.
+    pub(super) fn commit(
+        &self,
+        dirty: BTreeMap<PageId, Page>,
+        mut before: BTreeMap<PageId, Page>,
+        live: &[u64],
+    ) {
         let checked: Vec<(PageId, Page)> = dirty
             .into_iter()
             .map(|(id, page)| (id, page.checked()))
             .collect();
         let mut memory = self.memory_mut();
+        let memory = &mut *memory;
         memory.seq += 1;
         let seq = memory.seq;
+        debug_assert!(live.iter().all(|&open| open < seq) && live.is_sorted());
         for (id, page) in checked {
-            let replaced = memory.versions.insert(id, Version { seq, page });
-            debug_assert!(
-                replaced.is_none_or(|older| older.seq < seq),
-                "page {id} had a version from a later commit"
-            );
+            let chain = memory.versions.entry(id).or_default();
+            match chain.last() {
+                Some(newest) => {
+                    debug_assert!(
+                        newest.seq < seq,
+                        "page {id} had a version from a later commit"
+                    );
+                    if newest.written {
+                        memory.unwritten += 1;
+                    }
+                }
+                None => {
+                    memory.unwritten += 1;
+                    if !live.is_empty()
+                        && let Some(page) = before.remove(&id)
+                    {
+                        chain.push(Version {
+                            seq: 0,
+                            page,
+                            written: true,
+                        });
+                    }
+                }
+            }
+            chain.push(Version {
+                seq,
+                page,
+                written: false,
+            });
+            prune(chain, live);
         }
+    }
+
+    /// Drops the versions no open snapshot would read (`prune`), in every
+    /// page: for when snapshots have closed. A page left with one
+    /// version, which the file holds, has none in memory any more.
+    pub(super) fn forget(&self, live: &[u64]) {
+        let mut memory = self.memory_mut();
+        memory.versions.retain(|_id, chain| {
+            prune(chain, live);
+            !(chain.len() == 1 && chain[0].written)
+        });
     }
 
     /// The number of the last commit.
@@ -213,16 +356,35 @@ impl Pages {
         self.memory().seq
     }
 
-    /// The number of the commit that wrote page `id`, while it waits for
-    /// `checkpoint`.
+    /// The number of the commit that wrote page `id`'s newest version,
+    /// while it has versions in memory.
     #[cfg(test)]
     pub(super) fn version_seq(&self, id: PageId) -> Option<u64> {
-        self.memory().versions.get(&id).map(|version| version.seq)
+        let memory = self.memory();
+        memory
+            .versions
+            .get(&id)
+            .map(|chain| chain.last().unwrap().seq)
+    }
+
+    /// The commits of the versions page `id` has in memory, oldest
+    /// first: 0 for the page as it was before the first of them.
+    #[cfg(test)]
+    pub(crate) fn version_seqs(&self, id: PageId) -> Vec<u64> {
+        let memory = self.memory();
+        let chain = memory.versions.get(&id);
+        chain.map_or(Vec::new(), |chain| chain.iter().map(|v| v.seq).collect())
+    }
+
+    /// How many versions are in memory, over all pages.
+    #[cfg(test)]
+    pub(crate) fn versions_held(&self) -> usize {
+        self.memory().versions.values().map(Vec::len).sum()
     }
 
     /// How many committed pages wait for `checkpoint`.
     pub(super) fn unwritten(&self) -> usize {
-        self.memory().versions.len()
+        self.memory().unwritten
     }
 
     /// Writes every committed page not written back yet to the file,
@@ -233,31 +395,52 @@ impl Pages {
     /// it. A later call writes them all again.
     ///
     /// Beside the readers (SPEC §79): the writes and the flush hold no
-    /// lock. A page being written still has its version, which is what a
-    /// reader gets, so nobody reads the file where it changes. Only then,
-    /// under the lock, do the pages move from the versions to the cache,
-    /// at once: a reader finds each in one or the other.
-    pub(super) fn checkpoint(&self, page_count: u64) -> io::Result<()> {
+    /// lock. A page being written has versions in memory, which is what a
+    /// reader gets, so nobody reads the file where it changes — and a
+    /// reader that went to the file before the page had any sees that a
+    /// checkpoint began, and looks again (`read_at`).
+    ///
+    /// `live` as for `commit` (SPEC §80): the file gets the newest
+    /// version whoever is reading, and the versions an open snapshot
+    /// reads stay in memory, the newest with them, marked as written.
+    /// The rest go (`forget`).
+    pub(super) fn checkpoint(&self, page_count: u64, live: &[u64]) -> io::Result<()> {
         // No commit comes between this and the end: the writer is here.
-        let waiting: Vec<(PageId, Page)> = self
-            .memory()
-            .versions
-            .iter()
-            .map(|(&id, version)| (id, version.page.clone()))
-            .collect();
+        let waiting: Vec<(PageId, Page)> = {
+            let mut memory = self.memory_mut();
+            // Before the first write, and with the list: a reader that
+            // found no version for a page reads the file safely unless
+            // the count moves under it.
+            memory.file_epoch += 1;
+            let unwritten = memory.versions.iter().filter_map(|(&id, chain)| {
+                let newest = chain.last().unwrap();
+                (!newest.written).then(|| (id, newest.page.clone()))
+            });
+            unwritten.collect()
+        };
         if waiting.is_empty() {
+            self.forget(live);
             return Ok(());
         }
         self.write_back(&waiting)?;
         self.truncate(page_count)?;
         self.sync()?;
-        let mut memory = self.memory_mut();
-        memory.versions.clear();
-        // Not pages a later batch cut off the end: they're gone. Moved,
-        // not copied: the cache takes the pages the batch staged.
-        for (id, page) in waiting.into_iter().filter(|(id, _)| *id < page_count) {
-            memory.cache.put(id, page);
+        {
+            let mut memory = self.memory_mut();
+            let memory = &mut *memory;
+            for (id, page) in waiting {
+                let chain = memory.versions.get_mut(&id).unwrap();
+                chain.last_mut().unwrap().written = true;
+                // Not pages a later batch cut off the end: they're gone.
+                // Shared, not copied: the cache takes the pages the batch
+                // staged.
+                if id < page_count {
+                    memory.cache.put(id, page);
+                }
+            }
+            memory.unwritten = 0;
         }
+        self.forget(live);
         Ok(())
     }
 
@@ -304,6 +487,7 @@ impl Pages {
                 memory.versions.is_empty(),
                 "Pages::restore with pages to write back"
             );
+            memory.file_epoch += 1;
             memory.cache.clear();
         }
         for (id, page) in pages {
@@ -426,4 +610,47 @@ pub(super) fn write_all_at(file: &File, data: &[u8], mut offset: u64) -> io::Res
         offset += n as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `prune` leaves of versions from the commits `seqs`, with
+    /// snapshots open at `live`.
+    fn pruned(seqs: &[u64], live: &[u64]) -> Vec<u64> {
+        let mut chain: Vec<Version> = seqs
+            .iter()
+            .map(|&seq| Version {
+                seq,
+                page: Page::from(Vec::new()),
+                written: false,
+            })
+            .collect();
+        prune(&mut chain, live);
+        chain.iter().map(|version| version.seq).collect()
+    }
+
+    /// SPEC §80.3: the newest version stays, and of the others those an
+    /// open snapshot reads: the newest at or before its commit.
+    #[test]
+    fn prune_keeps_the_newest_and_what_an_open_snapshot_reads() {
+        // Nobody open: the newest.
+        assert_eq!(pruned(&[0, 3, 5, 9], &[]), [9]);
+        assert_eq!(pruned(&[9], &[]), [9]);
+        assert_eq!(pruned(&[9], &[2]), [9], "one version is never dropped");
+        // One snapshot, many commits since: two versions, not one each.
+        assert_eq!(pruned(&[0, 3, 5, 9], &[2]), [0, 9]);
+        assert_eq!(pruned(&[0, 3, 5, 9], &[3]), [3, 9], "its own commit's");
+        assert_eq!(pruned(&[0, 3, 5, 9], &[4]), [3, 9]);
+        assert_eq!(pruned(&[0, 3, 5, 9], &[8]), [5, 9]);
+        // At the newest or after it: it reads the newest.
+        assert_eq!(pruned(&[0, 3, 5, 9], &[9]), [9]);
+        assert_eq!(pruned(&[0, 3, 5, 9], &[12]), [9]);
+        // Several: each one's, once.
+        assert_eq!(pruned(&[0, 3, 5, 9], &[1, 2, 6, 7]), [0, 5, 9]);
+        assert_eq!(pruned(&[0, 3, 5, 9], &[1, 4, 8, 11]), [0, 3, 5, 9]);
+        // No version at or before the snapshot: nothing kept for it.
+        assert_eq!(pruned(&[3, 5, 9], &[2]), [9]);
+    }
 }

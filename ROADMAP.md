@@ -134,10 +134,16 @@ limit is described.
 - Snapshot reads (MVCC): reopened and planned in §77, for many small
   writes beside long reads, and one state across several calls. Six
   steps, §77 to §82. Done: §77 (the committed pages apart from the
-  writer's, commits numbered), §78 (every read through a snapshot) and
-  §79 (writers beside the readers). Next, §80: older versions kept
-  while a reader needs them, so a commit stops waiting for the reads
-  under way, and an export stops blocking writers (§30.6).
+  writer's, commits numbered), §78 (every read through a snapshot),
+  §79 (writers beside the readers) and §80 (older versions kept while
+  a reader needs them: commits wait for no read, and an export blocks
+  no writer, §30.6). Next, §81: `Database::snapshot`, a snapshot a
+  caller keeps, `View<T>`, and a cursor on one. Then §82: a limit on
+  the memory versions take.
+- Short reads on several threads: a tenth fewer with two readers since
+  §80, each read now writing to three shared places instead of one
+  (§80.6). With §81's kept snapshots counted, `compact` could do
+  without the gate on the read path (§80.8).
 
 **API**
 - A document as `serde_json::Value`, beside its text form (§71), if a

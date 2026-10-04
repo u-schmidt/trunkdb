@@ -67,8 +67,7 @@ impl Database {
     ///
     /// Problems are collected, not returned as errors: a damaged index
     /// doesn't stop the rest from being checked. A read like any other
-    /// (SPEC §79): other reads go on, and a commit waits to publish until
-    /// it's done.
+    /// on one snapshot (SPEC §80): reads and writes go on beside it.
     pub fn check(&self) -> crate::Result<CheckReport> {
         let state = self.read()?;
         let at = state.snapshot();

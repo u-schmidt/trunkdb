@@ -304,52 +304,65 @@ are shared, each with a lock of its own [§79](spec/79-writers-beside-the-reader
   A batch holds it from staging to its checkpoint; readers never take
   it. One writer at a time, and one process per file;
 - **the last commit**: its catalog and its commit number [§78](spec/78-reads-through-a-snapshot.md), behind
-  a read-write lock, the *gate*. A read (`get`, `find`, `count`,
-  `cursor`, `export`, `check`) holds it shared for the call, so reads
-  run in parallel; a commit takes it alone, only to publish;
+  a read-write lock held only to take it or to replace it. A read
+  (`get`, `find`, `count`, `cursor`, `export`, `check`) takes it when
+  it begins and keeps it, a *snapshot*, to its end;
 - **the committed pages**: the file, the page cache [§50](spec/50-a-page-cache.md) and the
-  pages waiting for a checkpoint [§77](spec/77-the-committed-pages-apart-from-the-writers.md), behind one read-write lock.
-  A page read takes it shared for the lookup, since a lookup changes
-  only an atomic flag [§65](spec/65-a-read-lock-for-the-page-cache.md); a page coming in from the file, a commit
-  and the end of a checkpoint take it alone, briefly. Pages are shared,
-  not copied: a read gets the page itself (`Page`, an `Arc`), and a
-  change copies it first [§64](spec/64-shared-pages.md).
+  versions of pages kept in memory [§77](spec/77-the-committed-pages-apart-from-the-writers.md) [§80](spec/80-older-versions-kept-for-open-snapshots.md), behind one read-write
+  lock. A page read takes it shared for the lookup, since a lookup
+  changes only an atomic flag [§65](spec/65-a-read-lock-for-the-page-cache.md); a page coming in from the file, a
+  commit and the two ends of a checkpoint take it alone, briefly. Pages
+  are shared, not copied: a read gets the page itself (`Page`, an
+  `Arc`), and a change copies it first [§64](spec/64-shared-pages.md).
 
-So a batch is staged, logged and flushed beside the readers, and a
-checkpoint writes the file beside them: a page being written back
-still has its version in memory, which is what readers get. Readers
-wait only for a publish, which puts the batch's pages into a map and
-swaps the snapshot. They see a batch entirely or not at all.
+**Nobody waits for anybody**, but for two short locks and `compact`:
+- a batch is staged, logged and flushed beside the readers, and
+  published by putting its pages into a map and swapping the snapshot.
+  Reads see a batch entirely or not at all;
+- a read goes on reading its own commit whatever is committed
+  meanwhile, and a commit doesn't wait for it. An export of some
+  seconds holds up no write;
+- a checkpoint writes the file beside all of them.
 
-What still waits: **a commit waits to publish until the reads under
-way are done**, and new reads wait behind it. A long read, an export
-say, holds up writers for as long as it runs. Only one version of a
-page is kept, so no reader may be on an older commit when a newer one
-comes.
+**Versions** make that work [§80](spec/80-older-versions-kept-for-open-snapshots.md). A page read names its commit and
+gets the newest version at or before it:
+- a page has versions in memory from its commit until a checkpoint has
+  written the newest to the file, and beyond that for as long as an
+  open snapshot would read an older one. Otherwise the file's page is
+  the only version, and everyone reads that;
+- the first commit to change a page keeps the page as it was, if a
+  snapshot is open; without one, nothing older is kept;
+- of a page's versions, the newest stays and each one an open snapshot
+  reads; the rest go at the next commit of that page or the next
+  checkpoint. One snapshot beside many commits costs one older copy of
+  each page changed, not one per commit;
+- a checkpoint always writes the newest version. A reader that went to
+  the file for a page just as a checkpoint wrote it sees that one
+  began, and looks again;
+- a freed page needs no tag: freeing and reusing it are newer versions
+  of that page.
 
-**Snapshot reads** end that, and are planned in six steps [§77](spec/77-the-committed-pages-apart-from-the-writers.md),
-three done. §57 deferred them until a workload asked: many small writes
-beside reads of up to 15 seconds, and one state across several calls,
-now do. They live below `PageStore` and in memory only: a reader pins
-the commit it started at, and a page read takes the newest version at
-or before it. Done so far: the committed pages apart from the writer's,
-and commits numbered [§77](spec/77-the-committed-pages-apart-from-the-writers.md); every read through a snapshot, the last
-commit's catalog and its pages through a read-only `PageStore`
-(`SnapshotStore`), which is all a read can reach [§78](spec/78-reads-through-a-snapshot.md); writers beside
-the readers [§79](spec/79-writers-beside-the-readers.md). Next: older versions kept while a reader needs
-them, so a read holds the gate only to take its snapshot.
+All of it is in memory: commit numbers start at 0 at every open, and
+the file and the WAL are as they were.
 
-The six rules of [§57.3](spec/57-concurrency.md) still bind every change to storage, with two
-notes from §77: a freed page needs no tag, since freeing and reusing it
-are just newer versions of that page; and a checkpoint will write the
-newest version always, older ones staying in memory for the readers
-that need them, instead of waiting for those readers.
+**`compact` takes the database alone**: it rewrites every page, so none
+can be kept as it was. It waits for the reads under way, lets none
+begin until it is committed, and fails with `Error::SnapshotOpen` if a
+snapshot is kept open beyond a read.
+
+**Still to come** [§77](spec/77-the-committed-pages-apart-from-the-writers.md): a snapshot a caller can keep, for one state
+across several calls, and a cursor on one (§81); a limit on the memory
+versions take (§82). §57 deferred snapshots until a workload asked;
+many small writes beside reads of up to 15 seconds now do.
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
 once or ten times a second costs readers nothing measurable. One that
 commits back to back made them wait tens of milliseconds, up to half a
 second; since §79 they do 18 to 31 times the reads beside it, with a
-p99.9 under 100 µs [§79.7](spec/79-writers-beside-the-readers.md). Readers run in parallel since pages are shared [§64](spec/64-shared-pages.md) and looked up
+p99.9 under 100 µs [§79.7](spec/79-writers-beside-the-readers.md). A writer beside an export that never
+stops waited up to 132 s for a commit; since §80, 24 ms, as fast as
+without the export [§80.6](spec/80-older-versions-kept-for-open-snapshots.md). The price: two readers do a tenth fewer
+short reads than before §80. Readers run in parallel since pages are shared [§64](spec/64-shared-pages.md) and looked up
 under a read lock [§65](spec/65-a-read-lock-for-the-page-cache.md): four do 3.2 times the work of one. Eight do no
 more than four.
 

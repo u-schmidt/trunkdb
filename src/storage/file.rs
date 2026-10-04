@@ -187,6 +187,15 @@ struct Staging {
     /// many times in one batch is held (and later logged) once. Includes
     /// the header, as page 0, once anything has changed it.
     dirty: BTreeMap<PageId, Page>,
+    /// Each of those pages as the batch found it, the committed one:
+    /// what a snapshot open at the commit goes on reading (SPEC §80).
+    /// Not for a page past the end of the file as it was, which no such
+    /// snapshot reads, nor for one that couldn't be read.
+    before: BTreeMap<PageId, Page>,
+    /// Whether the batch replaces the whole file (`replace_all`): then
+    /// nothing is kept in `before`, and the batch may only commit with
+    /// no snapshot open (`FileStore::replaces_all`).
+    replaces_all: bool,
 }
 
 impl FileStore {
@@ -379,6 +388,15 @@ impl FileStore {
     fn write_raw(&mut self, id: PageId, data: Page) -> io::Result<()> {
         match &mut self.staging {
             Some(staging) => {
+                if !staging.replaces_all
+                    && id < staging.header_before.page_count
+                    && !staging.dirty.contains_key(&id)
+                    // A page that can't be read is one a snapshot couldn't
+                    // read either: the write goes ahead without it.
+                    && let Ok(before) = self.pages.read(id)
+                {
+                    staging.before.insert(id, before);
+                }
                 staging.dirty.insert(id, data);
                 Ok(())
             }
@@ -447,6 +465,8 @@ impl FileStore {
         self.staging = Some(Staging {
             header_before: self.header,
             dirty: BTreeMap::new(),
+            before: BTreeMap::new(),
+            replaces_all: false,
         });
     }
 
@@ -479,10 +499,16 @@ impl FileStore {
         pages: impl IntoIterator<Item = (PageId, impl Into<Page>)>,
         page_count: u64,
     ) -> io::Result<()> {
-        assert!(
-            self.staging.is_some(),
-            "FileStore::replace_all without begin"
-        );
+        let staging = self
+            .staging
+            .as_mut()
+            .expect("FileStore::replace_all without begin");
+        // Every page changes, and the file may get shorter: keeping each
+        // as it was would be keeping the whole file in memory. So no
+        // snapshot may be open when this commits (rule 6 of SPEC §57.3,
+        // §80.5), and nothing needs keeping.
+        staging.replaces_all = true;
+        staging.before.clear();
         for (id, page) in pages {
             let page = page.into();
             assert!(
@@ -515,13 +541,31 @@ impl FileStore {
     /// Ends staging for a batch the WAL now holds (SPEC §51): its pages
     /// become the newest committed ones (`Pages::commit`), read from
     /// memory until `checkpoint` writes them back. Nothing is written to
-    /// the file.
+    /// the file. With no snapshot open: `commit_beside` otherwise.
     pub fn commit(&mut self) {
+        self.commit_beside(&[]);
+    }
+
+    /// `commit`, with snapshots open at the commits `live`, ascending
+    /// (SPEC §80): the pages as they were stay in memory for them.
+    pub(crate) fn commit_beside(&mut self, live: &[u64]) {
         let staging = self
             .staging
             .take()
             .expect("FileStore::commit without begin");
-        self.pages.commit(staging.dirty);
+        assert!(
+            live.is_empty() || !staging.replaces_all,
+            "a batch that replaces the whole file committed beside a snapshot"
+        );
+        self.pages.commit(staging.dirty, staging.before, live);
+    }
+
+    /// Whether the staged batch replaces the whole file (`replace_all`),
+    /// and so may only commit with no snapshot open.
+    pub(crate) fn replaces_all(&self) -> bool {
+        self.staging
+            .as_ref()
+            .is_some_and(|staging| staging.replaces_all)
     }
 
     /// How many committed pages wait for `checkpoint`.
@@ -532,9 +576,15 @@ impl FileStore {
     /// Writes every committed page not written back yet to the file,
     /// cuts it to the page count, and `fsync`s (`Pages::checkpoint`). On
     /// error they stay where they were, and a later call writes them all
-    /// again.
+    /// again. With no snapshot open: `checkpoint_beside` otherwise.
     pub fn checkpoint(&mut self) -> io::Result<()> {
-        self.pages.checkpoint(self.header.page_count)
+        self.checkpoint_beside(&[])
+    }
+
+    /// `checkpoint`, with snapshots open at the commits `live`, ascending
+    /// (SPEC §80): the versions they read stay in memory.
+    pub(crate) fn checkpoint_beside(&mut self, live: &[u64]) -> io::Result<()> {
+        self.pages.checkpoint(self.header.page_count, live)
     }
 
     /// `commit`, then `checkpoint`: the batch in the file at once — for
@@ -1946,5 +1996,222 @@ mod tests {
         denied(at.free_page(1));
         assert_eq!(store.read_page(1).unwrap(), filled(1));
         assert_eq!(store.free_pages().unwrap(), [4]);
+    }
+
+    // --- Older versions, kept for the snapshots open (SPEC §80) ---
+
+    /// Stages a write of `fill` to each of `ids` and commits it beside
+    /// the snapshots open at `live`.
+    fn commit_beside(store: &mut FileStore, ids: &[PageId], fill: u8, live: &[u64]) -> Commit {
+        store.begin();
+        for &id in ids {
+            store.write_page(id, filled(fill).into()).unwrap();
+        }
+        store.commit_beside(live);
+        store.last_commit()
+    }
+
+    /// A snapshot open at a commit goes on reading that commit: through
+    /// later commits of the same page, through the checkpoint that puts
+    /// the newest into the file, and from the cache's page being
+    /// replaced. A page that had no version in memory keeps the one the
+    /// batch found.
+    #[test]
+    fn an_open_snapshot_reads_its_commit_through_commits_and_checkpoints() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let open = store.last_commit();
+        assert_eq!(open.seq(), 0);
+
+        let first = commit_beside(&mut store, &[1, 2], 7, &[0]);
+        assert_eq!(store.at(open).read_page(1).unwrap(), filled(1));
+        assert_eq!(store.at(open).read_page(2).unwrap(), filled(2));
+        assert_eq!(store.at(first).read_page(1).unwrap(), filled(7));
+        assert_eq!(store.pages.version_seqs(1), [0, 1]);
+
+        let second = commit_beside(&mut store, &[2, 3], 8, &[0]);
+        assert_eq!(store.at(open).read_page(2).unwrap(), filled(2));
+        assert_eq!(store.at(open).read_page(3).unwrap(), filled(3));
+        assert_eq!(store.at(second).read_page(2).unwrap(), filled(8));
+        // Nobody is open at the first commit: its version of page 2 went.
+        assert_eq!(store.pages.version_seqs(2), [0, 2]);
+
+        store.checkpoint_beside(&[0]).unwrap();
+        assert_eq!(store.unwritten_pages(), 0);
+        let disk = on_disk(&store);
+        assert_eq!(
+            disk.read_page(1).unwrap(),
+            filled(7),
+            "the newest, in the file"
+        );
+        assert_eq!(disk.read_page(2).unwrap(), filled(8));
+        for (id, fill) in [(1, 1), (2, 2), (3, 3), (5, 5)] {
+            assert_eq!(store.at(open).read_page(id).unwrap(), filled(fill), "{id}");
+        }
+        assert_eq!(store.at(second).read_page(2).unwrap(), filled(8));
+        assert_eq!(store.pages.version_seqs(2), [0, 2], "kept, though written");
+
+        // And a commit after the checkpoint, of a page read from the
+        // file again.
+        let third = commit_beside(&mut store, &[5, 1], 9, &[0]);
+        assert_eq!(store.at(open).read_page(5).unwrap(), filled(5));
+        assert_eq!(store.at(open).read_page(1).unwrap(), filled(1));
+        assert_eq!(store.at(third).read_page(1).unwrap(), filled(9));
+        assert_eq!(store.pages.version_seqs(1), [0, 3]);
+        assert_eq!(store.unwritten_pages(), 2, "pages 1 and 5");
+    }
+
+    /// Once no snapshot is open, the next checkpoint or commit leaves
+    /// nothing older in memory: only what waits for a checkpoint, as
+    /// before §80.
+    #[test]
+    fn versions_go_when_no_snapshot_reads_them() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        commit_beside(&mut store, &[1, 2, 3], 7, &[0]);
+        commit_beside(&mut store, &[1, 2], 8, &[0, 1]);
+        store.checkpoint_beside(&[0, 1]).unwrap();
+        assert_eq!(store.pages.version_seqs(1), [0, 1, 2]);
+        assert_eq!(store.pages.version_seqs(3), [0, 1]);
+        let held = store.pages.versions_held();
+
+        // The one at 0 closed: its versions go, the others stay.
+        store.checkpoint_beside(&[1]).unwrap();
+        assert_eq!(store.pages.version_seqs(1), [1, 2]);
+        assert_eq!(store.pages.version_seqs(3), Vec::<u64>::new(), "the file's");
+        assert!(store.pages.versions_held() < held);
+
+        // All closed: by a commit, the pages it changes; by a
+        // checkpoint, every page.
+        commit_beside(&mut store, &[1], 9, &[]);
+        assert_eq!(store.pages.version_seqs(1), [3]);
+        assert_eq!(store.pages.version_seqs(2), [1, 2], "not this commit's");
+        store.checkpoint().unwrap();
+        assert_eq!(store.pages.versions_held(), 0);
+        for (id, fill) in [(1, 9), (2, 8), (3, 7)] {
+            assert_eq!(store.read_page(id).unwrap(), filled(fill));
+        }
+    }
+
+    /// One snapshot beside many commits of the same pages costs one
+    /// older version of each, not one per commit.
+    #[test]
+    fn a_hot_page_keeps_two_versions_beside_one_snapshot() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        for round in 1..=50u64 {
+            commit_beside(&mut store, &[1, 2], round as u8, &[0]);
+            if round % 7 == 0 {
+                store.checkpoint_beside(&[0]).unwrap();
+            }
+        }
+        assert_eq!(store.pages.version_seqs(1), [0, 50]);
+        assert_eq!(store.pages.versions_held(), 4);
+        assert_eq!(
+            store.at(Commit::new(0, store.header)).read_page(1).unwrap(),
+            filled(1)
+        );
+    }
+
+    /// Without a snapshot open, a commit keeps nothing older: as many
+    /// versions in memory as pages waiting.
+    #[test]
+    fn a_commit_keeps_nothing_older_with_no_snapshot_open() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        for round in 1..=5 {
+            commit_beside(&mut store, &[1, 2, 3], round, &[]);
+            assert_eq!(store.pages.versions_held(), 3);
+            assert_eq!(store.unwritten_pages(), 3);
+        }
+        assert_eq!(store.pages.version_seqs(1), [5]);
+    }
+
+    /// Rule 1 of §57.3, with no tag on the freed page: a page freed and
+    /// taken again for something else is, to an open snapshot, the page
+    /// it was, and the free list as it was.
+    #[test]
+    fn a_freed_page_taken_again_is_still_the_old_one_to_an_open_snapshot() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let open = store.last_commit();
+
+        store.begin();
+        store.free_page(2).unwrap();
+        store.commit_beside(&[0]);
+        store.begin();
+        assert_eq!(store.allocate_page().unwrap(), 2, "taken again at once");
+        store.write_page(2, filled(9).into()).unwrap();
+        store.commit_beside(&[0]);
+        store.checkpoint_beside(&[0]).unwrap();
+
+        let at = store.at(open);
+        assert_eq!(at.read_page(2).unwrap(), filled(2));
+        assert_eq!(at.free_pages().unwrap(), [4]);
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        assert_eq!(store.free_pages().unwrap(), [4]);
+    }
+
+    /// A reader that found a page in neither the versions nor the cache
+    /// goes to the file. If the page is committed and written back just
+    /// then, what the file holds is too new for it, or half written: it
+    /// sees that a checkpoint began, looks again, and finds its version.
+    /// And it doesn't leave its page in the cache for others.
+    #[test]
+    fn a_page_written_back_under_a_readers_file_read_is_read_again() {
+        let (_dir, path) = open_temp();
+        drop(five_page_file(&path));
+        let store = Arc::new(std::sync::Mutex::new(FileStore::open(&path).unwrap()));
+        let (pages, open) = {
+            let store = store.lock().unwrap();
+            (store.pages.clone(), store.last_commit())
+        };
+
+        let writer = store.clone();
+        pages.before_next_file_read(move || {
+            // Another thread, as the writer is: the reader holds no lock
+            // here.
+            let written = std::thread::spawn(move || {
+                let mut store = writer.lock().unwrap();
+                commit_beside(&mut store, &[3], 9, &[0]);
+                store.checkpoint_beside(&[0]).unwrap();
+            });
+            written.join().unwrap();
+        });
+        assert_eq!(pages.at(open).read_page(3).unwrap(), filled(3));
+
+        let store = store.lock().unwrap();
+        assert_eq!(on_disk(&store).read_page(3).unwrap(), filled(9));
+        assert_eq!(store.read_page(3).unwrap(), filled(9));
+        assert_eq!(store.cached(3).unwrap(), filled(9));
+        assert_eq!(store.pages.at(open).read_page(3).unwrap(), filled(3));
+    }
+
+    /// The same, for the scan of damaged pages: a page written back
+    /// under it isn't called damaged, nor skipped.
+    #[test]
+    fn a_checkpoint_beside_the_damaged_scan_is_no_damage() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        for round in 0..20 {
+            commit_beside(&mut store, &[1, 2, 3, 5], round, &[]);
+            let pages = store.pages.clone();
+            std::thread::scope(|scope| {
+                let scan = scope.spawn(move || pages.damaged(6).unwrap());
+                store.checkpoint().unwrap();
+                assert_eq!(scan.join().unwrap(), Vec::<PageId>::new(), "{round}");
+            });
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "replaces the whole file committed beside a snapshot")]
+    fn replacing_the_file_beside_a_snapshot_is_refused() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store.replace_all([(1, filled(8))], 2).unwrap();
+        assert!(store.replaces_all());
+        store.commit_beside(&[0]);
     }
 }
