@@ -8,7 +8,7 @@ commit whatever is committed, checkpointed or freed meanwhile. With an
 export running again and again beside single inserts, a commit waited
 132 seconds at worst before this section; now 24 ms.
 
-No public API yet: a snapshot still lives for one call. §81 lets a
+No public API yet: a snapshot still lives for one call. §82 lets a
 caller keep one.
 
 ## 80.1 What a read holds
@@ -203,7 +203,7 @@ writer is as fast with the export as without it.
   happen on demand.
 
 ## 80.8 Limits
-- **No bound on the memory versions take**: §82. A read is as long as
+- **No bound on the memory versions take**: §83. A read is as long as
   one call, so it's the pages changed during that call.
 - **Versions outlive their reader** until the next commit of their page
   or the next checkpoint (80.3): at most the pages changed since the
@@ -211,11 +211,11 @@ writer is as fast with the export as without it.
 - **Every first write of a page in a batch reads the committed page**,
   for `before`: from memory, unless the batch writes a page it never
   read, as `free_page` does, and the cache doesn't hold it.
-- **Two readers do a tenth fewer short reads** (80.6). With §81's
+- **Two readers do a tenth fewer short reads** (80.6). With §82's
   kept snapshots counted, `compact` could tell them from reads under
   way without the gate, which would take one of the three places off
   the read path.
 - **`compact` behind a long read** makes new reads wait as long: a
   waiting writer goes first on `std`'s `RwLock`.
 - **"Snapshot too old"** (§78.2) is left for a page whose `before`
-  couldn't be read, and for §82.
+  couldn't be read, and for §83.

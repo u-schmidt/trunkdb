@@ -133,16 +133,16 @@ limit is described.
   §79.7 measured a cut-down one on two cores.
 - Snapshot reads (MVCC): reopened and planned in §77, for many small
   writes beside long reads, and one state across several calls. Six
-  steps, §77 to §82. Done: §77 (the committed pages apart from the
+  steps, §77 to §83 without §81. Done: §77 (the committed pages apart from the
   writer's, commits numbered), §78 (every read through a snapshot),
   §79 (writers beside the readers) and §80 (older versions kept while
   a reader needs them: commits wait for no read, and an export blocks
-  no writer, §30.6). Next, §81: `Database::snapshot`, a snapshot a
-  caller keeps, `View<T>`, and a cursor on one. Then §82: a limit on
+  no writer, §30.6). Next, §82: `Database::snapshot`, a snapshot a
+  caller keeps, `View<T>`, and a cursor on one. Then §83: a limit on
   the memory versions take.
 - Short reads on several threads: a tenth fewer with two readers since
   §80, each read now writing to three shared places instead of one
-  (§80.6). With §81's kept snapshots counted, `compact` could do
+  (§80.6). With §82's kept snapshots counted, `compact` could do
   without the gate on the read path (§80.8).
 
 **API**
