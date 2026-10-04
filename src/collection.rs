@@ -521,7 +521,7 @@ impl Collection<Document> {
     /// Changes the documents `find(filter)` would return — `sort`, `skip`
     /// and `limit` included — by calling `change` on each, in that order, and
     /// writes the ones it changed; returns how many (SPEC §38). One batch
-    /// under one write lock, like `delete_many`: all changes land or none
+    /// under the writer's lock, like `delete_many`: all changes land or none
     /// — a unique index refusing one (§33) rolls back every one. An `_id`
     /// can't be changed: whatever `change` puts there, the document keeps
     /// its own.
@@ -622,7 +622,7 @@ impl Collection<Document> {
 
     /// Deletes exactly the documents `find(filter)` would return — `sort`,
     /// `skip` and `limit` included, so "the oldest 100" works — and says how many
-    /// (SPEC §37). One batch under one write lock, like `upsert`: all of
+    /// (SPEC §37). One batch under the writer's lock, like `upsert`: all of
     /// them go or none, and no write lands between the lookup and the
     /// deletes. A collection that doesn't exist has nothing to delete and
     /// isn't created.

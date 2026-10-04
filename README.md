@@ -22,9 +22,8 @@ into as few pages as it needs, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
-cloneable, thread-safe handle; reads share a lock, writes take it one
-at a time — though the page cache still lets readers through one at a
-time, SPEC §58). See [DESIGN.md](DESIGN.md) for how it works,
+cloneable, thread-safe handle; reads run together, writes one at a
+time beside them, SPEC §79). See [DESIGN.md](DESIGN.md) for how it works,
 [the spec](spec/README.md) for why, and [ROADMAP.md](ROADMAP.md) for progress.
 
 ## Why
@@ -76,8 +75,11 @@ src/
 ├── free_space.rs      FreeSpace: data pages with room, by free bytes
 ├── storage/
 │   ├── mod.rs         PageStore, page types
-│   ├── file.rs        FileStore: the file, checksums, staged and
-│   │                    committed pages, the file lock
+│   ├── file.rs        FileStore: the writer's staged pages, the
+│   │                    header, the file lock
+│   ├── pages.rs       Pages: the file, checksums, the committed
+│   │                    pages, shared by readers and the writer
+│   ├── snapshot.rs    SnapshotStore: the pages as of one commit
 │   ├── slotted.rs     SlottedPage: slot directory + cells
 │   ├── cache.rs       PageCache: CLOCK eviction
 │   └── memory.rs      MemoryStore: pages in memory (compaction, tests)
@@ -406,6 +408,20 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     Items 48–49 → 0.17.0: breaking for code that calls `find_with_ids`
     or `find_one_with_id`, or takes `(id, doc)` from a cursor (§74.3
     says how to migrate); files and exports as in 0.14.0.
+
+51. **The committed pages, apart from the writer's** (§77): snapshot
+    reads reopened and planned, in six steps; the first splits the
+    store, and numbers the commits. Nothing visible.
+52. **Reads through a snapshot** (§78): a read gets the last commit's
+    catalog and pages, and can't reach a batch being staged. Nothing
+    visible.
+53. **Writers beside the readers** (§79): a batch is staged, logged,
+    flushed and checkpointed without making readers wait; they wait
+    only while it is published. Beside a writer committing back to
+    back, readers do 18 to 31 times the reads. A commit still waits for
+    the reads under way.
+
+    Items 50–53: not released yet; no format change, no API change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

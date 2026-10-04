@@ -66,8 +66,9 @@ impl Database {
     ///   indexed value, in order, and a unique index no two equal values.
     ///
     /// Problems are collected, not returned as errors: a damaged index
-    /// doesn't stop the rest from being checked. Holds the read lock:
-    /// writers wait, readers don't.
+    /// doesn't stop the rest from being checked. A read like any other
+    /// (SPEC §79): other reads go on, and a commit waits to publish until
+    /// it's done.
     pub fn check(&self) -> crate::Result<CheckReport> {
         let state = self.read()?;
         let at = state.snapshot();

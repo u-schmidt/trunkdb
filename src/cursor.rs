@@ -9,7 +9,7 @@ use crate::query::Filter;
 /// Holds no lock between items. At creation it takes the ids of every
 /// candidate (from an index range or the primary index; ids only, no
 /// documents). Each `next` then looks one id up, reads that document
-/// under a short read lock, and checks it against the filter. So writes
+/// as its own short read, and checks it against the filter. So writes
 /// can happen while a cursor is open, with these effects:
 /// - a document deleted since creation is skipped;
 /// - a document updated since creation is checked in its current state,

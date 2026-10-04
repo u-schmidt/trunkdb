@@ -127,17 +127,17 @@ limit is described.
   cache's read lock, the page's reference count): the lock taken once
   per operation instead of once per page, or cached pages borrowed
   instead of counted (§65.3).
-- Writers that stage and flush beside the readers, taking the lock only
-  to publish (§57.2, option B). A writer committing back to back
-  starves readers now (§58.3). Scheduled as §79, the third step of
-  §77's plan.
+- Done in §79: writers that stage, flush and checkpoint beside the
+  readers, taking the gate only to publish (§57.2, option B). To do:
+  the full `reader_wait` (§58) on the machine of §58, beside redb;
+  §79.7 measured a cut-down one on two cores.
 - Snapshot reads (MVCC): reopened and planned in §77, for many small
   writes beside long reads, and one state across several calls. Six
-  steps, §77 to §82. Done, with nothing visible yet: §77 (the committed
-  pages apart from the writer's, commits numbered) and §78 (every read
-  through a snapshot, under the one lock). Next, §79: a lock for
-  writers only, so readers stop waiting for commits. They also stop an
-  export from blocking writers (§30.6).
+  steps, §77 to §82. Done: §77 (the committed pages apart from the
+  writer's, commits numbered), §78 (every read through a snapshot) and
+  §79 (writers beside the readers). Next, §80: older versions kept
+  while a reader needs them, so a commit stops waiting for the reads
+  under way, and an export stops blocking writers (§30.6).
 
 **API**
 - A document as `serde_json::Value`, beside its text form (§71), if a

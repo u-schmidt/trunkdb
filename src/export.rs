@@ -65,9 +65,9 @@ impl Database {
     /// documents with their ids — to `out` as JSON Lines, collections in
     /// name order, documents in id order.
     ///
-    /// A consistent snapshot: the read lock is held for the whole export,
-    /// so no write lands halfway through (writers wait until it's done;
-    /// readers don't). `out` is buffered here; it must not write to this
+    /// A consistent snapshot: it is one read, for the whole export, so no
+    /// write lands halfway through. Other reads go on; a commit waits to
+    /// publish until it's done (SPEC §79). `out` is buffered here; it must not write to this
     /// database itself, which would deadlock.
     pub fn export(&self, out: impl Write) -> crate::Result<Summary> {
         let mut out = BufWriter::new(out);
