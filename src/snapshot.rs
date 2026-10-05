@@ -479,7 +479,9 @@ mod tests {
 
     /// The workload of §77.1: a reader that counts, takes its time, and
     /// lists, beside a writer inserting back to back. On one snapshot the
-    /// two always agree; and the writer isn't held up by it.
+    /// two always agree, though the writer commits in between every
+    /// time: the reader waits for that, with its snapshot open, so a
+    /// writer held up by a snapshot would stop the test.
     #[test]
     fn a_count_and_a_list_agree_beside_a_writer() {
         let (_dir, _path, db) = open();
@@ -488,39 +490,48 @@ mod tests {
             .ensure_index_with("total", IndexOptions::new())
             .unwrap();
         let done = AtomicBool::new(false);
+        let written = std::sync::atomic::AtomicI64::new(0);
 
         std::thread::scope(|scope| {
-            let writer = scope.spawn(|| {
-                let mut written = 0;
+            scope.spawn(|| {
                 while !done.load(Ordering::Acquire) {
-                    orders.insert(order("Ann", written)).unwrap();
-                    written += 1;
-                    if written % 5 == 0 {
-                        orders
-                            .delete_many(Filter::new().eq("total", written - 3))
-                            .unwrap();
+                    let n = written.load(Ordering::Acquire);
+                    orders.insert(order("Ann", n)).unwrap();
+                    if n % 5 == 4 {
+                        let earlier = Filter::new().eq("total", n - 3);
+                        assert_eq!(orders.delete_many(earlier).unwrap(), 1);
                     }
+                    written.store(n + 1, Ordering::Release);
                 }
-                written
             });
-            let mut grew = 0;
-            let mut last = 0;
+            let mut counts = Vec::new();
             for _ in 0..40 {
                 let snapshot = db.snapshot().unwrap();
                 let then = snapshot.collection::<Order>("orders");
                 let count = then.count(Filter::new()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(3));
+
+                // Until the writer has committed again, twice over.
+                let before = written.load(Ordering::Acquire);
+                let waiting = std::time::Instant::now();
+                while written.load(Ordering::Acquire) < before + 2 {
+                    assert!(
+                        waiting.elapsed() < std::time::Duration::from_secs(20),
+                        "the writer is held up"
+                    );
+                    std::thread::yield_now();
+                }
+
                 let listed = then.find(Filter::new()).unwrap();
                 assert_eq!(listed.len(), count);
                 let through_the_index = then.count(Filter::new().gte("total", 0)).unwrap();
                 assert_eq!(through_the_index, count);
-                grew += usize::from(count > last);
-                last = count;
+                counts.push(count);
             }
             done.store(true, Ordering::Release);
-            let written = writer.join().unwrap();
-            assert!(written > 40, "the writer was held up: {written} inserts");
-            assert!(grew > 5, "snapshots didn't move on: {grew}");
+            // Each snapshot was taken after two more commits of the
+            // writer's, of which a delete takes back one insert at most.
+            let never_back = counts.windows(2).all(|pair| pair[0] <= pair[1]);
+            assert!(never_back && counts[39] > counts[0] + 20, "{counts:?}");
         });
         assert!(db.check().unwrap().is_ok());
     }
