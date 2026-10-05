@@ -84,6 +84,82 @@ pub(super) struct Memory {
     /// reader's commit: the reader sees the count has moved, and looks
     /// again (SPEC §80.4).
     file_epoch: u64,
+    /// How many versions are kept for open snapshots only: every version
+    /// but the newest of its page.
+    older: usize,
+    /// At most this many of those (SPEC §83). A commit that takes them
+    /// past it ends the oldest open snapshots, until what the rest read
+    /// fits.
+    limit: usize,
+    /// Every snapshot of a commit before this one has been ended by the
+    /// limit: its versions are gone, and a read as of it is refused. 0
+    /// until the limit first ends one.
+    ended_before: u64,
+    /// How many times the limit has ended snapshots, counted by their
+    /// commits.
+    ended: u64,
+}
+
+/// How many older versions are kept unless `OpenOptions::snapshot_memory`
+/// says otherwise (SPEC §83): 256 MiB of them, as much again as the page
+/// cache's default.
+pub(crate) const DEFAULT_VERSION_LIMIT: usize = (256 << 20) / PAGE_SIZE;
+
+/// What a read gets when its snapshot has been ended by the limit, or
+/// the version it needs was never kept: inside an `io::Error`, which
+/// `crate::Error` turns into `Error::SnapshotTooOld`.
+#[derive(Debug)]
+pub(crate) struct TooOld;
+
+impl std::fmt::Display for TooOld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("snapshot too old: the pages as it had them are no longer kept")
+    }
+}
+
+impl std::error::Error for TooOld {}
+
+fn too_old() -> io::Error {
+    io::Error::other(TooOld)
+}
+
+impl Memory {
+    /// Of the open snapshots' commits `live`, ascending, those the limit
+    /// hasn't ended.
+    fn still_open<'a>(&self, live: &'a [u64]) -> &'a [u64] {
+        &live[live.partition_point(|&seq| seq < self.ended_before)..]
+    }
+
+    /// Drops the versions no snapshot in `live` would read, in every
+    /// page, and counts what is left. A page left with one version,
+    /// which the file holds, has none in memory any more.
+    fn forget(&mut self, live: &[u64]) {
+        let live = self.still_open(live);
+        let mut older = 0;
+        self.versions.retain(|_id, chain| {
+            prune(chain, live);
+            older += chain.len() - 1;
+            !(chain.len() == 1 && chain[0].written)
+        });
+        self.older = older;
+    }
+
+    /// Ends the oldest open snapshots, one commit at a time, until the
+    /// versions kept for the rest are within the limit (SPEC §83). The
+    /// writer goes on either way: it is the reader that kept a snapshot
+    /// too long that hears of it, on its next read.
+    fn keep_within_limit(&mut self, live: &[u64]) {
+        while self.older > self.limit {
+            let Some(&oldest) = self.still_open(live).first() else {
+                // Nobody open: what's left is on its way out.
+                self.forget(live);
+                return;
+            };
+            self.ended_before = oldest + 1;
+            self.ended += 1;
+            self.forget(live);
+        }
+    }
 }
 
 /// A committed page, and the commit that made it what it is.
@@ -131,6 +207,10 @@ impl Pages {
                 unwritten: 0,
                 seq: 0,
                 file_epoch: 0,
+                older: 0,
+                limit: DEFAULT_VERSION_LIMIT,
+                ended_before: 0,
+                ended: 0,
             }),
             #[cfg(test)]
             failing_write_backs: AtomicUsize::new(0),
@@ -181,22 +261,23 @@ impl Pages {
     /// §66). The lock is held for the lookup only, not for reading the
     /// file.
     ///
-    /// Versions, but none at or before `seq`, is an error, "snapshot too
-    /// old": the one this reader needs wasn't kept. Not for a snapshot
+    /// `TooOld` if the limit has ended the snapshots of that commit (SPEC
+    /// §83), or there are versions but none at or before `seq`: the one
+    /// this reader needs wasn't kept, which doesn't happen to a snapshot
     /// the writer was told is open (`commit`, `checkpoint`). No bounds
     /// check — callers do that.
     pub(super) fn read_at(&self, id: PageId, seq: u64) -> io::Result<Page> {
         loop {
             let epoch = {
                 let memory = self.memory();
+                // Under the lock the versions are dropped under: a read
+                // either gets its version or learns that it's gone.
+                if seq < memory.ended_before {
+                    return Err(too_old());
+                }
                 if let Some(chain) = memory.versions.get(&id) {
-                    return match chain.iter().rev().find(|version| version.seq <= seq) {
-                        Some(version) => Ok(version.page.clone()),
-                        None => Err(io::Error::other(format!(
-                            "snapshot too old: page {id} as of commit {seq} is gone, commit {} changed it",
-                            chain[0].seq
-                        ))),
-                    };
+                    let version = chain.iter().rev().find(|version| version.seq <= seq);
+                    return version.map(|v| v.page.clone()).ok_or_else(too_old);
                 }
                 if let Some(page) = memory.cache.get(id) {
                     return Ok(page);
@@ -306,8 +387,10 @@ impl Pages {
         memory.seq += 1;
         let seq = memory.seq;
         debug_assert!(live.iter().all(|&open| open < seq) && live.is_sorted());
+        let open = memory.still_open(live);
         for (id, page) in checked {
             let chain = memory.versions.entry(id).or_default();
+            let older_before = chain.len().saturating_sub(1);
             match chain.last() {
                 Some(newest) => {
                     debug_assert!(
@@ -320,7 +403,7 @@ impl Pages {
                 }
                 None => {
                     memory.unwritten += 1;
-                    if !live.is_empty()
+                    if !open.is_empty()
                         && let Some(page) = before.remove(&id)
                     {
                         chain.push(Version {
@@ -336,19 +419,36 @@ impl Pages {
                 page,
                 written: false,
             });
-            prune(chain, live);
+            prune(chain, open);
+            memory.older = memory.older - older_before + (chain.len() - 1);
         }
+        memory.keep_within_limit(live);
     }
 
     /// Drops the versions no open snapshot would read (`prune`), in every
     /// page: for when snapshots have closed. A page left with one
     /// version, which the file holds, has none in memory any more.
     pub(super) fn forget(&self, live: &[u64]) {
-        let mut memory = self.memory_mut();
-        memory.versions.retain(|_id, chain| {
-            prune(chain, live);
-            !(chain.len() == 1 && chain[0].written)
-        });
+        self.memory_mut().forget(live);
+    }
+
+    /// At most `pages` older versions kept for open snapshots (SPEC
+    /// §83), from the next commit on.
+    pub(super) fn set_version_limit(&self, pages: usize) {
+        self.memory_mut().limit = pages;
+    }
+
+    /// How many older versions are kept for open snapshots, at most how
+    /// many, and how many times that limit has ended snapshots.
+    pub(crate) fn versions_kept(&self) -> (usize, usize, u64) {
+        let memory = self.memory();
+        (memory.older, memory.limit, memory.ended)
+    }
+
+    /// The first commit whose snapshots the limit hasn't ended: a read
+    /// as of an earlier one is refused.
+    pub(crate) fn ended_before(&self) -> u64 {
+        self.memory().ended_before
     }
 
     /// The number of the last commit.

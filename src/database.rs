@@ -164,6 +164,7 @@ pub struct OpenOptions {
     cache_size: usize,
     checkpoint_pages: usize,
     checkpoint_wal_bytes: Option<u64>,
+    snapshot_memory: usize,
 }
 
 impl Default for OpenOptions {
@@ -172,6 +173,7 @@ impl Default for OpenOptions {
             cache_size: crate::storage::DEFAULT_CACHE_SIZE,
             checkpoint_pages: DEFAULT_CHECKPOINT_PAGES,
             checkpoint_wal_bytes: None,
+            snapshot_memory: crate::storage::DEFAULT_VERSION_LIMIT * crate::storage::PAGE_SIZE,
         }
     }
 }
@@ -206,6 +208,27 @@ impl OpenOptions {
         self.checkpoint_wal_bytes = Some(bytes);
         self
     }
+
+    /// At most this many bytes of pages kept in memory as they were, for
+    /// the snapshots open (SPEC §83). Default: 256 MiB, as much again as
+    /// `cache_size`'s.
+    ///
+    /// A page changed while a snapshot is open stays as it was, once,
+    /// until that snapshot is dropped. A snapshot left open beside a busy
+    /// writer would take more and more. Past this limit the oldest open
+    /// snapshot is ended instead, then the next, until the rest fit:
+    /// their reads fail with `Error::SnapshotTooOld` from then on. Writes
+    /// are never refused or slowed for it.
+    ///
+    /// It counts for every read, since each reads a snapshot of its own:
+    /// an `export` that runs while more than this is rewritten fails the
+    /// same way. `usize::MAX` for no limit; with 0, a read fails as soon
+    /// as a page is changed beside it. `Database::snapshot_info` says how
+    /// much is kept now.
+    pub fn snapshot_memory(mut self, bytes: usize) -> Self {
+        self.snapshot_memory = bytes;
+        self
+    }
 }
 
 /// How many committed pages may wait in memory, logged but not written
@@ -234,8 +257,13 @@ impl Writer {
     /// only ever taken from `Shared::current`.
     fn live(&mut self) -> Vec<u64> {
         self.past.retain(|snapshot| snapshot.strong_count() > 0);
+        // Not those the memory limit has ended (SPEC §83): still held,
+        // maybe, but of no more use, and nothing is kept for them.
+        let ended_before = self.store.pages.ended_before();
         let open = self.past.iter().filter_map(Weak::upgrade);
-        open.map(|snapshot| snapshot.commit.seq()).collect()
+        open.map(|snapshot| snapshot.commit.seq())
+            .filter(|&seq| seq >= ended_before)
+            .collect()
     }
 }
 
@@ -299,6 +327,7 @@ impl Database {
         let path = path.as_ref();
         let mut store = FileStore::open_before_recovery(path)?;
         store.set_cache_size(options.cache_size);
+        store.set_snapshot_memory(options.snapshot_memory);
         let (mut durability, pending) = WalDurability::open(path)?;
         if !pending.is_empty() {
             store.restore_pages(&pending)?;
@@ -443,6 +472,11 @@ impl Database {
     pub(crate) fn read_at(&self, kept: &Committed) -> crate::Result<ReadGuard<'_>> {
         if self.is_poisoned() {
             return Err(crate::Error::Poisoned);
+        }
+        // Ended by the memory limit (SPEC §83): said here, before a read
+        // that needs no page, or only the catalog, goes through.
+        if kept.0.commit.seq() < self.inner.pages.ended_before() {
+            return Err(crate::Error::SnapshotTooOld);
         }
         Ok(ReadGuard {
             pages: &self.inner.pages,
@@ -646,6 +680,11 @@ impl Database {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// `Pages::versions_kept`, for `snapshot_info`.
+    pub(crate) fn versions_kept(&self) -> (usize, usize, u64) {
+        self.inner.pages.versions_kept()
     }
 
     /// The last commit, to replace, with no read taking it meanwhile.
@@ -2383,12 +2422,24 @@ mod tests {
             }
         }
 
-        let settings = [(0, 1), (3, 1), (3, 8), (1 << 15, 1000), (8, 3)];
-        for (seed, (cache_pages, checkpoint_pages)) in settings.into_iter().enumerate() {
+        // The cache's pages, the checkpoint threshold, and how many
+        // pages of older versions may be kept (SPEC §83).
+        const NO_LIMIT: usize = usize::MAX / PAGE_SIZE;
+        let settings = [
+            (0, 1, NO_LIMIT),
+            (3, 1, NO_LIMIT),
+            (3, 8, NO_LIMIT),
+            (1 << 15, 1000, NO_LIMIT),
+            (8, 3, NO_LIMIT),
+            (8, 3, 30),
+            (1 << 15, 1000, 12),
+        ];
+        for (seed, (cache_pages, checkpoint_pages, limit)) in settings.into_iter().enumerate() {
             let dir = tempfile::tempdir().unwrap();
             let options = OpenOptions::default()
                 .checkpoint_pages(checkpoint_pages)
-                .cache_size(cache_pages * PAGE_SIZE);
+                .cache_size(cache_pages * PAGE_SIZE)
+                .snapshot_memory(limit * PAGE_SIZE);
             let db = Database::open_with(dir.path().join("test.trunkdb"), options).unwrap();
             for name in NAMES {
                 db.collection::<Document>(name).ensure_index("n").unwrap();
@@ -2398,8 +2449,9 @@ mod tests {
             let mut open: Vec<(Committed, Model)> = Vec::new();
             let mut next_id = 0u128;
             let (mut refused, mut compacted, mut most_open) = (0, 0, 0);
+            let mut too_old = 0;
 
-            for step in 0..400 {
+            for step in 0..300 {
                 let what = format!("seed {seed}, step {step}");
                 match rng.below(12) {
                     0..=6 => {
@@ -2450,10 +2502,28 @@ mod tests {
                     },
                 }
                 most_open = most_open.max(open.len());
+                // Each open snapshot reads its copy, all of it, or has
+                // been ended by the limit and reads nothing: never
+                // something else. And the limit ends the oldest first.
+                let (mut ended, mut read) = (Vec::new(), Vec::new());
                 for (at, (snapshot, expected)) in open.iter().enumerate() {
-                    let reading = snapshot.reading(&db.inner.pages);
-                    assert_reads(&reading, expected, &format!("{what}, snapshot {at}"));
+                    let seq = snapshot.0.commit.seq();
+                    match db.read_at(snapshot) {
+                        Ok(reading) => {
+                            let what = format!("{what}, snapshot {at}");
+                            assert_reads(&reading.snapshot(), expected, &what);
+                            read.push(seq);
+                        }
+                        Err(crate::Error::SnapshotTooOld) => ended.push(seq),
+                        Err(e) => panic!("{what}: {e}"),
+                    }
                 }
+                let oldest_read = read.iter().min().copied().unwrap_or(u64::MAX);
+                assert!(ended.iter().all(|&seq| seq < oldest_read), "{what}");
+                too_old += ended.len();
+                let info = db.snapshot_info();
+                assert!(info.kept_pages <= limit, "{what}: {info:?}");
+                assert_eq!(info.ended > 0, too_old > 0, "{what}: {info:?}");
                 let now = db.current();
                 assert_reads(&now.reading(&db.inner.pages), &model, &what);
                 if step % 40 == 0 {
@@ -2461,6 +2531,7 @@ mod tests {
                 }
             }
             assert!(most_open >= 3 && refused > 0 && compacted > 0, "{seed}");
+            assert_eq!(too_old > 0, limit != NO_LIMIT, "seed {seed}: {too_old}");
 
             // With all of them closed, nothing older stays.
             open.clear();

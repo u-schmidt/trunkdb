@@ -358,8 +358,14 @@ per collection, are all of that moment. A cursor keeps the commit of
 its creation the same way. Both cost what §80 says an open snapshot
 costs: the pages changed since, in memory, and no `compact`.
 
-**Still to come** [§77](spec/77-the-committed-pages-apart-from-the-writers.md): a limit on the memory versions take (§83). §57 deferred snapshots until a workload asked;
-many small writes beside reads of up to 15 seconds now do.
+**A limit on that memory** [§83](spec/83-a-limit-on-the-memory-snapshots-take.md): `OpenOptions::snapshot_memory`,
+256 MiB unless set. Past it the oldest open snapshot is ended: its
+reads fail with `Error::SnapshotTooOld`, and the writer goes on.
+`Database::snapshot_info` says how much is kept. That ends the plan of
+[§77](spec/77-the-committed-pages-apart-from-the-writers.md): §57 deferred snapshots until a workload asked, and many small
+writes beside reads of up to 15 seconds did. Measured for it
+(`bench/`, `long_read`): single writes back to back take the same time
+with a snapshot open for 15 seconds as with none, and it kept 13 MiB.
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
 once or ten times a second costs readers nothing measurable. One that
@@ -375,7 +381,7 @@ more than four.
 ## 10. The API
 
 - `Database::open(path)`, or `open_with(path, OpenOptions)` with
-  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) and `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md).
+  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md) and `snapshot_memory` [§83](spec/83-a-limit-on-the-memory-snapshots-take.md).
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
   `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md);
   `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);
