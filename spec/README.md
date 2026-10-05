@@ -92,3 +92,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 79. [Writers beside the readers (`database.rs`, `storage/pages.rs`)](79-writers-beside-the-readers.md)
 80. [Older versions, kept for the snapshots open (`storage/pages.rs`, `storage/file.rs`, `database.rs`)](80-older-versions-kept-for-open-snapshots.md)
 81. [A failed log, taken back alone (`durability/`, `database.rs`)](81-a-failed-log-taken-back-alone.md)
+82. [A snapshot to keep (`snapshot.rs`, `collection.rs`, `cursor.rs`, `database.rs`)](82-a-snapshot-to-keep.md)

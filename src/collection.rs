@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::Cursor;
 use crate::data;
-use crate::database::Database;
+use crate::database::{Committed, Database, ReadGuard};
 use crate::document::{DocId, Document, encode_document, with_id};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
@@ -121,6 +121,11 @@ use std::marker::PhantomData;
 pub struct Collection<T> {
     db: Database,
     name: String,
+    /// The commit this handle reads, if it is a snapshot's (`View`, a
+    /// cursor: SPEC §82); the last one, as of each call, if `None`. A
+    /// handle with a commit never writes: nothing outside this crate can
+    /// reach a write method on one.
+    at: Option<Committed>,
     /// `fn() -> T`, not `T`: the handle holds no `T`, so whether it's
     /// `Send`/`Sync` shouldn't depend on whether `T` is — a plain
     /// `PhantomData<T>` would make it so.
@@ -131,7 +136,7 @@ pub struct Collection<T> {
 /// though only the handle is cloned, never a `T`.
 impl<T> Clone for Collection<T> {
     fn clone(&self) -> Self {
-        Collection::new(self.db.clone(), self.name.clone())
+        self.retyped()
     }
 }
 
@@ -140,7 +145,38 @@ impl<T> Collection<T> {
         Self {
             db,
             name: name.into(),
+            at: None,
             _marker: PhantomData,
+        }
+    }
+
+    /// A handle that reads the collection as of `at`, every time (SPEC
+    /// §82).
+    pub(crate) fn pinned(db: Database, name: impl Into<String>, at: Committed) -> Self {
+        Self {
+            at: Some(at),
+            ..Self::new(db, name)
+        }
+    }
+
+    /// The same handle, for another type of document: same database,
+    /// same collection, same commit if it reads one. Cloning `name` (a
+    /// short `String`) and the handles (`Arc` counts) is cheap.
+    fn retyped<U>(&self) -> Collection<U> {
+        Collection {
+            db: self.db.clone(),
+            name: self.name.clone(),
+            at: self.at.clone(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Access for a read: of this handle's commit if it has one, of the
+    /// last one otherwise.
+    fn read(&self) -> crate::Result<ReadGuard<'_>> {
+        match &self.at {
+            Some(at) => self.db.read_at(at),
+            None => self.db.read(),
         }
     }
 
@@ -278,7 +314,7 @@ impl<T> Collection<T> {
     /// This collection's secondary indexes, in creation order: each with
     /// its fields and options (SPEC §60).
     pub fn indexes(&self) -> crate::Result<Vec<IndexInfo>> {
-        let state = self.db.read()?;
+        let state = self.read()?;
         Ok(state
             .catalog()
             .indexes(&self.name)
@@ -306,7 +342,7 @@ impl<T> Collection<T> {
 
     #[cfg(test)]
     fn index_names_where(&self, keep: impl Fn(&IndexMeta) -> bool) -> crate::Result<Vec<String>> {
-        let state = self.db.read()?;
+        let state = self.read()?;
         Ok(state
             .catalog()
             .indexes(&self.name)
@@ -322,7 +358,7 @@ impl<T> Collection<T> {
         if filter.ids().is_some() {
             return Ok(QueryPlan::ById);
         }
-        let state = self.db.read()?;
+        let state = self.read()?;
         let indexes = state.catalog().indexes(&self.name);
         if let Some(order) = filter.index_order(indexes) {
             return Ok(QueryPlan::IndexOrder {
@@ -351,7 +387,7 @@ where
     /// same collection — cloning `name` (a short `String`) and the
     /// database handle (an `Arc` count) is cheap.
     fn as_document(&self) -> Collection<Document> {
-        Collection::new(self.db.clone(), self.name.clone())
+        self.retyped()
     }
 
     pub fn insert(&self, doc: T) -> crate::Result<DocId> {
@@ -492,7 +528,7 @@ impl Collection<Document> {
     }
 
     pub fn get(&self, id: &DocId) -> crate::Result<Option<Document>> {
-        let state = self.db.read()?;
+        let state = self.read()?;
         let at = state.snapshot();
         let Some(meta) = at.catalog.get(&self.name) else {
             return Ok(None); // collection doesn't exist yet, so neither does the document
@@ -639,7 +675,7 @@ impl Collection<Document> {
     /// Every match with the id of its cell: what `find` and a sorted
     /// `cursor` read.
     fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
-        let state = self.db.read()?;
+        let state = self.read()?;
         let at = state.snapshot();
         find_in(at.catalog, &at.store, &self.name, filter)
     }
@@ -681,7 +717,7 @@ impl Collection<Document> {
     /// `limit` (SPEC §72). Without conditions it only counts the primary
     /// index's entries — no document is read.
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
-        let state = self.db.read()?;
+        let state = self.read()?;
         let at = state.snapshot();
         let count = if filter.conditions.is_empty() {
             candidate_entries(at.catalog, &at.store, &self.name, &filter)?.len()
@@ -696,8 +732,9 @@ impl Collection<Document> {
     }
 
     /// A streaming `find`: yields matches one at a time, holding only
-    /// their ids in memory and no lock in between — see `Cursor` for what
-    /// it sees of writes made meanwhile.
+    /// where they are in memory, and no lock. It shows the collection as
+    /// it was when the cursor was made, and keeps that moment until it's
+    /// dropped — see `Cursor`.
     pub fn cursor(&self, filter: Filter) -> crate::Result<Cursor<Document>> {
         self.cursor_converting(filter, Ok)
     }
@@ -717,12 +754,30 @@ impl Collection<Document> {
                 .collect::<crate::Result<Vec<_>>>()?;
             return Ok(Cursor::collected(converted));
         }
-        let state = self.db.read()?;
+        // One commit for the candidates and for every document read
+        // after them (SPEC §82): kept by the cursor, as a snapshot is.
+        let kept = match &self.at {
+            Some(_) => self.clone(),
+            None => Collection::pinned(self.db.clone(), self.name.clone(), self.db.pin()?),
+        };
+        let state = kept.read()?;
         let at = state.snapshot();
         let entries = candidate_entries(at.catalog, &at.store, &self.name, &filter)?;
         drop(state);
-        let ids = entries.iter().map(|(key, _loc)| key::doc_id(key)).collect();
-        Ok(Cursor::streaming(self.clone(), ids, filter, convert))
+        let locs = entries.into_iter().map(|(_key, loc)| loc).collect();
+        Ok(Cursor::streaming(kept, locs, filter, convert))
+    }
+
+    /// The document at `loc`, as this handle's commit has it: for a
+    /// cursor, which took `loc` from an index of the same commit.
+    pub(crate) fn record_at(&self, loc: RecordLocation) -> crate::Result<Document> {
+        debug_assert!(
+            self.at.is_some(),
+            "a location is only good within one commit"
+        );
+        let state = self.read()?;
+        let (_id, doc) = data::get_record(&state.snapshot().store, loc)?;
+        Ok(doc)
     }
 
     /// Replaces the one document matching `filter`'s conditions (keeping
@@ -6332,11 +6387,14 @@ mod tests {
         );
     }
 
-    /// The cursor holds no lock between items — the writes below would
-    /// deadlock otherwise — and sees them as `Cursor` documents.
+    /// A cursor shows the moment it was created (SPEC §82). It holds no
+    /// lock — the writes below, on the same thread, would deadlock
+    /// otherwise — and sees none of them: not a delete of a document it
+    /// hasn't reached, not an update that makes one stop matching, not an
+    /// insert. Until §82 it saw each document as it was when it got there.
     #[test]
-    fn a_cursor_streams_and_sees_writes_made_meanwhile() {
-        let (_dir, _db, users) = users_db();
+    fn a_cursor_shows_the_moment_it_was_created() {
+        let (_dir, db, users) = users_db();
         let over_40 = age_filter(Op::Gt, 40);
         let ids: Vec<DocId> = users
             .find_with_ids(Filter::default())
@@ -6350,16 +6408,59 @@ mod tests {
 
         assert!(users.delete(&ids[2]).unwrap()); // Alan: gone before he's read
         assert!(users.update(&ids[3], user("Edsger", 39)).unwrap()); // no longer matches
-        assert!(users.update(&ids[0], user("Ada", 50)).unwrap()); // matches, but already passed
+        assert!(users.update(&ids[0], user("Ada", 50)).unwrap()); // matches now
         users.insert(user("Barbara", 60)).unwrap(); // after the cursor was created
+        // And the slot Alan was in taken by someone else, in the file.
+        users.insert(user("Linus", 99)).unwrap();
+        db.checkpoint().unwrap();
 
+        assert_eq!(cursor.next().unwrap().unwrap(), user("Alan", 41));
+        assert_eq!(cursor.next().unwrap().unwrap(), user("Edsger", 72));
         assert!(cursor.next().is_none());
+
+        // A cursor made now has all of it.
+        let now: Vec<User> = users
+            .cursor(over_40)
+            .unwrap()
+            .collect::<crate::Result<_>>()
+            .unwrap();
+        let expected = [
+            user("Ada", 50),
+            user("Grace", 45),
+            user("Barbara", 60),
+            user("Linus", 99),
+        ];
+        assert_eq!(now, expected);
 
         let limited = Filter {
             limit: Some(1),
             ..Filter::default()
         };
         assert_eq!(users.cursor(limited).unwrap().count(), 1);
+    }
+
+    /// An open cursor keeps its moment as a snapshot does (SPEC §82): the
+    /// database can't be compacted until it's dropped. A sorted cursor has
+    /// read everything when it's made, and keeps nothing.
+    #[test]
+    fn an_open_cursor_refuses_compaction() {
+        let (_dir, db, users) = users_db();
+        let ids: Vec<DocId> = (0..300)
+            .map(|i| users.insert(user(&"x".repeat(i % 900), 1)).unwrap())
+            .collect();
+        for id in &ids {
+            assert!(users.delete(id).unwrap());
+        }
+
+        let mut cursor = users.cursor(Filter::new()).unwrap();
+        assert!(cursor.next().is_some());
+        assert!(matches!(db.compact(), Err(crate::Error::SnapshotOpen)));
+        assert_eq!(cursor.count(), 3, "and reads on");
+
+        let sorted = users.cursor(by_age(SortOrder::Desc)).unwrap();
+        let compacted = db.compact().unwrap();
+        assert!(compacted.pages_after < compacted.pages_before);
+        assert_eq!(sorted.count(), 4);
     }
 
     #[test]

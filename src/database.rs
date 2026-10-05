@@ -48,7 +48,7 @@ struct Shared {
     /// only to take it, by a read, or to replace it, by a commit: a read
     /// keeps the snapshot, not the lock, and reads it whatever is
     /// committed meanwhile (SPEC §80).
-    current: RwLock<Snapshot>,
+    current: RwLock<Committed>,
     /// Held shared by every read for as long as it reads, and alone by a
     /// batch that replaces the whole file (`compact`), from before its
     /// commit to after it: the one kind of batch that can't keep the
@@ -84,7 +84,7 @@ pub(crate) struct Writer {
     /// they were replaced, oldest first: the ones a reader may still be
     /// reading (SPEC §80). Weak, so a snapshot ends when its last reader
     /// lets go, and is found gone here.
-    past: Vec<Weak<SnapshotInner>>,
+    past: Vec<Weak<CommittedInner>>,
     /// Test-only: called once, by the next batch, when it is logged and
     /// flushed and not yet published — to see what goes on beside it.
     #[cfg(test)]
@@ -95,16 +95,16 @@ pub(crate) struct Writer {
 /// pages, and the catalog as that commit left it. Shared, not copied: a
 /// clone is the same snapshot.
 #[derive(Clone)]
-pub(crate) struct Snapshot(Arc<SnapshotInner>);
+pub(crate) struct Committed(Arc<CommittedInner>);
 
-struct SnapshotInner {
+struct CommittedInner {
     commit: Commit,
     catalog: Catalog,
 }
 
-impl Snapshot {
+impl Committed {
     fn new(commit: Commit, catalog: Catalog) -> Self {
-        Snapshot(Arc::new(SnapshotInner { commit, catalog }))
+        Committed(Arc::new(CommittedInner { commit, catalog }))
     }
 
     pub(crate) fn catalog(&self) -> &Catalog {
@@ -135,10 +135,12 @@ pub(crate) struct Reading<'a> {
 /// the snapshot by mistake (SPEC §78).
 pub(crate) struct ReadGuard<'a> {
     pages: &'a Pages,
-    snapshot: Snapshot,
+    snapshot: Committed,
     /// Keeps a batch that replaces the whole file from committing under
-    /// this read (`Shared::gate`).
-    _gate: RwLockReadGuard<'a, ()>,
+    /// this read (`Shared::gate`). Not held by a read of a snapshot
+    /// somebody keeps (SPEC §82): that snapshot refuses such a batch
+    /// altogether, for as long as it's kept.
+    _gate: Option<RwLockReadGuard<'a, ()>>,
 }
 
 impl ReadGuard<'_> {
@@ -334,7 +336,7 @@ impl Database {
             store.write_back()?;
             durability.checkpoint()?;
         }
-        let current = Snapshot::new(store.last_commit(), catalog);
+        let current = Committed::new(store.last_commit(), catalog);
 
         Ok(Self {
             inner: Arc::new(Shared {
@@ -431,8 +433,35 @@ impl Database {
         Ok(ReadGuard {
             pages: &self.inner.pages,
             snapshot: self.current(),
-            _gate: gate,
+            _gate: Some(gate),
         })
+    }
+
+    /// Access for a read of `kept`, a commit somebody keeps (`pin`): the
+    /// same commit every time, whatever has been committed since (SPEC
+    /// §82). It waits for nothing. Poisoned as for `read`.
+    pub(crate) fn read_at(&self, kept: &Committed) -> crate::Result<ReadGuard<'_>> {
+        if self.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+        Ok(ReadGuard {
+            pages: &self.inner.pages,
+            snapshot: kept.clone(),
+            _gate: None,
+        })
+    }
+
+    /// The last commit, to keep (SPEC §82): for a `Snapshot`, or a
+    /// cursor. For as long as it, or a clone of it, is around, the pages
+    /// keep the versions it reads, and `compact` is refused. Taken under
+    /// the gate, so a `compact` that has found no snapshot kept doesn't
+    /// get one before it has committed. Poisoned as for `read`.
+    pub(crate) fn pin(&self) -> crate::Result<Committed> {
+        if self.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+        let _gate = self.inner.gate.read().map_err(|_| crate::Error::Poisoned)?;
+        Ok(self.current())
     }
 
     /// Access for a write batch, one at a time; poisoned as for `read`.
@@ -593,7 +622,7 @@ impl Database {
             }
             let live = writer.live();
             writer.store.commit_beside(&live);
-            let snapshot = Snapshot::new(writer.store.last_commit(), catalog);
+            let snapshot = Committed::new(writer.store.last_commit(), catalog);
             std::mem::replace(&mut *current, snapshot)
         };
         drop(alone);
@@ -611,7 +640,7 @@ impl Database {
     }
 
     /// The last commit, shared: the lock is held only to take it.
-    fn current(&self) -> Snapshot {
+    fn current(&self) -> Committed {
         self.inner
             .current
             .read()
@@ -620,7 +649,7 @@ impl Database {
     }
 
     /// The last commit, to replace, with no read taking it meanwhile.
-    fn current_locked(&self) -> std::sync::RwLockWriteGuard<'_, Snapshot> {
+    fn current_locked(&self) -> std::sync::RwLockWriteGuard<'_, Committed> {
         self.inner
             .current
             .write()
@@ -652,7 +681,7 @@ impl Database {
 #[cfg(test)]
 pub(crate) struct TestState<'a> {
     writer: MutexGuard<'a, Writer>,
-    current: Snapshot,
+    current: Committed,
     pages: &'a Pages,
 }
 
@@ -1818,7 +1847,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let current = |db: &Database| db.state().current.clone();
-        let same = |a: &Snapshot, b: &Snapshot| Arc::ptr_eq(&a.0, &b.0);
+        let same = |a: &Committed, b: &Committed| Arc::ptr_eq(&a.0, &b.0);
         let opened = current(&db);
 
         db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
@@ -2366,7 +2395,7 @@ mod tests {
             }
             let mut rng = crate::testing::XorShift(0x9E3779B97F4A7C15 ^ (seed as u64 + 1));
             let mut model: Model = NAMES.into_iter().map(|name| (name, Vec::new())).collect();
-            let mut open: Vec<(Snapshot, Model)> = Vec::new();
+            let mut open: Vec<(Committed, Model)> = Vec::new();
             let mut next_id = 0u128;
             let (mut refused, mut compacted, mut most_open) = (0, 0, 0);
 

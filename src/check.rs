@@ -6,7 +6,7 @@
 use crate::catalog::{Catalog, IndexMeta};
 use crate::collection::{index_keys, same_values, unique_tuples};
 use crate::data;
-use crate::database::Database;
+use crate::database::{Database, ReadGuard};
 use crate::document::{DocId, Document};
 use crate::index::{BTreeIndex, Index, key};
 use crate::storage::{PAGE_SIZE, PageId, RecordLocation, SnapshotStore};
@@ -46,7 +46,11 @@ impl Database {
     /// The header's facts: format, page size, how many pages, how many
     /// of them free.
     pub fn file_info(&self) -> crate::Result<FileInfo> {
-        let state = self.read()?;
+        Self::file_info_of(&self.read()?)
+    }
+
+    /// `file_info`, of the commit `state` reads.
+    pub(crate) fn file_info_of(state: &ReadGuard<'_>) -> crate::Result<FileInfo> {
         let store = state.snapshot().store;
         Ok(FileInfo {
             format_version: store.format_version()?,
@@ -69,7 +73,11 @@ impl Database {
     /// doesn't stop the rest from being checked. A read like any other
     /// on one snapshot (SPEC §80): reads and writes go on beside it.
     pub fn check(&self) -> crate::Result<CheckReport> {
-        let state = self.read()?;
+        Self::check_of(&self.read()?)
+    }
+
+    /// `check`, of the commit `state` reads.
+    pub(crate) fn check_of(state: &ReadGuard<'_>) -> crate::Result<CheckReport> {
         let at = state.snapshot();
         let (catalog, store) = (at.catalog, &at.store);
         let mut check = Check {

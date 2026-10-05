@@ -41,7 +41,7 @@ them are real now; `InMemoryIndex` remains, for tests.
 | Transactions | `TransactionManager` | `GlobalLockTxnManager`: one batch at a time, all or nothing | `txn/` |
 | Durability | `Durability` | `WalDurability`: a page-image write-ahead log | `durability/` |
 | Queries | — | `Filter`, `Condition`, `Sort`; a fixed-rule planner | `query.rs` |
-| API | — | `Database`, `Collection<T>`, `Batch`, `Cursor` | `database.rs`, `collection.rs`, `batch.rs`, `cursor.rs` |
+| API | — | `Database`, `Collection<T>`, `Batch`, `Cursor`, `Snapshot`, `View<T>` | `database.rs`, `collection.rs`, `batch.rs`, `cursor.rs`, `snapshot.rs` |
 
 `PageStore` is the one seam that isn't meant to be faked: everything
 above it works in pages, never in file offsets. Index and data code
@@ -352,9 +352,13 @@ can be kept as it was. It waits for the reads under way, lets none
 begin until it is committed, and fails with `Error::SnapshotOpen` if a
 snapshot is kept open beyond a read.
 
-**Still to come** [§77](spec/77-the-committed-pages-apart-from-the-writers.md): a snapshot a caller can keep, for one state
-across several calls, and a cursor on one (§82); a limit on the memory
-versions take (§83). §57 deferred snapshots until a workload asked;
+**A snapshot to keep** [§82](spec/82-a-snapshot-to-keep.md): `Database::snapshot` hands a commit
+out for as long as the caller keeps it. Reads through it, a `View<T>`
+per collection, are all of that moment. A cursor keeps the commit of
+its creation the same way. Both cost what §80 says an open snapshot
+costs: the pages changed since, in memory, and no `compact`.
+
+**Still to come** [§77](spec/77-the-committed-pages-apart-from-the-writers.md): a limit on the memory versions take (§83). §57 deferred snapshots until a workload asked;
 many small writes beside reads of up to 15 seconds now do.
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
@@ -381,6 +385,12 @@ more than four.
   `ensure_index` and `ensure_index_with` (`IndexOptions::new().unique()`,
   `.sparse()`), `indexes()` listing each index's fields and options
   [§28](spec/28-secondary-indexes.md) [§33](spec/33-unique-indexes.md) [§44](spec/44-sparse-indexes.md) [§60](spec/60-a-smaller-public-api.md).
+- **Snapshots:** `db.snapshot()`, the database at one moment for as
+  many reads as wanted; `snapshot.collection::<T>(name)` is a `View<T>`
+  with `get`, `find`, `find_one`, `count`, `cursor`, `explain` and
+  `indexes` and nothing that writes; `collections`, `export`, `check`
+  and `file_info` on the snapshot too. A `cursor` shows the moment it
+  was made [§82](spec/82-a-snapshot-to-keep.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** only through `Filter`'s methods; `limit` takes an `Option`
@@ -389,7 +399,7 @@ more than four.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.
 - **What's public** is only this: `Database`, `Collection`, `Batch`,
-  `Cursor`, `Document`, `DocId`, the options, reports and errors, and
+  `Cursor`, `Snapshot`, `View`, `Document`, `DocId`, the options, reports and errors, and
   `query`. Types a caller passes in are built with methods; types it
   gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md).
 - **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),

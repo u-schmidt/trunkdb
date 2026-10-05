@@ -63,7 +63,9 @@ src/
 ├── collection.rs      Collection<T>: CRUD, find, indexes, update_many,
 │                        update_fields
 ├── batch.rs           Batch: typed atomic multi-op writes
-├── cursor.rs          Cursor: streaming find
+├── cursor.rs          Cursor: streaming find, of one moment
+├── snapshot.rs        Snapshot and View<T>: the database at one
+│                        moment, to keep reading
 ├── query.rs           Filter, Condition, Sort; the planner
 ├── update.rs          Update: set, unset and inc on dotted paths
 ├── document.rs        Document and DocId: the schema-less value type
@@ -148,6 +150,25 @@ let third_page = users.find(Filter::new().sort_asc("name").skip(40).limit(20))?;
 let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new().set("team", "platform").inc("age", 1))?;
 let tagged = users.update_fields(Filter::new().id(id), &Update::new().add_to_set("tags", "admin").pull("tags", "guest"))?;
 ```
+
+### Reads that agree with each other
+
+Each call reads the database as it is at that moment, so a write on
+another thread can land between two calls. A snapshot is one moment
+for as many reads as you like, in every collection, and holds up
+nobody:
+
+```rust
+let snapshot = db.snapshot()?;
+let users = snapshot.collection::<User>("users"); // a View<User>: reads only
+let how_many = users.count(Filter::new())?;
+let everyone = users.find(Filter::new())?; // how_many == everyone.len(), always
+snapshot.export(std::fs::File::create("backup.jsonl")?)?; // the same moment
+```
+
+Drop it when the reads are done: while it's open, pages changed since
+stay in memory as they were, and `compact` is refused. A `cursor` is a
+snapshot of its own, for as long as it's iterated.
 
 ### Reading only some fields
 
@@ -431,7 +452,14 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     committed before it and not yet written back; a crash soon after
     lost those. A fix to §51.
 
-    Items 50–55: not released yet; no format change.
+56. **A snapshot to keep** (§82): `db.snapshot()` is the database at
+    one moment for as many reads as wanted, through `View<T>`, a
+    collection that only reads; `export`, `check`, `collections` and
+    `file_info` on it too. A `cursor` now shows the moment it was made,
+    not each document as it is when reached (breaking for code that
+    relied on that).
+
+    Items 50–56: not released yet; no format change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

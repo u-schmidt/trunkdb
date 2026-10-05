@@ -25,6 +25,7 @@ mod index;
 mod json;
 pub mod query;
 mod serde_bridge;
+mod snapshot;
 mod storage;
 mod txn;
 mod update;
@@ -41,6 +42,7 @@ pub use document::{DocId, Document, ParseIdError};
 pub use export::Summary;
 pub use json::ParseDocumentError;
 pub use serde_bridge::DocumentError;
+pub use snapshot::{Snapshot, View};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -106,7 +108,7 @@ pub enum Error {
         message: String,
     },
     /// `Database::compact` was called while a snapshot was open (SPEC
-    /// §80.5). A compaction rewrites every page, and keeping each as it
+    /// §80.5): a `Snapshot`, a `View` of one, or a `Cursor`. A compaction rewrites every page, and keeping each as it
     /// was for the snapshot would be keeping the whole file in memory.
     /// Nothing was changed; compact again when the snapshot is gone.
     #[error("a snapshot is open: the database can't be compacted until it is closed")]
