@@ -131,15 +131,16 @@ limit is described.
   readers, taking the gate only to publish (§57.2, option B). To do:
   the full `reader_wait` (§58) on the machine of §58, beside redb;
   §79.7 measured a cut-down one on two cores.
-- Snapshot reads (MVCC): reopened and planned in §77, for many small
-  writes beside long reads, and one state across several calls. Six
-  steps, §77 to §83 without §81. Done: §77 (the committed pages apart from the
-  writer's, commits numbered), §78 (every read through a snapshot),
-  §79 (writers beside the readers), §80 (older versions kept while
-  a reader needs them: commits wait for no read, and an export blocks
-  no writer, §30.6) and §82 (`Database::snapshot`, a snapshot a caller
-  keeps, `View<T>`, and a cursor of one moment). Next, §83: a limit on
-  the memory versions take, and counters to see it.
+- Done, §77 to §83 without §81: snapshot reads (MVCC), for many small
+  writes beside long reads, and one state across several calls. §77
+  (the committed pages apart from the writer's, commits numbered), §78
+  (every read through a snapshot), §79 (writers beside the readers),
+  §80 (older versions kept while a reader needs them: commits wait for
+  no read, and an export blocks no writer, §30.6), §82
+  (`Database::snapshot`, a snapshot a caller keeps, `View<T>`, and a
+  cursor of one moment) and §83 (a limit on the memory versions take,
+  `Error::SnapshotTooOld` for the oldest snapshot past it, counters,
+  and `bench`'s `long_read`). Not released yet.
 - Short reads on several threads: a tenth fewer with two readers since
   §80, each read now writing to three shared places instead of one
   (§80.6). With §82's kept snapshots counted, `compact` could do

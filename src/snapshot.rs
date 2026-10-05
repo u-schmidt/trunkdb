@@ -46,8 +46,13 @@ use std::io::Write;
 /// # What it costs while it is open
 /// - **Memory.** A page changed after the snapshot was taken stays in
 ///   memory as it was, once per page however often it changes, until the
-///   snapshot and its clones, views and cursors are dropped. A snapshot
-///   forgotten beside a busy writer keeps growing; there is no limit yet.
+///   snapshot and its clones, views and cursors are dropped.
+///   `Database::snapshot_info` says how much that is.
+/// - **It can get too old.** That memory is limited
+///   (`OpenOptions::snapshot_memory`, 256 MiB unless set). Past the
+///   limit the oldest snapshot is ended: every read through it fails
+///   with `Error::SnapshotTooOld` from then on. Writers are never held
+///   up for a snapshot.
 /// - **`Database::compact` is refused**, with `Error::SnapshotOpen`.
 /// - **The file stays open**, as with any other handle (SPEC §27).
 ///
@@ -65,7 +70,41 @@ impl std::fmt::Debug for Snapshot {
     }
 }
 
+/// What open snapshots cost right now — see
+/// [`Database::snapshot_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SnapshotInfo {
+    /// How many pages are kept in memory as they were, for the snapshots
+    /// open: a snapshot, a view, a cursor, or a read under way.
+    pub kept_pages: usize,
+    /// Those pages, in bytes.
+    pub kept_bytes: u64,
+    /// At most how many bytes of them are kept:
+    /// `OpenOptions::snapshot_memory`.
+    pub limit_bytes: u64,
+    /// How many times the limit has ended snapshots since the database
+    /// was opened. Not 0: some reader met `Error::SnapshotTooOld`, or
+    /// will on its next read.
+    pub ended: u64,
+}
+
 impl Database {
+    /// How much memory open snapshots take right now, and whether the
+    /// limit on it has ended any (SPEC §83). What is kept for a snapshot
+    /// that has been dropped is let go at the next write of each page, or
+    /// the next checkpoint, so this can lag behind.
+    pub fn snapshot_info(&self) -> SnapshotInfo {
+        let (kept_pages, limit_pages, ended) = self.versions_kept();
+        let bytes = |pages: usize| pages as u64 * crate::storage::PAGE_SIZE as u64;
+        SnapshotInfo {
+            kept_pages,
+            kept_bytes: bytes(kept_pages),
+            limit_bytes: bytes(limit_pages),
+            ended,
+        }
+    }
+
     /// The database as it is now, to keep reading as it is now — see
     /// [`Snapshot`]. It has every batch committed before this call, and
     /// none committed after it.
@@ -563,5 +602,340 @@ mod tests {
             Err(crate::Error::Poisoned)
         ));
         assert!(matches!(db.snapshot(), Err(crate::Error::Poisoned)));
+    }
+
+    // --- A limit on what snapshots keep (SPEC §83) ---
+
+    fn open_with_limit(pages: usize) -> (tempfile::TempDir, std::path::PathBuf, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let limit = pages * crate::storage::PAGE_SIZE;
+        let options = crate::OpenOptions::default().snapshot_memory(limit);
+        let db = Database::open_with(&path, options).unwrap();
+        (dir, path, db)
+    }
+
+    /// 200 documents of about a kilobyte each: some thirty pages.
+    fn fill(db: &Database) -> Vec<DocId> {
+        let docs = db.collection::<String>("docs");
+        let mut batch = db.batch();
+        let ids = (0..200)
+            .map(|i| batch.insert(&docs, format!("{i:01000}")).unwrap())
+            .collect();
+        batch.commit().unwrap();
+        ids
+    }
+
+    #[test]
+    fn the_limit_is_256_mib_unless_set() {
+        let (_dir, _path, db) = open();
+        let info = db.snapshot_info();
+        assert_eq!(
+            (info.limit_bytes, info.kept_pages, info.ended),
+            (256 << 20, 0, 0)
+        );
+        let (_dir, _path, db) = open_with_limit(10);
+        assert_eq!(db.snapshot_info().limit_bytes, 10 * 8192);
+    }
+
+    /// A snapshot kept while more is rewritten than snapshots may keep is
+    /// ended: every read through it, of any kind, fails with
+    /// `SnapshotTooOld`, and stays failed. The writer never fails, a
+    /// snapshot taken afterwards reads, and what was kept is let go.
+    #[test]
+    fn a_snapshot_kept_past_the_limit_is_too_old() {
+        let (_dir, _path, db) = open_with_limit(10);
+        let ids = fill(&db);
+        let docs = db.collection::<String>("docs");
+        let snapshot = db.snapshot().unwrap();
+        let then = snapshot.collection::<String>("docs");
+        let mut cursor = then.cursor(Filter::new()).unwrap();
+        assert!(cursor.next().unwrap().is_ok());
+
+        // A few pages rewritten: kept, and within the limit.
+        for id in &ids[..20] {
+            assert!(docs.update(id, "changed".to_string()).unwrap());
+        }
+        let info = db.snapshot_info();
+        assert!(
+            info.kept_pages > 0 && info.kept_bytes <= info.limit_bytes,
+            "{info:?}"
+        );
+        assert_eq!(info.ended, 0);
+        assert_eq!(then.count(Filter::new()).unwrap(), 200);
+        assert_eq!(then.get(&ids[0]).unwrap(), Some(format!("{:01000}", 0)));
+
+        // All of them: more than ten pages' worth.
+        for id in &ids {
+            assert!(docs.update(id, "changed again".to_string()).unwrap());
+        }
+        let info = db.snapshot_info();
+        assert!(
+            info.ended > 0 && info.kept_bytes <= info.limit_bytes,
+            "{info:?}"
+        );
+
+        let too_old = |result: crate::Result<()>| {
+            assert!(
+                matches!(result, Err(crate::Error::SnapshotTooOld)),
+                "{result:?}"
+            );
+        };
+        too_old(then.find(Filter::new()).map(drop));
+        too_old(then.get(&ids[150]).map(drop));
+        too_old(then.count(Filter::new()).map(drop));
+        too_old(then.find_one(Filter::new()).map(drop));
+        too_old(then.cursor(Filter::new()).map(drop));
+        too_old(cursor.next().unwrap().map(drop));
+        too_old(then.indexes().map(drop));
+        too_old(snapshot.collections().map(drop));
+        too_old(snapshot.export(std::io::sink()).map(drop));
+        too_old(snapshot.check().map(drop));
+        too_old(snapshot.file_info().map(drop));
+        too_old(
+            snapshot
+                .collection::<Document>("docs")
+                .find(Filter::new())
+                .map(drop),
+        );
+        // For good, also once the file has everything.
+        db.checkpoint().unwrap();
+        too_old(then.get(&ids[0]).map(drop));
+
+        // The database is as well as ever, and a new snapshot reads.
+        assert_eq!(
+            docs.get(&ids[0]).unwrap(),
+            Some("changed again".to_string())
+        );
+        let now = db.snapshot().unwrap().collection::<String>("docs");
+        assert_eq!(now.count(Filter::new()).unwrap(), 200);
+        assert!(db.check().unwrap().is_ok());
+
+        // With the old ones dropped, nothing is kept.
+        drop((snapshot, then, cursor, now));
+        db.checkpoint().unwrap();
+        assert_eq!(db.snapshot_info().kept_pages, 0);
+    }
+
+    /// The limit takes the oldest snapshot first, and leaves a newer one
+    /// that needs less.
+    #[test]
+    fn the_oldest_snapshot_goes_first() {
+        let (_dir, _path, db) = open_with_limit(12);
+        let ids = fill(&db);
+        let docs = db.collection::<String>("docs");
+        let older = db.snapshot().unwrap();
+        for id in &ids[..60] {
+            assert!(docs.update(id, "x".to_string()).unwrap());
+        }
+        let newer = db.snapshot().unwrap();
+        for id in &ids[60..110] {
+            assert!(docs.update(id, "y".to_string()).unwrap());
+        }
+        assert_eq!(db.snapshot_info().ended, 1);
+
+        let all = Filter::new();
+        let older = older.collection::<String>("docs");
+        assert!(matches!(
+            older.count(all.clone()),
+            Err(crate::Error::SnapshotTooOld)
+        ));
+        let newer = newer.collection::<String>("docs");
+        assert_eq!(newer.count(all.clone()).unwrap(), 200);
+        let changed = newer
+            .find(all)
+            .unwrap()
+            .iter()
+            .filter(|doc| *doc == "x")
+            .count();
+        assert_eq!(changed, 60, "the newer one's moment");
+    }
+
+    /// One long read is a snapshot too: an export beside which more is
+    /// rewritten than snapshots may keep fails, and the writer doesn't.
+    #[test]
+    fn a_long_read_past_the_limit_fails_and_the_writer_does_not() {
+        let (_dir, _path, db) = open_with_limit(4);
+        let ids = fill(&db);
+
+        /// Rewrites every document at the export's first write.
+        struct Rewriter {
+            db: Database,
+            ids: Vec<DocId>,
+            done: bool,
+        }
+        impl Write for Rewriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.done {
+                    let docs = self.db.collection::<String>("docs");
+                    for id in &self.ids {
+                        assert!(docs.update(id, "rewritten".to_string()).unwrap());
+                    }
+                    self.done = true;
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Rewriter {
+            db: db.clone(),
+            ids,
+            done: false,
+        };
+        let result = db.export(&mut out);
+        assert!(out.done);
+        assert!(
+            matches!(result, Err(crate::Error::SnapshotTooOld)),
+            "{result:?}"
+        );
+        // Again, with nobody writing beside it.
+        assert_eq!(db.export(std::io::sink()).unwrap().documents, 200);
+    }
+
+    /// A snapshot the limit has ended keeps nothing, so it no longer
+    /// stands in the way of a compaction, though it is still held.
+    #[test]
+    fn an_ended_snapshot_does_not_refuse_compaction() {
+        let (_dir, _path, db) = open_with_limit(4);
+        let ids = fill(&db);
+        let docs = db.collection::<String>("docs");
+        let snapshot = db.snapshot().unwrap();
+        for id in &ids[..190] {
+            assert!(docs.delete(id).unwrap());
+        }
+        assert!(db.snapshot_info().ended > 0);
+        // One that is still good does.
+        let good = db.snapshot().unwrap();
+        assert!(matches!(db.compact(), Err(crate::Error::SnapshotOpen)));
+        drop(good);
+
+        let compacted = db.compact().unwrap();
+        assert!(compacted.pages_after < compacted.pages_before);
+        let then = snapshot.collection::<String>("docs");
+        assert!(matches!(
+            then.count(Filter::new()),
+            Err(crate::Error::SnapshotTooOld)
+        ));
+        assert_eq!(docs.count(Filter::new()).unwrap(), 10);
+    }
+
+    /// Readers beside a writer that rewrites more than snapshots may
+    /// keep, so their snapshots are ended under them again and again, in
+    /// the middle of a read too. A read then either is whole and of one
+    /// moment — every transfer in it entirely or not at all — or fails
+    /// with `SnapshotTooOld`. Never anything else, and never a mix.
+    #[test]
+    fn a_read_ended_by_the_limit_fails_and_never_reads_a_mix() {
+        #[derive(Clone, Serialize, Deserialize)]
+        struct Account {
+            amount: i64,
+            pad: String,
+        }
+        const ACCOUNTS: usize = 60;
+        const TOTAL: i64 = ACCOUNTS as i64 * 100;
+
+        /// Whether the read was whole, and of one moment; `false` if it
+        /// was refused as too old. Anything else panics.
+        fn whole(listed: crate::Result<Vec<Account>>) -> bool {
+            match listed {
+                Ok(listed) => {
+                    assert_eq!(listed.len(), ACCOUNTS);
+                    assert_eq!(listed.iter().map(|a| a.amount).sum::<i64>(), TOTAL);
+                    true
+                }
+                Err(crate::Error::SnapshotTooOld) => false,
+                Err(e) => panic!("{e}"),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::OpenOptions::default()
+            .snapshot_memory(2 * crate::storage::PAGE_SIZE)
+            .checkpoint_pages(1)
+            .cache_size(3 * crate::storage::PAGE_SIZE);
+        let db = Database::open_with(dir.path().join("test.trunkdb"), options).unwrap();
+        let accounts = db.collection::<Account>("accounts");
+        let mut batch = db.batch();
+        let ids: Vec<DocId> = (0..ACCOUNTS)
+            .map(|_| {
+                let account = Account {
+                    amount: 100,
+                    pad: "x".repeat(700),
+                };
+                batch.insert(&accounts, account).unwrap()
+            })
+            .collect();
+        batch.commit().unwrap();
+        let done = AtomicBool::new(false);
+        // One kept from before the first transfer to after the last: it
+        // is ended for certain, however the threads fall.
+        let kept = db.snapshot().unwrap();
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let mut rng = crate::testing::XorShift(11);
+                for _ in 0..400 {
+                    let (from, to) = (rng.below(ACCOUNTS), rng.below(ACCOUNTS));
+                    if from == to {
+                        continue;
+                    }
+                    let mut a = accounts.get(&ids[from]).unwrap().unwrap();
+                    let mut b = accounts.get(&ids[to]).unwrap().unwrap();
+                    a.amount -= 7;
+                    b.amount += 7;
+                    let mut batch = db.batch();
+                    batch.update(&accounts, &ids[from], a).unwrap();
+                    batch.update(&accounts, &ids[to], b).unwrap();
+                    // The writer is never the one to fail.
+                    batch.commit().unwrap();
+                }
+                done.store(true, Ordering::Release);
+            });
+
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let (mut read, mut too_old) = (0, 0);
+                        while !done.load(Ordering::Acquire) {
+                            // One call, and a snapshot kept over two.
+                            let outcomes = [whole(accounts.find(Filter::new())), {
+                                let snapshot = db.snapshot().unwrap();
+                                let then = snapshot.collection::<Account>("accounts");
+                                let first = whole(then.find(Filter::new()));
+                                std::thread::yield_now();
+                                // Ended in between is fine; back again is not.
+                                let again = whole(then.find(Filter::new()));
+                                assert!(first || !again, "an ended snapshot read again");
+                                first && again
+                            }];
+                            for ok in outcomes {
+                                read += usize::from(ok);
+                                too_old += usize::from(!ok);
+                            }
+                        }
+                        (read, too_old)
+                    })
+                })
+                .collect();
+            writer.join().unwrap();
+            let (mut read, mut too_old) = (0, 0);
+            for reader in readers {
+                let (r, t) = reader.join().unwrap();
+                read += r;
+                too_old += t;
+            }
+            // How many of each is up to the machine; that there were
+            // reads isn't.
+            assert!(read + too_old > 0, "{read} read, {too_old} too old");
+        });
+        assert!(db.snapshot_info().ended > 0);
+        assert!(!whole(
+            kept.collection::<Account>("accounts").find(Filter::new())
+        ));
+        let listed = accounts.find(Filter::new()).unwrap();
+        assert_eq!(listed.iter().map(|a| a.amount).sum::<i64>(), TOTAL);
+        assert!(db.check().unwrap().is_ok());
     }
 }

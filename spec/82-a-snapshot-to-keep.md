@@ -137,8 +137,8 @@ known.
   poisoned database; a cursor reading each document as it is now.
 
 ## 82.6 Limits
-- **No limit on the memory a kept snapshot takes**: §83. Until then a
-  snapshot forgotten beside a busy writer grows without bound.
+- **No limit on the memory a kept snapshot takes** here: §83 adds
+  it.
 - **A cursor left open** is such a snapshot, and less visibly so than
   one named `Snapshot`.
 - **Taking a snapshot holds the gate for a moment**, so it waits for a

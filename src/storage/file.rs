@@ -410,6 +410,12 @@ impl FileStore {
         self.pages.set_cache_pages(bytes / PAGE_SIZE);
     }
 
+    /// How many bytes of older versions are kept for open snapshots at
+    /// most (SPEC §83).
+    pub fn set_snapshot_memory(&self, bytes: usize) {
+        self.pages.set_version_limit(bytes / PAGE_SIZE);
+    }
+
     #[cfg(test)]
     pub(crate) fn cache_size(&self) -> usize {
         self.pages.memory().cache.capacity()
@@ -2213,5 +2219,113 @@ mod tests {
         store.replace_all([(1, filled(8))], 2).unwrap();
         assert!(store.replaces_all());
         store.commit_beside(&[0]);
+    }
+
+    // --- A limit on the versions kept (SPEC §83) ---
+
+    /// Whether a read as of `commit` is refused as too old.
+    fn too_old(store: &FileStore, commit: Commit, id: PageId) -> bool {
+        match store.at(commit).read_page(id) {
+            Ok(_) => false,
+            Err(e) => {
+                assert!(e.get_ref().unwrap().is::<crate::storage::TooOld>(), "{e}");
+                true
+            }
+        }
+    }
+
+    /// Past the limit the oldest open snapshot is ended: its versions go,
+    /// and every read as of it is refused from then on, also of a page
+    /// nobody changed, also after a checkpoint has put newer pages in the
+    /// file — never handed one of those. A newer snapshot reads on. The
+    /// writer isn't refused anything.
+    #[test]
+    fn past_the_limit_the_oldest_snapshot_is_ended() {
+        let (_dir, path) = open_temp();
+        let mut store = FileStore::open(&path).unwrap();
+        for fill in 1..=20u8 {
+            let id = store.allocate_page().unwrap();
+            store.write_page(id, filled(fill).into()).unwrap();
+        }
+        store.pages.set_version_limit(6);
+        let oldest = store.last_commit();
+        let kept = |store: &FileStore| store.pages.versions_kept();
+
+        // Three pages, then the same three again: three older versions.
+        commit_beside(&mut store, &[1, 2, 3], 31, &[0]);
+        let newer = commit_beside(&mut store, &[1, 2, 3], 32, &[0]);
+        assert_eq!(kept(&store), (3, 6, 0));
+        // Two more pages, as both snapshots have them: five.
+        commit_beside(&mut store, &[4, 5], 33, &[0, 2]);
+        assert_eq!(kept(&store), (5, 6, 0));
+        assert!(!too_old(&store, oldest, 1));
+        assert_eq!(store.at(newer).read_page(1).unwrap(), filled(32));
+
+        // The first three again, and a sixth: now pages 1 to 3 are kept
+        // twice, as each snapshot has them. Nine, past the limit. The
+        // one at 0 is ended, and what was kept for it alone goes: six
+        // pages as the one at 2 has them, which is within it.
+        commit_beside(&mut store, &[1, 2, 3, 6], 34, &[0, 2]);
+        assert_eq!(kept(&store), (6, 6, 1));
+        assert_eq!(store.pages.ended_before(), 1);
+        for id in [1, 4, 6, 20] {
+            assert!(too_old(&store, oldest, id), "page {id}");
+        }
+        assert_eq!(store.at(newer).read_page(1).unwrap(), filled(32));
+        assert_eq!(store.at(newer).read_page(4).unwrap(), filled(4));
+        assert_eq!(store.at(newer).read_page(6).unwrap(), filled(6));
+
+        // Still refused once the file has the newest, and the header.
+        store.checkpoint_beside(&[0, 2]).unwrap();
+        assert!(too_old(&store, oldest, 1) && too_old(&store, oldest, 20));
+        assert!(
+            matches!(store.at(oldest).try_read_page(1), Err(e) if e.get_ref().unwrap().is::<crate::storage::TooOld>())
+        );
+        assert!(
+            store.at(oldest).format_version().is_err(),
+            "the header page too"
+        );
+        assert_eq!(store.at(newer).read_page(1).unwrap(), filled(32));
+
+        // Then the next oldest, when its turn comes.
+        let last = commit_beside(&mut store, &[7, 8, 9, 10, 11, 12], 35, &[0, 2]);
+        assert_eq!(kept(&store).2, 2);
+        assert!(too_old(&store, newer, 1) && too_old(&store, newer, 20));
+        assert_eq!(kept(&store).0, 0, "nobody left to keep anything for");
+        assert_eq!(store.at(last).read_page(7).unwrap(), filled(35));
+        assert_eq!(
+            store.read_page(1).unwrap(),
+            filled(34),
+            "the writer reads on"
+        );
+    }
+
+    /// Within the limit nobody is ended, however many commits.
+    #[test]
+    fn within_the_limit_no_snapshot_is_ended() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.pages.set_version_limit(3);
+        let open = store.last_commit();
+        for round in 1..=30 {
+            commit_beside(&mut store, &[1, 2, 3], round, &[0]);
+        }
+        assert_eq!(store.pages.versions_kept(), (3, 3, 0));
+        assert_eq!(store.at(open).read_page(2).unwrap(), filled(2));
+    }
+
+    /// With a limit of nothing, a snapshot ends with the first page
+    /// changed beside it; one nobody writes beside reads on.
+    #[test]
+    fn a_limit_of_nothing_ends_a_snapshot_at_the_first_change() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.pages.set_version_limit(0);
+        let open = store.last_commit();
+        assert_eq!(store.at(open).read_page(1).unwrap(), filled(1));
+        let next = commit_beside(&mut store, &[1], 7, &[0]);
+        assert!(too_old(&store, open, 1) && too_old(&store, open, 2));
+        assert_eq!(store.pages.versions_kept(), (0, 0, 1));
+        assert_eq!(store.at(next).read_page(1).unwrap(), filled(7));
     }
 }

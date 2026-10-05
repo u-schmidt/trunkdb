@@ -170,6 +170,12 @@ Drop it when the reads are done: while it's open, pages changed since
 stay in memory as they were, and `compact` is refused. A `cursor` is a
 snapshot of its own, for as long as it's iterated.
 
+That memory has a limit, 256 MiB unless `OpenOptions::snapshot_memory`
+says otherwise. A snapshot left open beside so many writes that it's
+passed is ended, the oldest first: its reads return
+`Error::SnapshotTooOld`, and a new snapshot reads on. Writes are never
+held up or refused for it. `db.snapshot_info()` shows how much is kept.
+
 ### Reading only some fields
 
 A collection can be opened with a smaller type: serde ignores the
@@ -238,6 +244,7 @@ read.
 ```
 cd bench && cargo run --release
 cd bench && cargo run --release --bin reader_wait   # readers while a writer commits
+cd bench && cargo run --release --bin long_read     # one long snapshot beside single writes
 ```
 
 ## Roadmap (short version)
@@ -458,8 +465,14 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `file_info` on it too. A `cursor` now shows the moment it was made,
     not each document as it is when reached (breaking for code that
     relied on that).
+57. **A limit on the memory snapshots take** (§83):
+    `OpenOptions::snapshot_memory`, 256 MiB unless set. A snapshot
+    kept open beside so many writes that the old pages pass it is
+    ended, the oldest first: its reads fail with
+    `Error::SnapshotTooOld`, and writes go on. `db.snapshot_info()`
+    says how much is kept.
 
-    Items 50–56: not released yet; no format change.
+    Items 50–57: not released yet; no format change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
