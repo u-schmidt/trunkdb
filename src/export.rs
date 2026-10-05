@@ -16,7 +16,7 @@
 
 use crate::catalog::IndexOptions;
 use crate::collection::get_or_create_meta;
-use crate::database::Database;
+use crate::database::{Database, ReadGuard};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index};
 use crate::json::{document_line, parse_document_line};
@@ -55,7 +55,11 @@ pub struct Summary {
 impl Database {
     /// The names of all collections, sorted.
     pub fn collections(&self) -> crate::Result<Vec<String>> {
-        let state = self.read()?;
+        Self::collections_of(&self.read()?)
+    }
+
+    /// `collections`, of the commit `state` reads.
+    pub(crate) fn collections_of(state: &ReadGuard<'_>) -> crate::Result<Vec<String>> {
         let mut names: Vec<String> = state.catalog().names().map(str::to_string).collect();
         names.sort();
         Ok(names)
@@ -70,9 +74,13 @@ impl Database {
     /// go on beside it; only a `compact` waits for it. `out` is buffered
     /// here.
     pub fn export(&self, out: impl Write) -> crate::Result<Summary> {
+        Self::export_of(&self.read()?, out)
+    }
+
+    /// `export`, of the commit `state` reads.
+    pub(crate) fn export_of(state: &ReadGuard<'_>, out: impl Write) -> crate::Result<Summary> {
         let mut out = BufWriter::new(out);
         let mut summary = Summary::default();
-        let state = self.read()?;
         let at = state.snapshot();
 
         write_line(&mut out, &object([(HEADER_KEY, EXPORT_VERSION.into())]))?;
@@ -119,7 +127,6 @@ impl Database {
                 summary.documents += 1;
             }
         }
-        drop(state);
         out.flush()?;
         Ok(summary)
     }
