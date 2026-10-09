@@ -87,3 +87,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 74. [`find_with_ids` removed, and a cursor of `T` (`collection.rs`, `cursor.rs`)](74-find-with-ids-removed.md)
 75. [A free-space map (`free_space.rs`, `data.rs`, `catalog.rs`)](75-a-free-space-map.md)
 76. [A WAL size limit (`database.rs`, `durability/`)](76-a-wal-size-limit.md)
+81. [A failed log, taken back alone (`durability/`, `database.rs`)](81-a-failed-log-taken-back-alone.md)
