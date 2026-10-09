@@ -25,8 +25,19 @@ use std::path::{Path, PathBuf};
 /// only some of its pages on disk (SPEC §19.1).
 pub struct WalDurability {
     file: File,
-    /// The file's length as of the last `log` or `checkpoint`.
+    /// The file's length as of the last `log` that succeeded, or the
+    /// last `checkpoint`: every byte up to here belongs to a committed
+    /// batch.
     len: u64,
+    /// Test-only fault injection: while non-zero, each `log` writes its
+    /// record whole, then fails as if the flush had (and decrements
+    /// this) — the case `undo_failed_log` is for.
+    #[cfg(test)]
+    pub(crate) failing_logs: u32,
+    /// Test-only: while non-zero, each `undo_failed_log` fails without
+    /// touching the file (and decrements this).
+    #[cfg(test)]
+    pub(crate) failing_undos: u32,
 }
 
 /// Every non-empty WAL file starts with this: magic, then a `u32` format
@@ -183,7 +194,15 @@ impl WalDurability {
         let pending = decode_pending(&bytes)?;
 
         let len = bytes.len() as u64;
-        Ok((Self { file, len }, pending))
+        let wal = Self {
+            file,
+            len,
+            #[cfg(test)]
+            failing_logs: 0,
+            #[cfg(test)]
+            failing_undos: 0,
+        };
+        Ok((wal, pending))
     }
 }
 
@@ -199,9 +218,27 @@ impl Durability for WalDurability {
         }
         bytes.extend_from_slice(&encode_record(pages));
         self.file.write_all(&bytes)?;
+        #[cfg(test)]
+        if self.failing_logs > 0 {
+            self.failing_logs -= 1;
+            return Err(io::Error::other("injected log failure"));
+        }
         crate::storage::sync(&self.file)?;
         self.len = end + bytes.len() as u64;
         Ok(())
+    }
+
+    fn undo_failed_log(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.failing_undos > 0 {
+            self.failing_undos -= 1;
+            return Err(io::Error::other("injected undo failure"));
+        }
+        // To `len`, not to nothing: what's before it are committed
+        // batches no checkpoint has written back yet (SPEC §51).
+        self.file.set_len(self.len)?;
+        self.file.seek(SeekFrom::Start(self.len))?;
+        crate::storage::sync(&self.file)
     }
 
     fn checkpoint(&mut self) -> io::Result<()> {
@@ -383,5 +420,68 @@ mod tests {
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
         assert!(recovered.is_empty());
+    }
+
+    // --- A failed log taken back (SPEC §81) ---
+
+    /// A log whose flush fails may leave its record whole in the file —
+    /// the next open would restore it. Taking it back cuts the log to
+    /// where it was: the batches before it stay, the failed one is gone,
+    /// and the next batch follows the last good one.
+    #[test]
+    fn a_failed_log_is_taken_back_and_the_batches_before_it_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        log(&mut wal, &[(3, page(1))]);
+        log(&mut wal, &[(4, page(2))]);
+        let good = wal_bytes(&db_path);
+        assert_eq!(wal.len(), good.len() as u64);
+
+        wal.failing_logs = 1;
+        assert!(wal.log(&[(5, &page(3))]).is_err());
+        assert_eq!(wal.len(), good.len() as u64, "not counted");
+        // What makes it dangerous: the record is there, and complete.
+        let left_behind = decode_pending(&wal_bytes(&db_path)).unwrap();
+        assert_eq!(left_behind.len(), 3);
+
+        wal.undo_failed_log().unwrap();
+        assert_eq!(wal_bytes(&db_path), good);
+        log(&mut wal, &[(6, page(4))]);
+        drop(wal);
+        let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(recovered, vec![(3, page(1)), (4, page(2)), (6, page(4))]);
+    }
+
+    /// The first log after a checkpoint writes the file's header with
+    /// its record: taken back, the file is empty again, and the next log
+    /// writes the header anew.
+    #[test]
+    fn a_failed_first_log_is_taken_back_to_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        wal.failing_logs = 1;
+        assert!(wal.log(&[(5, &page(3))]).is_err());
+        assert!(!wal_bytes(&db_path).is_empty());
+
+        wal.undo_failed_log().unwrap();
+        assert!(wal_bytes(&db_path).is_empty());
+        log(&mut wal, &two_page_batch());
+        drop(wal);
+        let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(recovered, two_page_batch());
+    }
+
+    /// After a log that succeeded there is nothing to take back.
+    #[test]
+    fn undoing_after_a_good_log_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        log(&mut wal, &two_page_batch());
+        let good = wal_bytes(&db_path);
+        wal.undo_failed_log().unwrap();
+        assert_eq!(wal_bytes(&db_path), good);
     }
 }

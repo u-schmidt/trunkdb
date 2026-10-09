@@ -402,6 +402,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     writes back once the WAL is that long, twice `checkpoint_pages`
     pages' bytes unless set, so commits that keep changing the same few
     pages cannot grow it without bound; no format change.
+51. **A failed log, taken back alone** (§81): a batch whose write to the
+    WAL fails no longer empties the WAL, which also held the batches
+    committed before it and not yet written back; a crash soon after
+    lost those. A fix to §51; no format change.
 
     Items 48–49 → 0.17.0: breaking for code that calls `find_with_ids`
     or `find_one_with_id`, or takes `(id, doc)` from a cursor (§74.3

@@ -402,9 +402,11 @@ impl Database {
             // A failed `log` may still have left a complete record behind
             // (say the write landed but the fsync failed), which the next
             // `open` would restore — for a batch this call reports as
-            // failed. Truncating the log rules that out; if even that
-            // fails, the batch's fate is genuinely unknown.
-            if state.durability.checkpoint().is_err() {
+            // failed. Cutting the log back to where it was rules that
+            // out, and keeps the batches committed before it, which are
+            // nowhere else on disk yet (SPEC §81); if even that fails,
+            // the batch's fate is genuinely unknown.
+            if state.durability.undo_failed_log().is_err() {
                 state.poisoned = true;
             }
             return Err(e.into());
@@ -1532,5 +1534,88 @@ mod tests {
         let db = Database::open(&path).unwrap();
         let numbers = db.collection::<i64>("numbers");
         assert_eq!(numbers.find(Filter::default()).unwrap(), vec![1]);
+    }
+
+    // --- A failed log, and the batches committed before it (SPEC §81) ---
+
+    /// The database as a crash right now would leave it: its file and
+    /// its WAL as they are on disk, copied, and the copy opened. (The
+    /// handle itself can't be dropped for this: that checkpoints.)
+    fn as_after_a_crash(db: &Database, path: &Path) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("crashed.trunkdb");
+        std::fs::write(&copy, db.state().store.file_bytes()).unwrap();
+        let wal = |path: &Path| {
+            let mut wal = path.as_os_str().to_os_string();
+            wal.push(".wal");
+            std::path::PathBuf::from(wal)
+        };
+        std::fs::copy(wal(path), wal(&copy)).unwrap();
+        let crashed = Database::open(&copy).unwrap();
+        (dir, crashed)
+    }
+
+    /// A batch whose log fails is taken back, and only it: the batches
+    /// committed before it and not yet written back are still in the
+    /// WAL, the one durable place they are in. A crash afterwards loses
+    /// none of them — it did, when the whole WAL was emptied.
+    #[test]
+    fn a_failed_log_loses_no_batch_committed_before_it() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        db.write_batch(vec![insert("posts", 2, 20)]).unwrap();
+        assert!(db.state().store.unwritten_pages() > 0, "not written back");
+        let logged = wal_len(&path);
+
+        db.state().durability.failing_logs = 1;
+        let failed = db.write_batch(vec![insert("posts", 3, 30)]);
+        assert!(matches!(failed, Err(crate::Error::Io(_))), "{failed:?}");
+        assert_eq!(wal_len(&path), logged, "cut back to before the failed log");
+        // Rolled back, and the database goes on.
+        assert_eq!(get(&db, "posts", 3), None);
+        assert_eq!(get(&db, "posts", 2), Some(Document::Int(20)));
+
+        let (_copy, crashed) = as_after_a_crash(&db, &path);
+        assert_eq!(get(&crashed, "posts", 1), Some(Document::Int(10)));
+        assert_eq!(get(&crashed, "posts", 2), Some(Document::Int(20)));
+        assert_eq!(
+            get(&crashed, "posts", 3),
+            None,
+            "the failed batch came back"
+        );
+        assert!(crashed.check().unwrap().is_ok());
+        drop(crashed);
+
+        // A batch after it is logged behind the last good one.
+        db.write_batch(vec![insert("posts", 4, 40)]).unwrap();
+        let (_copy, crashed) = as_after_a_crash(&db, &path);
+        for (id, value) in [(1, Some(10)), (2, Some(20)), (3, None), (4, Some(40))] {
+            assert_eq!(get(&crashed, "posts", id), value.map(Document::Int), "{id}");
+        }
+    }
+
+    /// If the failed log can't be taken back either, nobody knows
+    /// whether the batch is in the WAL: every call is refused until the
+    /// database is reopened (SPEC §19.6).
+    #[test]
+    fn a_failed_log_that_cannot_be_taken_back_poisons() {
+        let (_dir, _path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        {
+            let mut state = db.state();
+            state.durability.failing_logs = 1;
+            state.durability.failing_undos = 1;
+        }
+        let failed = db.write_batch(vec![insert("posts", 2, 20)]);
+        assert!(matches!(failed, Err(crate::Error::Io(_))), "{failed:?}");
+        assert!(matches!(
+            db.write_batch(vec![insert("posts", 3, 30)]),
+            Err(crate::Error::Poisoned)
+        ));
+        let posts = db.collection::<Document>("posts");
+        assert!(matches!(
+            posts.get(&DocId([1; 16])),
+            Err(crate::Error::Poisoned)
+        ));
     }
 }
