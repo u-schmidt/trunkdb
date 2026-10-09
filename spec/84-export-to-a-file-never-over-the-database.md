@@ -40,6 +40,8 @@ export into a missing directory fails.
 ## 84.5 Limits
 - Not tested: a failure partway through writing leaving `out` alone. It
   follows from the rename coming last.
-- A hard link on a platform without inodes is not recognized (§84.1).
+- A hard link on a platform without inodes is not recognized (§84.1)
+  and not refused: the export replaces the link's name, and the database
+  keeps its own. The test checks only that on Windows, where CI found it.
 - A second hard link to `out` itself is cut loose, not written through:
   the rename replaces the name, not the file.
