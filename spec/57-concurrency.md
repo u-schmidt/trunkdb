@@ -1,5 +1,9 @@
 # 57. Concurrency: one writer, and snapshots kept possible
 
+*Status: the deferral recorded here ended with §77 to §83, which built
+snapshot reads; the model below, one lock, is the one before them. The
+reasons and the rules are still the ones those sections followed.*
+
 The review after §52 asked for a decision instead of a default: will
 readers ever stop waiting for writers? This section records the answer.
 Snapshot reads (MVCC) are **deferred, not rejected**. The model stays as
