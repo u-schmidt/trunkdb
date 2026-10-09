@@ -21,11 +21,13 @@ pub(crate) use snapshot::{Commit, SnapshotStore};
 pub type PageId = u64;
 
 /// `file.sync_all()`, the flush every durability promise rests on —
-/// except in a `fuzzing` build (SPEC §55), which tests decoding, not
-/// durability, and where a flush of several milliseconds per commit
-/// would slow the fuzzer down a hundredfold.
+/// except under `--cfg fuzzing` (SPEC §55.1), which `cargo fuzz` sets and
+/// which tests decoding, not durability. A cfg and not the `fuzzing`
+/// feature: a feature can be switched on by `--all-features` or by any
+/// crate that depends on this one, and would turn the promise off
+/// without a word.
 pub(crate) fn sync(file: &std::fs::File) -> std::io::Result<()> {
-    if cfg!(feature = "fuzzing") {
+    if cfg!(fuzzing) {
         return Ok(());
     }
     file.sync_all()

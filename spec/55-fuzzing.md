@@ -39,9 +39,19 @@ under `trunkdb::fuzzing`, hidden from the docs:
   them, the fuzzer's bytes would almost never get past the checksums, and
   it would only ever test those.
 - `wal` makes a valid WAL record of given pages.
-- **No fsync.** `storage::sync` skips it in a fuzzing build: fuzzing
-  tests decoding, not durability, and a flush per commit made each run
-  slower.
+- **No fsync**, under `--cfg fuzzing` and not under the feature.
+  `storage::sync` skips the flush when the build has that cfg, which
+  `cargo fuzz` sets by default: fuzzing tests decoding, not durability,
+  and a flush per commit made each run slower. At first the feature
+  itself skipped it. A feature can be switched on by `--all-features`
+  or by any crate that depends on trunkdb, and would have turned off
+  the durability promise (§19, §51) without a word: a commit took 5.5
+  ms with the flush and about 0.0 ms without, measured, and nothing
+  said which an application had. A cfg is set only by `RUSTFLAGS`, so
+  an application can't get it by accident; `[lints.rust]
+  unexpected_cfgs` in `Cargo.toml` declares it. A fuzz build with
+  `--no-cfg-fuzzing` flushes: slower, otherwise the same. The feature
+  itself switches nothing off any more.
 
 **Seeds.** `cargo run --example seed_corpus` writes a whole database, a
 valid WAL and an export into `corpus/`. Random bytes rarely get past a

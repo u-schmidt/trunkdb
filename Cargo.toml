@@ -12,7 +12,12 @@ exclude = ["bench/", "fuzz/"]
 
 [features]
 # Hooks for the fuzz targets in `fuzz/` (SPEC §55); not for applications.
+# It switches nothing off: skipping the flush is `--cfg fuzzing`, which
+# `cargo fuzz` sets and a feature can't (SPEC §55.1).
 fuzzing = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
