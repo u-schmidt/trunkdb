@@ -81,6 +81,15 @@ impl Header {
         buf
     }
 
+    /// Whether `buf` has this build's magic and a format it reads: the
+    /// part of `decode` that says whose file it is, before the fields.
+    fn is_ours(buf: &[u8]) -> bool {
+        let format_version = u32::from_le_bytes(buf[28..32].try_into().unwrap());
+        &buf[0..8] == MAGIC
+            && (format_version == FORMAT_VERSION
+                || COMPATIBLE_OLDER_FORMATS.contains(&format_version))
+    }
+
     fn decode(buf: &[u8]) -> io::Result<Self> {
         if &buf[0..8] != MAGIC {
             return Err(io::Error::new(
@@ -175,6 +184,11 @@ pub struct FileStore {
     /// Whether the header's checksum has been checked — not yet between
     /// `open_before_recovery` and `check_header` (SPEC §40.4).
     header_checked: bool,
+    /// Why the header's fields were refused at open, when the file is
+    /// ours (magic, format) but they are not valid: held back until
+    /// `restore_pages` has had the chance to replace the header from the
+    /// WAL, and returned by `check_header` if it hasn't (SPEC §85).
+    header_error: Option<io::Error>,
     /// The batch in the making: the writer's alone (SPEC §77). Nothing
     /// of it is in `pages` before `commit`.
     staging: Option<Staging>,
@@ -269,6 +283,7 @@ impl FileStore {
                 ));
             }
         }
+        let mut header_error = None;
         let header = if is_fresh {
             Header {
                 page_size: PAGE_SIZE as u32,
@@ -277,7 +292,24 @@ impl FileStore {
                 format_version: FORMAT_VERSION,
             }
         } else {
-            Header::decode(&read_disk_page(&file, HEADER_PAGE)?[..USABLE_PAGE_SIZE])?
+            let disk = read_disk_page(&file, HEADER_PAGE)?;
+            match Header::decode(&disk[..USABLE_PAGE_SIZE]) {
+                Ok(header) => header,
+                // Fields that are damaged in a file that is ours may be
+                // in the WAL's header image (SPEC §85). Anything that
+                // says it isn't ours, or is of another format, is
+                // reported now: the WAL isn't opened beside it.
+                Err(e) if Header::is_ours(&disk[..USABLE_PAGE_SIZE]) => {
+                    header_error = Some(e);
+                    Header {
+                        page_size: PAGE_SIZE as u32,
+                        page_count: 1,
+                        free_list_head: NO_FREE_PAGE,
+                        format_version: FORMAT_VERSION,
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         Ok(Self {
@@ -285,6 +317,7 @@ impl FileStore {
             header,
             // A fresh file's header isn't on disk yet: nothing to check.
             header_checked: is_fresh,
+            header_error,
             staging: None,
         })
     }
@@ -292,6 +325,9 @@ impl FileStore {
     /// Checks the header's checksum, if `open_before_recovery` left it
     /// unchecked.
     pub(crate) fn check_header(&mut self) -> io::Result<()> {
+        if let Some(e) = self.header_error.take() {
+            return Err(e);
+        }
         if !self.header_checked {
             if !checksum_matches(
                 HEADER_PAGE,
@@ -615,6 +651,10 @@ impl FileStore {
         // it, is damage (SPEC §55): a batch that grows the file logs its
         // header too, and first, as page 0. Checked before anything is
         // written, so a damaged WAL leaves the file as it was.
+        if self.header_error.is_some() && !pages.iter().any(|(id, _)| *id == HEADER_PAGE) {
+            // Damaged fields, and nothing in the WAL to replace them.
+            return Err(self.header_error.take().unwrap());
+        }
         let mut page_count = read_header(self.pages.file()).ok().map(|h| h.page_count);
         for (id, page) in pages {
             if *id == HEADER_PAGE {
@@ -631,6 +671,7 @@ impl FileStore {
         self.pages.restore(pages)?;
         self.header = read_header(self.pages.file())?;
         self.header_checked = true;
+        self.header_error = None;
         // A crash can come between a shrinking batch's write-back and
         // its cut.
         self.pages.truncate(self.header.page_count)?;

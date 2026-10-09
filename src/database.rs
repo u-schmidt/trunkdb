@@ -1144,6 +1144,32 @@ mod tests {
         assert!(err.to_string().contains("page 0 is damaged"), "{err}");
     }
 
+    /// Damaged header fields (a page count of 0) in a file that is ours
+    /// are replaced from the WAL's header image, and are damage when the
+    /// WAL has none (SPEC §85).
+    #[test]
+    fn damaged_header_fields_are_recovered_from_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::BeforeCheckpoint);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[12..20].copy_from_slice(&0u64.to_le_bytes()); // page count
+        std::fs::write(&path, &bytes).unwrap();
+        let db = Database::open(&path).unwrap();
+        assert_two_collection_batch_present(&db);
+        assert!(db.check().unwrap().is_ok());
+        drop(db);
+
+        // Nothing in the WAL now: the same damage is reported.
+        bytes = std::fs::read(&path).unwrap();
+        bytes[12..20].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = Database::open(&path).err().expect("damage");
+        assert!(err.to_string().contains("header counts 0 pages"), "{err}");
+    }
+
     /// Writing back pages that are already in the main file changes
     /// nothing — no duplicate documents, no error.
     #[test]
