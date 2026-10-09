@@ -938,4 +938,251 @@ mod tests {
         assert_eq!(listed.iter().map(|a| a.amount).sum::<i64>(), TOTAL);
         assert!(db.check().unwrap().is_ok());
     }
+
+    // --- Page reuse beside an open snapshot: the free-space map (§75) and
+    // the free list (§80) ---
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Padded {
+        n: i64,
+        pad: String,
+    }
+
+    fn padded(n: i64, len: usize) -> Padded {
+        Padded {
+            n,
+            pad: format!("{n}:").repeat(len / 2 + 1)[..len].to_string(),
+        }
+    }
+
+    /// `count` documents of `len` bytes numbered from `from`, in batches
+    /// of 100 (one commit each), with the ids they got.
+    fn insert_padded(
+        db: &Database,
+        docs: &Collection<Padded>,
+        from: i64,
+        count: i64,
+        len: usize,
+    ) -> Vec<(DocId, Padded)> {
+        let mut made = Vec::new();
+        for chunk in (from..from + count).collect::<Vec<i64>>().chunks(100) {
+            let mut batch = db.batch();
+            for &n in chunk {
+                let doc = padded(n, len);
+                made.push((batch.insert(docs, doc.clone()).unwrap(), doc));
+            }
+            batch.commit().unwrap();
+        }
+        made
+    }
+
+    /// Every way to read `view` gives exactly `expected` (sorted by `n`).
+    fn assert_view_is(view: &View<Padded>, expected: &[(DocId, Padded)]) {
+        assert_eq!(view.count(Filter::new()).unwrap(), expected.len());
+        for (id, doc) in expected {
+            assert_eq!(view.get(id).unwrap().as_ref(), Some(doc));
+        }
+        let want: Vec<Padded> = expected.iter().map(|(_, d)| d.clone()).collect();
+        let mut listed = view.find(Filter::new()).unwrap();
+        listed.sort_by_key(|d| d.n);
+        assert_eq!(listed, want);
+    }
+
+    /// Deletes leave room in the collection's older data pages and the
+    /// free-space map sends the next inserts there, into pages a snapshot
+    /// is reading. It reads its documents as they were.
+    #[test]
+    fn a_snapshot_keeps_its_documents_when_inserts_refill_their_pages() {
+        let (_dir, _path, db) = open();
+        let docs = db.collection::<Padded>("docs");
+        let mut original = insert_padded(&db, &docs, 0, 2000, 400);
+        original.sort_by_key(|(_, d)| d.n);
+        let snapshot = db.snapshot().unwrap();
+        let cursor = snapshot
+            .collection::<Padded>("docs")
+            .cursor(Filter::new())
+            .unwrap();
+
+        let mut batch = db.batch();
+        for (id, _) in original.iter().step_by(2) {
+            batch.delete(&docs, id);
+        }
+        batch.commit().unwrap();
+        let pages_before = db.file_info().unwrap().pages;
+        let fresh = insert_padded(&db, &docs, 10_000, 1000, 400);
+        db.checkpoint().unwrap();
+        let grown = db.file_info().unwrap().pages - pages_before;
+        // The premise: 1,000 new documents of 400 bytes need about 50
+        // pages of 8 KB; they took the room the deletes left, so the file
+        // grew by index pages only.
+        assert!(
+            grown < 25,
+            "the file grew by {grown} pages: nothing refilled"
+        );
+
+        assert_view_is(&snapshot.collection::<Padded>("docs"), &original);
+        let mut streamed: Vec<Padded> = cursor.map(Result::unwrap).collect();
+        streamed.sort_by_key(|d| d.n);
+        let want: Vec<Padded> = original.iter().map(|(_, d)| d.clone()).collect();
+        assert_eq!(streamed, want);
+        assert!(snapshot.check().unwrap().is_ok());
+
+        // And the present is the present.
+        assert_eq!(docs.count(Filter::new()).unwrap(), 2000);
+        for (id, doc) in &fresh {
+            assert_eq!(docs.get(id).unwrap().as_ref(), Some(doc));
+        }
+        for (id, _) in original.iter().step_by(2) {
+            assert_eq!(docs.get(id).unwrap(), None);
+        }
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// The same when the room comes from updates that shrink documents
+    /// in place, and the new documents take it.
+    #[test]
+    fn a_snapshot_keeps_its_documents_when_shrinking_updates_leave_room() {
+        let (_dir, _path, db) = open();
+        let docs = db.collection::<Padded>("docs");
+        let mut original = insert_padded(&db, &docs, 0, 1000, 600);
+        original.sort_by_key(|(_, d)| d.n);
+        let snapshot = db.snapshot().unwrap();
+
+        let mut batch = db.batch();
+        for (id, doc) in &original {
+            batch.update(&docs, id, padded(doc.n, 20)).unwrap();
+        }
+        batch.commit().unwrap();
+        let fresh = insert_padded(&db, &docs, 5_000, 600, 500);
+        db.checkpoint().unwrap();
+
+        assert_view_is(&snapshot.collection::<Padded>("docs"), &original);
+        assert!(snapshot.check().unwrap().is_ok());
+        for (id, doc) in &original {
+            assert_eq!(docs.get(id).unwrap(), Some(padded(doc.n, 20)));
+        }
+        for (id, doc) in &fresh {
+            assert_eq!(docs.get(id).unwrap().as_ref(), Some(doc));
+        }
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// A dropped collection's pages go on the free list and a new
+    /// collection takes them. A snapshot from before reads the dropped one
+    /// whole, its index included.
+    #[test]
+    fn a_snapshot_reads_a_dropped_collection_whose_pages_are_taken_again() {
+        let (_dir, _path, db) = open();
+        let docs = db.collection::<Padded>("docs");
+        docs.ensure_index("n").unwrap();
+        let mut original = insert_padded(&db, &docs, 0, 800, 400);
+        original.sort_by_key(|(_, d)| d.n);
+        let snapshot = db.snapshot().unwrap();
+        let pages_before = db.file_info().unwrap().pages;
+
+        assert!(db.drop_collection("docs").unwrap());
+        let freed = db.file_info().unwrap().free_pages;
+        assert!(freed > 50, "only {freed} pages freed");
+        let other = db.collection::<Padded>("other");
+        other.ensure_index("n").unwrap();
+        let fresh = insert_padded(&db, &other, 100_000, 800, 400);
+        db.checkpoint().unwrap();
+        // The premise: the new collection took the freed pages.
+        let info = db.file_info().unwrap();
+        assert!(
+            info.pages < pages_before + 20 && info.free_pages < freed / 4,
+            "{} pages, was {pages_before}; {} free, was {freed}",
+            info.pages,
+            info.free_pages
+        );
+
+        let then = snapshot.collection::<Padded>("docs");
+        assert_view_is(&then, &original);
+        let range = Filter::new().gte("n", 100).lt("n", 200);
+        assert!(matches!(
+            then.explain(&range).unwrap(),
+            QueryPlan::Index { .. }
+        ));
+        assert_eq!(then.count(range.clone()).unwrap(), 100);
+        let found = then.find(range).unwrap();
+        assert!(found.iter().all(|d| (100..200).contains(&d.n)));
+        assert!(snapshot.check().unwrap().is_ok());
+        assert_eq!(snapshot.collections().unwrap(), ["docs"]);
+
+        assert_view_is(&db.snapshot().unwrap().collection::<Padded>("other"), &{
+            let mut f = fresh.clone();
+            f.sort_by_key(|(_, d)| d.n);
+            f
+        });
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// Random inserts, deletes and updates of every size, a checkpoint now
+    /// and then, and snapshots of several ages open throughout: every one
+    /// reads, every round, exactly what the collection held when it was
+    /// taken.
+    #[test]
+    fn snapshots_of_several_ages_survive_random_churn_and_page_reuse() {
+        use std::collections::HashMap;
+        let (_dir, _path, db) = open();
+        let docs = db.collection::<Padded>("docs");
+        docs.ensure_index("n").unwrap();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut below = |m: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % m as u64) as usize
+        };
+        let mut model: HashMap<DocId, Padded> = HashMap::new();
+        let mut next = 0i64;
+        let mut open_snapshots: Vec<(Snapshot, Vec<(DocId, Padded)>)> = Vec::new();
+
+        for round in 0..40 {
+            let mut batch = db.batch();
+            // Deletes, updates (to any size) and inserts (of any size).
+            let live: Vec<DocId> = model.keys().copied().collect();
+            for _ in 0..below(40) {
+                if live.is_empty() {
+                    break;
+                }
+                let id = live[below(live.len())];
+                if !model.contains_key(&id) {
+                    continue;
+                }
+                if below(2) == 0 {
+                    batch.delete(&docs, &id);
+                    model.remove(&id);
+                } else {
+                    let doc = padded(model[&id].n, 10 + below(1500));
+                    batch.update(&docs, &id, doc.clone()).unwrap();
+                    model.insert(id, doc);
+                }
+            }
+            for _ in 0..(20 + below(80)) {
+                let doc = padded(next, 10 + below(1500));
+                next += 1;
+                let id = batch.insert(&docs, doc.clone()).unwrap();
+                model.insert(id, doc);
+            }
+            batch.commit().unwrap();
+            if round % 3 == 0 {
+                db.checkpoint().unwrap();
+            }
+            if round % 5 == 0 {
+                let mut state: Vec<(DocId, Padded)> =
+                    model.iter().map(|(i, d)| (*i, d.clone())).collect();
+                state.sort_by_key(|(_, d)| d.n);
+                open_snapshots.push((db.snapshot().unwrap(), state));
+            }
+            for (snapshot, state) in &open_snapshots {
+                assert_view_is(&snapshot.collection::<Padded>("docs"), state);
+            }
+            if round % 10 == 9 {
+                assert!(open_snapshots[0].0.check().unwrap().is_ok());
+                assert!(db.check().unwrap().is_ok());
+            }
+        }
+        assert_eq!(docs.count(Filter::new()).unwrap(), model.len());
+    }
 }
