@@ -34,14 +34,14 @@ them are real now; `InMemoryIndex` remains, for tests.
 
 | Layer | Trait | Implementation | Code |
 |---|---|---|---|
-| Pages | `PageStore` | `FileStore`: the file, checksums, the page cache, staged and committed pages | `storage/` |
+| Pages | `PageStore` | `FileStore`: the writer's staged pages and header, over `Pages`: the file, checksums, the page cache and the committed pages [§77](spec/77-the-committed-pages-apart-from-the-writers.md) | `storage/` |
 | Documents | — | the `Document` enum, its byte encoding, the serde bridge, tagged JSON | `document.rs`, `serde_bridge.rs`, `json.rs`, `decode.rs` |
 | Ids | `IdGenerator` | `UuidV7Generator` | `id.rs` |
 | Indexes | `Index` | `BTreeIndex`, for the primary index and every secondary one | `index/` |
 | Transactions | `TransactionManager` | `GlobalLockTxnManager`: one batch at a time, all or nothing | `txn/` |
 | Durability | `Durability` | `WalDurability`: a page-image write-ahead log | `durability/` |
 | Queries | — | `Filter`, `Condition`, `Sort`; a fixed-rule planner | `query.rs` |
-| API | — | `Database`, `Collection<T>`, `Batch`, `Cursor` | `database.rs`, `collection.rs`, `batch.rs`, `cursor.rs` |
+| API | — | `Database`, `Collection<T>`, `Batch`, `Cursor`, `Snapshot`, `View<T>` | `database.rs`, `collection.rs`, `batch.rs`, `cursor.rs`, `snapshot.rs` |
 
 `PageStore` is the one seam that isn't meant to be faked: everything
 above it works in pages, never in file offsets. Index and data code
@@ -114,8 +114,8 @@ export and import [§30](spec/30-export-and-import-as-json-lines.md). The histor
 
 ## 5. Durability: WAL, commit and checkpoint
 
-A write batch goes through five steps under the write lock
-(`Database::transact`) [§19.3](spec/19-durability-take-two-a-page-image-wal.md) [§51](spec/51-one-flush-per-commit.md):
+A write batch goes through five steps under the writer's lock, which
+readers don't take (`Database::transact`) [§19.3](spec/19-durability-take-two-a-page-image-wal.md) [§51](spec/51-one-flush-per-commit.md):
 
 1. **Stage.** Every page write stays in memory, in the store's staging
    area.
@@ -210,8 +210,9 @@ the first of a chain of overflow pages [§26](spec/26-overflow-pages-and-u32-len
 **The catalog** (page 1) holds a cell per collection (its primary
 index root, its current data page, its name) and one per index (its
 fields, root and flags: unique, sparse) [§9](spec/09-catalog.md) [§28](spec/28-secondary-indexes.md) [§44](spec/44-sparse-indexes.md). It's read at
-open and kept in memory; a batch that fails restores the copy it
-started with.
+open and kept in memory, one per commit: a batch works on a copy of
+its own, which becomes the readers' at commit and is dropped if the
+batch fails [§78](spec/78-reads-through-a-snapshot.md).
 
 ## 7. Indexes
 
@@ -298,43 +299,89 @@ what matches.
 ## 9. Concurrency
 
 `Database` is a cheap, cloneable, `Send + Sync` handle; every clone,
-`Collection` and `Batch` shares one open database [§27](spec/27-a-thread-safe-cloneable-database-handle.md). The state sits
-behind one `RwLock`:
+`Collection` and `Batch` shares one open database [§27](spec/27-a-thread-safe-cloneable-database-handle.md). Three things
+are shared, each with a lock of its own [§79](spec/79-writers-beside-the-readers.md):
 
-- **reads** (`get`, `find`, `count`, `cursor`) share the read lock and
-  run in parallel;
-- **a write batch** holds the write lock from staging to its
-  checkpoint, so a reader sees a batch entirely or not at all, and
-  readers wait for it.
+- **the writer**: the batch being staged and the WAL, behind a mutex.
+  A batch holds it from staging to its checkpoint; readers never take
+  it. One writer at a time, and one process per file;
+- **the last commit**: its catalog and its commit number [§78](spec/78-reads-through-a-snapshot.md), behind
+  a read-write lock held only to take it or to replace it. A read
+  (`get`, `find`, `count`, `cursor`, `export`, `check`) takes it when
+  it begins and keeps it, a *snapshot*, to its end;
+- **the committed pages**: the file, the page cache [§50](spec/50-a-page-cache.md) and the
+  versions of pages kept in memory [§77](spec/77-the-committed-pages-apart-from-the-writers.md) [§80](spec/80-older-versions-kept-for-open-snapshots.md), behind one read-write
+  lock. A page read takes it shared for the lookup, since a lookup
+  changes only an atomic flag [§65](spec/65-a-read-lock-for-the-page-cache.md); a page coming in from the file, a
+  commit and the two ends of a checkpoint take it alone, briefly. Pages
+  are shared, not copied: a read gets the page itself (`Page`, an
+  `Arc`), and a change copies it first [§64](spec/64-shared-pages.md).
 
-The page cache is behind its own `RwLock` inside the store [§50](spec/50-a-page-cache.md):
-readers look pages up together under its read lock, since a lookup
-changes only an atomic flag, and a page coming in from the file takes
-the write lock [§65](spec/65-a-read-lock-for-the-page-cache.md). Pages are
-shared, not copied: a read gets the cache's page (`Page`, an `Arc`),
-and a change copies it first, so the cache's stays as it was [§64](spec/64-shared-pages.md). There is
-one writer at a time, and one process per file.
+**Nobody waits for anybody**, but for two short locks and `compact`:
+- a batch is staged, logged and flushed beside the readers, and
+  published by putting its pages into a map and swapping the snapshot.
+  Reads see a batch entirely or not at all;
+- a read goes on reading its own commit whatever is committed
+  meanwhile, and a commit doesn't wait for it. An export of some
+  seconds holds up no write;
+- a checkpoint writes the file beside all of them.
 
-**Snapshot reads are deferred, not rejected** [§57](spec/57-concurrency.md). Readers that
-don't wait for writers (as in SQLite's WAL mode, LiteDB 5 or redb) aren't
-needed by anything measured yet, and they'd live below `PageStore`, so
-features above it don't make them harder. To keep them possible, the
-storage layer follows six rules. The one to know first: **a freed page
-isn't reused while a reader could still need its old contents**. It
-costs nothing today, since no reader overlaps a commit, but the
-free-space map [§75](spec/75-a-free-space-map.md) and any other change to allocation must keep it.
+**Versions** make that work [§80](spec/80-older-versions-kept-for-open-snapshots.md). A page read names its commit and
+gets the newest version at or before it:
+- a page has versions in memory from its commit until a checkpoint has
+  written the newest to the file, and beyond that for as long as an
+  open snapshot would read an older one. Otherwise the file's page is
+  the only version, and everyone reads that;
+- the first commit to change a page keeps the page as it was, if a
+  snapshot is open; without one, nothing older is kept;
+- of a page's versions, the newest stays and each one an open snapshot
+  reads; the rest go at the next commit of that page or the next
+  checkpoint. One snapshot beside many commits costs one older copy of
+  each page changed, not one per commit;
+- a checkpoint always writes the newest version. A reader that went to
+  the file for a page just as a checkpoint wrote it sees that one
+  began, and looks again;
+- a freed page needs no tag: freeing and reusing it are newer versions
+  of that page.
+
+All of it is in memory: commit numbers start at 0 at every open, and
+the file and the WAL are as they were.
+
+**`compact` takes the database alone**: it rewrites every page, so none
+can be kept as it was. It waits for the reads under way, lets none
+begin until it is committed, and fails with `Error::SnapshotOpen` if a
+snapshot is kept open beyond a read.
+
+**A snapshot to keep** [§82](spec/82-a-snapshot-to-keep.md): `Database::snapshot` hands a commit
+out for as long as the caller keeps it. Reads through it, a `View<T>`
+per collection, are all of that moment. A cursor keeps the commit of
+its creation the same way. Both cost what §80 says an open snapshot
+costs: the pages changed since, in memory, and no `compact`.
+
+**A limit on that memory** [§83](spec/83-a-limit-on-the-memory-snapshots-take.md): `OpenOptions::snapshot_memory`,
+256 MiB unless set. Past it the oldest open snapshot is ended: its
+reads fail with `Error::SnapshotTooOld`, and the writer goes on.
+`Database::snapshot_info` says how much is kept. That ends the plan of
+[§77](spec/77-the-committed-pages-apart-from-the-writers.md): §57 deferred snapshots until a workload asked, and many small
+writes beside reads of up to 15 seconds did. Measured for it
+(`bench/`, `long_read`): single writes back to back take the same time
+with a snapshot open for 15 seconds as with none, and it kept 13 MiB.
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
-once or ten times a second costs readers nothing measurable; one that
-commits back to back makes them wait tens of milliseconds, up to half a
-second. Readers run in parallel since pages are shared [§64](spec/64-shared-pages.md) and looked up
+once or ten times a second costs readers nothing measurable. One that
+commits back to back made them wait tens of milliseconds, up to half a
+second; since §79 they do 18 to 31 times the reads beside it, with a
+p99.9 under 100 µs [§79.7](spec/79-writers-beside-the-readers.md). A writer beside an export that never
+stops waited up to 132 s for a commit; since §80, 24 ms, as fast as
+without the export [§80.6](spec/80-older-versions-kept-for-open-snapshots.md). The price: two readers do a tenth fewer
+short reads than before §80. Readers run in parallel since pages are shared [§64](spec/64-shared-pages.md) and looked up
 under a read lock [§65](spec/65-a-read-lock-for-the-page-cache.md): four do 3.2 times the work of one. Eight do no
 more than four.
 
 ## 10. The API
 
 - `Database::open(path)`, or `open_with(path, OpenOptions)` with
-  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) and `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md).
+  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md) and `snapshot_memory` [§83](spec/83-a-limit-on-the-memory-snapshots-take.md).
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
   `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md);
   `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);
@@ -344,6 +391,12 @@ more than four.
   `ensure_index` and `ensure_index_with` (`IndexOptions::new().unique()`,
   `.sparse()`), `indexes()` listing each index's fields and options
   [§28](spec/28-secondary-indexes.md) [§33](spec/33-unique-indexes.md) [§44](spec/44-sparse-indexes.md) [§60](spec/60-a-smaller-public-api.md).
+- **Snapshots:** `db.snapshot()`, the database at one moment for as
+  many reads as wanted; `snapshot.collection::<T>(name)` is a `View<T>`
+  with `get`, `find`, `find_one`, `count`, `cursor`, `explain` and
+  `indexes` and nothing that writes; `collections`, `export`, `check`
+  and `file_info` on the snapshot too. A `cursor` shows the moment it
+  was made [§82](spec/82-a-snapshot-to-keep.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** only through `Filter`'s methods; `limit` takes an `Option`
@@ -352,7 +405,7 @@ more than four.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.
 - **What's public** is only this: `Database`, `Collection`, `Batch`,
-  `Cursor`, `Document`, `DocId`, the options, reports and errors, and
+  `Cursor`, `Snapshot`, `View`, `Document`, `DocId`, the options, reports and errors, and
   `query`. Types a caller passes in are built with methods; types it
   gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md).
 - **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),

@@ -1,23 +1,17 @@
 # 81. A failed log, taken back alone (`durability/`, `database.rs`)
 
-A fix to §51. When a batch's `log` failed, `transact` emptied the WAL,
-to make sure the failed batch couldn't be restored by the next `open`
-(§19.6). Since §51 the WAL holds more than that batch: every batch
-committed since the last checkpoint, and it is the only durable place
-they are in. Emptying it took them along. They were still in memory,
-and the next checkpoint wrote them to the file; a crash before it lost
-them, though each had been reported as committed.
+Found while working on §80, and not part of §77's plan: a fix to
+§51. When a batch's `log` failed, `transact` emptied the WAL, to make
+sure the failed batch couldn't be restored by the next `open` (§19.6).
+Since §51 the WAL holds more than that batch: every batch committed
+since the last checkpoint, and it is the only durable place they are
+in. Emptying it took them along. They were still in memory, and the
+next checkpoint wrote them to the file; a crash before it lost them,
+though each had been reported as committed.
 
 It took two things at once, a failed write to the WAL (a full disk,
 say) and a crash before the next checkpoint. Now the log is cut back
 to where it was before the failed call, and no further.
-
-The number is not the next one: §77 to §80 are taken, by work on
-another branch, where this fix was first made. It is the same change
-there, in code that has been rewritten around it, so merging the two
-conflicts in `transact`, the tests' place in `database.rs`, this file
-and the list in `spec/README.md`: in each, the branch's side is the
-one to keep.
 
 ## 81.1 Why it was right once
 §19 wrote a batch to the WAL, then to the file, then emptied the WAL,
@@ -68,10 +62,9 @@ and then fails, as a failed flush would leave it; and an
   - a failed log that can't be taken back: the next write and the next
     read are refused.
 - Checked by breaking it on purpose, five ways, each failing a test:
-  the log emptied, as before this section (the WAL goes from 49,212
-  bytes to 0 on the failed log); nothing cut; the failed log not taken
-  back; no poisoning when taking back fails; a failed record counted
-  into the log's length.
+  the log emptied, as before this section; nothing cut; the failed log
+  not taken back; no poisoning when taking back fails; a failed record
+  counted into the log's length.
 
 ## 81.4 Limits
 - **A failed flush of the WAL may mean more than one lost record.** On

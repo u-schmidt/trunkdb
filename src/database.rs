@@ -5,10 +5,11 @@ use crate::data;
 use crate::durability::{Durability, WalDurability};
 use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
-use crate::storage::{FileStore, PageId};
+use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
 use std::path::Path;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 
 /// Opens the file and owns the whole stack — as a cheap, cloneable,
 /// thread-safe handle (SPEC §27): every clone refers to the same open
@@ -17,9 +18,11 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// `static`. The file stays open (and locked, §21.1) until the last clone
 /// — including those inside `Collection`s and `Batch`es — is dropped.
 ///
-/// Reads (`get`, `find`) share a read lock; a write batch takes the write
-/// lock for its whole commit (stage to checkpoint, SPEC §19.3), so readers
-/// see a batch entirely or not at all.
+/// Reads (`get`, `find`) run together, each on the commit that was the
+/// last when it began, to its end (SPEC §80). Write batches run one at a
+/// time, beside the reads, and wait for none of them: a batch is staged,
+/// logged and flushed where no reader sees it, and published at once,
+/// so a read sees it entirely or not at all (SPEC §19.3, §79).
 ///
 /// # Limits
 /// Each where it belongs (SPEC §60), all of them listed here:
@@ -34,32 +37,122 @@ pub struct Database {
     inner: Arc<Shared>,
 }
 
-/// What every clone shares. Only `state` changes after `open`, so only it
-/// sits behind the lock.
+/// What every clone shares (SPEC §79). Readers and the writer meet in
+/// two places only: `pages`, which locks itself, and `current`.
 struct Shared {
-    state: RwLock<State>,
+    /// The committed pages: read by everyone, changed by the writer at
+    /// commit and at a checkpoint.
+    pages: Arc<Pages>,
+    /// The last commit, as readers see it (SPEC §78): its pages and its
+    /// catalog. Replaced by every commit, never changed. The lock is held
+    /// only to take it, by a read, or to replace it, by a commit: a read
+    /// keeps the snapshot, not the lock, and reads it whatever is
+    /// committed meanwhile (SPEC §80).
+    current: RwLock<Committed>,
+    /// Held shared by every read for as long as it reads, and alone by a
+    /// batch that replaces the whole file (`compact`), from before its
+    /// commit to after it: the one kind of batch that can't keep the
+    /// pages as they were for the reads under way, so it waits for them
+    /// (rule 6 of SPEC §57.3, §80.5). No other batch takes it.
+    gate: RwLock<()>,
+    /// The writer's own, and the lock that makes it one writer at a
+    /// time. Held for a whole batch, from staging to its checkpoint;
+    /// readers never take it.
+    writer: Mutex<Writer>,
+    /// Set when a batch was durably logged but couldn't be written to the
+    /// main file, even on retry — see `transact`. From then on every call
+    /// fails with `Error::Poisoned` until the database is reopened.
+    poisoned: AtomicBool,
     id_gen: UuidV7Generator,
     txn: GlobalLockTxnManager,
 }
 
-/// The mutable part of an open database. Index and data-page code take
-/// `&mut dyn PageStore` / `&mut Catalog` as plain parameters rather than
-/// holding handles of their own, so the lock guard is the one place they
-/// come from.
-pub(crate) struct State {
+/// What a batch works with, and nobody else: the staged pages and the
+/// WAL. Index and data-page code take `&mut dyn PageStore` / `&mut
+/// Catalog` as plain parameters rather than holding handles of their own,
+/// so the writer's lock is the one place they come from.
+pub(crate) struct Writer {
     pub(crate) store: FileStore,
-    pub(crate) catalog: Catalog,
     durability: WalDurability,
-    /// Set when a batch was durably logged but couldn't be written to the
-    /// main file, even on retry — see `write_batch`. From then on every
-    /// call fails with `Error::Poisoned` until the database is reopened.
-    poisoned: bool,
     /// `OpenOptions::checkpoint_pages`, as of `open_with`: how many
     /// committed pages may wait before a commit writes them back.
     checkpoint_pages: usize,
     /// `OpenOptions::checkpoint_wal_bytes`, with its default worked out:
     /// how long the WAL may grow before a commit writes back.
     checkpoint_wal_bytes: u64,
+    /// The snapshots before the last commit that were still held when
+    /// they were replaced, oldest first: the ones a reader may still be
+    /// reading (SPEC §80). Weak, so a snapshot ends when its last reader
+    /// lets go, and is found gone here.
+    past: Vec<Weak<CommittedInner>>,
+    /// Test-only: called once, by the next batch, when it is logged and
+    /// flushed and not yet published — to see what goes on beside it.
+    #[cfg(test)]
+    after_log: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// One committed state of the database (SPEC §78): a commit of the
+/// pages, and the catalog as that commit left it. Shared, not copied: a
+/// clone is the same snapshot.
+#[derive(Clone)]
+pub(crate) struct Committed(Arc<CommittedInner>);
+
+struct CommittedInner {
+    commit: Commit,
+    catalog: Catalog,
+}
+
+impl Committed {
+    fn new(commit: Commit, catalog: Catalog) -> Self {
+        Committed(Arc::new(CommittedInner { commit, catalog }))
+    }
+
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.0.catalog
+    }
+
+    /// The snapshot, to read from `pages`: its catalog, and the pages as
+    /// of its commit.
+    fn reading<'a>(&'a self, pages: &'a Pages) -> Reading<'a> {
+        Reading {
+            catalog: self.catalog(),
+            store: pages.at(self.0.commit),
+        }
+    }
+}
+
+/// What a read works with (SPEC §78): a snapshot's catalog, and the
+/// pages as of its commit. Everything a reader sees comes through these
+/// two (rule 4 of §57.3).
+pub(crate) struct Reading<'a> {
+    pub(crate) catalog: &'a Catalog,
+    pub(crate) store: SnapshotStore<'a>,
+}
+
+/// A read under way (SPEC §80): the snapshot it took when it began,
+/// which it reads to its end whatever is committed meanwhile. The
+/// writer's store isn't reachable from here, so no read path can go past
+/// the snapshot by mistake (SPEC §78).
+pub(crate) struct ReadGuard<'a> {
+    pages: &'a Pages,
+    snapshot: Committed,
+    /// Keeps a batch that replaces the whole file from committing under
+    /// this read (`Shared::gate`). Not held by a read of a snapshot
+    /// somebody keeps (SPEC §82): that snapshot refuses such a batch
+    /// altogether, for as long as it's kept.
+    _gate: Option<RwLockReadGuard<'a, ()>>,
+}
+
+impl ReadGuard<'_> {
+    /// The snapshot, to read: its catalog and its pages.
+    pub(crate) fn snapshot(&self) -> Reading<'_> {
+        self.snapshot.reading(self.pages)
+    }
+
+    /// The snapshot's catalog, for a read that needs no pages.
+    pub(crate) fn catalog(&self) -> &Catalog {
+        self.snapshot.catalog()
+    }
 }
 
 /// How `Database::open_with` opens a database. Made with
@@ -71,6 +164,7 @@ pub struct OpenOptions {
     cache_size: usize,
     checkpoint_pages: usize,
     checkpoint_wal_bytes: Option<u64>,
+    snapshot_memory: usize,
 }
 
 impl Default for OpenOptions {
@@ -79,6 +173,7 @@ impl Default for OpenOptions {
             cache_size: crate::storage::DEFAULT_CACHE_SIZE,
             checkpoint_pages: DEFAULT_CHECKPOINT_PAGES,
             checkpoint_wal_bytes: None,
+            snapshot_memory: crate::storage::DEFAULT_VERSION_LIMIT * crate::storage::PAGE_SIZE,
         }
     }
 }
@@ -113,6 +208,27 @@ impl OpenOptions {
         self.checkpoint_wal_bytes = Some(bytes);
         self
     }
+
+    /// At most this many bytes of pages kept in memory as they were, for
+    /// the snapshots open (SPEC §83). Default: 256 MiB, as much again as
+    /// `cache_size`'s.
+    ///
+    /// A page changed while a snapshot is open stays as it was, once,
+    /// until that snapshot is dropped. A snapshot left open beside a busy
+    /// writer would take more and more. Past this limit the oldest open
+    /// snapshot is ended instead, then the next, until the rest fit:
+    /// their reads fail with `Error::SnapshotTooOld` from then on. Writes
+    /// are never refused or slowed for it.
+    ///
+    /// It counts for every read, since each reads a snapshot of its own:
+    /// an `export` that runs while more than this is rewritten fails the
+    /// same way. `usize::MAX` for no limit; with 0, a read fails as soon
+    /// as a page is changed beside it. `Database::snapshot_info` says how
+    /// much is kept now.
+    pub fn snapshot_memory(mut self, bytes: usize) -> Self {
+        self.snapshot_memory = bytes;
+        self
+    }
 }
 
 /// How many committed pages may wait in memory, logged but not written
@@ -120,15 +236,34 @@ impl OpenOptions {
 /// SQLite's default for its WAL mode too.
 const DEFAULT_CHECKPOINT_PAGES: usize = 1000;
 
-impl State {
+impl Writer {
     /// `Database::checkpoint`: the pages to the file, then the WAL
     /// emptied — only after they're durably in the file. If the WAL can't
     /// be emptied, its records are written back once more at the next
-    /// open: harmless, page images are idempotent.
+    /// open: harmless, page images are idempotent. Beside the readers
+    /// (`Pages::checkpoint`).
     fn checkpoint(&mut self) -> std::io::Result<()> {
-        self.store.checkpoint()?;
+        let live = self.live();
+        self.store.checkpoint_beside(&live)?;
         let _ = self.durability.checkpoint();
         Ok(())
+    }
+
+    /// The commits of the snapshots still open among those replaced,
+    /// ascending: what the pages have to keep older versions for (SPEC
+    /// §80). Those that have ended are forgotten here. One that ends
+    /// just now may still be counted, which keeps a version a little
+    /// longer; none can open that isn't counted, since a snapshot is
+    /// only ever taken from `Shared::current`.
+    fn live(&mut self) -> Vec<u64> {
+        self.past.retain(|snapshot| snapshot.strong_count() > 0);
+        // Not those the memory limit has ended (SPEC §83): still held,
+        // maybe, but of no more use, and nothing is kept for them.
+        let ended_before = self.store.pages.ended_before();
+        let open = self.past.iter().filter_map(Weak::upgrade);
+        open.map(|snapshot| snapshot.commit.seq())
+            .filter(|&seq| seq >= ended_before)
+            .collect()
     }
 }
 
@@ -137,10 +272,10 @@ impl State {
 /// recovers the same pages from the WAL.
 impl Drop for Shared {
     fn drop(&mut self) {
-        if let Ok(state) = self.state.get_mut()
-            && !state.poisoned
+        if !*self.poisoned.get_mut()
+            && let Ok(writer) = self.writer.get_mut()
         {
-            let _ = state.checkpoint();
+            let _ = writer.checkpoint();
         }
     }
 }
@@ -192,6 +327,7 @@ impl Database {
         let path = path.as_ref();
         let mut store = FileStore::open_before_recovery(path)?;
         store.set_cache_size(options.cache_size);
+        store.set_snapshot_memory(options.snapshot_memory);
         let (mut durability, pending) = WalDurability::open(path)?;
         if !pending.is_empty() {
             store.restore_pages(&pending)?;
@@ -229,19 +365,25 @@ impl Database {
             store.write_back()?;
             durability.checkpoint()?;
         }
+        let current = Committed::new(store.last_commit(), catalog);
 
         Ok(Self {
             inner: Arc::new(Shared {
-                state: RwLock::new(State {
+                pages: store.pages.clone(),
+                current: RwLock::new(current),
+                gate: RwLock::new(()),
+                writer: Mutex::new(Writer {
                     store,
-                    catalog,
                     durability,
-                    poisoned: false,
                     checkpoint_pages: options.checkpoint_pages,
                     checkpoint_wal_bytes: options.checkpoint_wal_bytes.unwrap_or(
                         2 * options.checkpoint_pages as u64 * crate::storage::PAGE_SIZE as u64,
                     ),
+                    past: Vec::new(),
+                    #[cfg(test)]
+                    after_log: None,
                 }),
+                poisoned: AtomicBool::new(false),
                 id_gen: UuidV7Generator,
                 txn: GlobalLockTxnManager::default(),
             }),
@@ -294,34 +436,80 @@ impl Database {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// Shared access for a read. `Err(Error::Poisoned)` once a failed
-    /// write has left the main file possibly half-written (see
-    /// `write_batch`), or a thread panicked in the middle of one — which
-    /// poisons the lock and may have left the store staging (SPEC §27.3).
-    /// Every public entry point goes through this or `write`.
-    pub(crate) fn read(&self) -> crate::Result<RwLockReadGuard<'_, State>> {
-        let state = self
-            .inner
-            .state
-            .read()
-            .map_err(|_| crate::Error::Poisoned)?;
-        if state.poisoned {
-            return Err(crate::Error::Poisoned);
-        }
-        Ok(state)
+    /// Whether the database refuses every call until it's reopened:
+    /// a failed write has left a batch's fate unknown (see `transact`),
+    /// or a thread panicked in the middle of a batch, which poisons the
+    /// writer's lock and may have left the store staging (SPEC §27.3).
+    /// The committed state a reader sees is whole even then; reads are
+    /// refused all the same, as they always were.
+    fn is_poisoned(&self) -> bool {
+        self.inner.poisoned.load(Ordering::Relaxed) || self.inner.writer.is_poisoned()
     }
 
-    /// Exclusive access for a write batch; poisoned as for `read`.
-    fn write(&self) -> crate::Result<RwLockWriteGuard<'_, State>> {
-        let state = self
-            .inner
-            .state
-            .write()
-            .map_err(|_| crate::Error::Poisoned)?;
-        if state.poisoned {
+    /// Access for a read: the last commit, taken now and kept for as
+    /// long as the guard lives (SPEC §80). It waits for nothing but a
+    /// `compact`: commits go on beside it, and it goes on reading its own
+    /// commit. `Err(Error::Poisoned)` as `is_poisoned` says. Every public
+    /// entry point goes through this or `write`.
+    ///
+    /// What comes back is that commit and nothing else (SPEC §78): a
+    /// read can't reach the store, where a batch may be staged.
+    pub(crate) fn read(&self) -> crate::Result<ReadGuard<'_>> {
+        if self.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
-        Ok(state)
+        let gate = self.inner.gate.read().map_err(|_| crate::Error::Poisoned)?;
+        Ok(ReadGuard {
+            pages: &self.inner.pages,
+            snapshot: self.current(),
+            _gate: Some(gate),
+        })
+    }
+
+    /// Access for a read of `kept`, a commit somebody keeps (`pin`): the
+    /// same commit every time, whatever has been committed since (SPEC
+    /// §82). It waits for nothing. Poisoned as for `read`.
+    pub(crate) fn read_at(&self, kept: &Committed) -> crate::Result<ReadGuard<'_>> {
+        if self.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+        // Ended by the memory limit (SPEC §83): said here, before a read
+        // that needs no page, or only the catalog, goes through.
+        if kept.0.commit.seq() < self.inner.pages.ended_before() {
+            return Err(crate::Error::SnapshotTooOld);
+        }
+        Ok(ReadGuard {
+            pages: &self.inner.pages,
+            snapshot: kept.clone(),
+            _gate: None,
+        })
+    }
+
+    /// The last commit, to keep (SPEC §82): for a `Snapshot`, or a
+    /// cursor. For as long as it, or a clone of it, is around, the pages
+    /// keep the versions it reads, and `compact` is refused. Taken under
+    /// the gate, so a `compact` that has found no snapshot kept doesn't
+    /// get one before it has committed. Poisoned as for `read`.
+    pub(crate) fn pin(&self) -> crate::Result<Committed> {
+        if self.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+        let _gate = self.inner.gate.read().map_err(|_| crate::Error::Poisoned)?;
+        Ok(self.current())
+    }
+
+    /// Access for a write batch, one at a time; poisoned as for `read`.
+    /// Readers go on.
+    fn write(&self) -> crate::Result<MutexGuard<'_, Writer>> {
+        let writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| crate::Error::Poisoned)?;
+        if self.inner.poisoned.load(Ordering::Relaxed) {
+            return Err(crate::Error::Poisoned);
+        }
+        Ok(writer)
     }
 
     /// Applies every op in `ops` as one atomic, durable unit. Ops may name
@@ -344,23 +532,33 @@ impl Database {
     }
 
     /// Runs `apply` — any change to the catalog and the pages — as one
-    /// atomic, durable unit, under the write lock. `write_batch` is one
+    /// atomic, durable unit, one batch at a time. `write_batch` is one
     /// use; building or dropping an index (SPEC §28) is another.
     ///
-    /// The protocol (SPEC §19.3):
+    /// The protocol (SPEC §19.3, §79, §80), all of it under the writer's
+    /// lock, with the reads going on beside it:
     /// 1. **stage** — `FileStore::begin`; every page write from here on
-    ///    stays in memory.
-    /// 2. **apply**. On error: roll back the staged pages *and* the
-    ///    catalog cache, and return the error — nothing of it ever
-    ///    reached the file, so there's nothing else to undo.
+    ///    stays in memory, the writer's alone.
+    /// 2. **apply**, to the staged pages and a catalog of the batch's
+    ///    own. On error: drop both, and return the error — nothing of it
+    ///    ever reached the file or a reader, so there's nothing to undo.
     /// 3. **log** every changed page to the WAL as one record, `fsync` —
     ///    the one flush a commit waits for (SPEC §51).
-    /// 4. **commit** — the pages become the newest committed ones, read
-    ///    from memory; the main file isn't touched.
+    /// 4. **publish**: the pages become the newest committed ones, read
+    ///    from memory, and with the batch's catalog the snapshot new
+    ///    reads get (SPEC §78). It takes as long as putting the pages
+    ///    into a map, and waits for no read: the reads under way keep
+    ///    their snapshot, and the pages as they were stay in memory for
+    ///    them. The main file isn't touched.
     /// 5. **checkpoint**, once `OpenOptions::checkpoint_pages` or more are
     ///    waiting (default 1,000) or the WAL has reached
-    ///    `OpenOptions::checkpoint_wal_bytes` (SPEC §76): write them back to the main file,
-    ///    `fsync`, truncate the WAL.
+    ///    `OpenOptions::checkpoint_wal_bytes` (SPEC §76): write them back
+    ///    to the main file, `fsync`, truncate the WAL.
+    ///
+    /// A batch that replaces the whole file (`compact`) is the exception:
+    /// it waits for the reads under way before 3, lets none begin until
+    /// after 4, and fails with `Error::SnapshotOpen` if a snapshot is
+    /// kept open beyond a read (SPEC §80.5).
     ///
     /// A crash before 3 completes leaves the state before; a crash after
     /// it leaves complete WAL records that `open` writes back, giving the
@@ -370,35 +568,61 @@ impl Database {
         apply: impl FnOnce(&mut Catalog, &mut FileStore) -> crate::Result<R>,
     ) -> crate::Result<R> {
         let mut guard = self.write()?;
-        // Reborrow the guard as a plain `&mut State` once, so the borrow
-        // checker can see that `store`, `catalog` and `durability` below
-        // are separate fields, each borrowable on its own.
-        let state = &mut *guard;
-        let catalog_before = state.catalog.clone();
+        // Reborrow the guard as a plain `&mut Writer` once, so the borrow
+        // checker can see that `store` and `durability` below are
+        // separate fields, each borrowable on its own.
+        let writer = &mut *guard;
+        // The batch's own catalog, as the staged pages are its own: the
+        // snapshot's becomes this one at commit, and stays as it is if
+        // the batch fails (SPEC §19.5, §78). No commit can come between
+        // this and ours: we hold the writer's lock.
+        let mut catalog = self.current().catalog().clone();
 
-        state.store.begin();
-        let result = match apply(&mut state.catalog, &mut state.store) {
+        writer.store.begin();
+        let result = match apply(&mut catalog, &mut writer.store) {
             Ok(result) => result,
             Err(e) => {
-                state.store.rollback();
-                state.catalog = catalog_before;
+                writer.store.rollback();
                 return Err(e);
             }
         };
 
-        let pages: Vec<(PageId, &[u8])> = state.store.dirty_pages().collect();
+        let pages: Vec<(PageId, &[u8])> = writer.store.dirty_pages().collect();
         if pages.is_empty() {
             // Nothing changed (e.g. an index that already existed):
             // nothing to log or write, just end staging.
             drop(pages);
-            state.store.rollback();
+            writer.store.rollback();
             return Ok(result);
         }
-        let logged = state.durability.log(&pages);
+        drop(pages);
+
+        // Alone, for a batch that replaces the whole file: the reads
+        // under way are waited for, and none begins before the commit.
+        // Before the log, so a batch refused here was never durable.
+        let alone = if writer.store.replaces_all() {
+            let gate = self
+                .inner
+                .gate
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // No read is under way now. A snapshot may still be open:
+            // one that somebody keeps.
+            let kept = Arc::strong_count(&self.current_locked().0) > 1;
+            if kept || !writer.live().is_empty() {
+                writer.store.rollback();
+                return Err(crate::Error::SnapshotOpen);
+            }
+            Some(gate)
+        } else {
+            None
+        };
+
+        let pages: Vec<(PageId, &[u8])> = writer.store.dirty_pages().collect();
+        let logged = writer.durability.log(&pages);
         drop(pages);
         if let Err(e) = logged {
-            state.store.rollback();
-            state.catalog = catalog_before;
+            writer.store.rollback();
             // A failed `log` may still have left a complete record behind
             // (say the write landed but the fsync failed), which the next
             // `open` would restore — for a batch this call reports as
@@ -406,22 +630,69 @@ impl Database {
             // out, and keeps the batches committed before it, which are
             // nowhere else on disk yet (SPEC §81); if even that fails,
             // the batch's fate is genuinely unknown.
-            if state.durability.undo_failed_log().is_err() {
-                state.poisoned = true;
+            if writer.durability.undo_failed_log().is_err() {
+                self.inner.poisoned.store(true, Ordering::Relaxed);
             }
             return Err(e.into());
         }
 
         // The batch is durable from here on: the WAL holds all its pages.
-        state.store.commit();
-        if state.store.unwritten_pages() >= state.checkpoint_pages
-            || state.durability.len() >= state.checkpoint_wal_bytes
+        #[cfg(test)]
+        if let Some(hook) = writer.after_log.take() {
+            hook();
+        }
+        // Before the lock, what needs none: the pages' layout checked.
+        writer.store.check_staged();
+        let before = {
+            // New reads wait here, for as long as it takes to put the
+            // pages in. A panic while it was held was a panic here, which
+            // poisoned the writer's lock too: nobody gets this far.
+            let mut current = self.current_locked();
+            // The snapshot about to be replaced stays open if a read
+            // holds it: no read can take it once it's replaced, so who
+            // holds it now is everyone who ever will.
+            if Arc::strong_count(&current.0) > 1 {
+                writer.past.push(Arc::downgrade(&current.0));
+            }
+            let live = writer.live();
+            writer.store.commit_beside(&live);
+            let snapshot = Committed::new(writer.store.last_commit(), catalog);
+            std::mem::replace(&mut *current, snapshot)
+        };
+        drop(alone);
+        // The catalog before, if no read holds it, freed outside the lock.
+        drop(before);
+
+        if writer.store.unwritten_pages() >= writer.checkpoint_pages
+            || writer.durability.len() >= writer.checkpoint_wal_bytes
         {
             // Not an error for this batch if it fails: it's durable, and
             // reads find its pages in memory. The next one tries again.
-            let _ = state.checkpoint();
+            let _ = writer.checkpoint();
         }
         Ok(result)
+    }
+
+    /// The last commit, shared: the lock is held only to take it.
+    fn current(&self) -> Committed {
+        self.inner
+            .current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// `Pages::versions_kept`, for `snapshot_info`.
+    pub(crate) fn versions_kept(&self) -> (usize, usize, u64) {
+        self.inner.pages.versions_kept()
+    }
+
+    /// The last commit, to replace, with no read taking it meanwhile.
+    fn current_locked(&self) -> std::sync::RwLockWriteGuard<'_, Committed> {
+        self.inner
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Writes every committed page back to the main file and empties the
@@ -432,11 +703,54 @@ impl Database {
         Ok(self.write()?.checkpoint()?)
     }
 
-    /// Direct access to the state for tests, bypassing the poisoned
+    /// Direct access to the writer for tests, bypassing the poisoned
     /// checks — e.g. to inject write-back faults, or inspect the catalog.
+    /// With the last commit as of this call.
     #[cfg(test)]
-    pub(crate) fn state(&self) -> RwLockWriteGuard<'_, State> {
-        self.inner.state.write().unwrap()
+    pub(crate) fn state(&self) -> TestState<'_> {
+        TestState {
+            writer: self.inner.writer.lock().unwrap(),
+            current: self.current(),
+            pages: &self.inner.pages,
+        }
+    }
+}
+
+/// `Database::state`: the writer, held, and the last commit.
+#[cfg(test)]
+pub(crate) struct TestState<'a> {
+    writer: MutexGuard<'a, Writer>,
+    current: Committed,
+    pages: &'a Pages,
+}
+
+#[cfg(test)]
+impl TestState<'_> {
+    /// The last commit, to read: its catalog and its pages. A batch being
+    /// staged is not in it.
+    pub(crate) fn snapshot(&self) -> Reading<'_> {
+        self.current.reading(self.pages)
+    }
+
+    /// The catalog as of the last commit.
+    pub(crate) fn catalog(&self) -> &Catalog {
+        self.current.catalog()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestState<'_> {
+    type Target = Writer;
+
+    fn deref(&self) -> &Writer {
+        &self.writer
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TestState<'_> {
+    fn deref_mut(&mut self) -> &mut Writer {
+        &mut self.writer
     }
 }
 
@@ -531,7 +845,7 @@ mod tests {
                     assert_eq!(docs.get(id).unwrap(), Some(crate::Document::Int(i as i64)));
                 }
             }
-            assert_eq!(db.read().unwrap().store.cache_size(), size / 8192);
+            assert_eq!(db.state().store.cache_size(), size / 8192);
         }
     }
 
@@ -639,8 +953,7 @@ mod tests {
             CrashPoint::DuringApply | CrashPoint::AfterLog => {}
             CrashPoint::MidWriteBack { pages_written } => {
                 assert!(pages_written < page_count, "that's not mid-write-back");
-                store.failing_write_backs = 1;
-                store.write_back_fails_after = pages_written;
+                store.pages.fail_write_backs(1, pages_written);
                 store.write_back().unwrap_err();
             }
             CrashPoint::BeforeCheckpoint => store.write_back().unwrap(),
@@ -928,7 +1241,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), file_len);
         assert!(result.is_err());
         assert_eq!(get(&db, "posts", 2), None);
-        assert!(db.state().catalog.get("posts").is_none());
+        assert!(db.state().catalog().get("posts").is_none());
 
         // The database keeps working, and the next batch that does create
         // "posts" gets a consistent collection, also after a reopen.
@@ -1119,7 +1432,7 @@ mod tests {
         let db = Database::open(&path).unwrap();
 
         db.write_batch(two_collection_batch()).unwrap();
-        db.state().store.failing_write_backs = 1;
+        db.state().store.pages.fail_write_backs(1, 1);
         assert!(db.checkpoint().is_err());
         assert_two_collection_batch_present(&db);
         assert!(wal_len(&path) > 0, "the WAL still holds the batch");
@@ -1155,10 +1468,9 @@ mod tests {
                 db.write_batch(ops).unwrap();
             }
             {
-                let mut state = db.state();
+                let state = db.state();
                 assert!(state.store.unwritten_pages() > fails_after);
-                state.store.failing_write_backs = 2;
-                state.store.write_back_fails_after = fails_after;
+                state.store.pages.fail_write_backs(2, fails_after);
             }
             assert!(db.checkpoint().is_err());
             drop(db);
@@ -1184,7 +1496,7 @@ mod tests {
         let db = Database::open(&path).unwrap();
 
         db.write_batch(two_collection_batch()).unwrap();
-        db.state().store.failing_write_backs = 2;
+        db.state().store.pages.fail_write_backs(2, 1);
         assert!(db.checkpoint().is_err());
         assert_two_collection_batch_present(&db);
         drop(db);
@@ -1203,7 +1515,7 @@ mod tests {
 
         let db = Database::open(&path).unwrap();
         assert_eq!(get(&db, "posts", 1), None);
-        assert!(db.state().catalog.get("posts").is_none());
+        assert!(db.state().catalog().get("posts").is_none());
     }
 
     /// A fresh file's first write is the catalog bootstrap. A crash at any
@@ -1237,8 +1549,7 @@ mod tests {
                 wal.log(&pages).unwrap();
                 drop(pages);
                 if pages_written < page_count {
-                    store.failing_write_backs = 1;
-                    store.write_back_fails_after = pages_written;
+                    store.pages.fail_write_backs(1, pages_written);
                     store.write_back().unwrap_err();
                 } else {
                     store.write_back().unwrap();
@@ -1287,10 +1598,10 @@ mod tests {
         fn first_splitting_insert(db: &Database, from: u32) -> u32 {
             let mut state = db.state();
             // Destructuring borrows both fields mutably at once, which
-            // two separate `state.catalog`/`state.store` borrows through
+            // two separate `state.catalog()`/`state.store` borrows through
             // the guard couldn't.
-            let State { catalog, store, .. } = &mut *state;
-            let snapshot = catalog.clone();
+            let mut catalog = state.catalog().clone();
+            let (catalog, store) = (&mut catalog, &mut state.store);
             store.begin();
             let mut leaves = None;
             for i in from..from + 1000 {
@@ -1301,7 +1612,6 @@ mod tests {
                     .count();
                 if leaves.is_some_and(|before| now > before) {
                     store.rollback();
-                    *catalog = snapshot;
                     return i;
                 }
                 leaves = Some(now);
@@ -1536,6 +1846,69 @@ mod tests {
         assert_eq!(numbers.find(Filter::default()).unwrap(), vec![1]);
     }
 
+    // --- Reads through a snapshot (SPEC §78) ---
+
+    /// While a batch is staged, the snapshot is the commit before it:
+    /// a read finds none of the batch, not its documents and not the
+    /// collection it made. What the write lock hides today (§27), and
+    /// what §79 relies on.
+    #[test]
+    fn a_snapshot_shows_nothing_of_a_staged_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+
+        let mut state = db.state();
+        let mut catalog = state.catalog().clone();
+        state.store.begin();
+        for op in [insert("posts", 2, 20), insert("authors", 3, 30)] {
+            apply_write_op(&mut catalog, &mut state.store, &op).unwrap();
+        }
+        assert!(catalog.get("authors").is_some(), "the batch's own catalog");
+
+        let at = state.snapshot();
+        assert!(at.catalog.get("authors").is_none());
+        let posts = at.catalog.get("posts").unwrap();
+        let entries = BTreeIndex::new(posts.index_root).scan(&at.store).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, DocId([1; 16]).0);
+        // The writer's own view has both.
+        let staged = catalog.get("posts").unwrap();
+        let entries = BTreeIndex::new(staged.index_root).scan(&state.store);
+        assert_eq!(entries.unwrap().len(), 2);
+        state.store.rollback();
+    }
+
+    /// A commit replaces the snapshot; a batch that fails, or changes
+    /// nothing, leaves the one there was.
+    #[test]
+    fn only_a_commit_replaces_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let current = |db: &Database| db.state().current.clone();
+        let same = |a: &Committed, b: &Committed| Arc::ptr_eq(&a.0, &b.0);
+        let opened = current(&db);
+
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        let first = current(&db);
+        assert!(!same(&opened, &first));
+        assert_eq!(first.0.commit.seq(), opened.0.commit.seq() + 1);
+        // The one from before is as it was: no such collection.
+        assert!(opened.catalog().get("posts").is_none());
+        assert!(first.catalog().get("posts").is_some());
+
+        db.write_batch(vec![insert("authors", 2, 20), insert("posts", 1, 11)])
+            .unwrap_err();
+        assert!(same(&first, &current(&db)), "a failed batch");
+
+        let docs = db.collection::<Document>("posts");
+        docs.ensure_index("n").unwrap();
+        let indexed = current(&db);
+        assert!(!same(&first, &indexed));
+        assert!(!docs.ensure_index("n").unwrap(), "it exists");
+        assert!(same(&indexed, &current(&db)), "a batch changing nothing");
+    }
+
     // --- A failed log, and the batches committed before it (SPEC §81) ---
 
     /// The database as a crash right now would leave it: its file and
@@ -1617,5 +1990,558 @@ mod tests {
             posts.get(&DocId([1; 16])),
             Err(crate::Error::Poisoned)
         ));
+    }
+
+    // --- Writers beside the readers (SPEC §79) ---
+
+    /// How long a test waits for something that must happen, before it
+    /// calls it a deadlock.
+    const SOON: std::time::Duration = std::time::Duration::from_secs(10);
+    /// How long a test waits to see that something doesn't happen.
+    const A_WHILE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// A batch being staged, and then logged and flushed, holds the
+    /// writer's lock, which no reader takes: reads go on, on the commit
+    /// before it. Until §79 they waited for all of it.
+    #[test]
+    fn reads_go_on_while_a_batch_is_staged_and_flushed() {
+        let (_dir, _path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+
+        /// What a reader on another thread gets, or an error if it
+        /// isn't back soon.
+        fn read_beside(db: &Database) -> Result<(usize, Option<Document>), String> {
+            let (sent, received) = std::sync::mpsc::channel();
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let posts = db.collection::<Document>("posts");
+                let all = posts.find(Filter::new()).unwrap().len();
+                let _ = sent.send((all, get(&db, "posts", 2)));
+            });
+            received
+                .recv_timeout(SOON)
+                .map_err(|_| "the read waited for the writer".to_string())
+        }
+
+        let (sent, flushed) = std::sync::mpsc::channel();
+        let beside = db.clone();
+        db.state().after_log = Some(Box::new(move || {
+            let _ = sent.send(read_beside(&beside));
+        }));
+        let staged = db
+            .transact(|catalog, store| {
+                apply_write_op(catalog, store, &insert("posts", 2, 20))?;
+                Ok(read_beside(&db))
+            })
+            .unwrap();
+
+        assert_eq!(staged, Ok((1, None)), "while staged");
+        assert_eq!(flushed.try_recv().unwrap(), Ok((1, None)), "while flushed");
+        assert_eq!(get(&db, "posts", 2), Some(Document::Int(20)));
+    }
+
+    /// Every document of `collection` as the reading has it, by id:
+    /// through the primary index, each read from its data page.
+    fn contents_at(at: &Reading<'_>, collection: &str) -> Vec<(DocId, Document)> {
+        let Some(meta) = at.catalog.get(collection) else {
+            return Vec::new();
+        };
+        let entries = BTreeIndex::new(meta.index_root).scan(&at.store).unwrap();
+        let read = |(_key, loc)| data::get_record(&at.store, loc).unwrap();
+        entries.into_iter().map(read).collect()
+    }
+
+    /// A commit waits for no read, and a read under way goes on reading
+    /// its own commit: through commits that change the very pages it
+    /// reads, make a collection and drop one, and through a checkpoint
+    /// that puts all of it into the file. Until §80 the commit waited.
+    #[test]
+    fn a_read_keeps_its_commit_while_commits_go_on() {
+        let (_dir, _path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10), insert("drafts", 5, 50)])
+            .unwrap();
+        let before = [(DocId([1; 16]), Document::Int(10))];
+
+        let reading = db.read().unwrap();
+        assert_eq!(contents_at(&reading.snapshot(), "posts"), before);
+
+        // On this very thread, with the read still open.
+        let update = WriteOp::Update("posts".into(), DocId([1; 16]), Document::Int(11));
+        db.write_batch(vec![update, insert("posts", 2, 20)])
+            .unwrap();
+        db.write_batch(vec![insert("authors", 3, 30)]).unwrap();
+        assert!(db.drop_collection("drafts").unwrap());
+        db.collection::<Document>("posts")
+            .ensure_index("n")
+            .unwrap();
+        db.checkpoint().unwrap();
+        let big = Document::Binary(vec![7; 30_000]);
+        db.collection::<Document>("authors").insert(big).unwrap();
+
+        let at = reading.snapshot();
+        assert_eq!(contents_at(&at, "posts"), before);
+        assert!(at.catalog.get("authors").is_none());
+        assert!(at.catalog.indexes("posts").is_empty());
+        let drafts = contents_at(&at, "drafts");
+        assert_eq!(drafts, [(DocId([5; 16]), Document::Int(50))]);
+        // The pages as they were, their count and the free list too.
+        let pages = at.store.page_count();
+        assert!(pages < db.file_info().unwrap().pages);
+        assert_eq!(at.store.free_pages().unwrap().len(), 0);
+
+        // A read begun now has all of it.
+        assert_eq!(get(&db, "posts", 1), Some(Document::Int(11)));
+        assert_eq!(get(&db, "posts", 2), Some(Document::Int(20)));
+        assert_eq!(get(&db, "drafts", 5), None);
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// The versions kept for a read go once it has ended: the next
+    /// checkpoint leaves no version in memory, and a commit after it
+    /// keeps only its own pages, as before §80.
+    #[test]
+    fn versions_kept_for_a_read_go_when_it_ends() {
+        let (_dir, _path, db) = open_temp();
+        let numbers = db.collection::<i64>("numbers");
+        let id = numbers.insert(0).unwrap();
+        db.checkpoint().unwrap();
+        let held = |db: &Database| db.inner.pages.versions_held();
+        assert_eq!(held(&db), 0);
+
+        let reading = db.read().unwrap();
+        for n in 1..=20 {
+            assert!(numbers.update(&id, n).unwrap());
+        }
+        let waiting = db.state().store.unwritten_pages();
+        // One older version of each page changed, however many commits.
+        assert_eq!(held(&db), 2 * waiting);
+        db.checkpoint().unwrap();
+        assert_eq!(held(&db), 2 * waiting, "the read is still open");
+        let at = reading.snapshot();
+        assert_eq!(contents_at(&at, "numbers"), [(id, Document::Int(0))]);
+
+        drop(reading);
+        assert!(numbers.update(&id, 21).unwrap());
+        // The commit drops them from the pages it changes.
+        assert_eq!(held(&db), db.state().store.unwritten_pages());
+        db.checkpoint().unwrap();
+        assert_eq!(held(&db), 0);
+        assert_eq!(numbers.get(&id).unwrap(), Some(21));
+    }
+
+    /// `compact` rewrites every page, so it can't keep them as they were
+    /// for a snapshot: one that is kept open refuses it, at once, with
+    /// nothing changed; and it waits for a read under way, as every
+    /// commit did until §80.
+    #[test]
+    fn compact_is_refused_by_a_kept_snapshot_and_waits_for_a_read() {
+        let (_dir, _path, db) = open_temp();
+        let docs = db.collection::<Document>("docs");
+        let ids: Vec<DocId> = (0..300)
+            .map(|i| {
+                docs.insert(Document::String("x".repeat(i * 13 % 900)))
+                    .unwrap()
+            })
+            .collect();
+        for id in &ids[..250] {
+            assert!(docs.delete(id).unwrap());
+        }
+        let pages = db.file_info().unwrap().pages;
+
+        // Kept from before a later commit, and kept at the last one.
+        for commits_after in [1, 0] {
+            let kept = db.current();
+            let count = docs.count(Filter::new()).unwrap();
+            for _ in 0..commits_after {
+                docs.insert(Document::Int(1)).unwrap();
+            }
+            assert!(matches!(db.compact(), Err(crate::Error::SnapshotOpen)));
+            assert_eq!(db.file_info().unwrap().pages, pages);
+            let at = kept.reading(&db.inner.pages);
+            assert_eq!(contents_at(&at, "docs").len(), count);
+            // Refused, not poisoned: writes go on.
+            docs.insert(Document::Int(2)).unwrap();
+        }
+
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let reading = db.read().unwrap();
+            let compacting = scope.spawn(|| {
+                let compacted = db.compact().unwrap();
+                done.store(true, std::sync::atomic::Ordering::Release);
+                compacted
+            });
+            std::thread::sleep(A_WHILE);
+            assert!(
+                !done.load(std::sync::atomic::Ordering::Acquire),
+                "compacted under a read"
+            );
+            assert_eq!(contents_at(&reading.snapshot(), "docs").len(), 53);
+            drop(reading);
+            let compacted = compacting.join().unwrap();
+            assert!(compacted.pages_after < compacted.pages_before);
+        });
+        assert_eq!(docs.count(Filter::new()).unwrap(), 53);
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// Once a batch's fate is unknown (its log failed, and so did taking
+    /// the log back), reads and writes are refused alike; reopening
+    /// recovers what the WAL holds.
+    #[test]
+    fn a_batch_of_unknown_fate_refuses_every_call() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        db.inner.poisoned.store(true, Ordering::Relaxed);
+
+        let posts = db.collection::<Document>("posts");
+        assert!(matches!(
+            posts.get(&DocId([1; 16])),
+            Err(crate::Error::Poisoned)
+        ));
+        assert!(matches!(
+            db.write_batch(vec![insert("posts", 2, 20)]),
+            Err(crate::Error::Poisoned)
+        ));
+        assert!(matches!(
+            db.write_batch(vec![]),
+            Err(crate::Error::Poisoned)
+        ));
+        assert!(matches!(db.checkpoint(), Err(crate::Error::Poisoned)));
+        drop((db, posts));
+        assert_eq!(
+            get(&Database::open(&path).unwrap(), "posts", 1),
+            Some(Document::Int(10))
+        );
+    }
+
+    /// Two threads writing at once take turns: every batch lands whole.
+    #[test]
+    fn writers_take_turns() {
+        let (_dir, _path, db) = open_temp();
+        let numbers = db.collection::<i64>("numbers");
+        std::thread::scope(|scope| {
+            for thread in 0..4i64 {
+                let (db, numbers) = (&db, &numbers);
+                scope.spawn(move || {
+                    for i in 0..25 {
+                        let mut batch = db.batch();
+                        batch.insert(numbers, thread * 100 + i).unwrap();
+                        batch.insert(numbers, -(thread * 100 + i)).unwrap();
+                        batch.commit().unwrap();
+                    }
+                });
+            }
+        });
+        let mut all = numbers.find(Filter::new()).unwrap();
+        assert_eq!(all.len(), 200);
+        assert_eq!(all.iter().sum::<i64>(), 0);
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 199, "each number once, 0 twice");
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// Readers beside a writer that commits back to back and checkpoints
+    /// after every commit, with a cache too small to keep a page: every
+    /// read meets a checkpoint writing the file, and reads the file
+    /// itself. Each batch moves an amount between two documents, updates
+    /// an indexed field and now and then deletes, inserts or compacts,
+    /// so a reader that saw half a batch, or a page half written, would
+    /// see a sum that's off, an index that disagrees, or a damaged page.
+    #[test]
+    fn readers_see_whole_commits_beside_checkpoints() {
+        #[derive(Serialize, Deserialize, Clone)]
+        struct Account {
+            n: i64,
+            amount: i64,
+            pad: String,
+        }
+        const ACCOUNTS: i64 = 40;
+        const TOTAL: i64 = ACCOUNTS * 100;
+
+        for cache_pages in [0, 3, 1 << 15] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = OpenOptions::default()
+                .checkpoint_pages(1)
+                .cache_size(cache_pages * PAGE_SIZE);
+            let db = Database::open_with(dir.path().join("test.trunkdb"), options).unwrap();
+            let accounts = db.collection::<Account>("accounts");
+            accounts.ensure_index("n").unwrap();
+            let mut batch = db.batch();
+            let ids: Vec<DocId> = (0..ACCOUNTS)
+                .map(|n| {
+                    // Of different sizes, so pages fill unevenly.
+                    let pad = "x".repeat(n as usize * 97 % 1500);
+                    let account = Account {
+                        n,
+                        amount: 100,
+                        pad,
+                    };
+                    batch.insert(&accounts, account).unwrap()
+                })
+                .collect();
+            batch.commit().unwrap();
+            let done = std::sync::atomic::AtomicBool::new(false);
+
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let mut rng = crate::testing::XorShift(7 + cache_pages as u64);
+                    let extras = db.collection::<Document>("extras");
+                    let mut extra_ids = Vec::new();
+                    for round in 0..150 {
+                        let (from, to) = (rng.below(ids.len()), rng.below(ids.len()));
+                        if from != to {
+                            let mut a = accounts.get(&ids[from]).unwrap().unwrap();
+                            let mut b = accounts.get(&ids[to]).unwrap().unwrap();
+                            let amount = rng.below(50) as i64;
+                            a.amount -= amount;
+                            b.amount += amount;
+                            // The pad changes size, so documents move.
+                            b.pad = "y".repeat(rng.below(2000));
+                            let mut batch = db.batch();
+                            batch.update(&accounts, &ids[from], a).unwrap();
+                            batch.update(&accounts, &ids[to], b).unwrap();
+                            batch.commit().unwrap();
+                        }
+                        // Pages freed and taken again, and a file that
+                        // shrinks under the readers.
+                        match round % 10 {
+                            3 => {
+                                let big = Document::String("z".repeat(20_000));
+                                extra_ids.push(extras.insert(big).unwrap());
+                            }
+                            7 => {
+                                for id in extra_ids.drain(..) {
+                                    assert!(extras.delete(&id).unwrap());
+                                }
+                            }
+                            9 => {
+                                db.compact().unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                    done.store(true, std::sync::atomic::Ordering::Release);
+                });
+
+                let mut readers = Vec::new();
+                for reader in 0..3 {
+                    let (db, accounts, ids, done) = (&db, &accounts, &ids, &done);
+                    readers.push(scope.spawn(move || {
+                        let mut reads = 0;
+                        while !done.load(std::sync::atomic::Ordering::Acquire) {
+                            let all = accounts.find(Filter::new()).unwrap();
+                            assert_eq!(all.len(), ACCOUNTS as usize);
+                            assert_eq!(all.iter().map(|a| a.amount).sum::<i64>(), TOTAL);
+                            // Through the index, and by id.
+                            let n = (reads + reader) % ACCOUNTS;
+                            let by_index = accounts.find(Filter::new().eq("n", n)).unwrap();
+                            assert_eq!(by_index.len(), 1, "n = {n}");
+                            let by_id = accounts.get(&ids[n as usize]).unwrap().unwrap();
+                            assert_eq!(by_id.n, n);
+                            if reads % 7 == 0 {
+                                let report = db.check().unwrap();
+                                assert!(report.is_ok(), "{report:#?}");
+                            }
+                            // One read kept open over many commits: the
+                            // same documents at its end as at its start
+                            // (SPEC §80).
+                            if reads % 3 == 0 {
+                                let reading = db.read().unwrap();
+                                let first = contents_at(&reading.snapshot(), "accounts");
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                let again = contents_at(&reading.snapshot(), "accounts");
+                                assert!(first == again, "a kept read changed");
+                                let amounts = first.iter().map(|(_id, doc)| match doc {
+                                    Document::Object(fields) => match fields["amount"] {
+                                        Document::Int(amount) => amount,
+                                        _ => panic!("not an amount"),
+                                    },
+                                    _ => panic!("not an account"),
+                                });
+                                assert_eq!(amounts.sum::<i64>(), TOTAL);
+                            }
+                            reads += 1;
+                        }
+                        reads
+                    }));
+                }
+                writer.join().unwrap();
+                for reader in readers {
+                    assert!(reader.join().unwrap() > 0);
+                }
+            });
+            let all = accounts.find(Filter::new()).unwrap();
+            assert_eq!(all.iter().map(|a| a.amount).sum::<i64>(), TOTAL);
+            assert!(db.check().unwrap().is_ok());
+        }
+    }
+
+    /// Random batches, snapshots taken and let go, checkpoints and
+    /// compactions, in any order, against a model: a copy of the whole
+    /// database's contents per snapshot taken. Every open snapshot reads
+    /// exactly its copy, after every step, through the primary index and
+    /// a secondary one; a read begun now reads the newest. With a cache
+    /// of no pages, a few, and many, and checkpoints after every commit,
+    /// after a few, and at the default.
+    #[test]
+    fn every_open_snapshot_reads_its_commit_through_random_writes() {
+        type Model = std::collections::BTreeMap<&'static str, Vec<(DocId, Document)>>;
+        const NAMES: [&str; 2] = ["a", "b"];
+
+        fn doc(n: i64, pad: usize) -> Document {
+            let fields = [
+                ("n", Document::Int(n)),
+                ("pad", Document::String("p".repeat(pad))),
+            ];
+            Document::Object(
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            )
+        }
+
+        /// What the reading has, against the model's copy.
+        fn assert_reads(at: &Reading<'_>, expected: &Model, what: &str) {
+            for name in NAMES {
+                let mut docs = contents_at(at, name);
+                // The stored document has its id in it (SPEC §59).
+                for (id, doc) in &mut docs {
+                    if let Document::Object(fields) = doc {
+                        assert_eq!(fields.shift_remove("_id"), Some(Document::Id(*id)));
+                    }
+                }
+                assert!(docs == expected[name], "{what}: {name}");
+                // The index on `n` has an entry for each, no more.
+                if let Some(index) = at.catalog.indexes(name).first() {
+                    let entries = BTreeIndex::new(index.root).scan(&at.store).unwrap();
+                    assert_eq!(entries.len(), docs.len(), "{what}: {name}'s index");
+                }
+            }
+        }
+
+        // The cache's pages, the checkpoint threshold, and how many
+        // pages of older versions may be kept (SPEC §83).
+        const NO_LIMIT: usize = usize::MAX / PAGE_SIZE;
+        let settings = [
+            (0, 1, NO_LIMIT),
+            (3, 1, NO_LIMIT),
+            (3, 8, NO_LIMIT),
+            (1 << 15, 1000, NO_LIMIT),
+            (8, 3, NO_LIMIT),
+            (8, 3, 30),
+            (1 << 15, 1000, 12),
+        ];
+        for (seed, (cache_pages, checkpoint_pages, limit)) in settings.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let options = OpenOptions::default()
+                .checkpoint_pages(checkpoint_pages)
+                .cache_size(cache_pages * PAGE_SIZE)
+                .snapshot_memory(limit * PAGE_SIZE);
+            let db = Database::open_with(dir.path().join("test.trunkdb"), options).unwrap();
+            for name in NAMES {
+                db.collection::<Document>(name).ensure_index("n").unwrap();
+            }
+            let mut rng = crate::testing::XorShift(0x9E3779B97F4A7C15 ^ (seed as u64 + 1));
+            let mut model: Model = NAMES.into_iter().map(|name| (name, Vec::new())).collect();
+            let mut open: Vec<(Committed, Model)> = Vec::new();
+            let mut next_id = 0u128;
+            let (mut refused, mut compacted, mut most_open) = (0, 0, 0);
+            let mut too_old = 0;
+
+            for step in 0..300 {
+                let what = format!("seed {seed}, step {step}");
+                match rng.below(12) {
+                    0..=6 => {
+                        let mut ops = Vec::new();
+                        for _ in 0..1 + rng.below(6) {
+                            let name = NAMES[rng.below(2)];
+                            let docs = model.get_mut(name).unwrap();
+                            // Sizes from a few bytes to several pages.
+                            let pad = match rng.below(12) {
+                                0 => 9_000 + rng.below(20_000),
+                                1..=4 => rng.below(3_000),
+                                _ => rng.below(200),
+                            };
+                            let new = doc(rng.below(50) as i64, pad);
+                            let at = rng.below(docs.len().max(1));
+                            match rng.below(4) {
+                                0 if !docs.is_empty() => {
+                                    let (id, _doc) = docs.remove(at);
+                                    ops.push(WriteOp::Delete(name.into(), id));
+                                }
+                                1 if !docs.is_empty() => {
+                                    docs[at].1 = new.clone();
+                                    ops.push(WriteOp::Update(name.into(), docs[at].0, new));
+                                }
+                                _ => {
+                                    next_id += 1;
+                                    let id = DocId(next_id.to_be_bytes());
+                                    // Ids ascend, so the model stays in id order.
+                                    docs.push((id, new.clone()));
+                                    ops.push(WriteOp::Insert(name.into(), id, new));
+                                }
+                            }
+                        }
+                        db.write_batch(ops).expect(&what);
+                    }
+                    7 | 8 if open.len() < 4 => open.push((db.current(), model.clone())),
+                    7..=9 if !open.is_empty() => {
+                        open.swap_remove(rng.below(open.len()));
+                    }
+                    10 => db.checkpoint().expect(&what),
+                    _ => match db.compact() {
+                        Ok(_) => compacted += 1,
+                        Err(crate::Error::SnapshotOpen) => {
+                            assert!(!open.is_empty(), "{what}: refused with none open");
+                            refused += 1;
+                        }
+                        Err(e) => panic!("{what}: {e}"),
+                    },
+                }
+                most_open = most_open.max(open.len());
+                // Each open snapshot reads its copy, all of it, or has
+                // been ended by the limit and reads nothing: never
+                // something else. And the limit ends the oldest first.
+                let (mut ended, mut read) = (Vec::new(), Vec::new());
+                for (at, (snapshot, expected)) in open.iter().enumerate() {
+                    let seq = snapshot.0.commit.seq();
+                    match db.read_at(snapshot) {
+                        Ok(reading) => {
+                            let what = format!("{what}, snapshot {at}");
+                            assert_reads(&reading.snapshot(), expected, &what);
+                            read.push(seq);
+                        }
+                        Err(crate::Error::SnapshotTooOld) => ended.push(seq),
+                        Err(e) => panic!("{what}: {e}"),
+                    }
+                }
+                let oldest_read = read.iter().min().copied().unwrap_or(u64::MAX);
+                assert!(ended.iter().all(|&seq| seq < oldest_read), "{what}");
+                too_old += ended.len();
+                let info = db.snapshot_info();
+                assert!(info.kept_pages <= limit, "{what}: {info:?}");
+                assert_eq!(info.ended > 0, too_old > 0, "{what}: {info:?}");
+                let now = db.current();
+                assert_reads(&now.reading(&db.inner.pages), &model, &what);
+                if step % 40 == 0 {
+                    assert!(db.check().unwrap().is_ok(), "{what}");
+                }
+            }
+            assert!(most_open >= 3 && refused > 0 && compacted > 0, "{seed}");
+            assert_eq!(too_old > 0, limit != NO_LIMIT, "seed {seed}: {too_old}");
+
+            // With all of them closed, nothing older stays.
+            open.clear();
+            db.checkpoint().unwrap();
+            assert_eq!(db.inner.pages.versions_held(), 0, "seed {seed}");
+            assert!(db.check().unwrap().is_ok());
+            drop(db);
+            let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+            let now = db.current();
+            assert_reads(&now.reading(&db.inner.pages), &model, "reopened");
+        }
     }
 }

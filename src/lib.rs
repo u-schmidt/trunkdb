@@ -25,6 +25,7 @@ mod index;
 mod json;
 pub mod query;
 mod serde_bridge;
+mod snapshot;
 mod storage;
 mod txn;
 mod update;
@@ -41,12 +42,13 @@ pub use document::{DocId, Document, ParseIdError};
 pub use export::Summary;
 pub use json::ParseDocumentError;
 pub use serde_bridge::DocumentError;
+pub use snapshot::{Snapshot, SnapshotInfo, View};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
     #[error(transparent)]
     Document(#[from] serde_bridge::DocumentError),
     /// A batch was durably logged but writing it to the main file failed,
@@ -105,11 +107,43 @@ pub enum Error {
         id: document::DocId,
         message: String,
     },
+    /// `Database::compact` was called while a snapshot was open (SPEC
+    /// §80.5): a `Snapshot`, a `View` of one, or a `Cursor`. A compaction rewrites every page, and keeping each as it
+    /// was for the snapshot would be keeping the whole file in memory.
+    /// Nothing was changed; compact again when the snapshot is gone.
+    #[error("a snapshot is open: the database can't be compacted until it is closed")]
+    SnapshotOpen,
+    /// A read through a snapshot that was open for too long beside
+    /// writes (SPEC §83): the pages as it had them took more memory than
+    /// `OpenOptions::snapshot_memory` allows, so they were let go, the
+    /// oldest snapshots' first. The snapshot is of no more use: take a new
+    /// one and read again. A `Snapshot`, a `View`, a `Cursor`, or one
+    /// long read such as an `export` can meet this; writes never do.
+    #[error(
+        "the snapshot is too old: what was written since took more memory than snapshots may keep; take a new one"
+    )]
+    SnapshotTooOld,
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
     #[non_exhaustive]
     #[error("import, line {line}: {message}")]
     Import { line: usize, message: String },
+}
+
+/// By hand, where the others are derived: a page read that found its
+/// snapshot ended says so inside an `io::Error`, as a page read says
+/// everything, and comes out as `Error::SnapshotTooOld`.
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        let too_old = error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<storage::TooOld>());
+        if too_old {
+            Error::SnapshotTooOld
+        } else {
+            Error::Io(error)
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

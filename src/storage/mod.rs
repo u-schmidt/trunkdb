@@ -2,16 +2,21 @@ mod cache;
 mod file;
 mod memory;
 mod page;
+mod pages;
 mod slotted;
+mod snapshot;
 
-#[cfg(feature = "fuzzing")]
-pub(crate) use file::checksum;
 #[cfg(test)]
 pub(crate) use file::rewrite_format_version;
-pub use file::{DEFAULT_CACHE_SIZE, FileStore, PAGE_SIZE, USABLE_PAGE_SIZE};
+pub use file::{DEFAULT_CACHE_SIZE, FileStore};
 pub(crate) use memory::MemoryStore;
 pub use page::Page;
+#[cfg(feature = "fuzzing")]
+pub(crate) use pages::checksum;
+pub(crate) use pages::{DEFAULT_VERSION_LIMIT, Pages, TooOld};
+pub use pages::{PAGE_SIZE, USABLE_PAGE_SIZE};
 pub use slotted::SlottedPage;
+pub(crate) use snapshot::{Commit, SnapshotStore};
 
 pub type PageId = u64;
 

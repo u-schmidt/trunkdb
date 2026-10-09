@@ -1,28 +1,33 @@
 use crate::collection::Collection;
-use crate::document::{DocId, Document};
+use crate::document::Document;
 use crate::query::Filter;
+use crate::storage::RecordLocation;
 
 /// A streaming `find`: an iterator over a filter's matches, reading one
 /// document at a time instead of collecting them all — see
 /// `Collection::cursor` (SPEC §29.4).
 ///
-/// Holds no lock between items. At creation it takes the ids of every
-/// candidate (from an index range or the primary index; ids only, no
-/// documents). Each `next` then looks one id up, reads that document
-/// under a short read lock, and checks it against the filter. So writes
-/// can happen while a cursor is open, with these effects:
-/// - a document deleted since creation is skipped;
-/// - a document updated since creation is checked in its current state,
-///   and skipped if it no longer matches;
-/// - a document inserted since creation isn't seen.
+/// A cursor shows one moment (SPEC §82): the collection as it was when
+/// the cursor was created, whatever is written while it is open, also by
+/// the code that iterates it. A document deleted meanwhile is still
+/// handed out, one updated meanwhile as it was, one inserted meanwhile
+/// not at all. For the documents as they are now, ask again: `get` by
+/// the id each one carries.
 ///
-/// Every item is one document as it was at one moment — never half of a
-/// batch — but different items may come from different moments.
+/// It holds no lock, so writes go on while it is open. It does keep its
+/// moment, as a `Snapshot` does: the pages changed since stay in memory
+/// as they were, and `Database::compact` is refused, until the cursor is
+/// dropped. Don't keep one around for longer than it is read.
+///
+/// At creation it takes where every candidate is (from an index range or
+/// the primary index; no documents). Each `next` then reads one document
+/// and checks it against the filter.
 ///
 /// With a `sort`, nothing can stream: every match has to be read to know
 /// which comes first. Such a cursor runs the whole `find` when it's
 /// created and hands out its results — which, with a `limit` and an index
-/// on the sort field, reads only as far as the limit (SPEC §34.2).
+/// on the sort field, reads only as far as the limit (SPEC §34.2). It
+/// keeps nothing.
 #[must_use = "a cursor reads nothing until it's iterated"]
 pub struct Cursor<T> {
     source: Source<T>,
@@ -30,8 +35,12 @@ pub struct Cursor<T> {
 
 enum Source<T> {
     Streaming {
+        /// The collection, as of the cursor's creation.
         documents: Collection<Document>,
-        ids: std::vec::IntoIter<DocId>,
+        /// Where each candidate is, in that same commit: a location
+        /// means nothing in another one, where its slot may hold a
+        /// different document (SPEC §20.2).
+        locs: std::vec::IntoIter<RecordLocation>,
         filter: Filter,
         /// Matches still to pass over (`Filter::skip`, SPEC §72).
         skipping: usize,
@@ -46,7 +55,7 @@ enum Source<T> {
 impl<T> Cursor<T> {
     pub(crate) fn streaming(
         documents: Collection<Document>,
-        ids: Vec<DocId>,
+        locs: Vec<RecordLocation>,
         filter: Filter,
         convert: fn(Document) -> crate::Result<T>,
     ) -> Self {
@@ -54,7 +63,7 @@ impl<T> Cursor<T> {
         Cursor {
             source: Source::Streaming {
                 documents,
-                ids: ids.into_iter(),
+                locs: locs.into_iter(),
                 filter,
                 skipping,
                 remaining,
@@ -81,7 +90,7 @@ impl<T> Iterator for Cursor<T> {
             Source::Collected(results) => results.next().map(Ok),
             Source::Streaming {
                 documents,
-                ids,
+                locs,
                 filter,
                 skipping,
                 remaining,
@@ -90,11 +99,10 @@ impl<T> Iterator for Cursor<T> {
                 if *remaining == Some(0) {
                     return None;
                 }
-                for id in ids.by_ref() {
-                    match documents.get(&id) {
+                for loc in locs.by_ref() {
+                    match documents.record_at(loc) {
                         Err(e) => return Some(Err(e)),
-                        Ok(None) => continue, // deleted since the cursor was created
-                        Ok(Some(doc)) if filter.matches(&doc) => {
+                        Ok(doc) if filter.matches(&doc) => {
                             if *skipping > 0 {
                                 *skipping -= 1;
                                 continue;
@@ -104,7 +112,7 @@ impl<T> Iterator for Cursor<T> {
                             }
                             return Some(convert(doc));
                         }
-                        Ok(Some(_)) => continue, // a candidate that doesn't match (any more)
+                        Ok(_) => continue, // a candidate that doesn't match
                     }
                 }
                 None
