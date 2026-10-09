@@ -272,9 +272,7 @@ impl<T> Collection<T> {
             // Each step a field name, then any number of `[*]` (SPEC §42).
             let names = field.split('.').map(|step| step.trim_end_matches("[*]"));
             if names.clone().next() == Some("_id") {
-                return Err(invalid(
-                    "`_id` is the primary key; it needs no secondary index",
-                ));
+                return Err(primary_key_error());
             }
             if names.clone().any(str::is_empty) {
                 return Err(invalid("an index path needs a name between every two dots"));
@@ -299,9 +297,16 @@ impl<T> Collection<T> {
     }
 
     /// Drops the secondary index on `fields` and frees its pages: `false`
-    /// if there was none.
+    /// if there was none. `_id` is the primary key, which can't be
+    /// dropped: an error, like `ensure_index` on it.
     pub fn drop_index(&self, fields: impl IndexFields) -> crate::Result<bool> {
         let fields = fields.into_fields();
+        if fields
+            .iter()
+            .any(|f| f.split('.').next().map(|s| s.trim_end_matches("[*]")) == Some("_id"))
+        {
+            return Err(primary_key_error());
+        }
         self.db.transact(|catalog, store| {
             let Some(index) = catalog.drop_index(store, &self.name, &fields)? else {
                 return Ok(false);
@@ -1679,6 +1684,14 @@ fn save_current_data_page(
     Ok(())
 }
 
+/// What creating or dropping an index on `_id` is refused with.
+fn primary_key_error() -> crate::Error {
+    crate::Error::from(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "`_id` is the primary key; it needs no secondary index",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1689,6 +1702,20 @@ mod tests {
     struct User {
         name: String,
         age: i64,
+    }
+
+    #[test]
+    fn the_primary_key_index_is_neither_created_nor_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("t.trunkdb")).unwrap();
+        let users = db.collection::<User>("users");
+        for fields in ["_id", "_id.x"] {
+            let create = users.ensure_index(fields).unwrap_err().to_string();
+            let drop = users.drop_index(fields).unwrap_err().to_string();
+            assert!(create.contains("primary key"), "{create}");
+            assert_eq!(create, drop);
+        }
+        assert!(!users.drop_index("age").unwrap());
     }
 
     #[test]
