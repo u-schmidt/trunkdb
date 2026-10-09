@@ -35,6 +35,7 @@ All of it is done:
 | 0.15.0 | `Document::DateTime` holds `trunkdb::DateTime` instead of a `SystemTime` (breaking), the same on every platform over an `i64` of seconds; `DateTime` fields, times before 1970 included; `ParseDateTimeError` | §70 |
 | 0.16.0 | Documents as JSON text: `Display` and `FromStr` for `Document`, tagged JSON as an export writes it, and `ParseDocumentError`; `Filter::skip`, for paging with `limit`, read through an index only as far as skip plus limit; more update operators, `min`, `max`, `rename`, and `push`, `add_to_set` and `pull` on arrays | §71–§73 |
 | 0.17.0 | `find_with_ids` and `find_one_with_id` removed, typed and untyped, and a `cursor` handing out `T` instead of `(DocId, T)` (breaking); the id from the type's `_id` field, a wrapper with `#[serde(flatten)]` for a type from another crate; a free-space map per collection, in memory, so inserts refill the room deletes and updates leave in older data pages | §74–§75 |
+| 0.18.0 | A WAL size limit, `OpenOptions::checkpoint_wal_bytes`, so a large `checkpoint_pages` cannot grow the WAL without bound; a failed log taken back alone, so it no longer empties the WAL along with the batches committed before it (a fix to §51); snapshot reads: a batch is staged, logged, flushed and checkpointed beside the readers, which wait only for its publish, and a page's older versions stay in memory for the snapshots open, so a read keeps its commit to its end and commits wait for no read; `Database::snapshot` and `View<T>`, a snapshot a caller keeps, and a `cursor` that shows the moment it was made (breaking for code that relied on seeing later changes); `OpenOptions::snapshot_memory`, a limit on what snapshots keep, past which the oldest is ended with `Error::SnapshotTooOld`; `compact` takes the database alone and is refused with `Error::SnapshotOpen` while a snapshot is kept | §76–§83 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -127,20 +128,9 @@ limit is described.
   cache's read lock, the page's reference count): the lock taken once
   per operation instead of once per page, or cached pages borrowed
   instead of counted (§65.3).
-- Done in §79: writers that stage, flush and checkpoint beside the
-  readers, taking the gate only to publish (§57.2, option B). To do:
-  the full `reader_wait` (§58) on the machine of §58, beside redb;
-  §79.7 measured a cut-down one on two cores.
-- Done, §77 to §83 without §81: snapshot reads (MVCC), for many small
-  writes beside long reads, and one state across several calls. §77
-  (the committed pages apart from the writer's, commits numbered), §78
-  (every read through a snapshot), §79 (writers beside the readers),
-  §80 (older versions kept while a reader needs them: commits wait for
-  no read, and an export blocks no writer, §30.6), §82
-  (`Database::snapshot`, a snapshot a caller keeps, `View<T>`, and a
-  cursor of one moment) and §83 (a limit on the memory versions take,
-  `Error::SnapshotTooOld` for the oldest snapshot past it, counters,
-  and `bench`'s `long_read`). Not released yet.
+- The full `reader_wait` (§58) with redb beside it, on the machine of
+  §58, for the snapshot build: §79.7 and §80.6 measured a cut-down one
+  on two cores.
 - Short reads on several threads: a tenth fewer with two readers since
   §80, each read now writing to three shared places instead of one
   (§80.6). With §82's kept snapshots counted, `compact` could do

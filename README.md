@@ -23,7 +23,8 @@ every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
 cloneable, thread-safe handle; reads run together, writes one at a
-time beside them, and neither waits for the other, SPEC §80). See [DESIGN.md](DESIGN.md) for how it works,
+time beside them, and neither waits for the other, but for a `compact`,
+SPEC §80). See [DESIGN.md](DESIGN.md) for how it works,
 [the spec](spec/README.md) for why, and [ROADMAP.md](ROADMAP.md) for progress.
 
 ## Why
@@ -472,7 +473,12 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `Error::SnapshotTooOld`, and writes go on. `db.snapshot_info()`
     says how much is kept.
 
-    Items 50–57: not released yet; no format change.
+    Items 50–57 → 0.18.0: breaking for code that relied on a `cursor`
+    showing each document as it is when reached, which it shows as it
+    was when the cursor was made now (§82); `compact` can fail with
+    `Error::SnapshotOpen` while a snapshot or cursor is kept (§80), and
+    a read of a snapshot kept past `snapshot_memory` with
+    `Error::SnapshotTooOld` (§83); files and exports as in 0.14.0.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
