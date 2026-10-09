@@ -656,9 +656,25 @@ impl FileStore {
             return Err(self.header_error.take().unwrap());
         }
         let mut page_count = read_header(self.pages.file()).ok().map(|h| h.page_count);
+        // The file grows by a page an allocation writes, and every page a
+        // batch writes is in the WAL (SPEC §87): so no header there counts
+        // more pages than the file has and the WAL holds. A WAL that says
+        // otherwise would have the restore write at the other end of a
+        // sparse file of any size.
+        let room = self.pages.file().metadata()?.len() / PAGE_SIZE as u64 + pages.len() as u64;
         for (id, page) in pages {
             if *id == HEADER_PAGE {
-                page_count = Some(Header::decode(page)?.page_count);
+                let counted = Header::decode(page)?.page_count;
+                if counted > room {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "the WAL's header counts {counted} pages, more than the file and \
+                             the WAL can account for ({room}) — it may be corrupt"
+                        ),
+                    ));
+                }
+                page_count = Some(counted);
             } else if page_count.is_none_or(|count| *id >= count) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1344,10 +1360,49 @@ mod tests {
         assert!(store.restore_pages(&[(u64::MAX, page.clone())]).is_err());
         assert_eq!(store.file_bytes(), before, "nothing written");
 
-        store
-            .restore_pages(&[(HEADER_PAGE, header(5)), (4, page.clone())])
-            .unwrap();
+        // Growing by three pages takes the three pages in the WAL, as a
+        // batch that allocates them logs them.
+        let grown = [
+            (HEADER_PAGE, header(5)),
+            (2, page.clone()),
+            (3, page.clone()),
+            (4, page.clone()),
+        ];
+        store.restore_pages(&grown).unwrap();
         assert_eq!(store.read_page(4).unwrap(), page);
+    }
+
+    /// A WAL header can't count more pages than the file and the WAL's
+    /// own pages make (SPEC §87): the restore would write at the far end
+    /// of a sparse file, of any size.
+    #[test]
+    fn a_wal_header_cannot_count_pages_nothing_accounts_for() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let mut store = FileStore::open(&path).unwrap();
+        let before = store.file_bytes();
+        let page = vec![7u8; USABLE_PAGE_SIZE];
+        let header = |page_count| {
+            Header {
+                page_size: PAGE_SIZE as u32,
+                page_count,
+                free_list_head: NO_FREE_PAGE,
+                format_version: FORMAT_VERSION,
+            }
+            .encode()
+            .to_vec()
+        };
+        let huge = 1u64 << 36;
+        let err = store
+            .restore_pages(&[(HEADER_PAGE, header(huge)), (huge - 1, page.clone())])
+            .unwrap_err();
+        assert!(err.to_string().contains("can account for"), "{err}");
+        assert_eq!(store.file_bytes(), before, "nothing written");
+        // One page more than the file's three and the one image.
+        let err = store
+            .restore_pages(&[(HEADER_PAGE, header(5))])
+            .unwrap_err();
+        assert!(err.to_string().contains("can account for (4)"), "{err}");
     }
 
     // ---------- replacing the whole content ----------
