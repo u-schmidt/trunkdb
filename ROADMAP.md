@@ -58,9 +58,8 @@ documents, data pages and the header are the expensive ones.
 - Done in §69: a date-time type, `Document::DateTime`, file format 11.
 - The WAL's format matters less: it's empty after a clean close, so a
   change needs only a checkpoint before upgrading.
-- Snapshot reads (§57) would most likely live in memory only, as in
-  SQLite's WAL mode; how freed pages are tagged decides whether they
-  touch the file.
+- Settled in §77: snapshot reads live in memory only, and freed pages
+  need no tag, so they don't touch the file format.
 
 **API questions: cheap now, breaking after 1.0**
 - Done in §74: `find_with_ids` and `find_one_with_id` removed, and
@@ -128,12 +127,24 @@ limit is described.
   cache's read lock, the page's reference count): the lock taken once
   per operation instead of once per page, or cached pages borrowed
   instead of counted (§65.3).
-- Writers that stage and flush beside the readers, taking the lock only
-  to publish (§57.2, option B). A writer committing back to back
-  starves readers now (§58.3); no current workload does. Not
-  scheduled.
-- Snapshot reads (MVCC): deferred, not rejected (§57). They would also
-  stop an export from blocking writers (§30.6).
+- Done in §79: writers that stage, flush and checkpoint beside the
+  readers, taking the gate only to publish (§57.2, option B). To do:
+  the full `reader_wait` (§58) on the machine of §58, beside redb;
+  §79.7 measured a cut-down one on two cores.
+- Done, §77 to §83 without §81: snapshot reads (MVCC), for many small
+  writes beside long reads, and one state across several calls. §77
+  (the committed pages apart from the writer's, commits numbered), §78
+  (every read through a snapshot), §79 (writers beside the readers),
+  §80 (older versions kept while a reader needs them: commits wait for
+  no read, and an export blocks no writer, §30.6), §82
+  (`Database::snapshot`, a snapshot a caller keeps, `View<T>`, and a
+  cursor of one moment) and §83 (a limit on the memory versions take,
+  `Error::SnapshotTooOld` for the oldest snapshot past it, counters,
+  and `bench`'s `long_read`). Not released yet.
+- Short reads on several threads: a tenth fewer with two readers since
+  §80, each read now writing to three shared places instead of one
+  (§80.6). With §82's kept snapshots counted, `compact` could do
+  without the gate on the read path (§80.8).
 
 **API**
 - A document as `serde_json::Value`, beside its text form (§71), if a
@@ -168,6 +179,9 @@ limit is described.
   compile time.
 
 **Tooling and reach**
+- A read-only open (`OpenOptions::read_only`): a shared file lock and
+  nothing written, not even by recovery, for a tool that inspects files
+  no application has open. Small, and independent of snapshots (§77).
 - Repairing what `check` finds, beyond export and import (§39.5).
 - `check` finding overlapping cells on a page (§54.2).
 - Longer fuzzing runs, with AddressSanitizer too, and short ones in CI

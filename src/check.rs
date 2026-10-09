@@ -6,10 +6,10 @@
 use crate::catalog::{Catalog, IndexMeta};
 use crate::collection::{index_keys, same_values, unique_tuples};
 use crate::data;
-use crate::database::Database;
+use crate::database::{Database, ReadGuard};
 use crate::document::{DocId, Document};
 use crate::index::{BTreeIndex, Index, key};
-use crate::storage::{FileStore, PAGE_SIZE, PageId, RecordLocation};
+use crate::storage::{PAGE_SIZE, PageId, RecordLocation, SnapshotStore};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the file is, from its header.
@@ -46,12 +46,17 @@ impl Database {
     /// The header's facts: format, page size, how many pages, how many
     /// of them free.
     pub fn file_info(&self) -> crate::Result<FileInfo> {
-        let state = self.read()?;
+        Self::file_info_of(&self.read()?)
+    }
+
+    /// `file_info`, of the commit `state` reads.
+    pub(crate) fn file_info_of(state: &ReadGuard<'_>) -> crate::Result<FileInfo> {
+        let store = state.snapshot().store;
         Ok(FileInfo {
-            format_version: state.store.format_version()?,
+            format_version: store.format_version()?,
             page_size: PAGE_SIZE,
-            pages: state.store.page_count(),
-            free_pages: state.store.free_pages()?.len(),
+            pages: store.page_count(),
+            free_pages: store.free_pages()?.len(),
         })
     }
 
@@ -65,11 +70,16 @@ impl Database {
     ///   indexed value, in order, and a unique index no two equal values.
     ///
     /// Problems are collected, not returned as errors: a damaged index
-    /// doesn't stop the rest from being checked. Holds the read lock:
-    /// writers wait, readers don't.
+    /// doesn't stop the rest from being checked. A read like any other
+    /// on one snapshot (SPEC §80): reads and writes go on beside it.
     pub fn check(&self) -> crate::Result<CheckReport> {
-        let state = self.read()?;
-        let (catalog, store) = (&state.catalog, &state.store);
+        Self::check_of(&self.read()?)
+    }
+
+    /// `check`, of the commit `state` reads.
+    pub(crate) fn check_of(state: &ReadGuard<'_>) -> crate::Result<CheckReport> {
+        let at = state.snapshot();
+        let (catalog, store) = (at.catalog, &at.store);
         let mut check = Check {
             owners: BTreeMap::new(),
             page_count: store.page_count(),
@@ -172,7 +182,7 @@ impl Check {
 fn check_collection(
     check: &mut Check,
     catalog: &Catalog,
-    store: &FileStore,
+    store: &SnapshotStore,
     name: &str,
     damaged: &BTreeSet<PageId>,
 ) -> std::io::Result<usize> {
@@ -248,7 +258,7 @@ fn check_collection(
 /// documents are skipped: there's nothing to compare them with.
 fn check_index(
     check: &mut Check,
-    store: &FileStore,
+    store: &SnapshotStore,
     name: &str,
     index: &IndexMeta,
     documents: &[(DocId, Document, RecordLocation)],
@@ -400,7 +410,7 @@ mod tests {
         let current = db
             .read()
             .unwrap()
-            .catalog
+            .catalog()
             .get("notes")
             .unwrap()
             .current_data_page;

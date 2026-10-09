@@ -29,8 +29,12 @@ impl Database {
     /// The new file is built in memory, then written like any batch —
     /// through the WAL, so a crash leaves the old file or the new one,
     /// never a mix. That needs memory for the whole new file, twice (the
-    /// pages, and the WAL record of them). It holds the write lock
-    /// throughout, so reads and writes wait.
+    /// pages, and the WAL record of them). Other writes wait for
+    /// all of it. Reads go on while the new file is built; then it waits
+    /// for the reads under way, and new ones wait until it is committed.
+    ///
+    /// `Error::SnapshotOpen` if a snapshot is kept open: every page
+    /// changes, and none can be kept as it was (SPEC §80.5).
     pub fn compact(&self) -> crate::Result<Compacted> {
         self.transact(|catalog, store| {
             let pages_before = store.page_count();
@@ -352,7 +356,7 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
 
         let db = Database::open(&path).unwrap();
-        db.state().store.failing_write_backs = 2;
+        db.state().store.pages.fail_write_backs(2, 1);
         let again = db.compact().unwrap();
         assert_eq!(
             (again.pages_before, again.pages_after),
@@ -383,12 +387,13 @@ mod tests {
         db.compact().unwrap();
 
         let state = db.read().unwrap();
-        let root = state.catalog.indexes("docs")[0].root;
+        let at = state.snapshot();
+        let root = at.catalog.indexes("docs")[0].root;
         let mut leaves: Vec<usize> = BTreeIndex::new(root)
-            .pages(&state.store)
+            .pages(&at.store)
             .unwrap()
             .into_iter()
-            .map(|page| SlottedPage::from_bytes(state.store.read_page(page).unwrap()).unwrap())
+            .map(|page| SlottedPage::from_bytes(at.store.read_page(page).unwrap()).unwrap())
             .filter(|page| page.page_type() == PageType::IndexLeaf)
             .map(|page| page.iter_cells().count())
             .collect();
@@ -476,9 +481,8 @@ mod tests {
         let pages_before = db.file_info().unwrap().pages;
         assert_eq!(file_pages(&path), pages_before);
         {
-            let mut state = db.state();
-            state.store.failing_write_backs = 2;
-            state.store.write_back_fails_after = 5;
+            let state = db.state();
+            state.store.pages.fail_write_backs(2, 5);
         }
         let compacted = db.compact().unwrap();
         assert!(compacted.pages_after < compacted.pages_before);

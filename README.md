@@ -22,9 +22,8 @@ into as few pages as it needs, a page-image write-ahead log making
 every write crash-safe, and atomic multi-collection batch writes
 (typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
-cloneable, thread-safe handle; reads share a lock, writes take it one
-at a time — though the page cache still lets readers through one at a
-time, SPEC §58). See [DESIGN.md](DESIGN.md) for how it works,
+cloneable, thread-safe handle; reads run together, writes one at a
+time beside them, and neither waits for the other, SPEC §80). See [DESIGN.md](DESIGN.md) for how it works,
 [the spec](spec/README.md) for why, and [ROADMAP.md](ROADMAP.md) for progress.
 
 ## Why
@@ -64,7 +63,9 @@ src/
 ├── collection.rs      Collection<T>: CRUD, find, indexes, update_many,
 │                        update_fields
 ├── batch.rs           Batch: typed atomic multi-op writes
-├── cursor.rs          Cursor: streaming find
+├── cursor.rs          Cursor: streaming find, of one moment
+├── snapshot.rs        Snapshot and View<T>: the database at one
+│                        moment, to keep reading
 ├── query.rs           Filter, Condition, Sort; the planner
 ├── update.rs          Update: set, unset and inc on dotted paths
 ├── document.rs        Document and DocId: the schema-less value type
@@ -76,8 +77,11 @@ src/
 ├── free_space.rs      FreeSpace: data pages with room, by free bytes
 ├── storage/
 │   ├── mod.rs         PageStore, page types
-│   ├── file.rs        FileStore: the file, checksums, staged and
-│   │                    committed pages, the file lock
+│   ├── file.rs        FileStore: the writer's staged pages, the
+│   │                    header, the file lock
+│   ├── pages.rs       Pages: the file, checksums, the committed
+│   │                    pages, shared by readers and the writer
+│   ├── snapshot.rs    SnapshotStore: the pages as of one commit
 │   ├── slotted.rs     SlottedPage: slot directory + cells
 │   ├── cache.rs       PageCache: CLOCK eviction
 │   └── memory.rs      MemoryStore: pages in memory (compaction, tests)
@@ -147,6 +151,31 @@ let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new
 let tagged = users.update_fields(Filter::new().id(id), &Update::new().add_to_set("tags", "admin").pull("tags", "guest"))?;
 ```
 
+### Reads that agree with each other
+
+Each call reads the database as it is at that moment, so a write on
+another thread can land between two calls. A snapshot is one moment
+for as many reads as you like, in every collection, and holds up
+nobody:
+
+```rust
+let snapshot = db.snapshot()?;
+let users = snapshot.collection::<User>("users"); // a View<User>: reads only
+let how_many = users.count(Filter::new())?;
+let everyone = users.find(Filter::new())?; // how_many == everyone.len(), always
+snapshot.export(std::fs::File::create("backup.jsonl")?)?; // the same moment
+```
+
+Drop it when the reads are done: while it's open, pages changed since
+stay in memory as they were, and `compact` is refused. A `cursor` is a
+snapshot of its own, for as long as it's iterated.
+
+That memory has a limit, 256 MiB unless `OpenOptions::snapshot_memory`
+says otherwise. A snapshot left open beside so many writes that it's
+passed is ended, the oldest first: its reads return
+`Error::SnapshotTooOld`, and a new snapshot reads on. Writes are never
+held up or refused for it. `db.snapshot_info()` shows how much is kept.
+
 ### Reading only some fields
 
 A collection can be opened with a smaller type: serde ignores the
@@ -215,6 +244,7 @@ read.
 ```
 cd bench && cargo run --release
 cd bench && cargo run --release --bin reader_wait   # readers while a writer commits
+cd bench && cargo run --release --bin long_read     # one long snapshot beside single writes
 ```
 
 ## Roadmap (short version)
@@ -402,14 +432,47 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     writes back once the WAL is that long, twice `checkpoint_pages`
     pages' bytes unless set, so commits that keep changing the same few
     pages cannot grow it without bound; no format change.
-51. **A failed log, taken back alone** (§81): a batch whose write to the
-    WAL fails no longer empties the WAL, which also held the batches
-    committed before it and not yet written back; a crash soon after
-    lost those. A fix to §51; no format change.
 
     Items 48–49 → 0.17.0: breaking for code that calls `find_with_ids`
     or `find_one_with_id`, or takes `(id, doc)` from a cursor (§74.3
     says how to migrate); files and exports as in 0.14.0.
+
+51. **The committed pages, apart from the writer's** (§77): snapshot
+    reads reopened and planned, in six steps; the first splits the
+    store, and numbers the commits. Nothing visible.
+52. **Reads through a snapshot** (§78): a read gets the last commit's
+    catalog and pages, and can't reach a batch being staged. Nothing
+    visible.
+53. **Writers beside the readers** (§79): a batch is staged, logged,
+    flushed and checkpointed without making readers wait; they wait
+    only while it is published. Beside a writer committing back to
+    back, readers do 18 to 31 times the reads. A commit still waits for
+    the reads under way.
+54. **Older versions kept for open snapshots** (§80): a read keeps
+    reading its own commit, and commits don't wait for it. A writer
+    beside an export that never stops: from 132 s for one commit to
+    24 ms. `compact` waits for the reads under way; a new error,
+    `Error::SnapshotOpen`, for one refused by a kept snapshot.
+
+55. **A failed log, taken back alone** (§81): a batch whose write to the
+    WAL fails no longer empties the WAL, which also held the batches
+    committed before it and not yet written back; a crash soon after
+    lost those. A fix to §51.
+
+56. **A snapshot to keep** (§82): `db.snapshot()` is the database at
+    one moment for as many reads as wanted, through `View<T>`, a
+    collection that only reads; `export`, `check`, `collections` and
+    `file_info` on it too. A `cursor` now shows the moment it was made,
+    not each document as it is when reached (breaking for code that
+    relied on that).
+57. **A limit on the memory snapshots take** (§83):
+    `OpenOptions::snapshot_memory`, 256 MiB unless set. A snapshot
+    kept open beside so many writes that the old pages pass it is
+    ended, the oldest first: its reads fail with
+    `Error::SnapshotTooOld`, and writes go on. `db.snapshot_info()`
+    says how much is kept.
+
+    Items 50–57: not released yet; no format change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

@@ -16,7 +16,7 @@
 
 use crate::catalog::IndexOptions;
 use crate::collection::get_or_create_meta;
-use crate::database::Database;
+use crate::database::{Database, ReadGuard};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index};
 use crate::json::{document_line, parse_document_line};
@@ -55,8 +55,12 @@ pub struct Summary {
 impl Database {
     /// The names of all collections, sorted.
     pub fn collections(&self) -> crate::Result<Vec<String>> {
-        let state = self.read()?;
-        let mut names: Vec<String> = state.catalog.names().map(str::to_string).collect();
+        Self::collections_of(&self.read()?)
+    }
+
+    /// `collections`, of the commit `state` reads.
+    pub(crate) fn collections_of(state: &ReadGuard<'_>) -> crate::Result<Vec<String>> {
+        let mut names: Vec<String> = state.catalog().names().map(str::to_string).collect();
         names.sort();
         Ok(names)
     }
@@ -65,20 +69,25 @@ impl Database {
     /// documents with their ids — to `out` as JSON Lines, collections in
     /// name order, documents in id order.
     ///
-    /// A consistent snapshot: the read lock is held for the whole export,
-    /// so no write lands halfway through (writers wait until it's done;
-    /// readers don't). `out` is buffered here; it must not write to this
-    /// database itself, which would deadlock.
+    /// A consistent snapshot (SPEC §80): the database as it was when the
+    /// export began, whatever is written while it runs. Reads and writes
+    /// go on beside it; only a `compact` waits for it. `out` is buffered
+    /// here.
     pub fn export(&self, out: impl Write) -> crate::Result<Summary> {
+        Self::export_of(&self.read()?, out)
+    }
+
+    /// `export`, of the commit `state` reads.
+    pub(crate) fn export_of(state: &ReadGuard<'_>, out: impl Write) -> crate::Result<Summary> {
         let mut out = BufWriter::new(out);
         let mut summary = Summary::default();
-        let state = self.read()?;
+        let at = state.snapshot();
 
         write_line(&mut out, &object([(HEADER_KEY, EXPORT_VERSION.into())]))?;
-        let mut names: Vec<&str> = state.catalog.names().collect();
+        let mut names: Vec<&str> = at.catalog.names().collect();
         names.sort();
         for name in names {
-            let indexes = state
+            let indexes = at
                 .catalog
                 .indexes(name)
                 .iter()
@@ -110,15 +119,14 @@ impl Database {
             write_line(&mut out, &header)?;
             summary.collections += 1;
 
-            let meta = state.catalog.get(name).expect("a listed collection");
-            let mut records = data::Records::new(&state.store);
-            for (_key, loc) in BTreeIndex::new(meta.index_root).scan(&state.store)? {
+            let meta = at.catalog.get(name).expect("a listed collection");
+            let mut records = data::Records::new(&at.store);
+            for (_key, loc) in BTreeIndex::new(meta.index_root).scan(&at.store)? {
                 let (id, doc) = records.get(loc)?;
                 write_line(&mut out, &document_line(id, &doc))?;
                 summary.documents += 1;
             }
         }
-        drop(state);
         out.flush()?;
         Ok(summary)
     }
@@ -813,8 +821,11 @@ mod tests {
         );
     }
 
+    /// An export is one snapshot, and a writer goes on beside it (SPEC
+    /// §80): a document updated while the export runs is exported as it
+    /// was, and the update is done before the export is.
     #[test]
-    fn export_is_a_snapshot_writers_wait_for() {
+    fn export_is_a_snapshot_writers_go_on_beside() {
         let dir = tempfile::tempdir().unwrap();
         let db = open(&dir, "db.trunkdb");
         let pad = Document::String("x".repeat(500));
@@ -827,25 +838,29 @@ mod tests {
         db.write_batch(ops).unwrap();
 
         /// Collects the export. At its first write — `BufWriter` passes
-        /// on 8 KB at a time, so that's early in the export — it starts a
-        /// thread that updates the *last* document, and gives it time to
-        /// finish. If the export didn't hold the read lock, it would then
-        /// export the updated document.
+        /// on 8 KB at a time, so that's early in the export — it updates
+        /// the *last* document on another thread, and waits for that to
+        /// be done: it is, though the export is still running, and the
+        /// export goes on to write the document as it was.
         struct Meddler {
             db: Database,
             out: Vec<u8>,
-            writer: Option<std::thread::JoinHandle<()>>,
+            updated: bool,
         }
         impl Write for Meddler {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                if self.writer.is_none() {
+                if !self.updated {
                     let db = self.db.clone();
-                    self.writer = Some(std::thread::spawn(move || {
+                    let (sent, done) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
                         let doc = object(&[("v", Document::Int(1))]);
                         let c = db.collection::<Document>("c");
                         assert!(c.update(&DocId(199u128.to_be_bytes()), doc).unwrap());
-                    }));
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                        sent.send(()).unwrap();
+                    });
+                    done.recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("the update waited for the export");
+                    self.updated = true;
                 }
                 self.out.extend_from_slice(buf);
                 Ok(buf.len())
@@ -857,13 +872,13 @@ mod tests {
         let mut meddler = Meddler {
             db: db.clone(),
             out: Vec::new(),
-            writer: None,
+            updated: false,
         };
         db.export(&mut meddler).unwrap();
+        assert!(meddler.updated);
         let text = String::from_utf8(meddler.out).unwrap();
         // `_id` comes first in every object (SPEC §59), so `v` follows it.
         assert_eq!(text.matches(r#","v":0,"#).count(), 200, "the update got in");
-        meddler.writer.unwrap().join().unwrap();
         let now = db
             .collection::<Document>("c")
             .get(&DocId(199u128.to_be_bytes()));
