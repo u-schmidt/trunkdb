@@ -201,3 +201,55 @@ impl OutputWith for Command {
         child.wait_with_output().unwrap()
     }
 }
+
+#[test]
+fn export_refuses_the_database_itself_and_replaces_the_output_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input, alias, out) = (
+        path(dir.path(), "db.trunkdb"),
+        path(dir.path(), "in.jsonl"),
+        path(dir.path(), "alias.trunkdb"),
+        path(dir.path(), "out.jsonl"),
+    );
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+    let before = std::fs::read(&db).unwrap();
+
+    // The database's own path, and a hard link to it.
+    std::fs::hard_link(&db, &alias).unwrap();
+    for target in [&db, &alias] {
+        let output = trunkdb(&["export", &db, target]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains("choose another file"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+    }
+    assert!(trunkdb(&["check", &db]).status.success());
+
+    // No temporary file is left behind, and an existing output is replaced whole.
+    std::fs::write(&out, "old").unwrap();
+    assert!(trunkdb(&["export", &db, &out]).status.success());
+    assert!(
+        std::fs::read_to_string(&out)
+            .unwrap()
+            .starts_with("{\"$trunkdb_export\"")
+    );
+    let leftovers = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+
+    // A failed export (unwritable directory) leaves nothing and touches nothing.
+    let missing = path(&dir.path().join("nope"), "x.jsonl");
+    assert_eq!(trunkdb(&["export", &db, &missing]).status.code(), Some(1));
+}

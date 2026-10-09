@@ -33,8 +33,8 @@ fn main() -> ExitCode {
         ["info", file] => existing(file).and_then(|db| info(file, &db)),
         ["check", file] => existing(file).and_then(|db| check(&db)),
         ["compact", file] => existing(file).and_then(|db| compact(&db)),
-        ["export", file] => existing(file).and_then(|db| export(&db, None)),
-        ["export", file, out] => existing(file).and_then(|db| export(&db, Some(out))),
+        ["export", file] => existing(file).and_then(|db| export(&db, file, None)),
+        ["export", file, out] => existing(file).and_then(|db| export(&db, file, Some(out))),
         ["import", file, input] => open(file).and_then(|db| import(&db, input)),
         ["help" | "-h" | "--help"] => {
             print!("{USAGE}");
@@ -168,15 +168,55 @@ fn size(bytes: u64) -> String {
     }
 }
 
-fn export(db: &Database, out: Option<&str>) -> Outcome {
-    let summary = match out {
-        Some(path) => {
-            let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
-            db.export(file)
+/// Whether two paths name the same file: the same inode (so hard links and
+/// symlinks count), or the same resolved path where there are no inodes.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
         }
-        None => db.export(io::stdout().lock()),
     }
-    .map_err(|e| e.to_string())?;
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Exports to `out` through a temporary file beside it, renamed over `out`
+/// only once the export is complete: a failed export leaves an existing
+/// `out` alone, and `out` can never be the database itself.
+fn export_to_file(db: &Database, file: &str, out: &str) -> Result<trunkdb::Summary, String> {
+    let mut wal = std::ffi::OsString::from(file);
+    wal.push(".wal");
+    for protected in [Path::new(file), Path::new(&wal)] {
+        if same_file(Path::new(out), protected) {
+            return Err(format!(
+                "{out}: is the database or its log; choose another file"
+            ));
+        }
+    }
+    // Write through a symlink to its target, not over the link.
+    let target = std::fs::canonicalize(out).unwrap_or_else(|_| out.into());
+    let mut temp = target.clone().into_os_string();
+    temp.push(format!(".tmp{}", std::process::id()));
+    let temp = std::path::PathBuf::from(temp);
+    let written = (|| {
+        let file = std::fs::File::create(&temp)?;
+        let summary = db.export(&file).map_err(io::Error::other)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &target)?;
+        Ok::<_, io::Error>(summary)
+    })();
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("{out}: {e}")
+    })
+}
+
+fn export(db: &Database, file: &str, out: Option<&str>) -> Outcome {
+    let summary = match out {
+        Some(path) => export_to_file(db, file, path),
+        None => db.export(io::stdout().lock()).map_err(|e| e.to_string()),
+    }?;
     // To stderr, so standard output stays pure JSON Lines.
     eprintln!(
         "exported {}, {}",

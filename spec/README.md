@@ -94,3 +94,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 81. [A failed log, taken back alone (`durability/`, `database.rs`)](81-a-failed-log-taken-back-alone.md)
 82. [A snapshot to keep (`snapshot.rs`, `collection.rs`, `cursor.rs`, `database.rs`)](82-a-snapshot-to-keep.md)
 83. [A limit on the memory snapshots take (`storage/pages.rs`, `database.rs`, `snapshot.rs`, `lib.rs`)](83-a-limit-on-the-memory-snapshots-take.md)
+84. [Export to a file, never over the database (`src/bin/trunkdb.rs`)](84-export-to-a-file-never-over-the-database.md)
