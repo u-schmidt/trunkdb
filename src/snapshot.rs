@@ -1185,4 +1185,263 @@ mod tests {
         }
         assert_eq!(docs.count(Filter::new()).unwrap(), model.len());
     }
+
+    // --- `compact` beside everything else (SPEC §80.5) ---
+
+    /// A compaction rewrites every page and cuts the file, and takes the
+    /// database alone: it waits for the reads under way, lets none begin
+    /// until it has published, and is refused while a snapshot or a cursor
+    /// is kept. Here it runs again and again beside writers (one moving
+    /// money between accounts, one filling and emptying a collection so
+    /// there is something to cut), kept snapshots, a slow cursor, exports
+    /// and plain finds. Every read sees every account and exactly the
+    /// total, a snapshot reads the same moment twice, nothing deadlocks
+    /// (a watchdog fails the test instead of hanging), and the database
+    /// checks out at the end.
+    #[test]
+    fn compaction_beside_snapshots_cursors_exports_and_writers_loses_nothing() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+        use std::time::{Duration, Instant};
+
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        struct Account {
+            amount: i64,
+            pad: String,
+        }
+        const ACCOUNTS: usize = 80;
+        const TOTAL: i64 = ACCOUNTS as i64 * 100;
+
+        #[derive(Default)]
+        struct Counts {
+            transfers: AtomicUsize,
+            churn: AtomicUsize,
+            compacted: AtomicUsize,
+            refused: AtomicUsize,
+            snapshots: AtomicUsize,
+            cursors: AtomicUsize,
+            exports: AtomicUsize,
+            finds: AtomicUsize,
+        }
+
+        fn whole(accounts: &[Account]) {
+            assert_eq!(accounts.len(), ACCOUNTS);
+            assert_eq!(accounts.iter().map(|a| a.amount).sum::<i64>(), TOTAL);
+        }
+
+        fn rng(seed: u64) -> impl FnMut(usize) -> usize {
+            let mut state = seed;
+            move |below| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % below as u64) as usize
+            }
+        }
+
+        let (_dir, _path, db) = open();
+        let pad = "x".repeat(300);
+        let accounts = db.collection::<Account>("accounts");
+        let ids: Vec<DocId> = {
+            let mut batch = db.batch();
+            let ids = (0..ACCOUNTS)
+                .map(|_| {
+                    let account = Account {
+                        amount: 100,
+                        pad: pad.clone(),
+                    };
+                    batch.insert(&accounts, account).unwrap()
+                })
+                .collect();
+            batch.commit().unwrap();
+            ids
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let counts = Arc::new(Counts::default());
+        let mut threads = Vec::new();
+        let mut spawn = |work: Box<dyn FnOnce() + Send>| threads.push(std::thread::spawn(work));
+
+        // The one writer of the accounts: transfers, so the total never moves.
+        {
+            let (db, stop, counts, ids, pad) = (
+                db.clone(),
+                stop.clone(),
+                counts.clone(),
+                ids.clone(),
+                pad.clone(),
+            );
+            spawn(Box::new(move || {
+                let accounts = db.collection::<Account>("accounts");
+                let mut amounts = vec![100i64; ACCOUNTS];
+                let mut below = rng(0x9E37_79B9_7F4A_7C15);
+                while !stop.load(Relaxed) {
+                    let from = below(ACCOUNTS);
+                    let to = (from + 1 + below(ACCOUNTS - 1)) % ACCOUNTS;
+                    let sum = 1 + below(20) as i64;
+                    amounts[from] -= sum;
+                    amounts[to] += sum;
+                    let mut batch = db.batch();
+                    for &i in &[from, to] {
+                        let account = Account {
+                            amount: amounts[i],
+                            pad: pad.clone(),
+                        };
+                        batch.update(&accounts, &ids[i], account).unwrap();
+                    }
+                    batch.commit().unwrap();
+                    counts.transfers.fetch_add(1, Relaxed);
+                    std::thread::sleep(Duration::from_micros(300));
+                }
+            }));
+        }
+
+        // Another writer: bulky documents in and out, so pages are freed.
+        {
+            let (db, stop, counts) = (db.clone(), stop.clone(), counts.clone());
+            spawn(Box::new(move || {
+                let churn = db.collection::<Padded>("churn");
+                let mut live = std::collections::VecDeque::new();
+                let mut next = 0;
+                while !stop.load(Relaxed) {
+                    let mut batch = db.batch();
+                    for _ in 0..25 {
+                        live.push_back(batch.insert(&churn, padded(next, 1200)).unwrap());
+                        next += 1;
+                    }
+                    if live.len() > 150 {
+                        for _ in 0..50 {
+                            batch.delete(&churn, &live.pop_front().unwrap());
+                        }
+                    }
+                    batch.commit().unwrap();
+                    counts.churn.fetch_add(1, Relaxed);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }));
+        }
+
+        // The compactor: done, or refused while something is kept.
+        {
+            let (db, stop, counts) = (db.clone(), stop.clone(), counts.clone());
+            spawn(Box::new(move || {
+                while !stop.load(Relaxed) {
+                    match db.compact() {
+                        Ok(_) => counts.compacted.fetch_add(1, Relaxed),
+                        Err(crate::Error::SnapshotOpen) => counts.refused.fetch_add(1, Relaxed),
+                        Err(e) => panic!("compact: {e}"),
+                    };
+                    std::thread::sleep(Duration::from_millis(4));
+                }
+            }));
+        }
+
+        // Kept snapshots: the same moment twice, a moment apart, and whole.
+        for seed in [1u64, 2] {
+            let (db, stop, counts) = (db.clone(), stop.clone(), counts.clone());
+            spawn(Box::new(move || {
+                let mut below = rng(seed * 0x2545_F491_4F6C_DD1D);
+                while !stop.load(Relaxed) {
+                    let snapshot = db.snapshot().unwrap();
+                    let view = snapshot.collection::<Account>("accounts");
+                    let first = view.find(Filter::new()).unwrap();
+                    whole(&first);
+                    std::thread::sleep(Duration::from_millis(1 + below(3) as u64));
+                    assert_eq!(view.find(Filter::new()).unwrap(), first, "one moment");
+                    assert_eq!(view.count(Filter::new()).unwrap(), ACCOUNTS);
+                    assert!(snapshot.check().unwrap().is_ok());
+                    counts.snapshots.fetch_add(1, Relaxed);
+                    drop(snapshot);
+                    std::thread::sleep(Duration::from_millis(1 + below(4) as u64));
+                }
+            }));
+        }
+
+        // A slow cursor: kept for as long as it is iterated.
+        {
+            let (db, stop, counts) = (db.clone(), stop.clone(), counts.clone());
+            spawn(Box::new(move || {
+                let accounts = db.collection::<Account>("accounts");
+                while !stop.load(Relaxed) {
+                    let mut seen = Vec::new();
+                    for (n, item) in accounts.cursor(Filter::new()).unwrap().enumerate() {
+                        seen.push(item.unwrap());
+                        if n % 10 == 9 {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    whole(&seen);
+                    counts.cursors.fetch_add(1, Relaxed);
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+            }));
+        }
+
+        // Exports: a long read that holds up a compaction waiting to begin.
+        {
+            let (db, stop, counts) = (db.clone(), stop.clone(), counts.clone());
+            spawn(Box::new(move || {
+                while !stop.load(Relaxed) {
+                    let mut out = Vec::new();
+                    db.export(&mut out).unwrap();
+                    assert!(!out.is_empty());
+                    counts.exports.fetch_add(1, Relaxed);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }));
+        }
+
+        // Plain finds, each its own short read.
+        {
+            let (db, stop, counts) = (db.clone(), stop.clone(), counts.clone());
+            spawn(Box::new(move || {
+                let accounts = db.collection::<Account>("accounts");
+                while !stop.load(Relaxed) {
+                    whole(&accounts.find(Filter::new()).unwrap());
+                    counts.finds.fetch_add(1, Relaxed);
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_secs(4));
+        stop.store(true, Relaxed);
+        // Every thread must finish: one that doesn't is a deadlock. A
+        // thread that panicked has finished too, and `join` says why.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for thread in threads {
+            while !thread.is_finished() {
+                assert!(Instant::now() < deadline, "a thread is stuck: deadlock");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            thread.join().unwrap();
+        }
+
+        // Nothing is kept now: one more compaction must go through.
+        db.compact().unwrap();
+        let ended = accounts.find(Filter::new()).unwrap();
+        whole(&ended);
+        assert!(db.check().unwrap().is_ok());
+        assert_eq!(db.snapshot_info().ended, 0);
+
+        let c = &counts;
+        let (transfers, compacted, refused) = (
+            c.transfers.load(Relaxed),
+            c.compacted.load(Relaxed),
+            c.refused.load(Relaxed),
+        );
+        eprintln!(
+            "transfers {transfers}, churn {}, compacted {compacted}, refused {refused}, \
+             snapshots {}, cursors {}, exports {}, finds {}",
+            c.churn.load(Relaxed),
+            c.snapshots.load(Relaxed),
+            c.cursors.load(Relaxed),
+            c.exports.load(Relaxed),
+            c.finds.load(Relaxed),
+        );
+        // That it ran beside all of it, and met both outcomes.
+        assert!(transfers > 0 && c.churn.load(Relaxed) > 0);
+        assert!(c.snapshots.load(Relaxed) > 0 && c.cursors.load(Relaxed) > 0);
+        assert!(c.exports.load(Relaxed) > 0 && c.finds.load(Relaxed) > 0);
+        assert!(compacted > 0, "no compaction ever went through");
+        assert!(refused > 0, "no compaction was ever refused");
+    }
 }
