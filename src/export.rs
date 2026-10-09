@@ -141,15 +141,25 @@ impl Database {
     /// before that batch stays. Importing into a new, empty file and
     /// switching over only when it succeeds is the safe way to use it.
     /// Each collection's indexes are built once its documents are in.
+    ///
+    /// A line longer than `ImportOptions::max_line_bytes` (256 MiB unless
+    /// changed) stops the import before it is read in full (SPEC §86);
+    /// `import_with` takes another limit.
     pub fn import(&self, input: impl Read) -> crate::Result<Summary> {
+        self.import_with(input, ImportOptions::default())
+    }
+
+    /// `import`, with `options`.
+    pub fn import_with(&self, input: impl Read, options: ImportOptions) -> crate::Result<Summary> {
         let mut summary = Summary::default();
         let mut tags: Option<crate::json::Tags> = None;
         let mut current: Option<CollectionHeader> = None;
         let mut chunk = Chunk::default();
 
-        for (number, line) in BufReader::new(input).lines().enumerate() {
-            let number = number + 1;
-            let line = line?;
+        let mut input = BufReader::new(input);
+        let mut number = 0;
+        while let Some(line) = read_line(&mut input, options.max_line_bytes, number + 1)? {
+            number += 1;
             if line.trim().is_empty() {
                 continue;
             }
@@ -210,6 +220,78 @@ impl Database {
         }
         Ok(summary)
     }
+}
+
+/// How `Database::import_with` reads. Made with `ImportOptions::default()`
+/// and its setters; the type is `#[non_exhaustive]`, so a new option
+/// breaks nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImportOptions {
+    max_line_bytes: usize,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        ImportOptions {
+            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+        }
+    }
+}
+
+/// 256 MiB: far above any line an export of ordinary documents writes,
+/// and what stops an input without a newline from filling memory.
+const DEFAULT_MAX_LINE_BYTES: usize = 256 << 20;
+
+impl ImportOptions {
+    /// The longest line an import reads, in bytes, newline excluded: a
+    /// longer one fails the import with `Error::Import` before it is held
+    /// in memory in full. A document takes about a third more as a line
+    /// than it does stored, for its binary fields in base64, and more for
+    /// its field names. `usize::MAX` for no limit, for an input you trust.
+    pub fn max_line_bytes(mut self, bytes: usize) -> Self {
+        self.max_line_bytes = bytes;
+        self
+    }
+}
+
+/// The next line of `input` without its `\n` (or `\r\n`), or `None` at
+/// the end; fails as soon as the line is longer than `max` bytes, not
+/// after reading all of it, which is what `BufRead::lines` would do.
+fn read_line(input: &mut impl BufRead, max: usize, number: usize) -> crate::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let (take, found) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i, true),
+            None => (available.len(), false),
+        };
+        if line.len() + take > max {
+            return Err(Error::Import {
+                line: number,
+                message: format!(
+                    "the line is longer than {max} bytes (ImportOptions::max_line_bytes)"
+                ),
+            });
+        }
+        line.extend_from_slice(&available[..take]);
+        input.consume(take + usize::from(found));
+        if found {
+            break;
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
 /// The documents an import has read but not yet written.
@@ -365,6 +447,28 @@ fn write_line(out: &mut impl Write, value: &Value) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_over_the_limit_fails_before_it_is_read_in_full() {
+        let mut input: &[u8] = b"short\r\nlonger line\nlast";
+        assert_eq!(read_line(&mut input, 11, 1).unwrap().unwrap(), "short");
+        assert_eq!(
+            read_line(&mut input, 11, 2).unwrap().unwrap(),
+            "longer line"
+        );
+        assert_eq!(read_line(&mut input, 11, 3).unwrap().unwrap(), "last");
+        assert!(read_line(&mut input, 11, 4).unwrap().is_none());
+
+        let mut input: &[u8] = b"123456789012\nnext";
+        let err = read_line(&mut input, 11, 7).unwrap_err().to_string();
+        assert!(
+            err.contains("line 7") && err.contains("longer than 11"),
+            "{err}"
+        );
+        // An endless line is refused after max bytes, not read to its end.
+        let mut endless = std::io::BufReader::new(std::io::repeat(b'a'));
+        assert!(read_line(&mut endless, 1 << 20, 1).is_err());
+    }
     use crate::document::{DocId, Document};
     use crate::query::{Condition, Filter, Op};
     use crate::testing::XorShift;

@@ -253,3 +253,30 @@ fn export_refuses_the_database_itself_and_replaces_the_output_whole() {
     let missing = path(&dir.path().join("nope"), "x.jsonl");
     assert_eq!(trunkdb(&["export", &db, &missing]).status.code(), Some(1));
 }
+
+#[test]
+fn import_stops_at_a_line_over_the_limit_unless_it_is_turned_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+
+    let output = trunkdb(&["import", &db, &input, "--max-line", "60"]);
+    assert_eq!(output.status.code(), Some(1));
+    let message = stderr(&output);
+    assert!(
+        message.contains("line 2") && message.contains("longer than 60"),
+        "{message}"
+    );
+
+    let output = trunkdb(&["import", &db, &input, "--max-line", "x"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("--max-line"));
+
+    let big = path(dir.path(), "big.trunkdb");
+    for limit in ["none", "1000"] {
+        let output = trunkdb(&["import", &big, &input, "--max-line", limit]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        std::fs::remove_file(&big).unwrap();
+        let _ = std::fs::remove_file(format!("{big}.wal"));
+    }
+}
