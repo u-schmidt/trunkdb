@@ -215,16 +215,20 @@ fn export_refuses_the_database_itself_and_replaces_the_output_whole() {
     assert!(trunkdb(&["import", &db, &input]).status.success());
     let before = std::fs::read(&db).unwrap();
 
-    // The database's own path, and a hard link to it.
+    // The database's own path, and a hard link to it. Only where files
+    // have inodes is the link refused (SPEC §84.1); elsewhere the rename
+    // replaces the link's name and the database is left alone all the same.
     std::fs::hard_link(&db, &alias).unwrap();
-    for target in [&db, &alias] {
+    for (target, refused) in [(&db, true), (&alias, cfg!(unix))] {
         let output = trunkdb(&["export", &db, target]);
-        assert_eq!(output.status.code(), Some(1));
-        assert!(
-            stderr(&output).contains("choose another file"),
-            "{}",
-            stderr(&output)
-        );
+        if refused {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                stderr(&output).contains("choose another file"),
+                "{}",
+                stderr(&output)
+            );
+        }
         assert_eq!(std::fs::read(&db).unwrap(), before);
     }
     assert!(trunkdb(&["check", &db]).status.success());
