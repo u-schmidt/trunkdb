@@ -22,8 +22,11 @@ commands:
                               needs, and cut it to that
   export <file> [out.jsonl]   write the database as JSON Lines, to the
                               given file or to standard output
-  import <file> <in.jsonl>    read an export into the database, created if
-                              it doesn't exist; `-` reads standard input
+  import <file> <in.jsonl> [--max-line <bytes|none>]
+                              read an export into the database, created if
+                              it doesn't exist; `-` reads standard input.
+                              A line over 256 MiB (or the given size) stops
+                              the import; `none` turns the limit off
 ";
 
 fn main() -> ExitCode {
@@ -35,7 +38,9 @@ fn main() -> ExitCode {
         ["compact", file] => existing(file).and_then(|db| compact(&db)),
         ["export", file] => existing(file).and_then(|db| export(&db, file, None)),
         ["export", file, out] => existing(file).and_then(|db| export(&db, file, Some(out))),
-        ["import", file, input] => open(file).and_then(|db| import(&db, input)),
+        ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
+        ["import", file, input, "--max-line", limit] => max_line(limit)
+            .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
         ["help" | "-h" | "--help"] => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -226,15 +231,29 @@ fn export(db: &Database, file: &str, out: Option<&str>) -> Outcome {
     Ok(ExitCode::SUCCESS)
 }
 
-fn import(db: &Database, input: &str) -> Outcome {
+/// The argument of `--max-line`: a size in bytes, or `none`.
+fn max_line(text: &str) -> Result<usize, String> {
+    match text {
+        "none" => Ok(usize::MAX),
+        _ => text
+            .parse()
+            .map_err(|_| format!("--max-line: {text:?} is not a number of bytes or `none`")),
+    }
+}
+
+fn import(db: &Database, input: &str, max_line: Option<usize>) -> Outcome {
+    let options = match max_line {
+        Some(bytes) => trunkdb::ImportOptions::default().max_line_bytes(bytes),
+        None => trunkdb::ImportOptions::default(),
+    };
     let summary = if input == "-" {
         if io::stdin().is_terminal() {
             return Err("`-` reads an export from standard input; pipe one in".to_string());
         }
-        db.import(io::stdin().lock())
+        db.import_with(io::stdin().lock(), options)
     } else {
         let file = std::fs::File::open(input).map_err(|e| format!("{input}: {e}"))?;
-        db.import(io::BufReader::new(file))
+        db.import_with(io::BufReader::new(file), options)
     }
     .map_err(|e| e.to_string())?;
     eprintln!(

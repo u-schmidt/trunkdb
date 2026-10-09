@@ -96,3 +96,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 83. [A limit on the memory snapshots take (`storage/pages.rs`, `database.rs`, `snapshot.rs`, `lib.rs`)](83-a-limit-on-the-memory-snapshots-take.md)
 84. [Export to a file, never over the database (`src/bin/trunkdb.rs`)](84-export-to-a-file-never-over-the-database.md)
 85. [Header fields recovered from the WAL (`storage/file.rs`, `database.rs`)](85-header-fields-recovered-from-the-wal.md)
+86. [A limit on the line an import reads (`export.rs`, `src/bin/trunkdb.rs`)](86-a-limit-on-the-line-an-import-reads.md)
