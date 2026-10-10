@@ -431,7 +431,9 @@ more than four.
   without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md).
 - **Compaction** rebuilds the collections into a fresh image in memory,
   with full pages, logs it through the WAL like any batch and truncates
-  the file [§41](spec/41-compaction.md). The whole new image is held in memory while it runs.
+  the file [§41](spec/41-compaction.md). The whole new image is held in memory while it runs, once:
+  the WAL record is written from its pages, not built beside them, and
+  a batch, so a compaction too, can't be over 4 GiB of pages [§90](spec/90-a-wal-record-written-from-the-pages.md).
 - **Export and import** write and read JSON Lines, with the types JSON
   lacks kept by tags (`{"$id": ...}`, `{"$binary": ...}`, `{"$date":
   "<RFC 3339>"}`), so an export is a readable backup and the path

@@ -100,3 +100,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 87. [A WAL header cannot grow the file past its pages (`storage/file.rs`)](87-a-wal-header-cannot-grow-the-file-past-its-pages.md)
 88. [A read-only open (`database.rs`, `storage/file.rs`, `durability/wal.rs`, `src/bin/trunkdb.rs`)](88-a-read-only-open.md)
 89. [A huge checkpoint threshold no longer overflows (`database.rs`)](89-a-huge-checkpoint-threshold-no-longer-overflows.md)
+90. [A WAL record written from the pages (`durability/wal.rs`)](90-a-wal-record-written-from-the-pages.md)

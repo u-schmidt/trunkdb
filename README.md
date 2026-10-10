@@ -497,6 +497,13 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 
     Items 58–59 → 0.19.0: nothing breaking; an import stops at a line
     over 256 MiB now (§86); files and exports as in 0.14.0.
+60. **Compaction in a third of the memory** (§90): the WAL record is
+    written from the pages instead of built beside them, so compacting
+    takes about 1.2× the new file's size instead of 3.3×. A batch over
+    4 GiB of pages, a `compact` of a file that large too, is refused
+    instead of logged with a length cut to 32 bits.
+
+    Item 60: not released yet; no format change.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

@@ -1,8 +1,8 @@
 use super::Durability;
-use crate::crc32::crc32;
+use crate::crc32::{Crc32, crc32};
 use crate::storage::{PageId, PageImage, USABLE_PAGE_SIZE};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// The real `Durability` implementation: a single append-only file
@@ -72,25 +72,92 @@ pub(crate) fn encode_header() -> [u8; WAL_HEADER_LEN] {
 /// The length prefix catches a record cut short; the CRC catches one that
 /// is length-complete but whose bytes didn't all make it to disk (a
 /// partially persisted sector).
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn encode_record(pages: &[(PageId, &[u8])]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(4 + pages.len() * PAGE_ENTRY_LEN);
-    body.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+    let mut record = Vec::new();
+    write_record(&mut record, pages).expect("a record small enough to encode");
+    record
+}
+
+/// Writes `pages` to `out` as one record (`encode_record`), straight from
+/// the pages, without the record whole in memory (SPEC §90): the CRC
+/// heads the record, so it's worked out first, in a pass over the pages
+/// in memory, and then they are written. Returns the record's length.
+///
+/// A record can't hold more than `u32::MAX` bytes of body, about 4 GiB
+/// of pages: a batch over that is refused, with nothing written.
+fn write_record(out: &mut impl Write, pages: &[(PageId, &[u8])]) -> io::Result<u64> {
+    let body_len = body_len(pages.len())?;
+    let count = (pages.len() as u32).to_le_bytes();
+    let mut crc = Crc32::new();
+    crc.update(&count);
     for (id, page) in pages {
         assert_eq!(
             page.len(),
             USABLE_PAGE_SIZE,
             "WAL page images are whole pages"
         );
-        body.extend_from_slice(&id.to_le_bytes());
-        body.extend_from_slice(page);
+        crc.update(&id.to_le_bytes());
+        crc.update(page);
     }
-
-    let mut record = Vec::with_capacity(8 + body.len());
-    record.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    record.extend_from_slice(&crc32(&body).to_le_bytes());
-    record.extend_from_slice(&body);
-    record
+    out.write_all(&body_len.to_le_bytes())?;
+    out.write_all(&crc.finish().to_le_bytes())?;
+    out.write_all(&count)?;
+    for (id, page) in pages {
+        out.write_all(&id.to_le_bytes())?;
+        out.write_all(page)?;
+    }
+    Ok(8 + u64::from(body_len))
 }
+
+/// The body length of a record of `pages` pages, if it fits the record's
+/// `u32` length (SPEC §90): before it was cut to 32 bits without a word,
+/// and recovery after a crash misread the record.
+fn body_len(pages: usize) -> io::Result<u32> {
+    (pages as u64)
+        .checked_mul(PAGE_ENTRY_LEN as u64)
+        .and_then(|entries| entries.checked_add(4))
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a batch of {pages} pages is too large for one WAL record: at most {} pages",
+                    MAX_RECORD_PAGES
+                ),
+            )
+        })
+}
+
+/// The most pages one record holds: its body, a `u32` count and the
+/// entries, within `u32::MAX` bytes. 524,032 pages, 4 GiB of them.
+const MAX_RECORD_PAGES: usize = (u32::MAX as usize - 4) / PAGE_ENTRY_LEN;
+
+/// `log`'s writing: the WAL's header first if `first`, then the record,
+/// through a buffer, flushed. Returns how many bytes were written.
+///
+/// The flush is not left to the buffer's drop, which ignores an error:
+/// a last write that failed (a full disk) would have `log` report a
+/// record durable that isn't whole (SPEC §90).
+fn write_buffered(file: impl Write, first: bool, pages: &[(PageId, &[u8])]) -> io::Result<u64> {
+    // Refused before the header goes into the buffer, which dropping it
+    // would write: a refused batch leaves nothing to undo.
+    body_len(pages.len())?;
+    let capacity = WRITE_BUFFER.min(pages.len() * PAGE_ENTRY_LEN + 32);
+    let mut out = BufWriter::with_capacity(capacity, file);
+    let mut len = 0;
+    if first {
+        out.write_all(&encode_header())?;
+        len += WAL_HEADER_LEN as u64;
+    }
+    len += write_record(&mut out, pages)?;
+    out.flush()?;
+    Ok(len)
+}
+
+/// How many bytes of a record `log` collects before a write: enough
+/// that a large batch takes one system call per megabyte, not two a page.
+const WRITE_BUFFER: usize = 1 << 20;
 
 /// Reads every complete batch record in `bytes` and returns their page
 /// images, flattened in log order — restoring them in that order leaves
@@ -225,19 +292,14 @@ impl Durability for WalDurability {
             return Ok(());
         }
         let end = self.file.seek(SeekFrom::End(0))?;
-        let mut bytes = Vec::new();
-        if end == 0 {
-            bytes.extend_from_slice(&encode_header());
-        }
-        bytes.extend_from_slice(&encode_record(pages));
-        self.file.write_all(&bytes)?;
+        let len = write_buffered(&self.file, end == 0, pages)?;
         #[cfg(test)]
         if self.failing_logs > 0 {
             self.failing_logs -= 1;
             return Err(io::Error::other("injected log failure"));
         }
         crate::storage::sync(&self.file)?;
-        self.len = end + bytes.len() as u64;
+        self.len = end + len;
         Ok(())
     }
 
@@ -339,6 +401,114 @@ mod tests {
             vec![(5, page(5))],
             "header rewritten after the checkpoint"
         );
+    }
+
+    /// A record is written as `encode_record` encodes it, in pieces
+    /// through the buffer when it's larger than that (SPEC §90), and read
+    /// back whole.
+    #[test]
+    fn a_record_larger_than_the_write_buffer_is_logged_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let images: Vec<PageImage> = (0..300).map(|id| (id, page(id as u8))).collect();
+        assert!(images.len() * PAGE_ENTRY_LEN > 2 * WRITE_BUFFER);
+        let pages: Vec<(PageId, &[u8])> = images.iter().map(|(id, p)| (*id, &p[..])).collect();
+
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        wal.log(&pages).unwrap();
+        log(&mut wal, &two_page_batch());
+        let mut expected = encode_header().to_vec();
+        expected.extend_from_slice(&encode_record(&pages));
+        let bytes = wal_bytes(&db_path);
+        assert_eq!(bytes[..expected.len()], expected[..]);
+        assert_eq!(wal.len(), bytes.len() as u64);
+        drop(wal);
+
+        let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let mut all = images.clone();
+        all.extend(two_page_batch());
+        assert_eq!(recovered, all);
+    }
+
+    /// A batch whose record would be over 4 GiB is refused, before
+    /// anything is written (SPEC §90): its length would not fit the
+    /// record's `u32`.
+    #[test]
+    fn a_batch_too_large_for_one_record_is_refused_with_nothing_written() {
+        assert_eq!(body_len(0).unwrap(), 4);
+        let largest = body_len(MAX_RECORD_PAGES).unwrap();
+        assert!(u64::from(largest) + PAGE_ENTRY_LEN as u64 > u64::from(u32::MAX));
+        assert!(body_len(MAX_RECORD_PAGES + 1).is_err());
+        assert!(body_len(usize::MAX).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        log(&mut wal, &two_page_batch());
+        let before = wal_bytes(&db_path);
+        let one = page(7);
+        let too_many = vec![(1, &one[..]); MAX_RECORD_PAGES + 1];
+        let err = wal.log(&too_many).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("too large for one WAL record"),
+            "{err}"
+        );
+        assert_eq!(wal_bytes(&db_path), before);
+        assert_eq!(wal.len(), before.len() as u64);
+
+        wal.checkpoint().unwrap();
+        let err = wal.log(&too_many).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(wal_bytes(&db_path).is_empty(), "not even the header");
+    }
+
+    /// Takes `room` bytes, then fails every write, as a full disk does.
+    struct FullAfter {
+        room: usize,
+        written: Vec<u8>,
+    }
+
+    impl Write for FullAfter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let n = bytes.len().min(self.room - self.written.len());
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
+            }
+            self.written.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A write that fails at the very end of a record fails `log`'s
+    /// writing too, for a batch smaller than the buffer and for one
+    /// larger: none is reported written that isn't whole (SPEC §90).
+    #[test]
+    fn a_record_whose_last_bytes_fail_to_write_is_an_error() {
+        for count in [2, 300] {
+            let images: Vec<PageImage> = (0..count).map(|id| (id, page(id as u8))).collect();
+            let pages: Vec<(PageId, &[u8])> = images.iter().map(|(id, p)| (*id, &p[..])).collect();
+            let whole = WAL_HEADER_LEN + encode_record(&pages).len();
+
+            let mut fits = FullAfter {
+                room: whole,
+                written: Vec::new(),
+            };
+            assert_eq!(
+                write_buffered(&mut fits, true, &pages).unwrap(),
+                whole as u64
+            );
+            let mut short = FullAfter {
+                room: whole - 1,
+                written: Vec::new(),
+            };
+            let err = write_buffered(&mut short, true, &pages).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::StorageFull, "{count} pages");
+        }
     }
 
     #[test]
