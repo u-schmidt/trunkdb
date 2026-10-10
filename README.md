@@ -217,6 +217,10 @@ trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
 trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 ```
 
+`info`, `check` and `export` open the file read-only: they change
+nothing in it or in its WAL, even after a crash of the program that had
+it open.
+
 ## Performance
 
 Not fast yet, and measured so it can get there. `bench/` runs one
@@ -479,6 +483,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `Error::SnapshotOpen` while a snapshot or cursor is kept (§80), and
     a read of a snapshot kept past `snapshot_memory` with
     `Error::SnapshotTooOld` (§83); files and exports as in 0.14.0.
+58. **A read-only open** (§88): `OpenOptions::read_only(true)` takes a
+    shared lock and writes nothing, not even recovery, which it keeps
+    in memory. Every write fails with `Error::ReadOnly`. The command's
+    `info`, `check` and `export` open read-only.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

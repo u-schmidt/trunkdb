@@ -36,6 +36,7 @@ All of it is done:
 | 0.16.0 | Documents as JSON text: `Display` and `FromStr` for `Document`, tagged JSON as an export writes it, and `ParseDocumentError`; `Filter::skip`, for paging with `limit`, read through an index only as far as skip plus limit; more update operators, `min`, `max`, `rename`, and `push`, `add_to_set` and `pull` on arrays | §71–§73 |
 | 0.17.0 | `find_with_ids` and `find_one_with_id` removed, typed and untyped, and a `cursor` handing out `T` instead of `(DocId, T)` (breaking); the id from the type's `_id` field, a wrapper with `#[serde(flatten)]` for a type from another crate; a free-space map per collection, in memory, so inserts refill the room deletes and updates leave in older data pages | §74–§75 |
 | 0.18.0 | A WAL size limit, `OpenOptions::checkpoint_wal_bytes`, so a large `checkpoint_pages` cannot grow the WAL without bound; a failed log taken back alone, so it no longer empties the WAL along with the batches committed before it (a fix to §51); snapshot reads: a batch is staged, logged, flushed and checkpointed beside the readers, which wait only for its publish, and a page's older versions stay in memory for the snapshots open, so a read keeps its commit to its end and commits wait for no read; `Database::snapshot` and `View<T>`, a snapshot a caller keeps, and a `cursor` that shows the moment it was made (breaking for code that relied on seeing later changes); `OpenOptions::snapshot_memory`, a limit on what snapshots keep, past which the oldest is ended with `Error::SnapshotTooOld`; `compact` takes the database alone and is refused with `Error::SnapshotOpen` while a snapshot is kept | §76–§83 |
+| next | A read-only open, `OpenOptions::read_only`: a shared file lock, nothing written, the WAL's batches and the open's own changes kept in memory, every write refused with `Error::ReadOnly`; the `trunkdb` command's `info`, `check` and `export` open read-only | §88 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -169,9 +170,8 @@ limit is described.
   compile time.
 
 **Tooling and reach**
-- A read-only open (`OpenOptions::read_only`): a shared file lock and
-  nothing written, not even by recovery, for a tool that inspects files
-  no application has open. Small, and independent of snapshots (§77).
+- Done in §88: a read-only open (`OpenOptions::read_only`), a shared
+  file lock and nothing written, recovery kept in memory.
 - Repairing what `check` finds, beyond export and import (§39.5).
 - `check` finding overlapping cells on a page (§54.2).
 - Longer fuzzing runs, with AddressSanitizer too, and short ones in CI
