@@ -206,6 +206,19 @@ impl WalDurability {
     }
 }
 
+/// The page images of every batch still pending in the WAL next to
+/// `db_path`, for a read-only open (SPEC §88): read, never written —
+/// a torn tail is left where it is, and a WAL that isn't there is not
+/// created. Nothing pending then.
+pub fn read_pending(db_path: &Path) -> io::Result<Vec<PageImage>> {
+    let bytes = match std::fs::read(wal_path(db_path)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    decode_pending(&bytes)
+}
+
 impl Durability for WalDurability {
     fn log(&mut self, pages: &[(PageId, &[u8])]) -> io::Result<()> {
         if pages.is_empty() {

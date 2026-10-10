@@ -194,6 +194,17 @@ pub struct FileStore {
     staging: Option<Staging>,
 }
 
+/// How `FileStore::from_file` locks the file.
+enum Lock {
+    /// For an open that writes: no other open beside it.
+    Exclusive,
+    /// For a read-only open (SPEC §88): other read-only opens beside it.
+    Shared,
+    /// For a test's second handle on a file it has open already.
+    #[cfg(test)]
+    None,
+}
+
 struct Staging {
     /// The header as of `begin`, restored by `rollback`.
     header_before: Header,
@@ -241,23 +252,37 @@ impl FileStore {
             .create(true)
             .truncate(false)
             .open(path)?;
-        Self::from_file(file, true)
+        Self::from_file(file, Lock::Exclusive)
     }
 
-    /// `open` on an already-open file; `lock: false` only for tests, which
+    /// `open_before_recovery` for a read-only open (SPEC §88): the file
+    /// opened for reading only, so nothing can be written through it,
+    /// and never created — a missing one is `ErrorKind::NotFound`. The
+    /// lock is shared: other read-only opens may hold it too, but an
+    /// open that writes may not, and none is had while one holds it.
+    pub(crate) fn open_read_only(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        Self::from_file(file, Lock::Shared)
+    }
+
+    /// `open` on an already-open file; `Lock::None` only for tests, which
     /// look at the file through a second handle (`on_disk`).
-    fn from_file(file: File, lock: bool) -> io::Result<Self> {
-        if lock {
-            // Before reading anything: what we'd read could be mid-change
-            // by the holder.
-            file.try_lock().map_err(|e| match e {
-                std::fs::TryLockError::WouldBlock => io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "database file is already open (by another process, or another handle in this one)",
-                ),
-                std::fs::TryLockError::Error(e) => e,
-            })?;
-        }
+    fn from_file(file: File, lock: Lock) -> io::Result<Self> {
+        // Before reading anything: what we'd read could be mid-change by
+        // the holder.
+        let locked = match lock {
+            Lock::Exclusive => file.try_lock(),
+            Lock::Shared => file.try_lock_shared(),
+            #[cfg(test)]
+            Lock::None => Ok(()),
+        };
+        locked.map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "database file is already open (by another process, or another handle in this one)",
+            ),
+            std::fs::TryLockError::Error(e) => e,
+        })?;
 
         // Fresh unless a complete header page is on disk. The header isn't
         // written here: it reaches the file with the first write that
@@ -647,6 +672,50 @@ impl FileStore {
             self.staging.is_none(),
             "FileStore::restore_pages while staging"
         );
+        self.check_restorable(pages)?;
+        self.pages.restore(pages)?;
+        self.header = read_header(self.pages.file())?;
+        self.header_checked = true;
+        self.header_error = None;
+        // A crash can come between a shrinking batch's write-back and
+        // its cut.
+        self.pages.truncate(self.header.page_count)?;
+        self.pages.sync()
+    }
+
+    /// `restore_pages` for a read-only open (SPEC §88): the same pages,
+    /// checked the same way, but kept in memory instead of written to
+    /// the file — as one commit, read from memory like any commit not
+    /// written back yet, and never written back. The file and the WAL
+    /// stay as they are, and the next open that writes recovers from the
+    /// WAL as it would have. The header is the WAL's newest image of it,
+    /// if it has one; then the file's isn't checked, nor read again.
+    pub(crate) fn restore_in_memory(&mut self, pages: &[PageImage]) -> io::Result<()> {
+        assert!(
+            self.staging.is_none(),
+            "FileStore::restore_in_memory while staging"
+        );
+        self.check_restorable(pages)?;
+        // A page logged more than once ends at its latest image, as
+        // `restore_pages` writes them in order.
+        let latest: BTreeMap<PageId, Page> = pages
+            .iter()
+            .map(|(id, page)| (*id, Page::from(&page[..])))
+            .collect();
+        if let Some(header) = latest.get(&HEADER_PAGE) {
+            self.header = Header::decode(header)?;
+            self.header_checked = true;
+            self.header_error = None;
+        }
+        self.pages.commit(latest, BTreeMap::new(), &[]);
+        Ok(())
+    }
+
+    /// Whether the pages recovered from the WAL can be restored: the
+    /// header's fields, if the file's are damaged, and every page within
+    /// the file as the WAL's header has it. Checked before anything is
+    /// restored, so a damaged WAL leaves the file as it was.
+    fn check_restorable(&mut self, pages: &[PageImage]) -> io::Result<()> {
         // A page past the end of the file, as the header before it has
         // it, is damage (SPEC §55): a batch that grows the file logs its
         // header too, and first, as page 0. Checked before anything is
@@ -684,14 +753,7 @@ impl FileStore {
                 ));
             }
         }
-        self.pages.restore(pages)?;
-        self.header = read_header(self.pages.file())?;
-        self.header_checked = true;
-        self.header_error = None;
-        // A crash can come between a shrinking batch's write-back and
-        // its cut.
-        self.pages.truncate(self.header.page_count)?;
-        self.pages.sync()
+        Ok(())
     }
 }
 
@@ -1372,6 +1434,49 @@ mod tests {
         assert_eq!(store.read_page(4).unwrap(), page);
     }
 
+    /// `restore_in_memory` refuses what `restore_pages` does (SPEC §88),
+    /// and restores the rest to memory only: read, but not in the file.
+    #[test]
+    fn restoring_in_memory_checks_the_pages_and_writes_none() {
+        let (_dir, path) = open_temp();
+        two_page_file(&path);
+        let before = std::fs::read(&path).unwrap();
+        let mut store = FileStore::open_read_only(&path).unwrap();
+        let page = vec![7u8; USABLE_PAGE_SIZE];
+        let header = |page_count| {
+            Header {
+                page_size: PAGE_SIZE as u32,
+                page_count,
+                free_list_head: NO_FREE_PAGE,
+                format_version: FORMAT_VERSION,
+            }
+            .encode()
+            .to_vec()
+        };
+
+        let past = store.restore_in_memory(&[(3, page.clone())]).unwrap_err();
+        assert!(past.to_string().contains("page 3, past the end"), "{past}");
+        let err = store
+            .restore_in_memory(&[(HEADER_PAGE, header(5))])
+            .unwrap_err();
+        assert!(err.to_string().contains("can account for (4)"), "{err}");
+
+        let grown = [
+            (HEADER_PAGE, header(5)),
+            (2, vec![1u8; USABLE_PAGE_SIZE]),
+            (2, page.clone()),
+            (3, page.clone()),
+            (4, page.clone()),
+        ];
+        store.restore_in_memory(&grown).unwrap();
+        store.check_header().unwrap();
+        assert_eq!(store.page_count(), 5);
+        assert_eq!(store.read_page(2).unwrap(), page, "the latest image");
+        assert_eq!(store.read_page(4).unwrap(), page);
+        drop(store);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    }
+
     /// A WAL header can't count more pages than the file and the WAL's
     /// own pages make (SPEC §87): the restore would write at the far end
     /// of a sparse file, of any size.
@@ -1492,7 +1597,7 @@ mod tests {
     /// the lock is mandatory, so a separately opened handle couldn't read
     /// the locked file at all.
     fn on_disk(store: &FileStore) -> FileStore {
-        FileStore::from_file(store.pages.file().try_clone().unwrap(), false).unwrap()
+        FileStore::from_file(store.pages.file().try_clone().unwrap(), Lock::None).unwrap()
     }
 
     #[test]

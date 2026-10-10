@@ -177,6 +177,38 @@ fn a_file_in_use_is_named_as_such() {
     assert!(trunkdb(&["info", &db_path]).status.success());
 }
 
+/// `info`, `check` and `export` open the file read-only (SPEC §88), so
+/// they go beside a read-only open of it, and `compact` doesn't.
+#[test]
+fn looking_into_a_file_opens_it_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db_path, out) = (
+        path(dir.path(), "db.trunkdb"),
+        path(dir.path(), "out.jsonl"),
+    );
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    db.collection::<trunkdb::Document>("users")
+        .insert(trunkdb::Document::Int(1))
+        .unwrap();
+    drop(db);
+    let read_only = trunkdb::OpenOptions::default().read_only(true);
+    let db = trunkdb::Database::open_with(&db_path, read_only).unwrap();
+
+    let output = trunkdb(&["info", &db_path]);
+    assert!(
+        stdout(&output).contains("users: 1 document"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(trunkdb(&["check", &db_path]).status.success());
+    assert!(trunkdb(&["export", &db_path, &out]).status.success());
+    assert!(std::fs::read_to_string(&out).unwrap().contains("users"));
+    let output = trunkdb(&["compact", &db_path]);
+    assert!(stderr(&output).contains("in use by another program"));
+    drop(db);
+    assert!(trunkdb(&["compact", &db_path]).status.success());
+}
+
 /// `Command::output`, with something written to the child's stdin first.
 trait OutputWith {
     fn output_with(

@@ -59,7 +59,9 @@ they come from [§8](spec/08-ownership-one-refcell-boundary-not-one-per-componen
 The database file holds an OS advisory lock (`flock`, `LockFileEx`)
 while it's open, so a second `open` fails at once instead of reading a
 file another process is writing [§21](spec/21-an-exclusive-file-lock-and-a-format-version.md). Within one process, a handle is
-cloned, not opened twice.
+cloned, not opened twice. A read-only open (`OpenOptions::read_only`)
+takes the lock shared: read-only opens go together, and none goes
+beside an open that writes [§88](spec/88-a-read-only-open.md).
 
 Between checkpoints the newest pages are only in the WAL. The main file
 is complete on its own after `db.checkpoint()`, and after the last
@@ -154,6 +156,13 @@ replaced because a crash between the several page writes of one
 operation, a B-tree split say, left a file that replaying the operation
 couldn't repair; page images need no structure-specific recovery at all
 [§16](spec/16-durability-a-real-write-ahead-log.md) [§19.1](spec/19-durability-take-two-a-page-image-wal.md).
+
+A read-only open recovers in memory: the WAL's batches, checked as for a
+restore, become one commit that is never written back. The same goes for
+whatever the open would change itself (an empty file's catalog page, an
+old file's index keys). The file and the WAL stay as they are, and the
+next open that writes recovers from the WAL. Every write fails with
+`Error::ReadOnly` [§88](spec/88-a-read-only-open.md).
 
 ## 6. Documents and data pages
 
@@ -381,7 +390,7 @@ more than four.
 ## 10. The API
 
 - `Database::open(path)`, or `open_with(path, OpenOptions)` with
-  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md) and `snapshot_memory` [§83](spec/83-a-limit-on-the-memory-snapshots-take.md).
+  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md), `snapshot_memory` [§83](spec/83-a-limit-on-the-memory-snapshots-take.md) and `read_only` [§88](spec/88-a-read-only-open.md).
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
   `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md);
   `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);
@@ -416,7 +425,7 @@ more than four.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md); `info`, `check` and `export` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
   without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md).

@@ -2,7 +2,7 @@ use crate::batch::Batch;
 use crate::catalog::Catalog;
 use crate::collection::{Collection, apply_write_op};
 use crate::data;
-use crate::durability::{Durability, WalDurability};
+use crate::durability::{self, Durability, WalDurability};
 use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
 use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
@@ -73,7 +73,9 @@ struct Shared {
 /// so the writer's lock is the one place they come from.
 pub(crate) struct Writer {
     pub(crate) store: FileStore,
-    durability: WalDurability,
+    /// `None` for a read-only open (SPEC §88), which has no WAL to write
+    /// to: `Database::write` refuses before anything reaches for it.
+    durability: Option<WalDurability>,
     /// `OpenOptions::checkpoint_pages`, as of `open_with`: how many
     /// committed pages may wait before a commit writes them back.
     checkpoint_pages: usize,
@@ -165,6 +167,7 @@ pub struct OpenOptions {
     checkpoint_pages: usize,
     checkpoint_wal_bytes: Option<u64>,
     snapshot_memory: usize,
+    read_only: bool,
 }
 
 impl Default for OpenOptions {
@@ -174,6 +177,7 @@ impl Default for OpenOptions {
             checkpoint_pages: DEFAULT_CHECKPOINT_PAGES,
             checkpoint_wal_bytes: None,
             snapshot_memory: crate::storage::DEFAULT_VERSION_LIMIT * crate::storage::PAGE_SIZE,
+            read_only: false,
         }
     }
 }
@@ -229,6 +233,26 @@ impl OpenOptions {
         self.snapshot_memory = bytes;
         self
     }
+
+    /// Opens the database without writing to it (SPEC §88): for a tool
+    /// that looks into a file no application has open. Default: `false`.
+    ///
+    /// Nothing is written, not even what an open does by itself: the
+    /// batches a crash left in the WAL are read into memory, not written
+    /// back, and the WAL stays as it is for the next open that writes. A
+    /// missing file is an error, not a new database; a missing WAL is
+    /// none. The file only has to be readable.
+    ///
+    /// Every write fails with `Error::ReadOnly`, `checkpoint` and
+    /// `compact` too. Reads, snapshots, `check` and `export` work as ever.
+    ///
+    /// The file's lock is shared: any number of read-only opens may hold
+    /// it together, but while one does, an open that writes fails, as it
+    /// does beside another one that writes — and the other way round.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
 }
 
 /// How many committed pages may wait in memory, logged but not written
@@ -237,6 +261,12 @@ impl OpenOptions {
 const DEFAULT_CHECKPOINT_PAGES: usize = 1000;
 
 impl Writer {
+    /// The WAL, for tests that look at it or make it fail.
+    #[cfg(test)]
+    pub(crate) fn wal(&mut self) -> &mut WalDurability {
+        wal(&mut self.durability)
+    }
+
     /// `Database::checkpoint`: the pages to the file, then the WAL
     /// emptied — only after they're durably in the file. If the WAL can't
     /// be emptied, its records are written back once more at the next
@@ -245,7 +275,7 @@ impl Writer {
     fn checkpoint(&mut self) -> std::io::Result<()> {
         let live = self.live();
         self.store.checkpoint_beside(&live)?;
-        let _ = self.durability.checkpoint();
+        let _ = wal(&mut self.durability).checkpoint();
         Ok(())
     }
 
@@ -267,6 +297,14 @@ impl Writer {
     }
 }
 
+/// The writer's WAL. Only a read-only open has none, and `Database::write`
+/// refuses that one before a batch or a checkpoint gets here (SPEC §88).
+fn wal(durability: &mut Option<WalDurability>) -> &mut WalDurability {
+    durability
+        .as_mut()
+        .expect("a read-only database is never written to")
+}
+
 /// The last handle gone: what's committed goes to the main file, so it's
 /// complete without its WAL. Best effort — if it fails, the next open
 /// recovers the same pages from the WAL.
@@ -274,6 +312,8 @@ impl Drop for Shared {
     fn drop(&mut self) {
         if !*self.poisoned.get_mut()
             && let Ok(writer) = self.writer.get_mut()
+            // Read-only (SPEC §88): what's in memory stays there.
+            && writer.durability.is_some()
         {
             let _ = writer.checkpoint();
         }
@@ -325,6 +365,27 @@ impl Database {
     /// ```
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> crate::Result<Self> {
         let path = path.as_ref();
+        if options.read_only {
+            let mut store = FileStore::open_read_only(path)?;
+            store.set_cache_size(options.cache_size);
+            store.set_snapshot_memory(options.snapshot_memory);
+            let pending = durability::read_pending(path)?;
+            if !pending.is_empty() {
+                store.restore_in_memory(&pending)?;
+            }
+            store.check_header()?;
+            let catalog = Self::load_catalog(&mut store)?;
+            if store.dirty_pages().next().is_some() {
+                // A fresh file's catalog page, or the index keys an old
+                // file lacks: committed in memory, never logged nor
+                // written back, like the WAL's pages.
+                store.check_staged();
+                store.commit();
+            } else {
+                store.rollback();
+            }
+            return Ok(Self::from_parts(store, None, catalog, options));
+        }
         let mut store = FileStore::open_before_recovery(path)?;
         store.set_cache_size(options.cache_size);
         store.set_snapshot_memory(options.snapshot_memory);
@@ -340,19 +401,7 @@ impl Database {
         // next batch must not be appended after that garbage.
         durability.checkpoint()?;
 
-        store.begin();
-        let catalog = match Catalog::load(&mut store)
-            .map_err(crate::Error::from)
-            .and_then(|catalog| {
-                crate::collection::key_ids_in_old_indexes(&catalog, &mut store)?;
-                Ok(catalog)
-            }) {
-            Ok(catalog) => catalog,
-            Err(e) => {
-                store.rollback();
-                return Err(e);
-            }
-        };
+        let catalog = Self::load_catalog(&mut store)?;
         let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
         if pages.is_empty() {
             drop(pages);
@@ -365,9 +414,36 @@ impl Database {
             store.write_back()?;
             durability.checkpoint()?;
         }
-        let current = Committed::new(store.last_commit(), catalog);
+        Ok(Self::from_parts(store, Some(durability), catalog, options))
+    }
 
-        Ok(Self {
+    /// The catalog, loaded in a batch begun here and left staged: on a
+    /// fresh file it bootstraps the catalog page, and on an old one it
+    /// keys the ids its indexes lack (SPEC §62). Rolled back on error.
+    fn load_catalog(store: &mut FileStore) -> crate::Result<Catalog> {
+        store.begin();
+        let loaded = Catalog::load(store)
+            .map_err(crate::Error::from)
+            .and_then(|catalog| {
+                crate::collection::key_ids_in_old_indexes(&catalog, store)?;
+                Ok(catalog)
+            });
+        if loaded.is_err() {
+            store.rollback();
+        }
+        loaded
+    }
+
+    /// The handle, on a store recovered and loaded with `catalog`, all of
+    /// it committed; `durability` is `None` for a read-only open.
+    fn from_parts(
+        store: FileStore,
+        durability: Option<WalDurability>,
+        catalog: Catalog,
+        options: OpenOptions,
+    ) -> Self {
+        let current = Committed::new(store.last_commit(), catalog);
+        Self {
             inner: Arc::new(Shared {
                 pages: store.pages.clone(),
                 current: RwLock::new(current),
@@ -387,7 +463,7 @@ impl Database {
                 id_gen: UuidV7Generator,
                 txn: GlobalLockTxnManager::default(),
             }),
-        })
+        }
     }
 
     pub fn collection<T>(&self, name: &str) -> Collection<T> {
@@ -499,13 +575,18 @@ impl Database {
     }
 
     /// Access for a write batch, one at a time; poisoned as for `read`.
-    /// Readers go on.
+    /// Readers go on. `Err(Error::ReadOnly)` on a database opened
+    /// read-only (SPEC §88), before anything else: every write, and
+    /// `checkpoint`, comes through here.
     fn write(&self) -> crate::Result<MutexGuard<'_, Writer>> {
         let writer = self
             .inner
             .writer
             .lock()
             .map_err(|_| crate::Error::Poisoned)?;
+        if writer.durability.is_none() {
+            return Err(crate::Error::ReadOnly);
+        }
         if self.inner.poisoned.load(Ordering::Relaxed) {
             return Err(crate::Error::Poisoned);
         }
@@ -619,7 +700,7 @@ impl Database {
         };
 
         let pages: Vec<(PageId, &[u8])> = writer.store.dirty_pages().collect();
-        let logged = writer.durability.log(&pages);
+        let logged = wal(&mut writer.durability).log(&pages);
         drop(pages);
         if let Err(e) = logged {
             writer.store.rollback();
@@ -630,7 +711,7 @@ impl Database {
             // out, and keeps the batches committed before it, which are
             // nowhere else on disk yet (SPEC §81); if even that fails,
             // the batch's fate is genuinely unknown.
-            if writer.durability.undo_failed_log().is_err() {
+            if wal(&mut writer.durability).undo_failed_log().is_err() {
                 self.inner.poisoned.store(true, Ordering::Relaxed);
             }
             return Err(e.into());
@@ -664,7 +745,7 @@ impl Database {
         drop(before);
 
         if writer.store.unwritten_pages() >= writer.checkpoint_pages
-            || writer.durability.len() >= writer.checkpoint_wal_bytes
+            || wal(&mut writer.durability).len() >= writer.checkpoint_wal_bytes
         {
             // Not an error for this batch if it fails: it's durable, and
             // reads find its pages in memory. The next one tries again.
@@ -992,7 +1073,7 @@ mod tests {
         let path = dir.path().join("test.trunkdb");
         let db = Database::open(&path).unwrap();
         let catalog_page = crate::storage::PageStore::read_page(&db.state().store, 1).unwrap();
-        db.state().durability.log(&[(1, &catalog_page)]).unwrap();
+        db.state().wal().log(&[(1, &catalog_page)]).unwrap();
         let wal_path = dir.path().join("test.trunkdb.wal");
         let wal_len = std::fs::metadata(&wal_path).unwrap().len();
 
@@ -1004,6 +1085,231 @@ mod tests {
 
         drop(db);
         Database::open(&path).unwrap();
+    }
+
+    // --- A read-only open (SPEC §88) ---
+
+    fn open_read_only(path: &Path) -> crate::Result<Database> {
+        Database::open_with(path, OpenOptions::default().read_only(true))
+    }
+
+    /// The database file's bytes and its WAL's, `None` for one missing.
+    fn files(path: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let wal = path.with_extension("trunkdb.wal");
+        (std::fs::read(path).ok(), std::fs::read(wal).ok())
+    }
+
+    /// Opens `path` read-only and reads it every way there is, then drops
+    /// it: the bytes of the file and the WAL are what they were.
+    fn read_everything_read_only(path: &Path) -> Database {
+        let before = files(path);
+        let db = open_read_only(path).unwrap();
+        db.file_info().unwrap();
+        assert!(db.check().unwrap().is_ok());
+        db.export(std::io::sink()).unwrap();
+        for name in db.collections().unwrap() {
+            db.collection::<Document>(&name)
+                .find(Filter::new())
+                .unwrap();
+        }
+        drop(db.snapshot().unwrap());
+        drop(db.clone());
+        assert_eq!(files(path), before, "an open handle wrote");
+        let kept = open_read_only(path).unwrap();
+        drop(db);
+        assert_eq!(files(path), before, "the last handle's drop wrote");
+        kept
+    }
+
+    #[test]
+    fn a_read_only_open_writes_nothing_to_a_clean_file() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        let db = read_everything_read_only(&path);
+        assert_two_collection_batch_present(&db);
+    }
+
+    /// The WAL's batches are read into memory and not written back: the
+    /// read-only open reads them, and the WAL stays for the next open
+    /// that writes, which recovers them as it would have.
+    #[test]
+    fn a_read_only_open_reads_the_wal_and_leaves_it() {
+        for crash in [
+            CrashPoint::AfterLog,
+            CrashPoint::MidWriteBack { pages_written: 1 },
+            CrashPoint::BeforeCheckpoint,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.trunkdb");
+            drop(Database::open(&path).unwrap());
+            log_batch_then_crash(&path, &two_collection_batch(), crash);
+            let wal = files(&path).1.unwrap();
+            assert!(!wal.is_empty());
+
+            let db = read_everything_read_only(&path);
+            assert_two_collection_batch_present(&db);
+            drop(db);
+            assert_eq!(files(&path).1.unwrap(), wal);
+
+            let db = Database::open(&path).unwrap();
+            assert_two_collection_batch_present(&db);
+            assert!(db.check().unwrap().is_ok());
+            drop(db);
+            assert_eq!(
+                files(&path).1.unwrap(),
+                b"",
+                "recovered by the open that writes"
+            );
+        }
+    }
+
+    /// A torn tail is left where it is: cutting it off is a write.
+    #[test]
+    fn a_read_only_open_leaves_a_torn_wal_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+        let wal_path = dir.path().join("test.trunkdb.wal");
+        let len = std::fs::metadata(&wal_path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+
+        let db = read_everything_read_only(&path);
+        assert_eq!(get(&db, "posts", 1), None);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), len - 3);
+    }
+
+    /// Damaged header fields are replaced from the WAL's header image in
+    /// memory, as an open that writes replaces them in the file (SPEC
+    /// §85); without one they are damage here too.
+    #[test]
+    fn a_read_only_open_takes_damaged_header_fields_from_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::BeforeCheckpoint);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[12..20].copy_from_slice(&0u64.to_le_bytes()); // page count
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = read_everything_read_only(&path);
+        assert_two_collection_batch_present(&db);
+        drop(db);
+
+        std::fs::remove_file(dir.path().join("test.trunkdb.wal")).unwrap();
+        let err = open_read_only(&path).err().expect("damage");
+        assert!(err.to_string().contains("header counts 0 pages"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// A missing file isn't created, nor its WAL: it is an error. An
+    /// empty one, which an open that writes would bootstrap, is an empty
+    /// database, and stays an empty file.
+    #[test]
+    fn a_read_only_open_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let Err(crate::Error::Io(err)) = open_read_only(&path) else {
+            panic!("a missing file must fail with an I/O error");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        std::fs::write(&path, b"").unwrap();
+        let db = read_everything_read_only(&path);
+        assert!(db.collections().unwrap().is_empty());
+        assert_eq!(get(&db, "posts", 1), None);
+        drop(db);
+        assert_eq!(files(&path), (Some(Vec::new()), None));
+    }
+
+    #[test]
+    fn every_write_to_a_read_only_database_is_refused() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(two_collection_batch()).unwrap();
+        db.collection::<Document>("posts")
+            .ensure_index("a")
+            .unwrap();
+        drop(db);
+        let before = files(&path);
+        let db = open_read_only(&path).unwrap();
+        let posts = db.collection::<Document>("posts");
+        let id = DocId([1; 16]);
+        let export = {
+            let mut out = Vec::new();
+            db.export(&mut out).unwrap();
+            out
+        };
+
+        let mut batch = db.batch();
+        batch.insert(&posts, Document::Int(1)).unwrap();
+        let results: Vec<(&str, crate::Result<()>)> = vec![
+            ("write_batch", db.write_batch(vec![insert("posts", 7, 7)])),
+            ("an empty write_batch", db.write_batch(Vec::new())),
+            ("insert", posts.insert(Document::Int(1)).map(drop)),
+            ("update", posts.update(&id, Document::Int(2)).map(drop)),
+            ("delete", posts.delete(&id).map(drop)),
+            ("delete_many", posts.delete_many(Filter::new()).map(drop)),
+            ("an index that exists", posts.ensure_index("a").map(drop)),
+            ("drop_index", posts.drop_index("a").map(drop)),
+            ("drop_collection", db.drop_collection("posts").map(drop)),
+            ("batch", batch.commit()),
+            ("import", db.import(&export[..]).map(drop)),
+            ("compact", db.compact().map(drop)),
+            ("checkpoint", db.checkpoint()),
+        ];
+        for (what, result) in results {
+            assert!(
+                matches!(result, Err(crate::Error::ReadOnly)),
+                "{what}: {result:?}"
+            );
+        }
+        assert_two_collection_batch_present(&db);
+        drop((posts, db));
+        assert_eq!(files(&path), before);
+    }
+
+    /// The lock is shared: read-only opens go together, an open that
+    /// writes goes with none of them, nor they with it.
+    #[test]
+    fn read_only_opens_share_the_lock_that_an_open_that_writes_keeps() {
+        let (_dir, path, db) = open_temp();
+        let in_use = |result: crate::Result<Database>| matches!(result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock);
+        assert!(in_use(open_read_only(&path)), "read-only beside a writer");
+        drop(db);
+
+        let first = open_read_only(&path).unwrap();
+        let second = open_read_only(&path).unwrap();
+        assert!(in_use(Database::open(&path)), "a writer beside read-only");
+        drop(first);
+        assert!(in_use(Database::open(&path)), "a writer beside the other");
+        drop(second);
+        Database::open(&path).unwrap();
+    }
+
+    /// The file only has to be readable.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_open_opens_a_file_it_may_not_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, path, db) = open_temp();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        std::fs::remove_file(dir.path().join("test.trunkdb.wal")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let opened = open_read_only(&path);
+        let read_write = Database::open(&path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(read_write.is_err(), "the test can't take write access away");
+        assert_two_collection_batch_present(&opened.unwrap());
     }
 
     /// Pointing `open` at someone else's small file must neither
@@ -1966,7 +2272,7 @@ mod tests {
         assert!(db.state().store.unwritten_pages() > 0, "not written back");
         let logged = wal_len(&path);
 
-        db.state().durability.failing_logs = 1;
+        db.state().wal().failing_logs = 1;
         let failed = db.write_batch(vec![insert("posts", 3, 30)]);
         assert!(matches!(failed, Err(crate::Error::Io(_))), "{failed:?}");
         assert_eq!(wal_len(&path), logged, "cut back to before the failed log");
@@ -2002,8 +2308,8 @@ mod tests {
         db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
         {
             let mut state = db.state();
-            state.durability.failing_logs = 1;
-            state.durability.failing_undos = 1;
+            state.wal().failing_logs = 1;
+            state.wal().failing_undos = 1;
         }
         let failed = db.write_batch(vec![insert("posts", 2, 20)]);
         assert!(matches!(failed, Err(crate::Error::Io(_))), "{failed:?}");

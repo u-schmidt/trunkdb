@@ -4733,6 +4733,49 @@ mod tests {
     /// for ids. Opening it rebuilds those, and only those, in place, and
     /// stamps the file 10. A file without secondary indexes needs nothing
     /// and stays as it is, until the first write stamps it.
+    /// A read-only open keys the ids an old file's indexes lack as an
+    /// open that writes does, but in memory (SPEC §88): reads find them,
+    /// the file stays as it was, and is keyed again at the next open.
+    #[test]
+    fn a_read_only_open_keys_an_older_files_ids_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let owners;
+        {
+            let db = Database::open(&path).unwrap();
+            owners = (0..3).map(|_| db.id_gen().generate()).collect::<Vec<_>>();
+            let cars = db.collection::<Document>("cars");
+            let mut batch = db.batch();
+            for seats in 0..300 {
+                let owner = Document::Id(owners[seats as usize % 3]);
+                let car = object(vec![("owner", owner), ("seats", Document::Int(seats))]);
+                batch.insert(&cars, car).unwrap();
+            }
+            batch.commit().unwrap();
+            key_ids_the_old_way(&db, "cars", &["owner"], IndexOptions::new());
+        }
+        crate::storage::rewrite_format_version(&path, 9);
+        let before = std::fs::read(&path).unwrap();
+
+        let read_only = crate::OpenOptions::default().read_only(true);
+        for _ in 0..2 {
+            let mut opened = None;
+            let reads = records_read(|| {
+                opened = Some(Database::open_with(&path, read_only).unwrap());
+            });
+            assert!(reads >= 300, "keyed at every read-only open");
+            let db = opened.unwrap();
+            assert!(db.check().unwrap().is_ok());
+            let cars = db.collection::<Document>("cars");
+            let owned = Filter::new().eq("owner", owners[1]);
+            let field = "owner".to_string();
+            assert_eq!(cars.explain(&owned).unwrap(), QueryPlan::Index { field });
+            assert_eq!(cars.count(owned).unwrap(), 100);
+            drop((cars, db));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
     #[test]
     fn opening_an_older_file_keys_the_ids_its_indexes_lack() {
         let dir = tempfile::tempdir().unwrap();

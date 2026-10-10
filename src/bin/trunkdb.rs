@@ -1,5 +1,6 @@
 //! The `trunkdb` command (SPEC §39): look into a database file, check it,
-//! compact it, export it, import into it.
+//! compact it, export it, import into it. Looking, checking and exporting
+//! open it read-only (SPEC §88).
 //!
 //! Arguments are parsed by hand: five subcommands don't need a parser
 //! crate, and a library's dependencies are compiled for everyone who uses
@@ -8,7 +9,7 @@
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::ExitCode;
-use trunkdb::Database;
+use trunkdb::{Database, OpenOptions};
 
 const USAGE: &str = "\
 usage: trunkdb <command> <file> [argument]
@@ -27,17 +28,20 @@ commands:
                               it doesn't exist; `-` reads standard input.
                               A line over 256 MiB (or the given size) stops
                               the import; `none` turns the limit off
+
+info, check and export only read: they change nothing in the file or its
+log, not even what a crash of the program that had it open left there.
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args[..] {
-        ["info", file] => existing(file).and_then(|db| info(file, &db)),
-        ["check", file] => existing(file).and_then(|db| check(&db)),
+        ["info", file] => read_only(file).and_then(|db| info(file, &db)),
+        ["check", file] => read_only(file).and_then(|db| check(&db)),
         ["compact", file] => existing(file).and_then(|db| compact(&db)),
-        ["export", file] => existing(file).and_then(|db| export(&db, file, None)),
-        ["export", file, out] => existing(file).and_then(|db| export(&db, file, Some(out))),
+        ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
+        ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
         ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
         ["import", file, input, "--max-line", limit] => max_line(limit)
             .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
@@ -79,8 +83,20 @@ fn existing(file: &str) -> Result<Database, String> {
     open(file)
 }
 
+/// `existing`, opened read-only (SPEC §88): to look at, writing nothing.
+fn read_only(file: &str) -> Result<Database, String> {
+    if !Path::new(file).is_file() {
+        return Err(format!("{file}: no such file"));
+    }
+    open_with(file, OpenOptions::default().read_only(true))
+}
+
 fn open(file: &str) -> Result<Database, String> {
-    Database::open(file).map_err(|e| match e {
+    open_with(file, OpenOptions::default())
+}
+
+fn open_with(file: &str, options: OpenOptions) -> Result<Database, String> {
+    Database::open_with(file, options).map_err(|e| match e {
         trunkdb::Error::Io(e) if e.kind() == io::ErrorKind::WouldBlock => {
             format!("{file}: in use by another program (it's locked while open)")
         }

@@ -123,6 +123,10 @@ pub enum Error {
         "the snapshot is too old: what was written since took more memory than snapshots may keep; take a new one"
     )]
     SnapshotTooOld,
+    /// A write to a database opened with `OpenOptions::read_only` (SPEC
+    /// §88) — or a `checkpoint` or `compact` of one. Nothing was changed.
+    #[error("the database is open read-only: it can't be written to")]
+    ReadOnly,
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
     #[non_exhaustive]
