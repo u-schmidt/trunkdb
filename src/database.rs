@@ -207,7 +207,8 @@ impl OpenOptions {
     /// again add a page image to the WAL each time, and the next open
     /// after a crash reads all of it back. Checked after a commit, so one
     /// large commit can take the WAL past it. Default: twice the bytes of
-    /// `checkpoint_pages` pages, 16 MB at 1,000; raise both together.
+    /// `checkpoint_pages` pages, 16 MB at 1,000, and no limit for a
+    /// `checkpoint_pages` too large to count them; raise both together.
     pub fn checkpoint_wal_bytes(mut self, bytes: u64) -> Self {
         self.checkpoint_wal_bytes = Some(bytes);
         self
@@ -452,8 +453,12 @@ impl Database {
                     store,
                     durability,
                     checkpoint_pages: options.checkpoint_pages,
+                    // Saturating: a `checkpoint_pages` past 2^50 would
+                    // overflow, and wrap to a limit of next to nothing
+                    // (SPEC §89).
                     checkpoint_wal_bytes: options.checkpoint_wal_bytes.unwrap_or(
-                        2 * options.checkpoint_pages as u64 * crate::storage::PAGE_SIZE as u64,
+                        (options.checkpoint_pages as u64)
+                            .saturating_mul(2 * crate::storage::PAGE_SIZE as u64),
                     ),
                     past: Vec::new(),
                     #[cfg(test)]
@@ -1704,6 +1709,20 @@ mod tests {
         assert!(peak < 40 * PAGE_SIZE as u64, "{peak}");
         let explicit = options.checkpoint_wal_bytes(u64::MAX);
         assert!(hot_page_wal_peak(explicit).0 > 200 * PAGE_SIZE as u64);
+    }
+
+    /// A `checkpoint_pages` too large for the default WAL limit's bytes
+    /// leaves that limit at its largest, not wrapped round to a small one
+    /// (SPEC §89): `usize::MAX` checkpoints neither by pages nor by WAL.
+    #[test]
+    fn a_huge_checkpoint_pages_leaves_the_default_wal_limit_at_its_largest() {
+        let pages = 1usize << 50; // times 16 KB is 2^64: one past u64::MAX
+        for huge in [usize::MAX, pages] {
+            let options = OpenOptions::default().checkpoint_pages(huge);
+            let (peak, waiting) = hot_page_wal_peak(options);
+            assert!(peak > 200 * PAGE_SIZE as u64, "{huge}: {peak}");
+            assert!(waiting > 0, "{huge}");
+        }
     }
 
     /// Enough waiting pages, and the commit writes them back itself.

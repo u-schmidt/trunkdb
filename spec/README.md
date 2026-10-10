@@ -99,3 +99,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 86. [A limit on the line an import reads (`export.rs`, `src/bin/trunkdb.rs`)](86-a-limit-on-the-line-an-import-reads.md)
 87. [A WAL header cannot grow the file past its pages (`storage/file.rs`)](87-a-wal-header-cannot-grow-the-file-past-its-pages.md)
 88. [A read-only open (`database.rs`, `storage/file.rs`, `durability/wal.rs`, `src/bin/trunkdb.rs`)](88-a-read-only-open.md)
+89. [A huge checkpoint threshold no longer overflows (`database.rs`)](89-a-huge-checkpoint-threshold-no-longer-overflows.md)
