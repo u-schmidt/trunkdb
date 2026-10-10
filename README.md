@@ -487,6 +487,16 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     shared lock and writes nothing, not even recovery, which it keeps
     in memory. Every write fails with `Error::ReadOnly`. The command's
     `info`, `check` and `export` open read-only.
+59. **Damaged or hostile input handled** (§84–§87, §89): `trunkdb
+    export` writes through a temporary file and refuses the database or
+    its WAL as the destination; damaged header fields are recovered from
+    the WAL; an import line is limited to 256 MiB unless
+    `ImportOptions::max_line_bytes` says otherwise; a WAL header can't
+    grow the file past the pages it holds; a huge `checkpoint_pages`
+    no longer overflows the default WAL limit.
+
+    Items 58–59 → 0.19.0: nothing breaking; an import stops at a line
+    over 256 MiB now (§86); files and exports as in 0.14.0.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
