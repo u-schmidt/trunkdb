@@ -37,6 +37,7 @@ All of it is done:
 | 0.17.0 | `find_with_ids` and `find_one_with_id` removed, typed and untyped, and a `cursor` handing out `T` instead of `(DocId, T)` (breaking); the id from the type's `_id` field, a wrapper with `#[serde(flatten)]` for a type from another crate; a free-space map per collection, in memory, so inserts refill the room deletes and updates leave in older data pages | §74–§75 |
 | 0.18.0 | A WAL size limit, `OpenOptions::checkpoint_wal_bytes`, so a large `checkpoint_pages` cannot grow the WAL without bound; a failed log taken back alone, so it no longer empties the WAL along with the batches committed before it (a fix to §51); snapshot reads: a batch is staged, logged, flushed and checkpointed beside the readers, which wait only for its publish, and a page's older versions stay in memory for the snapshots open, so a read keeps its commit to its end and commits wait for no read; `Database::snapshot` and `View<T>`, a snapshot a caller keeps, and a `cursor` that shows the moment it was made (breaking for code that relied on seeing later changes); `OpenOptions::snapshot_memory`, a limit on what snapshots keep, past which the oldest is ended with `Error::SnapshotTooOld`; `compact` takes the database alone and is refused with `Error::SnapshotOpen` while a snapshot is kept | §76–§83 |
 | 0.19.0 | Damaged and hostile input: `trunkdb export` through a temporary file, never over the database or its WAL; damaged header fields recovered from the WAL; a limit on the line an import reads, 256 MiB unless `ImportOptions::max_line_bytes` says otherwise; a WAL header that can't grow the file past its pages; `drop_index` on `_id` refused. A read-only open, `OpenOptions::read_only`: a shared file lock, nothing written, the WAL's batches and the open's own changes kept in memory, every write refused with `Error::ReadOnly`; the `trunkdb` command's `info`, `check` and `export` open read-only; a `checkpoint_pages` past 2^50 no longer overflows the default WAL limit (a fix to §76) | §84–§89 |
+| next | The WAL record written from the pages instead of built beside them: compaction in 1.2× the new file's size instead of 3.3×; a batch over 4 GiB of pages refused, where its record's length was cut to 32 bits | §90 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -111,10 +112,17 @@ limit is described.
   PostgreSQL's, one byte per data page, rounded down to 32 bytes, in map
   pages of their own, read at open into the exact map; one byte so most
   commits write no map page (§75.4).
-- Compaction without holding the whole new file in memory: a streamed
-  WAL record (§41.5). Leaves built from sorted entries instead of
-  inserted one by one would make it faster still (§48.4), though 1 s for
-  100,000 documents (§52.3) makes that less pressing.
+- Compaction and crash recovery in memory that doesn't grow with the
+  file, for files of a few GB, in three steps (§90). Done, step 1: the
+  WAL record written from the pages, compaction from 3.3× the new file
+  to 1.2×, and batches over 4 GiB refused instead of logged with a
+  length cut to 32 bits. Step 2: recovery that reads the WAL record by
+  record (now 2.1× the WAL at the open after a crash), with a batch
+  allowed to span several records as one unit, which lifts the 4 GiB
+  limit; a WAL format change. Step 3: compaction's new image built in a
+  file instead of memory. Leaves built from sorted entries instead of
+  inserted one by one would make compaction faster still (§48.4),
+  though 1 s for 100,000 documents (§52.3) makes that less pressing.
 - Batched writes, still about 2× behind: nearly every batch of 1,000
   crosses the default checkpoint threshold once the indexes are large.
   `OpenOptions::checkpoint_pages` can raise it (§53); the WAL's size
