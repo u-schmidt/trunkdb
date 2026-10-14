@@ -119,6 +119,16 @@ fn import_info_check_and_export_round_trip() {
         "{info}"
     );
     assert!(info.contains("empty: 0 documents"), "{info}");
+    // The sizes (SPEC §93), each under the lines that were there before.
+    assert!(info.contains("\n  pages: 1 header, 1 catalog, "), "{info}");
+    assert!(info.contains("\n  compact would "), "{info}");
+    assert!(
+        info.contains(
+            "\n    0 bytes of documents in 0 data pages, 0 bytes free in them; indexes 1 page\n"
+        ),
+        "{info}"
+    );
+    assert!(info.contains(" of documents in 1 data page, "), "{info}");
 
     let output = trunkdb(&["check", &db]);
     assert!(output.status.success());

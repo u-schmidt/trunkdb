@@ -7,7 +7,7 @@ use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
 use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 
@@ -65,6 +65,10 @@ struct Shared {
     poisoned: AtomicBool,
     id_gen: UuidV7Generator,
     txn: GlobalLockTxnManager,
+    /// Where the WAL is, for `stats` to measure (SPEC §93).
+    wal_path: PathBuf,
+    /// What the open restored from the WAL, for `stats`.
+    recovered: Option<crate::Recovered>,
 }
 
 /// What a batch works with, and nobody else: the staged pages and the
@@ -383,6 +387,7 @@ impl Database {
             store.set_cache_size(options.cache_size);
             store.set_snapshot_memory(options.snapshot_memory);
             let pending = durability::read_pending(path)?;
+            let recovered = crate::Recovered::of(&pending, true);
             if !pending.is_empty() {
                 store.restore_in_memory(&pending)?;
             }
@@ -397,12 +402,15 @@ impl Database {
             } else {
                 store.rollback();
             }
-            return Ok(Self::from_parts(store, None, catalog, options));
+            return Ok(Self::from_parts(
+                store, None, catalog, options, path, recovered,
+            ));
         }
         let mut store = FileStore::open_before_recovery(path)?;
         store.set_cache_size(options.cache_size);
         store.set_snapshot_memory(options.snapshot_memory);
         let (mut durability, pending) = WalDurability::open(path)?;
+        let recovered = crate::Recovered::of(&pending, false);
         if !pending.is_empty() {
             store.restore_pages(&pending)?;
         }
@@ -427,7 +435,14 @@ impl Database {
             store.write_back()?;
             durability.checkpoint()?;
         }
-        Ok(Self::from_parts(store, Some(durability), catalog, options))
+        Ok(Self::from_parts(
+            store,
+            Some(durability),
+            catalog,
+            options,
+            path,
+            recovered,
+        ))
     }
 
     /// The catalog, loaded in a batch begun here and left staged: on a
@@ -454,6 +469,8 @@ impl Database {
         durability: Option<WalDurability>,
         catalog: Catalog,
         options: OpenOptions,
+        path: &Path,
+        recovered: Option<crate::Recovered>,
     ) -> Self {
         let current = Committed::new(store.last_commit(), catalog);
         Self {
@@ -479,8 +496,18 @@ impl Database {
                 poisoned: AtomicBool::new(false),
                 id_gen: UuidV7Generator,
                 txn: GlobalLockTxnManager::default(),
+                wal_path: durability::wal_path(path),
+                recovered,
             }),
         }
+    }
+
+    pub(crate) fn wal_path(&self) -> &Path {
+        &self.inner.wal_path
+    }
+
+    pub(crate) fn recovered(&self) -> Option<crate::Recovered> {
+        self.inner.recovered
     }
 
     pub fn collection<T>(&self, name: &str) -> Collection<T> {
@@ -1013,6 +1040,7 @@ mod tests {
     }
 
     /// Where `log_batch_then_crash` stops, mirroring `write_batch`'s steps.
+    #[derive(Debug, Clone, Copy)]
     enum CrashPoint {
         /// Ops applied to staged pages, nothing logged yet.
         DuringApply,
@@ -1177,6 +1205,51 @@ mod tests {
                 files(&path).1.unwrap(),
                 b"",
                 "recovered by the open that writes"
+            );
+        }
+    }
+
+    /// `stats` says what the open restored after a crash, and nothing
+    /// after a clean one (SPEC §93): in memory for a read-only open, then
+    /// written back by the open that writes.
+    #[test]
+    fn stats_say_what_the_open_recovered() {
+        for crash in [
+            CrashPoint::AfterLog,
+            CrashPoint::MidWriteBack { pages_written: 1 },
+            CrashPoint::BeforeCheckpoint,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.trunkdb");
+            assert_eq!(
+                Database::open(&path).unwrap().stats().unwrap().recovered,
+                None
+            );
+            log_batch_then_crash(&path, &two_collection_batch(), crash);
+            let pages =
+                crate::storage::PendingPages::count(&durability::read_pending(&path).unwrap());
+            assert!(pages > 0);
+
+            let recovered = |db: &Database| {
+                db.stats()
+                    .unwrap()
+                    .recovered
+                    .map(|r| (r.pages, r.in_memory))
+            };
+            assert_eq!(
+                recovered(&open_read_only(&path).unwrap()),
+                Some((pages, true)),
+                "{crash:?}"
+            );
+            assert_eq!(
+                recovered(&Database::open(&path).unwrap()),
+                Some((pages, false)),
+                "{crash:?}"
+            );
+            assert_eq!(
+                recovered(&Database::open(&path).unwrap()),
+                None,
+                "{crash:?}"
             );
         }
     }

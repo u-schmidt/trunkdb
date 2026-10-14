@@ -408,6 +408,96 @@ fn walk_chain(
     }
 }
 
+/// What a document's cell takes and holds, for `Database::stats` (SPEC
+/// §93): its length on the page, the encoded document's bytes, and the
+/// overflow pages of its chain — counted from its length, without
+/// reading them.
+pub(crate) struct CellShape {
+    pub(crate) cell_len: usize,
+    pub(crate) document_bytes: u64,
+    pub(crate) chain_pages: u64,
+}
+
+/// The shape of the cell at `loc` on `page`, one of a collection's data
+/// pages.
+pub(crate) fn cell_shape(page: &SlottedPage, loc: RecordLocation) -> std::io::Result<CellShape> {
+    let cell = live_cell(page, loc)?;
+    Ok(match Cell::parse(cell)? {
+        Cell::Inline(_id, encoded) => CellShape {
+            cell_len: cell.len(),
+            document_bytes: encoded.len() as u64,
+            chain_pages: 0,
+        },
+        Cell::Overflow { len, .. } => CellShape {
+            cell_len: cell.len(),
+            document_bytes: len as u64,
+            chain_pages: (len as usize).div_ceil(OVERFLOW_CAPACITY) as u64,
+        },
+    })
+}
+
+/// The data pages `insert_record` fills with cells handed to it one
+/// after another into a new collection — as `compact` does, in id order
+/// (SPEC §41) — counted instead of written (SPEC §93.4): the current
+/// page first, then the fullest page in the free-space map that has
+/// room, then a new page, exactly as `place_cell` decides. A page only
+/// filled has lost exactly a slot and its cell per insert, so room is
+/// all it keeps of a page, and only of the current one and those in the
+/// map.
+#[derive(Default)]
+pub(crate) struct PackedBuild {
+    pages: u64,
+    current: PageId,
+    /// Room left, for `current` and the pages in `free`.
+    room: std::collections::HashMap<PageId, usize>,
+    free: FreeSpace,
+}
+
+impl PackedBuild {
+    /// The next cell, by its length.
+    pub(crate) fn push(&mut self, cell_len: usize) {
+        let needed = SlottedPage::space_needed(cell_len);
+        if self.current != 0 && self.room[&self.current] >= needed {
+            *self.room.get_mut(&self.current).unwrap() -= needed;
+            return;
+        }
+        if let Some(page) = self.free.find(needed as u16) {
+            *self.room.get_mut(&page).unwrap() -= needed;
+            self.note_room(page);
+            return;
+        }
+        self.pages += 1;
+        let page = self.pages; // a stand-in id, one per page
+        self.room
+            .insert(page, SlottedPage::new(PageType::Data).free_space() - needed);
+        let old = std::mem::replace(&mut self.current, page);
+        if old != 0 {
+            self.note_room(old);
+        }
+    }
+
+    /// `note_room`, on what this keeps of a page.
+    fn note_room(&mut self, page: PageId) {
+        let room = self.room[&page];
+        let enough = match self.free.contains(page) {
+            true => MIN_ROOM_TO_STAY,
+            false => MIN_ROOM,
+        };
+        if page != self.current && room >= enough {
+            self.free.set(page, room as u16);
+        } else {
+            self.free.remove(page);
+            if page != self.current {
+                self.room.remove(&page);
+            }
+        }
+    }
+
+    pub(crate) fn pages(&self) -> u64 {
+        self.pages
+    }
+}
+
 /// Returns a chain's pages to the free list. Walks the whole chain first:
 /// freeing a page overwrites its `next` pointer.
 fn free_chain(store: &mut dyn PageStore, first: PageId, len: u32) -> std::io::Result<()> {
@@ -440,7 +530,10 @@ fn write_or_free(
     }
 }
 
-fn read_data_page(store: &dyn PageStore, page_id: PageId) -> std::io::Result<SlottedPage> {
+pub(crate) fn read_data_page(
+    store: &dyn PageStore,
+    page_id: PageId,
+) -> std::io::Result<SlottedPage> {
     let page = SlottedPage::from_bytes(store.read_page(page_id)?)?;
     if page.page_type() != PageType::Data {
         return Err(std::io::Error::new(
