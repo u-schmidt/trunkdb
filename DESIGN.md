@@ -54,7 +54,7 @@ they come from [§8](spec/08-ownership-one-refcell-boundary-not-one-per-componen
 | File | What |
 |---|---|
 | `app.trunkdb` | the database: pages of 8 KB |
-| `app.trunkdb.wal` | the write-ahead log: whole page images, one record per commit |
+| `app.trunkdb.wal` | the write-ahead log: whole page images, one record per commit, several for a commit over 32 MiB |
 
 The database file holds an OS advisory lock (`flock`, `LockFileEx`)
 while it's open, so a second `open` fails at once instead of reading a
@@ -135,8 +135,12 @@ readers don't take (`Database::transact`) [§19.3](spec/19-durability-take-two-a
    the main file, `fsync`, truncate the WAL.
 
 A crash before step 3 finishes leaves the state before the batch; a
-crash after it leaves a complete WAL record, which the next `open`
-writes back before anything reads the file. Page images are
+crash after it leaves the batch whole in the WAL, which the next `open`
+writes back before anything reads the file. A batch over 32 MiB is
+logged in several records, each flushed before the next, and restored
+only if its last one is there; recovery reads the WAL a record at a
+time, so it takes one record's memory whatever the WAL's size
+[§91](spec/91-a-batch-in-several-records.md). Page images are
 idempotent, so writing one back twice is harmless [§19](spec/19-durability-take-two-a-page-image-wal.md). A WAL page
 past the file's end, as the header before it has it, is refused before
 anything is written [§55](spec/55-fuzzing.md). A checkpoint
@@ -432,8 +436,8 @@ more than four.
 - **Compaction** rebuilds the collections into a fresh image in memory,
   with full pages, logs it through the WAL like any batch and truncates
   the file [§41](spec/41-compaction.md). The whole new image is held in memory while it runs, once:
-  the WAL record is written from its pages, not built beside them, and
-  a batch, so a compaction too, can't be over 4 GiB of pages [§90](spec/90-a-wal-record-written-from-the-pages.md).
+  the WAL's records are written from its pages, 32 MiB at a time, not
+  built beside them [§90](spec/90-a-wal-record-written-from-the-pages.md) [§91](spec/91-a-batch-in-several-records.md).
 - **Export and import** write and read JSON Lines, with the types JSON
   lacks kept by tags (`{"$id": ...}`, `{"$binary": ...}`, `{"$date":
   "<RFC 3339>"}`), so an export is a readable backup and the path

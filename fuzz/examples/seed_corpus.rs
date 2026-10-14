@@ -31,8 +31,12 @@ fn main() {
         })
         .collect();
     let mut wal = vec![ALL & 0x7F];
-    wal.extend_from_slice(&trunkdb::fuzzing::wal(&pages));
+    wal.extend_from_slice(&trunkdb::fuzzing::wal(&pages, usize::MAX));
     write("recover_wal", "record", &wal);
+    // The same batch in two records of a page each (SPEC §91).
+    let mut wal = vec![ALL & 0x7F];
+    wal.extend_from_slice(&trunkdb::fuzzing::wal(&pages, 1));
+    write("recover_wal", "records", &wal);
 
     // import: an export of the base database.
     let dir = tempfile::tempdir().unwrap();

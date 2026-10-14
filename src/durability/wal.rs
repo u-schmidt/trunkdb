@@ -1,8 +1,10 @@
 use super::Durability;
-use crate::crc32::{Crc32, crc32};
-use crate::storage::{PageId, PageImage, USABLE_PAGE_SIZE};
+use crate::crc32::crc32;
+#[cfg(test)]
+use crate::storage::PageImage;
+use crate::storage::{HEADER_PAGE, PageId, PendingPages, SeePage, TakePage, USABLE_PAGE_SIZE};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// The real `Durability` implementation: a single append-only file
@@ -29,6 +31,16 @@ pub struct WalDurability {
     /// last `checkpoint`: every byte up to here belongs to a committed
     /// batch.
     len: u64,
+    /// The most pages `log` puts into one record: `RECORD_PAGES`, but
+    /// for tests of batches in several.
+    record_pages: usize,
+    /// Whether `log` may add to what the file holds: not to records of
+    /// an older version, nor behind a torn header. A checkpoint empties
+    /// the file, and `Database::open` always makes one before it logs.
+    appendable: bool,
+    /// Test-only: how many times the file was flushed by `log`.
+    #[cfg(test)]
+    pub(crate) syncs: u32,
     /// Test-only fault injection: while non-zero, each `log` writes its
     /// record whole, then fails as if the flush had (and decrements
     /// this) — the case `undo_failed_log` is for.
@@ -44,15 +56,26 @@ pub struct WalDurability {
 /// version — so a file from another tool, or from an older trunkdb whose
 /// WAL held ops instead of pages (version 0) or pages of another size
 /// (1, before page checksums: SPEC §40), is a clear error rather than a
-/// misread.
+/// misread. Version 2 had one record per batch, with no flags; it is
+/// still read, so a WAL a crash left under an older build is recovered
+/// (SPEC §91), and never added to.
 /// Written together with the first record after a checkpoint, never on
 /// its own.
 const WAL_MAGIC: &[u8; 8] = b"TRUNKWAL";
-const WAL_VERSION: u32 = 2;
+const WAL_VERSION: u32 = 3;
+const WAL_VERSION_WITHOUT_FLAGS: u32 = 2;
 const WAL_HEADER_LEN: usize = 12;
 
 /// Bytes per page entry in a record body: `[u64 page id][page bytes]`.
 const PAGE_ENTRY_LEN: usize = 8 + USABLE_PAGE_SIZE;
+
+/// A record's flag: its batch goes on in the next record (SPEC §91).
+const MORE: u32 = 1;
+
+/// The most pages `log` puts into one record: 32 MiB of them (SPEC
+/// §91). A batch of more takes several records, so that neither `log`
+/// nor recovery holds more than one of this size in memory.
+const RECORD_PAGES: usize = (32 << 20) / crate::storage::PAGE_SIZE;
 
 pub(crate) fn encode_header() -> [u8; WAL_HEADER_LEN] {
     let mut header = [0u8; WAL_HEADER_LEN];
@@ -61,173 +84,309 @@ pub(crate) fn encode_header() -> [u8; WAL_HEADER_LEN] {
     header
 }
 
-/// `[u32 body_len][u32 crc32(body)][body]`, one record per logged batch.
-/// `body` is `[u32 page_count]` followed by `page_count` ×
-/// `[u64 page id][USABLE_PAGE_SIZE page bytes]` — fixed-size entries, so a body's
-/// length is fully determined by its count.
+/// Appends one record of `pages` to `record`:
+/// `[u32 body_len][u32 crc32(body)][body]`, where `body` is
+/// `[u32 page_count][u32 flags]` followed by `page_count` ×
+/// `[u64 page id][USABLE_PAGE_SIZE page bytes]` — fixed-size entries, so
+/// a body's length is fully determined by its count.
 ///
-/// One record per batch is what makes a batch atomic across a crash
-/// during `log` itself: recovery either finds the whole record intact and
-/// restores every page in it, or finds it torn and restores none (§16.6).
-/// The length prefix catches a record cut short; the CRC catches one that
-/// is length-complete but whose bytes didn't all make it to disk (a
-/// partially persisted sector).
-#[cfg(any(test, feature = "fuzzing"))]
-pub(crate) fn encode_record(pages: &[(PageId, &[u8])]) -> Vec<u8> {
-    let mut record = Vec::new();
-    write_record(&mut record, pages).expect("a record small enough to encode");
-    record
-}
-
-/// Writes `pages` to `out` as one record (`encode_record`), straight from
-/// the pages, without the record whole in memory (SPEC §90): the CRC
-/// heads the record, so it's worked out first, in a pass over the pages
-/// in memory, and then they are written. Returns the record's length.
-///
-/// A record can't hold more than `u32::MAX` bytes of body, about 4 GiB
-/// of pages: a batch over that is refused, with nothing written.
-fn write_record(out: &mut impl Write, pages: &[(PageId, &[u8])]) -> io::Result<u64> {
-    let body_len = body_len(pages.len())?;
-    let count = (pages.len() as u32).to_le_bytes();
-    let mut crc = Crc32::new();
-    crc.update(&count);
+/// A batch is one record, or several with `MORE` set in all but the last
+/// (SPEC §91). Recovery restores a batch whose last record it finds
+/// intact, with every page in every record of it, and none of a batch
+/// that ends torn: that is what makes a batch atomic across a crash
+/// during `log` itself (§16.6). The length prefix catches a record cut
+/// short; the CRC catches one that is length-complete but whose bytes
+/// didn't all make it to disk (a partially persisted sector).
+fn encode_record_into(record: &mut Vec<u8>, pages: &[(PageId, &[u8])], more: bool) {
+    let body_len = u32::try_from(8 + pages.len() * PAGE_ENTRY_LEN)
+        .expect("a record of at most `RECORD_PAGES` pages fits its length");
+    let start = record.len();
+    record.extend_from_slice(&body_len.to_le_bytes());
+    record.extend_from_slice(&[0; 4]); // the CRC, once the body is there
+    record.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+    record.extend_from_slice(&(if more { MORE } else { 0 }).to_le_bytes());
     for (id, page) in pages {
         assert_eq!(
             page.len(),
             USABLE_PAGE_SIZE,
             "WAL page images are whole pages"
         );
-        crc.update(&id.to_le_bytes());
-        crc.update(page);
+        record.extend_from_slice(&id.to_le_bytes());
+        record.extend_from_slice(page);
     }
-    out.write_all(&body_len.to_le_bytes())?;
-    out.write_all(&crc.finish().to_le_bytes())?;
-    out.write_all(&count)?;
-    for (id, page) in pages {
-        out.write_all(&id.to_le_bytes())?;
-        out.write_all(page)?;
-    }
-    Ok(8 + u64::from(body_len))
+    let crc = crc32(&record[start + 8..]);
+    record[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// The body length of a record of `pages` pages, if it fits the record's
-/// `u32` length (SPEC §90): before it was cut to 32 bits without a word,
-/// and recovery after a crash misread the record.
-fn body_len(pages: usize) -> io::Result<u32> {
-    (pages as u64)
-        .checked_mul(PAGE_ENTRY_LEN as u64)
-        .and_then(|entries| entries.checked_add(4))
-        .and_then(|len| u32::try_from(len).ok())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "a batch of {pages} pages is too large for one WAL record: at most {} pages",
-                    MAX_RECORD_PAGES
-                ),
-            )
-        })
+/// A batch of `pages` as `log` writes it, in records of at most
+/// `record_pages` pages: for the fuzz targets and the tests.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn encode_batch(pages: &[(PageId, &[u8])], record_pages: usize) -> Vec<u8> {
+    let mut batch = Vec::new();
+    let records = pages.chunks(record_pages);
+    let last = records.len().saturating_sub(1);
+    for (i, record) in records.enumerate() {
+        encode_record_into(&mut batch, record, i < last);
+    }
+    batch
 }
 
-/// The most pages one record holds: its body, a `u32` count and the
-/// entries, within `u32::MAX` bytes. 524,032 pages, 4 GiB of them.
-const MAX_RECORD_PAGES: usize = (u32::MAX as usize - 4) / PAGE_ENTRY_LEN;
-
-/// `log`'s writing: the WAL's header first if `first`, then the record,
-/// through a buffer, flushed. Returns how many bytes were written.
+/// The records of a WAL, read one at a time (SPEC §91): what is in
+/// memory is one record, whatever the WAL's length.
 ///
-/// The flush is not left to the buffer's drop, which ignores an error:
-/// a last write that failed (a full disk) would have `log` report a
-/// record durable that isn't whole (SPEC §90).
-fn write_buffered(file: impl Write, first: bool, pages: &[(PageId, &[u8])]) -> io::Result<u64> {
-    // Refused before the header goes into the buffer, which dropping it
-    // would write: a refused batch leaves nothing to undo.
-    body_len(pages.len())?;
-    let capacity = WRITE_BUFFER.min(pages.len() * PAGE_ENTRY_LEN + 32);
-    let mut out = BufWriter::with_capacity(capacity, file);
-    let mut len = 0;
-    if first {
-        out.write_all(&encode_header())?;
-        len += WAL_HEADER_LEN as u64;
-    }
-    len += write_record(&mut out, pages)?;
-    out.flush()?;
-    Ok(len)
-}
-
-/// How many bytes of a record `log` collects before a write: enough
-/// that a large batch takes one system call per megabyte, not two a page.
-const WRITE_BUFFER: usize = 1 << 20;
-
-/// Reads every complete batch record in `bytes` and returns their page
-/// images, flattened in log order — restoring them in that order leaves
-/// each page at its latest logged state.
-///
-/// Stops — without erroring — at a torn tail: a final record whose length
-/// prefix promises more bytes than remain, or whose CRC doesn't match.
-/// Either is what a crash mid-`log` looks like, and it means that batch
-/// was never durably logged (and so never written back), so it's correct
-/// to treat it as if it never happened. A file shorter than the header is
-/// the same case: the header is only ever written together with a record.
+/// It ends — without an error — at a torn tail: a final record whose
+/// length prefix promises more bytes than remain, or whose CRC doesn't
+/// match. Either is what a crash mid-`log` looks like, and it means the
+/// batch was never durably logged (and so never written back), so it's
+/// correct to treat it as if it never happened.
 ///
 /// A CRC mismatch on a record that is *not* the last one is a different,
-/// stronger signal — a crash only ever tears the tail — so that's a hard
-/// error, as is a CRC-valid body that doesn't decode, or a bad header.
-fn decode_pending(bytes: &[u8]) -> io::Result<Vec<PageImage>> {
-    if bytes.len() < WAL_HEADER_LEN {
-        return Ok(Vec::new());
+/// stronger signal — a crash only ever tears the tail, since `log`
+/// flushes every record of a batch before it writes the next — so that's
+/// a hard error, as is a CRC-valid body that doesn't decode, or a bad
+/// header.
+struct Records<R> {
+    input: R,
+    version: u32,
+    /// How many bytes of the WAL are still to be read.
+    left: u64,
+    /// How many have been read, as whole records and the header.
+    offset: u64,
+    /// The record last read: its body.
+    body: Vec<u8>,
+}
+
+/// One record, as `Records::next` hands it out.
+struct Record<'a> {
+    /// Whether its batch goes on in the next record.
+    more: bool,
+    /// Its entries, `PAGE_ENTRY_LEN` bytes each.
+    entries: &'a [u8],
+}
+
+impl Record<'_> {
+    fn pages(&self) -> impl Iterator<Item = (PageId, &[u8])> {
+        let entries = self.entries.as_chunks::<PAGE_ENTRY_LEN>().0;
+        entries.iter().map(|entry| {
+            let id = PageId::from_le_bytes(entry[0..8].try_into().unwrap());
+            (id, &entry[8..])
+        })
     }
-    if &bytes[0..8] != WAL_MAGIC {
-        return Err(corrupt(
-            "not a trunkdb page-image WAL (bad magic) — possibly one written by an older trunkdb",
-        ));
-    }
-    let version = read_u32(&bytes[8..]);
-    if version != WAL_VERSION {
-        return Err(corrupt(&format!(
-            "unsupported WAL version {version}, this build expects {WAL_VERSION}"
-        )));
+}
+
+impl<R: Read> Records<R> {
+    /// The records in the first `len` bytes of `input`, a WAL from its
+    /// start. `None` for one shorter than its header, which holds
+    /// nothing: the header is only ever written together with a record.
+    fn new(mut input: R, len: u64) -> io::Result<Option<Self>> {
+        if len < WAL_HEADER_LEN as u64 {
+            return Ok(None);
+        }
+        let mut header = [0u8; WAL_HEADER_LEN];
+        input.read_exact(&mut header)?;
+        if &header[0..8] != WAL_MAGIC {
+            return Err(corrupt(
+                "not a trunkdb page-image WAL (bad magic) — possibly one written by an older trunkdb",
+            ));
+        }
+        let version = read_u32(&header[8..]);
+        if version != WAL_VERSION && version != WAL_VERSION_WITHOUT_FLAGS {
+            return Err(corrupt(&format!(
+                "unsupported WAL version {version}, this build reads {WAL_VERSION_WITHOUT_FLAGS} and {WAL_VERSION}"
+            )));
+        }
+        Ok(Some(Records {
+            input,
+            version,
+            left: len - WAL_HEADER_LEN as u64,
+            offset: WAL_HEADER_LEN as u64,
+            body: Vec::new(),
+        }))
     }
 
-    let mut pages = Vec::new();
-    let mut bytes = &bytes[WAL_HEADER_LEN..];
-    while bytes.len() >= 8 {
-        let body_len = read_u32(bytes) as usize;
-        let checksum = read_u32(&bytes[4..]);
-        let after_header = &bytes[8..];
-        if after_header.len() < body_len {
-            break; // torn tail — the final record was cut short
+    /// The next record, or `None` at the end or at a torn tail.
+    fn next(&mut self) -> io::Result<Option<Record<'_>>> {
+        if self.left < 8 {
+            return Ok(None);
         }
-        let (body, rest) = after_header.split_at(body_len);
-        if crc32(body) != checksum {
-            if rest.is_empty() {
-                break; // torn tail — the final record's bytes didn't all land
+        let mut prefix = [0u8; 8];
+        self.input.read_exact(&mut prefix)?;
+        let body_len = u64::from(read_u32(&prefix));
+        let checksum = read_u32(&prefix[4..]);
+        self.left -= 8;
+        if self.left < body_len {
+            return Ok(None); // torn tail — the final record was cut short
+        }
+        // No more than is left of the file, whatever the length says.
+        self.body.resize(body_len as usize, 0);
+        self.input.read_exact(&mut self.body)?;
+        self.left -= body_len;
+        if crc32(&self.body) != checksum {
+            if self.left == 0 {
+                return Ok(None); // torn tail — the final record's bytes didn't all land
             }
             return Err(corrupt("WAL record checksum mismatch before the tail"));
         }
-        decode_batch(body, &mut pages)?;
-        bytes = rest;
+        self.offset += 8 + body_len;
+
+        let flags_len = if self.version == WAL_VERSION { 4 } else { 0 };
+        if self.body.len() < 4 + flags_len {
+            return Err(corrupt("WAL batch record too short for its page count"));
+        }
+        let count = read_u32(&self.body) as usize;
+        let flags = match flags_len {
+            0 => 0,
+            _ => read_u32(&self.body[4..]),
+        };
+        if flags & !MORE != 0 {
+            return Err(corrupt(&format!(
+                "WAL record with flags this build doesn't know ({flags:#x})"
+            )));
+        }
+        let entries = &self.body[4 + flags_len..];
+        if Some(entries.len()) != count.checked_mul(PAGE_ENTRY_LEN) {
+            return Err(corrupt(
+                "WAL batch record's length doesn't match its page count",
+            ));
+        }
+        Ok(Some(Record {
+            more: flags & MORE != 0,
+            entries,
+        }))
     }
-    Ok(pages)
 }
 
-fn decode_batch(body: &[u8], pages: &mut Vec<PageImage>) -> io::Result<()> {
-    if body.len() < 4 {
-        return Err(corrupt("WAL batch record too short for its page count"));
-    }
-    let count = read_u32(body) as usize;
-    let entries = &body[4..];
-    if Some(entries.len()) != count.checked_mul(PAGE_ENTRY_LEN) {
-        return Err(corrupt(
-            "WAL batch record's length doesn't match its page count",
-        ));
-    }
-    for entry in entries.as_chunks::<PAGE_ENTRY_LEN>().0 {
-        let id = PageId::from_le_bytes(entry[0..8].try_into().unwrap());
-        pages.push((id, entry[8..].to_vec()));
-    }
-    Ok(())
+/// What a WAL holds of batches a prior run logged and never checkpointed
+/// (SPEC §91): which pages, and where the last whole batch ends — not the
+/// pages themselves, which are read from the file again when they are
+/// restored (`PendingPages::pages`), a record at a time. Kept beside
+/// that: every image of the header page, which the checks before a
+/// restore need (SPEC §85, §87), and 8 bytes a page.
+///
+/// Read in `scan`, once through: every record's CRC checked, a torn tail
+/// found, and a batch without its last record left out, with all its
+/// records.
+pub struct Pending {
+    /// The WAL, on a handle of its own; `None` when there is none.
+    file: Option<File>,
+    /// Where the last whole batch ends.
+    end: u64,
+    /// The page of every image in the whole batches, in log order —
+    /// restoring them in that order leaves each page at its latest
+    /// logged state.
+    ids: Vec<PageId>,
+    /// The header page's images, each with its place in `ids`.
+    headers: Vec<(usize, Vec<u8>)>,
 }
+
+impl Pending {
+    fn nothing() -> Self {
+        Pending {
+            file: None,
+            end: 0,
+            ids: Vec::new(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// Reads the WAL `file` through, and returns what is pending in it
+    /// with the version its header says, if it has one.
+    fn scan(file: File) -> io::Result<(Self, Option<u32>)> {
+        let len = file.metadata()?.len();
+        let input = BufReader::with_capacity(READ_BUFFER, &file);
+        let Some(mut records) = Records::new(input, len)? else {
+            return Ok((Self::nothing(), None));
+        };
+        let version = records.version;
+        let (mut ids, mut headers) = (Vec::new(), Vec::new());
+        // How much of `ids`, and of the file, whole batches make up.
+        let (mut whole, mut end) = (0, records.offset);
+        while let Some(record) = records.next()? {
+            for (id, page) in record.pages() {
+                if id == HEADER_PAGE {
+                    headers.push((ids.len(), page.to_vec()));
+                }
+                ids.push(id);
+            }
+            if !record.more {
+                (whole, end) = (ids.len(), records.offset);
+            }
+        }
+        // A batch without its last record: a crash mid-`log`. Its header
+        // images would never be shown, with their places cut off: they
+        // go only to free them.
+        ids.truncate(whole);
+        headers.retain(|(at, _)| *at < whole);
+        let pending = Pending {
+            file: Some(file),
+            end,
+            ids,
+            headers,
+        };
+        Ok((pending, Some(version)))
+    }
+
+    /// Whether nothing is pending.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Every pending page image, in log order: for tests, which read
+    /// small WALs.
+    #[cfg(test)]
+    pub(crate) fn images(&self) -> Vec<PageImage> {
+        let mut images = Vec::new();
+        self.pages(&mut |id, page| {
+            images.push((id, page.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        images
+    }
+}
+
+impl PendingPages for Pending {
+    fn count(&self) -> u64 {
+        self.ids.len() as u64
+    }
+
+    fn outline(&self, see: &mut SeePage<'_>) -> io::Result<()> {
+        let mut headers = self.headers.iter().peekable();
+        for (at, &id) in self.ids.iter().enumerate() {
+            let header = headers.next_if(|(place, _)| *place == at);
+            see(id, header.map(|(_, image)| &image[..]))?;
+        }
+        Ok(())
+    }
+
+    /// Reads the WAL again, up to the end of its last whole batch, and
+    /// hands out each page as it comes: one record in memory at a time.
+    fn pages(&self, take: &mut TakePage<'_>) -> io::Result<()> {
+        let Some(mut file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        file.seek(SeekFrom::Start(0))?;
+        let input = BufReader::with_capacity(READ_BUFFER, file);
+        let mut taken = 0;
+        if let Some(mut records) = Records::new(input, self.end)? {
+            while let Some(record) = records.next()? {
+                for (id, page) in record.pages() {
+                    take(id, page)?;
+                    taken += 1;
+                }
+            }
+        }
+        // As `scan` found them: we hold the database's lock, so nobody
+        // else writes this WAL.
+        if taken != self.ids.len() {
+            return Err(corrupt("the WAL changed while it was being recovered"));
+        }
+        Ok(())
+    }
+}
+
+/// How many bytes of the WAL a read asks the file for at once.
+const READ_BUFFER: usize = 1 << 20;
 
 fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes[0..4].try_into().unwrap())
@@ -245,61 +404,107 @@ fn wal_path(db_path: &Path) -> PathBuf {
 
 impl WalDurability {
     /// Opens (creating if needed) the WAL file next to `db_path`, and
-    /// returns the page images of every batch still pending from a prior
-    /// unclean shutdown — `Database::open` writes those back to the main
-    /// file, then checkpoints, before handing out a usable `Database`.
-    pub fn open(db_path: &Path) -> io::Result<(Self, Vec<PageImage>)> {
-        let mut file = OpenOptions::new()
+    /// returns what is still pending in it from a prior unclean shutdown
+    /// — `Database::open` writes those pages back to the main file, then
+    /// checkpoints, before handing out a usable `Database`.
+    pub fn open(db_path: &Path) -> io::Result<(Self, Pending)> {
+        let path = wal_path(db_path);
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(wal_path(db_path))?;
+            .open(&path)?;
+        let len = file.metadata()?.len();
+        // On a handle of its own, so reading it again for the restore
+        // doesn't move the place `log` writes at.
+        let (pending, version) = Pending::scan(File::open(&path)?)?;
 
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let pending = decode_pending(&bytes)?;
-
-        let len = bytes.len() as u64;
         let wal = Self {
             file,
             len,
+            record_pages: RECORD_PAGES,
+            appendable: len == 0 || version == Some(WAL_VERSION),
             #[cfg(test)]
             failing_logs: 0,
             #[cfg(test)]
             failing_undos: 0,
+            #[cfg(test)]
+            syncs: 0,
         };
         Ok((wal, pending))
     }
+
+    /// Test-only: at most `pages` pages in a record from here on, for
+    /// batches in several records without 32 MiB of pages.
+    #[cfg(test)]
+    pub(crate) fn set_record_pages(&mut self, pages: usize) {
+        self.record_pages = pages;
+    }
+
+    /// Flushes the file, and counts it for the tests.
+    fn sync(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.syncs += 1;
+        }
+        crate::storage::sync(&self.file)
+    }
 }
 
-/// The page images of every batch still pending in the WAL next to
-/// `db_path`, for a read-only open (SPEC §88): read, never written —
-/// a torn tail is left where it is, and a WAL that isn't there is not
-/// created. Nothing pending then.
-pub fn read_pending(db_path: &Path) -> io::Result<Vec<PageImage>> {
-    let bytes = match std::fs::read(wal_path(db_path)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    decode_pending(&bytes)
+/// What is still pending in the WAL next to `db_path`, for a read-only
+/// open (SPEC §88): read, never written — a torn tail is left where it
+/// is, and a WAL that isn't there is not created. Nothing pending then.
+pub fn read_pending(db_path: &Path) -> io::Result<Pending> {
+    match File::open(wal_path(db_path)) {
+        Ok(file) => Ok(Pending::scan(file)?.0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Pending::nothing()),
+        Err(e) => Err(e),
+    }
 }
 
 impl Durability for WalDurability {
+    /// One record for a batch of up to `RECORD_PAGES` pages, written
+    /// with one write and flushed once, as ever. A larger batch goes out
+    /// in several records (SPEC §91), each built in the same buffer and
+    /// flushed before the next is written: so the last record, which
+    /// makes the batch whole, is only ever on disk behind all the
+    /// others, and a crash tears the WAL's tail and nothing before it.
     fn log(&mut self, pages: &[(PageId, &[u8])]) -> io::Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
         let end = self.file.seek(SeekFrom::End(0))?;
-        let len = write_buffered(&self.file, end == 0, pages)?;
+        if end != 0 && !self.appendable {
+            return Err(io::Error::other(
+                "the WAL holds records of an older version, or a torn header: checkpoint it before logging",
+            ));
+        }
+        let records = pages.chunks(self.record_pages);
+        let last = records.len() - 1;
+        let largest = pages.len().min(self.record_pages);
+        let mut record = Vec::with_capacity(WAL_HEADER_LEN + 16 + largest * PAGE_ENTRY_LEN);
+        if end == 0 {
+            record.extend_from_slice(&encode_header());
+        }
+        let mut len = 0;
+        for (i, chunk) in records.enumerate() {
+            encode_record_into(&mut record, chunk, i < last);
+            self.file.write_all(&record)?;
+            len += record.len() as u64;
+            record.clear();
+            if i < last {
+                self.sync()?;
+            }
+        }
         #[cfg(test)]
         if self.failing_logs > 0 {
             self.failing_logs -= 1;
             return Err(io::Error::other("injected log failure"));
         }
-        crate::storage::sync(&self.file)?;
+        self.sync()?;
         self.len = end + len;
+        self.appendable = true;
         Ok(())
     }
 
@@ -321,6 +526,7 @@ impl Durability for WalDurability {
         self.file.seek(SeekFrom::Start(0))?;
         crate::storage::sync(&self.file)?;
         self.len = 0;
+        self.appendable = true;
         Ok(())
     }
 
@@ -366,6 +572,7 @@ mod tests {
         drop(wal); // simulates a crash: never checkpointed
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert_eq!(recovered, two_page_batch());
     }
 
@@ -380,6 +587,7 @@ mod tests {
         drop(wal);
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert_eq!(recovered, vec![(3, page(1)), (3, page(9)), (4, page(4))]);
     }
 
@@ -396,6 +604,7 @@ mod tests {
         drop(wal);
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert_eq!(
             recovered,
             vec![(5, page(5))],
@@ -403,112 +612,236 @@ mod tests {
         );
     }
 
-    /// A record is written as `encode_record` encodes it, in pieces
-    /// through the buffer when it's larger than that (SPEC §90), and read
-    /// back whole.
+    fn borrowed(images: &[PageImage]) -> Vec<(PageId, &[u8])> {
+        images.iter().map(|(id, p)| (*id, &p[..])).collect()
+    }
+
+    /// Pages 0 to `count`, the header's among them, each filled with its
+    /// id.
+    fn images(count: u64) -> Vec<PageImage> {
+        (0..count).map(|id| (id, page(id as u8))).collect()
+    }
+
+    /// A WAL open on `db_path` that puts at most three pages in a record.
+    fn open_with_small_records(db_path: &Path) -> WalDurability {
+        let (mut wal, _) = WalDurability::open(db_path).unwrap();
+        wal.record_pages = 3;
+        wal
+    }
+
+    /// A batch of one record costs one write and one flush, as it always
+    /// did. One over the record size goes out in several (SPEC §91),
+    /// each flushed before the next is written, and is recovered whole,
+    /// with the batches around it.
     #[test]
-    fn a_record_larger_than_the_write_buffer_is_logged_whole() {
+    fn a_batch_over_one_record_is_logged_in_several_and_recovered_whole() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.trunkdb");
-        let images: Vec<PageImage> = (0..300).map(|id| (id, page(id as u8))).collect();
-        assert!(images.len() * PAGE_ENTRY_LEN > 2 * WRITE_BUFFER);
-        let pages: Vec<(PageId, &[u8])> = images.iter().map(|(id, p)| (*id, &p[..])).collect();
-
-        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
-        wal.log(&pages).unwrap();
+        let mut wal = open_with_small_records(&db_path);
         log(&mut wal, &two_page_batch());
+        assert_eq!(wal.syncs, 1);
+
+        let eight = images(8);
+        log(&mut wal, &eight);
+        assert_eq!(wal.syncs, 1 + 3, "three records, each flushed");
         let mut expected = encode_header().to_vec();
-        expected.extend_from_slice(&encode_record(&pages));
-        let bytes = wal_bytes(&db_path);
-        assert_eq!(bytes[..expected.len()], expected[..]);
-        assert_eq!(wal.len(), bytes.len() as u64);
+        expected.extend(encode_batch(&borrowed(&two_page_batch()), 3));
+        expected.extend(encode_batch(&borrowed(&eight), 3));
+        assert_eq!(wal_bytes(&db_path), expected);
+        assert_eq!(wal.len(), expected.len() as u64);
+        // Three records: two that say more follows, and one that doesn't.
+        let one = 8 + 8 + 3 * PAGE_ENTRY_LEN;
+        let batch = &expected[expected.len() - (2 * one + 16 + 2 * PAGE_ENTRY_LEN)..];
+        let flags = |record: &[u8]| read_u32(&record[12..]);
+        assert_eq!(
+            [flags(batch), flags(&batch[one..]), flags(&batch[2 * one..])],
+            [MORE, MORE, 0]
+        );
+        log(&mut wal, &[(9, page(9))]);
         drop(wal);
 
-        let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
-        let mut all = images.clone();
-        all.extend(two_page_batch());
-        assert_eq!(recovered, all);
+        let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+        let mut all = two_page_batch();
+        all.extend(eight);
+        all.push((9, page(9)));
+        assert_eq!(pending.images(), all);
+        assert_eq!(pending.count(), 11);
+        // The outline: every page, and the image of the header's alone.
+        let mut outline = Vec::new();
+        pending
+            .outline(&mut |id, header| {
+                outline.push((id, header.map(<[u8]>::to_vec)));
+                Ok(())
+            })
+            .unwrap();
+        let expected: Vec<_> = all
+            .iter()
+            .map(|(id, page)| (*id, (*id == HEADER_PAGE).then(|| page.clone())))
+            .collect();
+        assert_eq!(outline, expected);
     }
 
-    /// A batch whose record would be over 4 GiB is refused, before
-    /// anything is written (SPEC §90): its length would not fit the
-    /// record's `u32`.
+    /// A batch in several records is restored whole or not at all: cut
+    /// anywhere before its end, at a record's end or inside one, or with
+    /// its last record damaged, none of it is recovered, and the batch
+    /// before it is (SPEC §91).
     #[test]
-    fn a_batch_too_large_for_one_record_is_refused_with_nothing_written() {
-        assert_eq!(body_len(0).unwrap(), 4);
-        let largest = body_len(MAX_RECORD_PAGES).unwrap();
-        assert!(u64::from(largest) + PAGE_ENTRY_LEN as u64 > u64::from(u32::MAX));
-        assert!(body_len(MAX_RECORD_PAGES + 1).is_err());
-        assert!(body_len(usize::MAX).is_err());
-
+    fn a_batch_torn_in_any_of_its_records_recovers_none_of_it() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.trunkdb");
-        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        let mut wal = open_with_small_records(&db_path);
         log(&mut wal, &two_page_batch());
-        let before = wal_bytes(&db_path);
-        let one = page(7);
-        let too_many = vec![(1, &one[..]); MAX_RECORD_PAGES + 1];
-        let err = wal.log(&too_many).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            err.to_string().contains("too large for one WAL record"),
-            "{err}"
+        let before = wal.len() as usize;
+        log(&mut wal, &images(8));
+        drop(wal);
+        let whole = wal_bytes(&db_path);
+        let one = 8 + 8 + 3 * PAGE_ENTRY_LEN;
+
+        let cuts = [
+            before + 5,         // inside the first record's prefix
+            before + one,       // after the first record
+            before + one + 100, // inside the second
+            before + 2 * one,   // after the second: only the last missing
+            whole.len() - 1,    // one byte short
+        ];
+        for cut in cuts {
+            set_wal_bytes(&db_path, &whole[..cut]);
+            let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+            assert_eq!(pending.images(), two_page_batch(), "cut at {cut}");
+            assert_eq!(pending.count(), 2, "cut at {cut}");
+            let mut headers = 0;
+            pending
+                .outline(&mut |_, header| {
+                    headers += header.is_some() as u32;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(headers, 0, "the torn batch's header image, cut at {cut}");
+        }
+        let mut damaged = whole.clone();
+        *damaged.last_mut().unwrap() ^= 0xFF;
+        set_wal_bytes(&db_path, &damaged);
+        let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(
+            pending.images(),
+            two_page_batch(),
+            "the last record damaged"
         );
-        assert_eq!(wal_bytes(&db_path), before);
-        assert_eq!(wal.len(), before.len() as u64);
+
+        set_wal_bytes(&db_path, &whole);
+        let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(pending.count(), 10);
+    }
+
+    /// Every record of a batch is flushed before the next is written, so
+    /// a damaged record with another behind it is damage, not a crash:
+    /// an error, inside a batch as between batches.
+    #[test]
+    fn a_bad_checksum_inside_a_batch_before_its_last_record_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let mut wal = open_with_small_records(&db_path);
+        log(&mut wal, &images(8));
+        drop(wal);
+        let one = 8 + 8 + 3 * PAGE_ENTRY_LEN;
+        for record in [0, 1] {
+            let mut bytes = wal_bytes(&db_path);
+            bytes[WAL_HEADER_LEN + record * one + 20] ^= 0xFF;
+            set_wal_bytes(&db_path, &bytes);
+            let err = WalDurability::open(&db_path)
+                .err()
+                .expect("must not recover");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "record {record}");
+            bytes[WAL_HEADER_LEN + record * one + 20] ^= 0xFF;
+            set_wal_bytes(&db_path, &bytes);
+        }
+    }
+
+    /// A record as version 2 wrote it: no flags, a batch of its own.
+    fn version_2_record(pages: &[PageImage]) -> Vec<u8> {
+        let mut body = (pages.len() as u32).to_le_bytes().to_vec();
+        for (id, page) in pages {
+            body.extend_from_slice(&id.to_le_bytes());
+            body.extend_from_slice(page);
+        }
+        let mut record = (body.len() as u32).to_le_bytes().to_vec();
+        record.extend_from_slice(&crc32(&body).to_le_bytes());
+        record.extend(body);
+        record
+    }
+
+    /// A WAL a crash left under a build before §91 is recovered: version
+    /// 2, a record a batch, no flags. It isn't added to: the first log
+    /// after the checkpoint starts a file of this version.
+    #[test]
+    fn a_wal_of_the_version_before_is_recovered_and_not_added_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let mut old = WAL_MAGIC.to_vec();
+        old.extend_from_slice(&2u32.to_le_bytes());
+        old.extend(version_2_record(&two_page_batch()));
+        old.extend(version_2_record(&[(5, page(5))]));
+        let torn = version_2_record(&[(6, page(6))]);
+        old.extend_from_slice(&torn[..torn.len() - 7]);
+        set_wal_bytes(&db_path, &old);
+
+        let (mut wal, pending) = WalDurability::open(&db_path).unwrap();
+        let mut both = two_page_batch();
+        both.push((5, page(5)));
+        assert_eq!(pending.images(), both);
+        drop(pending);
+        let one = page(1);
+        wal.log(&[(1, &one[..])]).unwrap_err();
+        assert_eq!(wal_bytes(&db_path), old, "nothing added");
 
         wal.checkpoint().unwrap();
-        let err = wal.log(&too_many).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(wal_bytes(&db_path).is_empty(), "not even the header");
-    }
+        wal.log(&[(1, &one[..])]).unwrap();
+        assert_eq!(wal_bytes(&db_path)[..WAL_HEADER_LEN], encode_header());
+        drop(wal);
+        let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(pending.images(), vec![(1, one)]);
 
-    /// Takes `room` bytes, then fails every write, as a full disk does.
-    struct FullAfter {
-        room: usize,
-        written: Vec<u8>,
-    }
-
-    impl Write for FullAfter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let n = bytes.len().min(self.room - self.written.len());
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"));
-            }
-            self.written.extend_from_slice(&bytes[..n]);
-            Ok(n)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+        // Any other version is refused, as before.
+        for version in [1u32, 4] {
+            let mut other = WAL_MAGIC.to_vec();
+            other.extend_from_slice(&version.to_le_bytes());
+            other.extend(version_2_record(&two_page_batch()));
+            set_wal_bytes(&db_path, &other);
+            let err = WalDurability::open(&db_path).err().expect("refused");
+            assert!(err.to_string().contains("unsupported WAL version"), "{err}");
         }
     }
 
-    /// A write that fails at the very end of a record fails `log`'s
-    /// writing too, for a batch smaller than the buffer and for one
-    /// larger: none is reported written that isn't whole (SPEC §90).
+    /// A header a crash cut short holds nothing, and isn't written
+    /// behind either.
     #[test]
-    fn a_record_whose_last_bytes_fail_to_write_is_an_error() {
-        for count in [2, 300] {
-            let images: Vec<PageImage> = (0..count).map(|id| (id, page(id as u8))).collect();
-            let pages: Vec<(PageId, &[u8])> = images.iter().map(|(id, p)| (*id, &p[..])).collect();
-            let whole = WAL_HEADER_LEN + encode_record(&pages).len();
+    fn a_torn_header_is_not_added_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        set_wal_bytes(&db_path, &encode_header()[..5]);
+        let (mut wal, pending) = WalDurability::open(&db_path).unwrap();
+        assert!(pending.is_empty());
+        let one = page(1);
+        wal.log(&[(1, &one[..])]).unwrap_err();
+        wal.checkpoint().unwrap();
+        wal.log(&[(1, &one[..])]).unwrap();
+    }
 
-            let mut fits = FullAfter {
-                room: whole,
-                written: Vec::new(),
-            };
-            assert_eq!(
-                write_buffered(&mut fits, true, &pages).unwrap(),
-                whole as u64
-            );
-            let mut short = FullAfter {
-                room: whole - 1,
-                written: Vec::new(),
-            };
-            let err = write_buffered(&mut short, true, &pages).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::StorageFull, "{count} pages");
-        }
+    /// A flag this build doesn't know is from a later one, which meant
+    /// something by it: an error, not a guess.
+    #[test]
+    fn a_record_with_unknown_flags_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let mut bytes = encode_header().to_vec();
+        bytes.extend(encode_batch(&borrowed(&two_page_batch()), 3));
+        let record = WAL_HEADER_LEN;
+        bytes[record + 12] = 2; // the flags, after length, CRC and count
+        let crc = crc32(&bytes[record + 8..]);
+        bytes[record + 4..record + 8].copy_from_slice(&crc.to_le_bytes());
+        set_wal_bytes(&db_path, &bytes);
+        let err = WalDurability::open(&db_path).err().expect("refused");
+        assert!(err.to_string().contains("flags"), "{err}");
     }
 
     #[test]
@@ -536,6 +869,7 @@ mod tests {
         set_wal_bytes(&db_path, &bytes[..bytes.len() - USABLE_PAGE_SIZE / 2]);
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert!(recovered.is_empty(), "got a partial batch");
     }
 
@@ -556,6 +890,7 @@ mod tests {
         set_wal_bytes(&db_path, &bytes);
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert!(recovered.is_empty());
     }
 
@@ -602,6 +937,7 @@ mod tests {
         set_wal_bytes(&db_path, &WAL_MAGIC[..5]);
 
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert!(recovered.is_empty());
     }
 
@@ -625,7 +961,7 @@ mod tests {
         assert!(wal.log(&[(5, &page(3))]).is_err());
         assert_eq!(wal.len(), good.len() as u64, "not counted");
         // What makes it dangerous: the record is there, and complete.
-        let left_behind = decode_pending(&wal_bytes(&db_path)).unwrap();
+        let left_behind = read_pending(&db_path).unwrap().images();
         assert_eq!(left_behind.len(), 3);
 
         wal.undo_failed_log().unwrap();
@@ -633,6 +969,7 @@ mod tests {
         log(&mut wal, &[(6, page(4))]);
         drop(wal);
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert_eq!(recovered, vec![(3, page(1)), (4, page(2)), (6, page(4))]);
     }
 
@@ -653,6 +990,7 @@ mod tests {
         log(&mut wal, &two_page_batch());
         drop(wal);
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        let recovered = recovered.images();
         assert_eq!(recovered, two_page_batch());
     }
 

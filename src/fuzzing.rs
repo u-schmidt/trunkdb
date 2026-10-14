@@ -35,11 +35,15 @@ pub fn unseal(file: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// A WAL file holding one valid record of `pages`, each `(id, bytes)`
-/// with `USABLE_PAGE_SIZE` bytes — what a commit of them would log.
-pub fn wal(pages: &[(PageId, Vec<u8>)]) -> Vec<u8> {
+/// A WAL file holding one valid batch of `pages`, each `(id, bytes)`
+/// with `USABLE_PAGE_SIZE` bytes — what a commit of them would log, in
+/// records of at most `record_pages` pages (SPEC §91); at least one.
+pub fn wal(pages: &[(PageId, Vec<u8>)], record_pages: usize) -> Vec<u8> {
     let pages: Vec<(PageId, &[u8])> = pages.iter().map(|(id, page)| (*id, &page[..])).collect();
     let mut file = crate::durability::encode_header().to_vec();
-    file.extend_from_slice(&crate::durability::encode_record(&pages));
+    file.extend_from_slice(&crate::durability::encode_batch(
+        &pages,
+        record_pages.max(1),
+    ));
     file
 }
