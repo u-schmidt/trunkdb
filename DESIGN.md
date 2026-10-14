@@ -424,7 +424,10 @@ more than four.
 - **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),
   `compact` [§41](spec/41-compaction.md), `checkpoint` [§51](spec/51-one-flush-per-commit.md), `drop_collection` [§37](spec/37-delete-many-and-dropping-a-collection.md).
 - **Errors:** one `Error` enum. A failed batch is rolled back and says
-  why: `DuplicateId`, `DuplicateValue`, `NotFound`, and so on.
+  why: `DuplicateId`, `DuplicateValue`, `NotFound`, and so on. An open
+  says why it failed in types, not words: `Format` for a file or WAL
+  this build can't read at all, `Io` of kind `WouldBlock` for a file
+  another open holds, `Io` of kind `InvalidData` for damage [§92](spec/92-typed-format-errors.md).
 
 ## 11. Tools
 

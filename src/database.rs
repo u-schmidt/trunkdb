@@ -349,6 +349,18 @@ impl Database {
     /// before it reads anything — not even the WAL, which the running
     /// instance may be halfway through writing. To share one database
     /// within a process, clone the handle instead of opening it again.
+    ///
+    /// # Errors
+    /// How an open fails says why, for a program to match on (SPEC §92):
+    /// - `Error::Format`: the file, or the WAL beside it, is not one this
+    ///   build can read at all — another program's file, or a format it
+    ///   doesn't read. Nothing was changed.
+    /// - `Error::Io` of kind `WouldBlock`: another open holds the file,
+    ///   in this process or another one.
+    /// - `Error::Io` of kind `InvalidData`: the file is trunkdb's but
+    ///   damaged; the message says where.
+    /// - `Error::Io` of other kinds: the file system's, such as
+    ///   `PermissionDenied`, or `NotFound` for a read-only open.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         Self::open_with(path, OpenOptions::default())
     }
@@ -1325,9 +1337,173 @@ mod tests {
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, b"my notes").unwrap();
 
-        assert!(Database::open(&path).is_err());
+        assert!(matches!(
+            Database::open(&path),
+            Err(crate::Error::Format(crate::FormatError::NotTrunkdb))
+        ));
         assert_eq!(std::fs::read(&path).unwrap(), b"my notes");
         assert!(!dir.path().join("notes.txt.wal").exists());
+    }
+
+    /// Both opens: `open` and a read-only one.
+    fn both_opens(path: &Path) -> [crate::Result<Database>; 2] {
+        [Database::open(path), open_read_only(path)]
+    }
+
+    /// The format error an open of `path` met, both opens agreeing, with
+    /// its message; the file's bytes are what they were.
+    fn format_error_of(path: &Path) -> (crate::FormatError, String) {
+        let before = std::fs::read(path).unwrap();
+        let [writing, read_only] = both_opens(path).map(|result| match result {
+            Err(crate::Error::Format(format)) => format,
+            other => panic!("expected a format error, got {:?}", other.err()),
+        });
+        assert_eq!(writing, read_only);
+        assert_eq!(std::fs::read(path).unwrap(), before, "nothing changed");
+        let message = crate::Error::Format(writing.clone()).to_string();
+        (writing, message)
+    }
+
+    /// The header's format version, replaced in place; its checksum no
+    /// longer matches, which an unreadable format is reported before.
+    fn set_format_version(path: &Path, version: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[28..32].copy_from_slice(&version.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A file an open can't read at all comes back as `Error::Format`,
+    /// saying which case, with the same words as before it was typed
+    /// (SPEC §92).
+    #[test]
+    fn an_open_says_which_file_it_cannot_read() {
+        let (dir, path, db) = open_temp();
+        drop(db);
+        let database = std::fs::read(&path).unwrap();
+
+        let foreign = dir.path().join("foreign.bin");
+        for bytes in [vec![b'x'; PAGE_SIZE * 2], b"my notes".to_vec()] {
+            std::fs::write(&foreign, &bytes).unwrap();
+            assert_eq!(
+                format_error_of(&foreign),
+                (
+                    crate::FormatError::NotTrunkdb,
+                    "not a trunkdb file (bad magic)".to_string()
+                )
+            );
+        }
+
+        for (version, expected, message) in [
+            (
+                0,
+                crate::FormatError::Unversioned,
+                "file was written before format versioning (trunkdb 0.1.0 or an early \
+                 development build), which this build can't read",
+            ),
+            (
+                12,
+                crate::FormatError::Newer {
+                    found: 12,
+                    current: 11,
+                },
+                "file has format 12, newer than this build's 11 — open it with a newer trunkdb",
+            ),
+            (
+                5,
+                crate::FormatError::Older {
+                    found: 5,
+                    oldest: 6,
+                    current: 11,
+                },
+                "file has format 5, older than this build's 11: export it with the trunkdb \
+                 version that wrote it (`trunkdb export`), and import the export into a new \
+                 file with this one",
+            ),
+        ] {
+            std::fs::write(&path, &database).unwrap();
+            set_format_version(&path, version);
+            assert_eq!(
+                format_error_of(&path),
+                (expected, message.to_string()),
+                "format {version}"
+            );
+        }
+    }
+
+    /// The WAL beside the file is checked the same way: another
+    /// program's bytes, or a version this build doesn't read.
+    #[test]
+    fn an_open_says_which_wal_it_cannot_read() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        let wal = path.with_extension("trunkdb.wal");
+
+        let mut newer = b"TRUNKWAL".to_vec();
+        newer.extend_from_slice(&4u32.to_le_bytes());
+        for (bytes, expected, message) in [
+            (
+                b"some other program's log".to_vec(),
+                crate::FormatError::WalNotTrunkdb,
+                "not a trunkdb page-image WAL (bad magic) — possibly one written by an older trunkdb",
+            ),
+            (
+                newer,
+                crate::FormatError::WalVersion { found: 4 },
+                "unsupported WAL version 4, this build reads 2 and 3",
+            ),
+        ] {
+            std::fs::write(&wal, &bytes).unwrap();
+            assert_eq!(format_error_of(&path), (expected, message.to_string()));
+            assert_eq!(
+                std::fs::read(&wal).unwrap(),
+                bytes,
+                "the WAL is left as it is"
+            );
+        }
+        std::fs::remove_file(&wal).unwrap();
+        assert_two_collection_batch_present(&Database::open(&path).unwrap());
+    }
+
+    /// What isn't a format question stays `Error::Io`: damage is
+    /// `InvalidData` — a page size not this build's among it, as trunkdb
+    /// has only ever had one — and a held file is `WouldBlock`.
+    #[test]
+    fn damage_and_a_held_file_are_not_format_errors() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        let database = std::fs::read(&path).unwrap();
+
+        let mut other_page_size = database.clone();
+        other_page_size[8..12].copy_from_slice(&4096u32.to_le_bytes());
+        let mut bad_checksum = database.clone();
+        bad_checksum[100] ^= 0xff;
+        for (bytes, words) in [
+            (other_page_size, "page size mismatch"),
+            (bad_checksum, "damaged"),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            for result in both_opens(&path) {
+                match result {
+                    Err(crate::Error::Io(e)) => {
+                        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+                        assert!(e.to_string().contains(words), "{e}");
+                    }
+                    other => panic!("expected damage, got {:?}", other.err()),
+                }
+            }
+        }
+
+        std::fs::write(&path, &database).unwrap();
+        let _held = Database::open(&path).unwrap();
+        for result in both_opens(&path) {
+            assert!(
+                matches!(&result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "{:?}",
+                result.err()
+            );
+        }
     }
 
     #[test]

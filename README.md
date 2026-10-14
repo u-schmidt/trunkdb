@@ -508,9 +508,17 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     a crash in a compaction to 1.2 GB it took 37 MB, where it took
     2.5 GB. No batch size limit. WAL version 3; a version 2 WAL left by
     a crash is still recovered.
+62. **Typed format errors** (§92): an open of a file this build can't
+    read at all fails with `Error::Format`: not a trunkdb file, a format
+    too old or too new (with the versions), a WAL that isn't trunkdb's
+    or of a version it doesn't read. The messages are the same.
+    `InvalidData` at an open now means damage only, and `WouldBlock` a
+    file another open holds, as before.
 
-    Items 60–61: not released yet; no change to the database file's
+    Items 60–62: not released yet; no change to the database file's
     format. An older build refuses a WAL this one left after a crash.
+    Code that caught a foreign or unreadable file as `Error::Io` with
+    `InvalidData` now gets `Error::Format` instead.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
