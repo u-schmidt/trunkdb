@@ -580,7 +580,7 @@ impl Pages {
     /// image. The cache is emptied first: pages are about to change under
     /// it. No bounds check, no flush: `FileStore::restore_pages` does
     /// both. At open only, before there is a reader.
-    pub(super) fn restore(&self, pages: &[super::PageImage]) -> io::Result<()> {
+    pub(super) fn restore(&self, pages: &dyn super::PendingPages) -> io::Result<()> {
         {
             let mut memory = self.memory_mut();
             assert!(
@@ -590,10 +590,7 @@ impl Pages {
             memory.file_epoch += 1;
             memory.cache.clear();
         }
-        for (id, page) in pages {
-            write_page_at(&self.file, *id, page)?;
-        }
-        Ok(())
+        pages.pages(&mut |id, page| write_page_at(&self.file, id, page))
     }
 
     /// Cuts the file to `page_count` pages, if it's longer — after a

@@ -500,10 +500,17 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
 60. **Compaction in a third of the memory** (§90): the WAL record is
     written from the pages instead of built beside them, so compacting
     takes about 1.2× the new file's size instead of 3.3×. A batch over
-    4 GiB of pages, a `compact` of a file that large too, is refused
-    instead of logged with a length cut to 32 bits.
+    4 GiB of pages was logged with its length cut to 32 bits, which
+    recovery after a crash misread; §91 lifts the limit.
+61. **Crash recovery in the memory of one record** (§91): a batch over
+    32 MiB is logged in several records, each flushed before the next,
+    and the open after a crash reads the WAL a record at a time. After
+    a crash in a compaction to 1.2 GB it took 37 MB, where it took
+    2.5 GB. No batch size limit. WAL version 3; a version 2 WAL left by
+    a crash is still recovered.
 
-    Item 60: not released yet; no format change.
+    Items 60–61: not released yet; no change to the database file's
+    format. An older build refuses a WAL this one left after a crash.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

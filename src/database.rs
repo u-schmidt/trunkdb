@@ -1481,6 +1481,59 @@ mod tests {
         assert!(err.to_string().contains("header counts 0 pages"), "{err}");
     }
 
+    /// A batch logged in several records (SPEC §91) — here a compaction,
+    /// two pages a record — is recovered whole from the whole WAL, and
+    /// not at all from one cut anywhere before its end: then the file is
+    /// as it was before the batch, and sound.
+    #[test]
+    fn a_batch_in_several_records_is_recovered_whole_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let never = OpenOptions::default().checkpoint_pages(usize::MAX);
+        let db = Database::open_with(&path, never).unwrap();
+        fill(&db, "kept");
+        fill(&db, "dropped");
+        db.drop_collection("dropped").unwrap();
+        db.checkpoint().unwrap();
+        let before = (db.state().store.file_bytes(), contents(&db, "kept"));
+        let pages_before = db.file_info().unwrap().pages;
+
+        db.state().wal().set_record_pages(2);
+        let compacted = db.compact().unwrap();
+        assert!(compacted.pages_after < pages_before);
+        assert_eq!(db.state().store.file_bytes(), before.0, "not written back");
+        let wal = std::fs::read(dir.path().join("test.trunkdb.wal")).unwrap();
+        let record = 16 + 2 * (8 + crate::storage::USABLE_PAGE_SIZE);
+        let records = (wal.len() - 12).div_ceil(record);
+        assert!(records > 20, "{records} records");
+
+        // As a crash leaves them: the file, and so much of the WAL.
+        let crashed = |name: &str, wal: &[u8]| {
+            let copy = dir.path().join(name);
+            std::fs::write(&copy, &before.0).unwrap();
+            std::fs::write(dir.path().join(format!("{name}.wal")), wal).unwrap();
+            Database::open(&copy).unwrap()
+        };
+        let whole = crashed("whole.trunkdb", &wal);
+        assert_eq!(whole.file_info().unwrap().pages, compacted.pages_after);
+        assert_eq!(contents(&whole, "kept"), before.1);
+        assert!(whole.check().unwrap().is_ok());
+
+        let cuts = [
+            12 + record,                 // its first record alone
+            12 + (records / 2) * record, // half of them
+            12 + (records / 2) * record + 99,
+            12 + (records - 1) * record, // all but the last
+            wal.len() - 1,
+        ];
+        for (i, cut) in cuts.into_iter().enumerate() {
+            let torn = crashed(&format!("torn{i}.trunkdb"), &wal[..cut]);
+            assert_eq!(torn.file_info().unwrap().pages, pages_before, "cut {i}");
+            assert_eq!(contents(&torn, "kept"), before.1, "cut {i}");
+            assert!(torn.check().unwrap().is_ok(), "cut {i}");
+        }
+    }
+
     /// Writing back pages that are already in the main file changes
     /// nothing — no duplicate documents, no error.
     #[test]

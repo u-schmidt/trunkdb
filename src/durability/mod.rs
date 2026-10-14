@@ -1,7 +1,7 @@
 mod wal;
 pub use wal::{WalDurability, read_pending};
 #[cfg(feature = "fuzzing")]
-pub(crate) use wal::{encode_header, encode_record};
+pub(crate) use wal::{encode_batch, encode_header};
 
 use crate::storage::PageId;
 

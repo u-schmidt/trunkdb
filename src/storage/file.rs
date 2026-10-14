@@ -1,10 +1,12 @@
+#[cfg(test)]
+use super::PageImage;
 use super::pages::{
     PAGE_SIZE, Pages, USABLE_PAGE_SIZE, checksum_matches, damaged, read_disk_page, read_exact_at,
 };
 use super::snapshot::Commit;
 #[cfg(test)]
 use super::snapshot::SnapshotStore;
-use super::{Page, PageId, PageImage, PageStore, PageType};
+use super::{Page, PageId, PageStore, PageType, PendingPages};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
@@ -47,7 +49,7 @@ const FORMAT_VERSION: u32 = 11;
 /// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
 /// the checksum (6), and uses the bytes where it now goes.
 const COMPATIBLE_OLDER_FORMATS: [u32; 5] = [6, 7, 8, 9, 10];
-pub(super) const HEADER_PAGE: PageId = 0;
+pub(crate) const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
 const NO_FREE_PAGE: PageId = 0;
@@ -667,7 +669,7 @@ impl FileStore {
     /// may have been among them — and `fsync`s. No bounds check: the batch
     /// that logged these pages may have grown the file past what the
     /// on-disk header says, and its header image is what makes them valid.
-    pub fn restore_pages(&mut self, pages: &[PageImage]) -> io::Result<()> {
+    pub fn restore_pages(&mut self, pages: &dyn PendingPages) -> io::Result<()> {
         assert!(
             self.staging.is_none(),
             "FileStore::restore_pages while staging"
@@ -690,7 +692,7 @@ impl FileStore {
     /// stay as they are, and the next open that writes recovers from the
     /// WAL as it would have. The header is the WAL's newest image of it,
     /// if it has one; then the file's isn't checked, nor read again.
-    pub(crate) fn restore_in_memory(&mut self, pages: &[PageImage]) -> io::Result<()> {
+    pub(crate) fn restore_in_memory(&mut self, pages: &dyn PendingPages) -> io::Result<()> {
         assert!(
             self.staging.is_none(),
             "FileStore::restore_in_memory while staging"
@@ -698,10 +700,11 @@ impl FileStore {
         self.check_restorable(pages)?;
         // A page logged more than once ends at its latest image, as
         // `restore_pages` writes them in order.
-        let latest: BTreeMap<PageId, Page> = pages
-            .iter()
-            .map(|(id, page)| (*id, Page::from(&page[..])))
-            .collect();
+        let mut latest: BTreeMap<PageId, Page> = BTreeMap::new();
+        pages.pages(&mut |id, page| {
+            latest.insert(id, Page::from(page));
+            Ok(())
+        })?;
         if let Some(header) = latest.get(&HEADER_PAGE) {
             self.header = Header::decode(header)?;
             self.header_checked = true;
@@ -714,13 +717,19 @@ impl FileStore {
     /// Whether the pages recovered from the WAL can be restored: the
     /// header's fields, if the file's are damaged, and every page within
     /// the file as the WAL's header has it. Checked before anything is
-    /// restored, so a damaged WAL leaves the file as it was.
-    fn check_restorable(&mut self, pages: &[PageImage]) -> io::Result<()> {
+    /// restored, so a damaged WAL leaves the file as it was — and from
+    /// the pages' outline, without the pages themselves (SPEC §91).
+    fn check_restorable(&mut self, pages: &dyn PendingPages) -> io::Result<()> {
+        let mut has_header = false;
+        pages.outline(&mut |_, header| {
+            has_header |= header.is_some();
+            Ok(())
+        })?;
         // A page past the end of the file, as the header before it has
         // it, is damage (SPEC §55): a batch that grows the file logs its
         // header too, and first, as page 0. Checked before anything is
         // written, so a damaged WAL leaves the file as it was.
-        if self.header_error.is_some() && !pages.iter().any(|(id, _)| *id == HEADER_PAGE) {
+        if self.header_error.is_some() && !has_header {
             // Damaged fields, and nothing in the WAL to replace them.
             return Err(self.header_error.take().unwrap());
         }
@@ -730,10 +739,10 @@ impl FileStore {
         // more pages than the file has and the WAL holds. A WAL that says
         // otherwise would have the restore write at the other end of a
         // sparse file of any size.
-        let room = self.pages.file().metadata()?.len() / PAGE_SIZE as u64 + pages.len() as u64;
-        for (id, page) in pages {
-            if *id == HEADER_PAGE {
-                let counted = Header::decode(page)?.page_count;
+        let room = self.pages.file().metadata()?.len() / PAGE_SIZE as u64 + pages.count();
+        pages.outline(&mut |id, header| {
+            if let Some(header) = header {
+                let counted = Header::decode(header)?.page_count;
                 if counted > room {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -744,7 +753,7 @@ impl FileStore {
                     ));
                 }
                 page_count = Some(counted);
-            } else if page_count.is_none_or(|count| *id >= count) {
+            } else if page_count.is_none_or(|count| id >= count) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -752,8 +761,8 @@ impl FileStore {
                     ),
                 ));
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
