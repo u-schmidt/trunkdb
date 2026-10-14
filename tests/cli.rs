@@ -54,6 +54,45 @@ fn a_missing_file_is_an_error_and_isnt_created() {
     assert!(!Path::new(&missing).exists());
 }
 
+/// A file this build can't read is reported in the same words as
+/// before the error was typed (SPEC §92), and nothing is changed.
+#[test]
+fn a_file_it_cannot_read_is_reported_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let (notes, newer, input) = (
+        path(dir.path(), "notes.txt"),
+        path(dir.path(), "newer.trunkdb"),
+        path(dir.path(), "in.jsonl"),
+    );
+    std::fs::write(&notes, b"my notes").unwrap();
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &newer, &input]).status.success());
+    let mut bytes = std::fs::read(&newer).unwrap();
+    bytes[28..32].copy_from_slice(&12u32.to_le_bytes());
+    std::fs::write(&newer, &bytes).unwrap();
+
+    for (file, message) in [
+        (&notes, "not a trunkdb file (bad magic)".to_string()),
+        (
+            &newer,
+            "file has format 12, newer than this build's 11 — open it with a newer trunkdb"
+                .to_string(),
+        ),
+    ] {
+        let before = std::fs::read(file).unwrap();
+        for command in ["info", "check", "compact"] {
+            let output = trunkdb(&[command, file]);
+            assert_eq!(output.status.code(), Some(1), "{command}");
+            assert_eq!(
+                stderr(&output),
+                format!("trunkdb: {file}: {message}\n"),
+                "{command}"
+            );
+        }
+        assert_eq!(std::fs::read(file).unwrap(), before);
+    }
+}
+
 #[test]
 fn import_info_check_and_export_round_trip() {
     let dir = tempfile::tempdir().unwrap();

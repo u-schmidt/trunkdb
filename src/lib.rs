@@ -132,21 +132,89 @@ pub enum Error {
     #[non_exhaustive]
     #[error("import, line {line}: {message}")]
     Import { line: usize, message: String },
+    /// An open found a file this build can't read at all: not a trunkdb
+    /// file, or one of a format it doesn't read (SPEC §92). Nothing was
+    /// changed. Damage is something else: `Io` of kind `InvalidData`.
+    #[error(transparent)]
+    Format(FormatError),
+}
+
+/// Why an open can't read a file at all (SPEC §92), as
+/// `Error::Format`. The message is the one people see; the variant is
+/// for programs, which shouldn't have to read it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FormatError {
+    /// The file doesn't start with trunkdb's magic: some other
+    /// program's file.
+    #[error("not a trunkdb file (bad magic)")]
+    NotTrunkdb,
+    /// Format 0: written before format versioning, by trunkdb 0.1.0 or
+    /// an early development build.
+    #[error(
+        "file was written before format versioning (trunkdb 0.1.0 or an early development build), which this build can't read"
+    )]
+    Unversioned,
+    /// A format newer than this build's `current`: open it with a newer
+    /// trunkdb.
+    #[non_exhaustive]
+    #[error(
+        "file has format {found}, newer than this build's {current} — open it with a newer trunkdb"
+    )]
+    Newer { found: u32, current: u32 },
+    /// A format older than `oldest`, the oldest this build reads as it
+    /// is: export it with the build that wrote it, and import the export
+    /// with this one.
+    #[non_exhaustive]
+    #[error(
+        "file has format {found}, older than this build's {current}: export it with the trunkdb version that wrote it (`trunkdb export`), and import the export into a new file with this one"
+    )]
+    Older {
+        found: u32,
+        oldest: u32,
+        current: u32,
+    },
+    /// The WAL beside the file doesn't start with the WAL's magic — one
+    /// from before the page-image WAL (SPEC §19), or another program's.
+    #[error("not a trunkdb page-image WAL (bad magic) — possibly one written by an older trunkdb")]
+    WalNotTrunkdb,
+    /// The WAL has a version this build doesn't read: one a crash left
+    /// under a newer build, say.
+    #[non_exhaustive]
+    #[error(
+        "unsupported WAL version {found}, this build reads {}",
+        durability::readable_wal_versions()
+    )]
+    WalVersion { found: u32 },
+}
+
+impl FormatError {
+    /// As an `io::Error`, which is how an open carries it until
+    /// `From<io::Error> for Error` takes it out again.
+    pub(crate) fn into_io(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, self)
+    }
 }
 
 /// By hand, where the others are derived: a page read that found its
 /// snapshot ended says so inside an `io::Error`, as a page read says
-/// everything, and comes out as `Error::SnapshotTooOld`.
+/// everything, and comes out as `Error::SnapshotTooOld`; an open that
+/// can't read the file at all says so the same way, and comes out as
+/// `Error::Format` (SPEC §92).
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        let too_old = error
-            .get_ref()
-            .is_some_and(|inner| inner.is::<storage::TooOld>());
-        if too_old {
-            Error::SnapshotTooOld
-        } else {
-            Error::Io(error)
+        let inner = error.get_ref();
+        if inner.is_some_and(|inner| inner.is::<storage::TooOld>()) {
+            return Error::SnapshotTooOld;
         }
+        if inner.is_some_and(|inner| inner.is::<FormatError>()) {
+            let format = error
+                .into_inner()
+                .and_then(|inner| inner.downcast::<FormatError>().ok())
+                .expect("checked above");
+            return Error::Format(*format);
+        }
+        Error::Io(error)
     }
 }
 

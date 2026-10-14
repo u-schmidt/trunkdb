@@ -102,3 +102,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 89. [A huge checkpoint threshold no longer overflows (`database.rs`)](89-a-huge-checkpoint-threshold-no-longer-overflows.md)
 90. [A WAL record written from the pages (`durability/wal.rs`)](90-a-wal-record-written-from-the-pages.md)
 91. [A batch in several records, and recovery a record at a time (`durability/wal.rs`, `storage/file.rs`, `storage/pages.rs`)](91-a-batch-in-several-records.md)
+92. [Typed format errors (`lib.rs`, `storage/file.rs`, `durability/wal.rs`, `database.rs`)](92-typed-format-errors.md)

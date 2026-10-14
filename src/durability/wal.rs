@@ -1,4 +1,5 @@
 use super::Durability;
+use crate::FormatError;
 use crate::crc32::crc32;
 #[cfg(test)]
 use crate::storage::PageImage;
@@ -185,15 +186,11 @@ impl<R: Read> Records<R> {
         let mut header = [0u8; WAL_HEADER_LEN];
         input.read_exact(&mut header)?;
         if &header[0..8] != WAL_MAGIC {
-            return Err(corrupt(
-                "not a trunkdb page-image WAL (bad magic) — possibly one written by an older trunkdb",
-            ));
+            return Err(FormatError::WalNotTrunkdb.into_io());
         }
         let version = read_u32(&header[8..]);
         if version != WAL_VERSION && version != WAL_VERSION_WITHOUT_FLAGS {
-            return Err(corrupt(&format!(
-                "unsupported WAL version {version}, this build reads {WAL_VERSION_WITHOUT_FLAGS} and {WAL_VERSION}"
-            )));
+            return Err(FormatError::WalVersion { found: version }.into_io());
         }
         Ok(Some(Records {
             input,
@@ -383,6 +380,12 @@ impl PendingPages for Pending {
         }
         Ok(())
     }
+}
+
+/// The WAL versions recovery reads, as `FormatError::WalVersion`'s
+/// message names them.
+pub(crate) fn readable_wal_versions() -> String {
+    format!("{WAL_VERSION_WITHOUT_FLAGS} and {WAL_VERSION}")
 }
 
 /// How many bytes of the WAL a read asks the file for at once.
@@ -809,6 +812,10 @@ mod tests {
             set_wal_bytes(&db_path, &other);
             let err = WalDurability::open(&db_path).err().expect("refused");
             assert!(err.to_string().contains("unsupported WAL version"), "{err}");
+            assert_eq!(
+                err.get_ref().unwrap().downcast_ref::<FormatError>(),
+                Some(&FormatError::WalVersion { found: version })
+            );
         }
     }
 

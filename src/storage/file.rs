@@ -7,6 +7,7 @@ use super::snapshot::Commit;
 #[cfg(test)]
 use super::snapshot::SnapshotStore;
 use super::{Page, PageId, PageStore, PageType, PendingPages};
+use crate::FormatError;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
@@ -49,6 +50,8 @@ const FORMAT_VERSION: u32 = 11;
 /// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
 /// the checksum (6), and uses the bytes where it now goes.
 const COMPATIBLE_OLDER_FORMATS: [u32; 5] = [6, 7, 8, 9, 10];
+/// The oldest format an open reads, for `FormatError::Older`.
+const OLDEST_READABLE_FORMAT: u32 = COMPATIBLE_OLDER_FORMATS[0];
 pub(crate) const HEADER_PAGE: PageId = 0;
 // Page 0 is reserved for the header and is never itself a free/data page,
 // so 0 doubles safely as "no free page" within the free list.
@@ -94,30 +97,25 @@ impl Header {
 
     fn decode(buf: &[u8]) -> io::Result<Self> {
         if &buf[0..8] != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not a trunkdb file (bad magic)",
-            ));
+            return Err(FormatError::NotTrunkdb.into_io());
         }
         // Checked before anything else in the header: another format
         // version may not even lay the rest of the header out this way.
         let format_version = u32::from_le_bytes(buf[28..32].try_into().unwrap());
         if format_version != FORMAT_VERSION && !COMPATIBLE_OLDER_FORMATS.contains(&format_version) {
-            let message = match format_version {
-                0 => "file was written before format versioning (trunkdb 0.1.0 or an early \
-                      development build), which this build can't read"
-                    .to_string(),
-                v if v > FORMAT_VERSION => format!(
-                    "file has format {v}, newer than this build's {FORMAT_VERSION} — \
-                     open it with a newer trunkdb"
-                ),
-                v => format!(
-                    "file has format {v}, older than this build's {FORMAT_VERSION}: \
-                     export it with the trunkdb version that wrote it (`trunkdb export`), \
-                     and import the export into a new file with this one"
-                ),
+            let error = match format_version {
+                0 => FormatError::Unversioned,
+                found if found > FORMAT_VERSION => FormatError::Newer {
+                    found,
+                    current: FORMAT_VERSION,
+                },
+                found => FormatError::Older {
+                    found,
+                    oldest: OLDEST_READABLE_FORMAT,
+                    current: FORMAT_VERSION,
+                },
             };
-            return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+            return Err(error.into_io());
         }
         let page_size = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         if page_size as usize != PAGE_SIZE {
@@ -304,10 +302,7 @@ impl FileStore {
             let mut start = vec![0u8; (len as usize).min(MAGIC.len())];
             read_exact_at(&file, &mut start, 0)?;
             if !MAGIC.starts_with(&start) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "not a trunkdb file (bad magic)",
-                ));
+                return Err(FormatError::NotTrunkdb.into_io());
             }
         }
         let mut header_error = None;
@@ -1146,6 +1141,10 @@ mod tests {
             let err = FileStore::open(&path).err().expect("must be rejected");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert!(
+                err.get_ref().unwrap().is::<FormatError>(),
+                "format {version}: typed (SPEC §92)"
+            );
+            assert!(
                 err.to_string().contains(expected),
                 "format {version}: {err}"
             );
@@ -1160,6 +1159,10 @@ mod tests {
 
         let err = FileStore::open(&path).err().expect("must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.get_ref().unwrap().downcast_ref::<FormatError>(),
+            Some(&FormatError::NotTrunkdb)
+        );
         assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 
