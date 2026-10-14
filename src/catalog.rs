@@ -297,6 +297,33 @@ impl Catalog {
         self.indexes.get(collection).map_or(&[], Vec::as_slice)
     }
 
+    /// How many pages the catalog `compact` writes would take (SPEC
+    /// §93.4): this one's cells, in the order `compact` creates them —
+    /// each collection by name, then its indexes — each on the first page
+    /// with room, as `append_cell` puts them.
+    pub(crate) fn rebuilt_pages(&self) -> u64 {
+        let mut names: Vec<&str> = self.names().collect();
+        names.sort();
+        let empty = SlottedPage::new(PageType::Catalog).free_space();
+        let mut rooms = vec![empty];
+        for name in names {
+            let meta = self.collections[name];
+            let cells = std::iter::once(encode_collection(name, &meta).len()).chain(
+                self.indexes(name)
+                    .iter()
+                    .map(|index| encode_index(name, index).len()),
+            );
+            for cell in cells {
+                let needed = SlottedPage::space_needed(cell);
+                match rooms.iter_mut().find(|room| **room >= needed) {
+                    Some(room) => *room -= needed,
+                    None => rooms.push(empty - needed),
+                }
+            }
+        }
+        rooms.len() as u64
+    }
+
     pub fn create_collection(
         &mut self,
         store: &mut dyn PageStore,

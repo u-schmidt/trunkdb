@@ -399,7 +399,7 @@ fn corrupt(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn wal_path(db_path: &Path) -> PathBuf {
+pub(crate) fn wal_path(db_path: &Path) -> PathBuf {
     let mut os_string = db_path.as_os_str().to_os_string();
     os_string.push(".wal");
     PathBuf::from(os_string)

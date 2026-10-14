@@ -26,6 +26,7 @@ mod json;
 pub mod query;
 mod serde_bridge;
 mod snapshot;
+mod stats;
 mod storage;
 mod txn;
 mod update;
@@ -43,6 +44,7 @@ pub use export::{ImportOptions, Summary};
 pub use json::ParseDocumentError;
 pub use serde_bridge::DocumentError;
 pub use snapshot::{Snapshot, SnapshotInfo, View};
+pub use stats::{CollectionStats, IndexStats, PageUse, Recovered, Stats};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

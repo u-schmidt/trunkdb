@@ -210,7 +210,7 @@ cargo test
 
 ```
 cargo install --path .
-trunkdb info app.trunkdb                 # format, pages, collections, indexes
+trunkdb info app.trunkdb                 # format, pages and sizes, collections, indexes
 trunkdb check app.trunkdb                # consistency check; exit code 1 on problems
 trunkdb compact app.trunkdb              # rebuild into as few pages as needed
 trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
@@ -515,7 +515,14 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `InvalidData` at an open now means damage only, and `WouldBlock` a
     file another open holds, as before.
 
-    Items 60–62: not released yet; no change to the database file's
+63. **Storage statistics** (§93): `db.stats()` says where the file's
+    space goes: pages by kind, each collection's documents, bytes, data
+    and overflow pages and free room, each index's entries, pages and
+    depth, the WAL's size, what the open recovered, and how many pages a
+    `compact` would leave, exactly, without compacting. A sixth of what
+    `check` costs. `trunkdb info` prints them.
+
+    Items 60–63: not released yet; no change to the database file's
     format. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with
     `InvalidData` now gets `Error::Format` instead.

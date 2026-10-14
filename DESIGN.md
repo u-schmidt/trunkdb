@@ -422,7 +422,10 @@ more than four.
   `query`. Types a caller passes in are built with methods; types it
   gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md).
 - **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),
-  `compact` [§41](spec/41-compaction.md), `checkpoint` [§51](spec/51-one-flush-per-commit.md), `drop_collection` [§37](spec/37-delete-many-and-dropping-a-collection.md).
+  `compact` [§41](spec/41-compaction.md), `checkpoint` [§51](spec/51-one-flush-per-commit.md), `drop_collection` [§37](spec/37-delete-many-and-dropping-a-collection.md),
+  `stats`: pages by kind, each collection's and index's size, the WAL's,
+  and the pages a `compact` would leave, worked out exactly from the
+  sizes without compacting [§93](spec/93-storage-statistics.md).
 - **Errors:** one `Error` enum. A failed batch is rolled back and says
   why: `DuplicateId`, `DuplicateValue`, `NotFound`, and so on. An open
   says why it failed in types, not words: `Format` for a file or WAL

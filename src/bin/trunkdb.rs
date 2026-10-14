@@ -112,6 +112,18 @@ fn info(file: &str, db: &Database) -> Outcome {
         "  format {}, {} pages of {} bytes, {} free",
         file_info.format_version, file_info.pages, file_info.page_size, file_info.free_pages
     );
+    // The sizes (SPEC §93) after the lines that were there before, which
+    // scripts may read; on a file they can't be read from, those still are.
+    let stats = match db.stats() {
+        Ok(stats) => {
+            print_page_use(&stats);
+            Some(stats)
+        }
+        Err(e) => {
+            println!("  sizes not available: {e} (`trunkdb check` says more)");
+            None
+        }
+    };
     let collections = db.collections().map_err(failed)?;
     if collections.is_empty() {
         println!("  no collections");
@@ -140,8 +152,88 @@ fn info(file: &str, db: &Database) -> Outcome {
             true => println!("  {name}: {documents}"),
             false => println!("  {name}: {documents}, indexes: {}", indexes.join(", ")),
         }
+        let sizes = stats
+            .as_ref()
+            .and_then(|stats| stats.collections.iter().find(|c| c.name == name));
+        if let Some(sizes) = sizes {
+            print_collection_sizes(sizes);
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `info`'s summary of where the pages go (SPEC §93).
+fn print_page_use(stats: &trunkdb::Stats) {
+    let pages = &stats.pages;
+    let mut parts = vec![
+        format!("{} header", pages.header),
+        format!("{} catalog", pages.catalog),
+        format!("{} data", pages.data),
+        format!("{} overflow", pages.overflow),
+        format!("{} index", pages.index),
+        format!("{} free", pages.free),
+    ];
+    if pages.unaccounted > 0 {
+        parts.push(format!("{} unaccounted", pages.unaccounted));
+    }
+    println!("  pages: {}", parts.join(", "));
+    let after = stats.compacted_pages_estimate();
+    match stats.file.pages - after {
+        0 => println!("  compact would not make it smaller"),
+        saved => println!(
+            "  compact would leave {}, {} fewer",
+            count(after as usize, "page"),
+            bytes(saved * stats.file.page_size as u64)
+        ),
+    }
+    if let Some(wal) = stats.wal_bytes {
+        println!("  WAL: {}", bytes(wal));
+    }
+    if let Some(recovered) = stats.recovered {
+        println!(
+            "  recovered {} from the WAL{}",
+            count(recovered.pages as usize, "page"),
+            if recovered.in_memory {
+                ", in memory"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+/// One collection's sizes, under its line.
+fn print_collection_sizes(sizes: &trunkdb::CollectionStats) {
+    let index_pages: u64 = std::iter::once(&sizes.primary)
+        .chain(&sizes.indexes)
+        .map(|index| index.pages)
+        .sum();
+    let overflow = match sizes.overflow_pages {
+        0 => String::new(),
+        n => format!(" and {}", count(n as usize, "overflow page")),
+    };
+    println!(
+        "    {} of documents in {}{overflow}, {} free in them; indexes {}",
+        bytes(sizes.document_bytes),
+        count(sizes.data_pages as usize, "data page"),
+        bytes(sizes.free_bytes),
+        count(index_pages as usize, "page"),
+    );
+}
+
+/// `512 bytes`, `4.0 KiB`, `1.2 MiB`, `3.4 GiB`.
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
+    if n < 1024 {
+        return count(n as usize, "byte");
+    }
+    let mut value = n as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn check(db: &Database) -> Outcome {

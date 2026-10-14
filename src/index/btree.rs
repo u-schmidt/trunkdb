@@ -77,6 +77,116 @@ impl BTreeIndex {
     }
 }
 
+impl BTreeIndex {
+    /// How many levels the tree has: 1 for a lone leaf. Down the first
+    /// children, which every level has as deep as any other.
+    pub fn depth(&self, store: &dyn PageStore) -> std::io::Result<u32> {
+        let mut page_id = self.root;
+        for depth in 1..=MAX_DEPTH as u32 + 1 {
+            let page = read_node(store, page_id)?;
+            match page.page_type() {
+                PageType::IndexLeaf => return Ok(depth),
+                PageType::IndexBranch => {
+                    page_id = page
+                        .iter_cells()
+                        .next()
+                        .map_or(page.next_page(), |(_slot, cell)| {
+                            decode_branch_entry(cell).1
+                        });
+                }
+                other => return Err(corrupt_page_type(page_id, other)),
+            }
+        }
+        Err(too_deep(page_id))
+    }
+}
+
+/// The tree `insert` builds from keys handed to it in ascending order —
+/// as `compact` rebuilds every index (SPEC §41) — counted instead of
+/// built (SPEC §93.4): only the keys' lengths decide its shape. A full
+/// rightmost leaf stays full and the new key starts the next one; a full
+/// branch splits by bytes and promotes its middle entry, as
+/// `insert_into_branch` does. It holds one page's worth of lengths per
+/// level, whatever the number of keys.
+#[derive(Default)]
+pub(crate) struct SortedBuild {
+    /// Leaves finished or begun; 0 before the first key.
+    leaves: u64,
+    /// Room left in the last leaf.
+    leaf_room: usize,
+    /// Above the leaves, lowest first: each level's rightmost branch.
+    levels: Vec<BranchLevel>,
+}
+
+struct BranchLevel {
+    /// Pages of this level already left behind by a split.
+    finished: u64,
+    /// The rightmost page's separator key lengths, in order.
+    keys: Vec<usize>,
+    room: usize,
+}
+
+impl SortedBuild {
+    /// The next key, by its length: at or above every key before it.
+    pub(crate) fn push(&mut self, key_len: usize) {
+        let needed = SlottedPage::space_needed(key_len + MIN_INDEX_ENTRY_LEN);
+        if self.leaves == 0 {
+            self.leaves = 1;
+            self.leaf_room = empty_room(PageType::IndexLeaf);
+        }
+        if self.leaf_room >= needed {
+            self.leaf_room -= needed;
+            return;
+        }
+        self.leaves += 1;
+        self.leaf_room = empty_room(PageType::IndexLeaf) - needed;
+        // The new leaf's first key is the separator above it.
+        self.separate(0, key_len);
+    }
+
+    fn separate(&mut self, level: usize, key_len: usize) {
+        let cell = |key_len: usize| SlottedPage::space_needed(key_len + MIN_BRANCH_ENTRY_LEN);
+        if level == self.levels.len() {
+            // The root split: a new root above, with this one entry.
+            self.levels.push(BranchLevel {
+                finished: 0,
+                keys: vec![key_len],
+                room: empty_room(PageType::IndexBranch) - cell(key_len),
+            });
+            return;
+        }
+        let branch = &mut self.levels[level];
+        if branch.room >= cell(key_len) {
+            branch.keys.push(key_len);
+            branch.room -= cell(key_len);
+            return;
+        }
+        branch.keys.push(key_len);
+        let mid = byte_midpoint(branch.keys.iter().map(|len| len + 8)) - 1;
+        let right = branch.keys.split_off(mid + 1);
+        let promoted = branch.keys.pop().expect("mid is within the keys");
+        branch.finished += 1;
+        branch.room =
+            empty_room(PageType::IndexBranch) - right.iter().map(|&len| cell(len)).sum::<usize>();
+        branch.keys = right;
+        self.separate(level + 1, promoted);
+    }
+
+    /// The tree's pages: an empty one is its root leaf alone.
+    pub(crate) fn pages(&self) -> u64 {
+        self.leaves.max(1)
+            + self
+                .levels
+                .iter()
+                .map(|level| level.finished + 1)
+                .sum::<u64>()
+    }
+}
+
+fn empty_room(page_type: PageType) -> usize {
+    SlottedPage::new(page_type).free_space()
+}
+
 /// What happened after inserting into a page: either it fit, or the page
 /// split and the caller (the parent branch, or `insert` itself for a root
 /// split) needs to route around the new sibling.
