@@ -15,6 +15,7 @@ mod datetime;
 mod decode;
 mod document;
 mod durability;
+mod explain;
 mod export;
 mod free_space;
 #[cfg(feature = "fuzzing")]

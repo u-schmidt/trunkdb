@@ -309,6 +309,12 @@ Every document is checked against the whole filter after an index
 narrows the set, so an index only ever decides how much is read, never
 what matches.
 
+`explain_run` runs a query and says how it went: the plan, each index
+read with the conditions that bound it, how many sort keys the index
+gave, and the entries and documents examined, matched and returned
+[§94](spec/94-explain-with-execution-statistics.md). It is `find` with its counters read out: every read
+counts, and only `explain_run` keeps the counts.
+
 ## 9. Concurrency
 
 `Database` is a cheap, cloneable, `Send + Sync` handle; every clone,
@@ -396,7 +402,8 @@ more than four.
 - `Database::open(path)`, or `open_with(path, OpenOptions)` with
   `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md), `snapshot_memory` [§83](spec/83-a-limit-on-the-memory-snapshots-take.md) and `read_only` [§88](spec/88-a-read-only-open.md).
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
-  `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md);
+  `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md),
+  `explain_run` [§94](spec/94-explain-with-execution-statistics.md);
   `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);
   `update_fields` with operators, `Update::new().set(..).inc(..).unset(..)`
   on dotted paths [§68](spec/68-update-operators.md), and `min`, `max`, `rename`, and `push`,
@@ -406,8 +413,8 @@ more than four.
   [§28](spec/28-secondary-indexes.md) [§33](spec/33-unique-indexes.md) [§44](spec/44-sparse-indexes.md) [§60](spec/60-a-smaller-public-api.md).
 - **Snapshots:** `db.snapshot()`, the database at one moment for as
   many reads as wanted; `snapshot.collection::<T>(name)` is a `View<T>`
-  with `get`, `find`, `find_one`, `count`, `cursor`, `explain` and
-  `indexes` and nothing that writes; `collections`, `export`, `check`
+  with `get`, `find`, `find_one`, `count`, `cursor`, `explain`,
+  `explain_run` and `indexes` and nothing that writes; `collections`, `export`, `check`
   and `file_info` on the snapshot too. A `cursor` shows the moment it
   was made [§82](spec/82-a-snapshot-to-keep.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike

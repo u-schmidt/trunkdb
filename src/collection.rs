@@ -3,9 +3,12 @@ use crate::cursor::Cursor;
 use crate::data;
 use crate::database::{Committed, Database, ReadGuard};
 use crate::document::{DocId, Document, encode_document, with_id};
+use crate::explain::Trace;
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
-use crate::query::{Filter, OrderedRead, QueryPlan, SortOrder, Update};
+use crate::query::{
+    Condition, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork, Update,
+};
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
 use serde::Serialize;
@@ -360,27 +363,65 @@ impl<T> Collection<T> {
     /// How `find` would run `filter`: a full scan, lookups by id in the
     /// primary index, or ranges of secondary indexes.
     pub fn explain(&self, filter: &Filter) -> crate::Result<QueryPlan> {
-        if filter.ids().is_some() {
-            return Ok(QueryPlan::ById);
-        }
         let state = self.read()?;
-        let indexes = state.catalog().indexes(&self.name);
-        if let Some(order) = filter.index_order(indexes) {
-            return Ok(QueryPlan::IndexOrder {
-                field: order.index.name(),
-            });
-        }
-        Ok(match filter.index_ranges(indexes) {
-            None => QueryPlan::Scan,
-            Some(ranges) => match &ranges[..] {
-                [(index, _range)] => QueryPlan::Index {
-                    field: index.name(),
-                },
-                _ => QueryPlan::IndexUnion {
-                    fields: ranges.iter().map(|(index, _)| index.name()).collect(),
-                },
-            },
-        })
+        Ok(plan_for(filter, state.catalog().indexes(&self.name)))
+    }
+
+    /// Runs `filter` as `find` does and says how (SPEC §94): the plan,
+    /// as `explain` names it; each index read, with the conditions that
+    /// bound it; how the sort was done; and how many index entries and
+    /// documents it read, how many matched and were returned, and how
+    /// long it took. The documents are read and checked as `find` would,
+    /// then dropped — for them too, run `find` and `explain_run` on one
+    /// `View`.
+    ///
+    /// It is `find` with its counters read out, not a second
+    /// implementation: `find` counts the same on every call, and throws
+    /// the counts away. `skip` and `limit` are part of it, since they
+    /// change the plan (§34.2) and the cost (§72.3). Errors as `find`'s.
+    ///
+    /// ```
+    /// # use serde::Serialize;
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = trunkdb::Database::open(dir.path().join("app.trunkdb"))?;
+    /// use trunkdb::query::{Filter, QueryPlan};
+    ///
+    /// #[derive(Serialize, serde::Deserialize)]
+    /// struct Person { age: i64 }
+    ///
+    /// let people = db.collection::<Person>("people");
+    /// people.ensure_index("age")?;
+    /// for age in 0..100 {
+    ///     people.insert(Person { age })?;
+    /// }
+    /// let adults = people.explain_run(Filter::new().gte("age", 18).lt("age", 65))?;
+    /// assert_eq!(adults.plan, QueryPlan::Index { field: "age".into() });
+    /// assert_eq!(adults.reads[0].bounds.len(), 2); // age >= 18, age < 65
+    /// // The range holds age 65 too, which the check against the
+    /// // filter leaves out (SPEC §28.3).
+    /// assert_eq!(adults.stats.documents_examined, 48);
+    /// assert_eq!(adults.stats.documents_returned, 47);
+    /// # Ok::<(), trunkdb::Error>(())
+    /// ```
+    pub fn explain_run(&self, filter: Filter) -> crate::Result<Explained> {
+        let started = std::time::Instant::now();
+        let state = self.read()?;
+        let at = state.snapshot();
+        let indexes = at.catalog.indexes(&self.name);
+        let plan = plan_for(&filter, indexes);
+        let sort = match filter.sort.len() {
+            0 => None,
+            keys => {
+                let from_index = filter.index_order(indexes).map_or(0, |order| order.served);
+                Some(SortWork {
+                    from_index,
+                    in_memory: keys - from_index,
+                })
+            }
+        };
+        let trace = Trace::default();
+        let found = find_in(at.catalog, &at.store, &self.name, &filter, &trace)?;
+        Ok(trace.explained(plan, sort, found.len(), started.elapsed()))
     }
 }
 
@@ -645,7 +686,7 @@ impl Collection<Document> {
         mut change: impl FnMut(DocId, Document) -> crate::Result<Document>,
     ) -> crate::Result<usize> {
         self.db.transact(|catalog, store| {
-            let found = find_in(catalog, store, &self.name, &filter)?;
+            let found = find_in(catalog, store, &self.name, &filter, &Trace::default())?;
             let mut changed = 0;
             for (id, old) in found {
                 let new = with_id(change(id, old.clone())?, id);
@@ -669,7 +710,7 @@ impl Collection<Document> {
     /// isn't created.
     pub fn delete_many(&self, filter: Filter) -> crate::Result<usize> {
         self.db.transact(|catalog, store| {
-            let doomed = find_in(catalog, store, &self.name, &filter)?;
+            let doomed = find_in(catalog, store, &self.name, &filter, &Trace::default())?;
             for (id, _doc) in &doomed {
                 apply_write_op(catalog, store, &WriteOp::Delete(self.name.clone(), *id))?;
             }
@@ -682,7 +723,7 @@ impl Collection<Document> {
     fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
         let state = self.read()?;
         let at = state.snapshot();
-        find_in(at.catalog, &at.store, &self.name, filter)
+        find_in(at.catalog, &at.store, &self.name, filter, &Trace::default())
     }
 
     /// Every document matching `filter`. An `Object` document carries its
@@ -724,10 +765,11 @@ impl Collection<Document> {
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
         let state = self.read()?;
         let at = state.snapshot();
+        let trace = Trace::default();
         let count = if filter.conditions.is_empty() {
-            candidate_entries(at.catalog, &at.store, &self.name, &filter)?.len()
+            candidate_entries(at.catalog, &at.store, &self.name, &filter, &trace)?.len()
         } else {
-            read_candidates(at.catalog, &at.store, &self.name, &filter)?
+            read_candidates(at.catalog, &at.store, &self.name, &filter, &trace)?
                 .iter()
                 .filter(|(_id, doc)| filter.matches(doc))
                 .count()
@@ -767,7 +809,13 @@ impl Collection<Document> {
         };
         let state = kept.read()?;
         let at = state.snapshot();
-        let entries = candidate_entries(at.catalog, &at.store, &self.name, &filter)?;
+        let entries = candidate_entries(
+            at.catalog,
+            &at.store,
+            &self.name,
+            &filter,
+            &Trace::default(),
+        )?;
         drop(state);
         let locs = entries.into_iter().map(|(_key, loc)| loc).collect();
         Ok(Cursor::streaming(kept, locs, filter, convert))
@@ -795,11 +843,12 @@ impl Collection<Document> {
     pub fn upsert(&self, filter: Filter, doc: Document) -> crate::Result<Upserted> {
         let id_if_new = id_for_insert(&self.db, &doc);
         self.db.transact(|catalog, store| {
-            let matches: Vec<DocId> = read_candidates(catalog, store, &self.name, &filter)?
-                .into_iter()
-                .filter(|(_id, candidate)| filter.matches(candidate))
-                .map(|(id, _candidate)| id)
-                .collect();
+            let matches: Vec<DocId> =
+                read_candidates(catalog, store, &self.name, &filter, &Trace::default())?
+                    .into_iter()
+                    .filter(|(_id, candidate)| filter.matches(candidate))
+                    .map(|(id, _candidate)| id)
+                    .collect();
             let (op, outcome) = match matches[..] {
                 [] => (
                     WriteOp::Insert(self.name.clone(), id_if_new, doc),
@@ -854,27 +903,58 @@ impl Collection<Document> {
     }
 }
 
+/// The plan `find` follows for `filter` among a collection's `indexes`
+/// — what `explain` says.
+fn plan_for(filter: &Filter, indexes: &[IndexMeta]) -> QueryPlan {
+    if filter.ids().is_some() {
+        return QueryPlan::ById;
+    }
+    if let Some(order) = filter.index_order(indexes) {
+        return QueryPlan::IndexOrder {
+            field: order.index.name(),
+        };
+    }
+    match filter.index_ranges(indexes) {
+        None => QueryPlan::Scan,
+        Some(ranges) => match &ranges[..] {
+            [range] => QueryPlan::Index {
+                field: range.index.name(),
+            },
+            _ => QueryPlan::IndexUnion {
+                fields: ranges.iter().map(|range| range.index.name()).collect(),
+            },
+        },
+    }
+}
+
 /// Every match with its id, against a catalog and store the caller
 /// has locked — for a read, or inside a write batch (`delete_many`).
+/// What it read and matched goes to `trace` (SPEC §94.3).
 fn find_in(
     catalog: &Catalog,
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
+    trace: &Trace,
 ) -> crate::Result<Vec<(DocId, Document)>> {
     if let Some(order) = filter.index_order(catalog.indexes(collection)) {
         // Read as far as skip plus limit, then pass over the skipped (SPEC §72).
-        let mut found = read_in_index_order(catalog, store, collection, filter, order)?;
+        let mut found = read_in_index_order(catalog, store, collection, filter, order, trace)?;
         found.drain(..filter.skip.min(found.len()));
         return Ok(found);
     }
-    let mut candidates = read_candidates(catalog, store, collection, filter)?;
+    let mut matches: Vec<(DocId, Document)> =
+        read_candidates(catalog, store, collection, filter, trace)?
+            .into_iter()
+            .filter(|(_id, doc)| filter.matches(doc))
+            .collect();
+    trace.matched(matches.len());
     if !filter.sort.is_empty() {
         // So equal sort values end up in id order, as they do when read
         // from an index (the sort is stable).
-        candidates.sort_unstable_by_key(|(id, _doc)| *id);
+        matches.sort_unstable_by_key(|(id, _doc)| *id);
     }
-    Ok(filter.apply_to(candidates, |(_id, doc)| doc))
+    Ok(filter.arrange(matches, |(_id, doc)| doc))
 }
 
 /// The index entries `find` has to look at for `filter`: the primary
@@ -889,11 +969,19 @@ fn candidate_entries(
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
+    trace: &Trace,
 ) -> std::io::Result<Vec<(Vec<u8>, RecordLocation)>> {
     let Some(meta) = catalog.get(collection) else {
         return Ok(Vec::new());
     };
     if let Some(ids) = filter.ids() {
+        let by_id = |id: &DocId| Condition::id(*id);
+        let bounds = match &ids[..] {
+            [id] => vec![by_id(id)],
+            _ => vec![Condition::any(ids.iter().map(by_id))],
+        };
+        let read = trace.read(crate::document::ID_FIELD.to_string(), bounds, false);
+        trace.entries(read, ids.len());
         let primary = BTreeIndex::new(meta.index_root);
         let mut entries = Vec::new();
         for id in ids {
@@ -905,12 +993,20 @@ fn candidate_entries(
         return Ok(entries);
     }
     match filter.index_ranges(catalog.indexes(collection)) {
-        None => BTreeIndex::new(meta.index_root).scan(store),
+        None => {
+            let read = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
+            let entries = BTreeIndex::new(meta.index_root).scan(store)?;
+            trace.entries(read, entries.len());
+            Ok(entries)
+        }
         Some(ranges) => {
             let mut seen = std::collections::HashSet::new();
             let mut entries = Vec::new();
-            for (index, range) in ranges {
-                for entry in BTreeIndex::new(index.root).range(store, &range)? {
+            for range in ranges {
+                let read = trace.read(range.index.name(), range.by, false);
+                let found = BTreeIndex::new(range.index.root).range(store, &range.range)?;
+                trace.entries(read, found.len());
+                for entry in found {
                     if seen.insert(key::doc_id(&entry.0)) {
                         entries.push(entry);
                     }
@@ -950,6 +1046,7 @@ fn read_in_index_order(
     collection: &str,
     filter: &Filter,
     order: OrderedRead,
+    trace: &Trace,
 ) -> crate::Result<Vec<(DocId, Document)>> {
     let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
         unreachable!("index_order needs a sort and a limit");
@@ -964,6 +1061,7 @@ fn read_in_index_order(
     let index = order.index;
     let unordered_can_match = order.range.is_none() && !index.is_compound();
     let backward = first.order == SortOrder::Desc;
+    let walk = trace.read(index.name(), order.by, backward);
     let mut entries = BTreeIndex::new(index.root).walk(
         store,
         order.range.unwrap_or_else(KeyRange::everything),
@@ -974,7 +1072,10 @@ fn read_in_index_order(
     let spans = Spans { at, end, fields };
     let in_memory = filter.sort.len() > order.served;
     let mut records = data::Records::new(store);
-    let mut read = |loc: &RecordLocation| records.get(*loc);
+    let mut read = |loc: &RecordLocation| {
+        trace.examined();
+        records.get(*loc)
+    };
     // Hands out one group's matching documents; `true` once `limit` are.
     let mut take = |group: Group, results: &mut Vec<(DocId, Document)>| -> crate::Result<bool> {
         // Ties in id order: fields after the served ones would order them
@@ -989,6 +1090,7 @@ fn read_in_index_order(
             for (_key, loc) in &group {
                 let (id, doc) = read(loc)?;
                 if filter.matches(&doc) {
+                    trace.matched(1);
                     results.push((id, doc));
                     if results.len() == limit {
                         return Ok(true);
@@ -1005,7 +1107,9 @@ fn read_in_index_order(
                 limit: None,
                 ..filter.clone()
             };
-            for found in unlimited.apply_to(docs, |(_id, doc)| doc) {
+            let found = unlimited.apply_to(docs, |(_id, doc)| doc);
+            trace.matched(found.len());
+            for found in found {
                 results.push(found);
                 if results.len() == limit {
                     return Ok(true);
@@ -1018,6 +1122,7 @@ fn read_in_index_order(
     let mut group: Group = Vec::new();
     loop {
         let entry = entries.next().transpose()?;
+        trace.entries(walk, entry.is_some() as usize);
         let ends_group = match (&entry, group.first()) {
             (Some((key, _)), Some((first_key, _))) => spans.group(key) != spans.group(first_key),
             (None, Some(_)) => true,
@@ -1042,10 +1147,14 @@ fn read_in_index_order(
             .get(collection)
             .expect("an indexed collection exists");
         let mut unordered = Vec::new();
-        for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
+        let primary = BTreeIndex::new(meta.index_root).scan(store)?;
+        let scan = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
+        trace.entries(scan, primary.len());
+        for (_key, loc) in primary {
             let (id, doc) = read(&loc)?;
             let value = crate::query::value_or_null(&doc, &first.field);
             if crate::query::is_unordered(value) && filter.matches(&doc) {
+                trace.matched(1);
                 unordered.push((id, doc));
                 // Without keys after the first, id order is their order.
                 if !in_memory && unordered_after + unordered.len() == limit {
@@ -1212,12 +1321,16 @@ fn read_candidates(
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
+    trace: &Trace,
 ) -> std::io::Result<Vec<(DocId, Document)>> {
     let mut records = data::Records::new(store);
-    candidate_entries(catalog, store, collection, filter)?
+    candidate_entries(catalog, store, collection, filter, trace)?
         .into_iter()
         // The id stored in the data cell itself (SPEC §11).
-        .map(|(_key, loc)| records.get(loc))
+        .map(|(_key, loc)| {
+            trace.examined();
+            records.get(loc)
+        })
         .collect()
 }
 
@@ -2772,7 +2885,7 @@ mod tests {
         for _ in 0..300 {
             let f = random_filter(rng, path);
             let expected = sorted_ids(f.apply_to(all.clone(), |(_, doc)| doc));
-            let plan = docs.explain(&f).unwrap();
+            let plan = explained(docs, &f);
             let found = sorted_ids(docs.find_with_ids(f.clone()).unwrap());
             assert_eq!(found, expected, "{f:?} via {plan:?}");
         }
@@ -2918,7 +3031,7 @@ mod tests {
                 f = f.eq("w", rng.below(3) as i64);
             }
             let expected = sorted_ids(f.apply_to(all.clone(), |(_, doc)| doc));
-            let plan = docs.explain(&f).unwrap();
+            let plan = explained(docs, &f);
             let found = sorted_ids(docs.find_with_ids(f.clone()).unwrap());
             assert_eq!(found, expected, "{f:?} via {plan:?}");
             plans.insert(format!("{plan:?}"));
@@ -3617,7 +3730,7 @@ mod tests {
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect();
-            let plan = docs.explain(&f).unwrap();
+            let plan = explained(docs, &f);
             let found: Vec<DocId> = docs
                 .find_with_ids(f.clone())
                 .unwrap()
@@ -3809,7 +3922,7 @@ mod tests {
                     ids
                 };
                 let expected = ids(f.apply_to(all.clone(), |(_, doc)| doc));
-                let plan = docs.explain(&f).unwrap();
+                let plan = explained(docs, &f);
                 let found = ids(docs.find_with_ids(f.clone()).unwrap());
                 if f.sort.is_empty() && (f.limit.is_some() || f.skip > 0) {
                     // Which documents a skip or limit without a sort keeps
@@ -3885,6 +3998,94 @@ mod tests {
             .collect();
         assert_eq!(docs.index_names().unwrap(), names);
         check(&docs, &mut rng);
+    }
+
+    /// `explain`'s plan for `f`, after checking `explain_run` against it
+    /// and against `find` (SPEC §94.7): the same plan; as many returned
+    /// and as many documents read as `find` returns and reads; counts
+    /// that agree with each other and with the plan; and every document
+    /// found within the bounds of a read.
+    fn explained(docs: &Collection<Document>, f: &Filter) -> QueryPlan {
+        let plan = docs.explain(f).unwrap();
+        let run = docs.explain_run(f.clone()).unwrap();
+        assert_eq!(run.plan, plan, "{f:?}");
+        let mut found = Vec::new();
+        let read = records_read(|| found = docs.find_with_ids(f.clone()).unwrap());
+        let stats = run.stats;
+        assert_eq!(stats.documents_returned, found.len() as u64, "{f:?}");
+        assert_eq!(stats.documents_examined, read as u64, "{f:?} via {plan:?}");
+        let entries: u64 = run.reads.iter().map(|read| read.entries).sum();
+        assert_eq!(stats.keys_examined, entries);
+        assert!(
+            stats.keys_examined >= stats.documents_examined,
+            "{f:?}: {run:?}"
+        );
+        assert!(
+            stats.documents_matched <= stats.documents_examined,
+            "{f:?}: {run:?}"
+        );
+        let unlimited = Filter {
+            skip: 0,
+            limit: None,
+            ..f.clone()
+        };
+        let matching = docs.count(unlimited).unwrap() as u64;
+        match plan {
+            // Stops once it has skip plus limit.
+            QueryPlan::IndexOrder { .. } => {
+                let wanted = match f.limit.unwrap() {
+                    0 => 0, // reads nothing at all
+                    limit => (f.skip as u64).saturating_add(limit as u64),
+                };
+                assert!(
+                    stats.documents_matched >= matching.min(wanted),
+                    "{f:?}: {run:?}"
+                );
+                assert!(stats.documents_matched <= matching, "{f:?}: {run:?}");
+            }
+            _ => assert_eq!(stats.documents_matched, matching, "{f:?}: {run:?}"),
+        }
+        let names: Vec<&str> = run.reads.iter().map(|read| read.index.as_str()).collect();
+        match &plan {
+            QueryPlan::Scan | QueryPlan::ById => {
+                assert!(names.is_empty() || names == ["_id"], "{f:?}: {run:?}");
+            }
+            QueryPlan::Index { field } => assert_eq!(names, [field.as_str()]),
+            QueryPlan::IndexUnion { fields } => assert_eq!(names, *fields),
+            QueryPlan::IndexOrder { .. } if f.limit == Some(0) => assert!(names.is_empty()),
+            QueryPlan::IndexOrder { field } => {
+                assert_eq!(names[0], field);
+                assert!(
+                    names[1..].is_empty() || names[1..] == ["_id"],
+                    "{f:?}: {run:?}"
+                );
+                let descending = f.sort[0].order == SortOrder::Desc;
+                assert_eq!(run.reads[0].backward, descending);
+            }
+        }
+        if !matches!(plan, QueryPlan::Scan | QueryPlan::IndexOrder { .. }) {
+            for read in &run.reads {
+                assert!(!read.bounds.is_empty(), "{f:?}: {run:?}");
+            }
+        }
+        // A document found is in some read: it meets all of its bounds.
+        for (_id, doc) in &found {
+            assert!(
+                run.reads
+                    .iter()
+                    .any(|read| read.bounds.iter().all(|bound| bound.matches(doc))),
+                "{doc:?} outside every read of {run:?}"
+            );
+        }
+        match &run.sort {
+            None => assert!(f.sort.is_empty()),
+            Some(sort) => {
+                assert_eq!(sort.from_index + sort.in_memory, f.sort.len());
+                let ordered = matches!(plan, QueryPlan::IndexOrder { .. });
+                assert_eq!(sort.from_index > 0, ordered, "{f:?}: {run:?}");
+            }
+        }
+        plan
     }
 
     fn records_read(f: impl FnOnce()) -> usize {
@@ -4524,7 +4725,7 @@ mod tests {
                 found.into_iter().map(|(id, _)| id).collect()
             };
             let mut expected = ids(f.apply_to(all.clone(), |(_, doc)| doc));
-            let plan = docs.explain(&f).unwrap();
+            let plan = explained(docs, &f);
             let mut found = ids(docs.find_with_ids(f.clone()).unwrap());
             let streamed = docs
                 .cursor(f.clone())

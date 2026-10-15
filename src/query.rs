@@ -1,11 +1,12 @@
 use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
+pub use crate::explain::{ExecutionStats, Explained, IndexRead, SortWork};
 use crate::index::{KeyRange, key};
 pub use crate::update::Update;
 
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
 /// arm, so a new operator isn't a breaking change (SPEC §45.4).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Op {
     Eq,
@@ -27,7 +28,7 @@ pub enum Op {
 /// a test of its shape — there at all, an array of some size (§45) — or
 /// several conditions combined, nested as deep as needed.
 /// `#[non_exhaustive]`, like `Op`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Condition {
     /// `field op value`.
@@ -454,11 +455,20 @@ impl Filter {
         items: impl IntoIterator<Item = T>,
         doc_of: impl Fn(&T) -> &Document,
     ) -> Vec<T> {
-        let mut results: Vec<T> = items
+        let results: Vec<T> = items
             .into_iter()
             .filter(|item| self.matches(doc_of(item)))
             .collect();
+        self.arrange(results, doc_of)
+    }
 
+    /// `apply_to` for matches already checked: sort, then skip, then
+    /// limit.
+    pub(crate) fn arrange<T>(
+        &self,
+        mut results: Vec<T>,
+        doc_of: impl Fn(&T) -> &Document,
+    ) -> Vec<T> {
         if !self.sort.is_empty() {
             // Stable: equal in every key, they keep the order they came in.
             results.sort_by(|a, b| compare_by(&self.sort, doc_of(a), doc_of(b)));
@@ -572,7 +582,7 @@ fn ids_for(condition: &Condition) -> Option<Vec<DocId>> {
 /// fields beat fewer — a compound index narrowed by two conditions
 /// beats one index narrowed by one (SPEC §43.3).
 struct Bounds<'a> {
-    ranges: Vec<(&'a IndexMeta, KeyRange)>,
+    ranges: Vec<IndexRange<'a>>,
     kind: BoundKind,
     fields: usize,
 }
@@ -624,34 +634,42 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
                 if seen {
                     continue;
                 }
-                let on_field = conditions.iter().filter_map(|c| match c {
-                    Condition::Compare {
-                        field: f,
-                        op,
-                        value,
-                    } if f == field && (!index.sparse || rules_out_null(op, value)) => {
-                        Some((op, key::range_for(op, value)?))
-                    }
-                    _ => None,
-                });
-                let (by_value, mut ranges): (Vec<bool>, Vec<KeyRange>) = on_field
-                    .map(|(op, range)| (matches!(op, Op::Eq), range))
-                    .unzip();
-                if is_multi(field) && !ranges.is_empty() {
+                // Each comparison that bounds the index: whether it's an
+                // `Eq`, its range, and itself, for `explain_run` (§94.2).
+                let mut on_field: Vec<(bool, KeyRange, &Condition)> = conditions
+                    .iter()
+                    .filter_map(|c| match c {
+                        Condition::Compare {
+                            field: f,
+                            op,
+                            value,
+                        } if f == field && (!index.sparse || rules_out_null(op, value)) => {
+                            Some((matches!(op, Op::Eq), key::range_for(op, value)?, c))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let by_value = on_field.iter().any(|(eq, ..)| *eq);
+                if is_multi(field) && !on_field.is_empty() {
                     // Different elements may meet different comparisons —
                     // `tags[*] > 5 AND tags[*] < 3` holds for `[1, 10]` —
                     // so their ranges can't be intersected (SPEC §42.3).
                     // One of them bounds the documents: an `Eq`'s if any.
-                    let one = by_value.iter().position(|&b| b).unwrap_or(0);
-                    ranges = vec![ranges.swap_remove(one)];
+                    let one = on_field.iter().position(|(eq, ..)| *eq).unwrap_or(0);
+                    on_field = vec![on_field.swap_remove(one)];
                 }
-                if let Some(range) = ranges.into_iter().reduce(KeyRange::intersect) {
-                    let kind = match by_value.contains(&true) {
+                let by: Vec<Condition> = on_field.iter().map(|(.., c)| (*c).clone()).collect();
+                let range = on_field
+                    .into_iter()
+                    .map(|(_, range, _)| range)
+                    .reduce(KeyRange::intersect);
+                if let Some(range) = range {
+                    let kind = match by_value {
                         true => BoundKind::ByValue,
                         false => BoundKind::ByRange,
                     };
                     consider(Bounds {
-                        ranges: vec![(index, range)],
+                        ranges: vec![IndexRange { index, range, by }],
                         kind,
                         fields: 1,
                     });
@@ -773,14 +791,17 @@ fn excludes_null(index: &IndexMeta, conditions: &[Condition]) -> bool {
 /// those values, and range comparisons on the field after them narrow
 /// further. Nothing on its first field, no bounds.
 fn compound_bounds<'a>(index: &'a IndexMeta, conditions: &[Condition]) -> Option<Bounds<'a>> {
-    let (prefix, equal) = equal_prefix(index, conditions, index.fields.len());
+    let (prefix, equal, mut by) = equal_prefix(index, conditions, index.fields.len());
     let range = index
         .fields
         .get(equal)
         .and_then(|next| field_range(index, conditions, next));
     let fields = equal + range.is_some() as usize;
     let range = match range {
-        Some(range) => range.under(&prefix),
+        Some((range, on_next)) => {
+            by.extend(on_next);
+            range.under(&prefix)
+        }
         None if equal > 0 => KeyRange::prefixed(&prefix),
         None => return None,
     };
@@ -789,7 +810,7 @@ fn compound_bounds<'a>(index: &'a IndexMeta, conditions: &[Condition]) -> Option
         false => BoundKind::ByRange,
     };
     Some(Bounds {
-        ranges: vec![(index, range)],
+        ranges: vec![IndexRange { index, range, by }],
         kind,
         fields,
     })
@@ -797,40 +818,53 @@ fn compound_bounds<'a>(index: &'a IndexMeta, conditions: &[Condition]) -> Option
 
 /// How many of `index`'s first fields, up to `max`, an `Eq` among
 /// `conditions` fixes — and those values encoded one after another, as
-/// its keys begin.
-fn equal_prefix(index: &IndexMeta, conditions: &[Condition], max: usize) -> (Vec<u8>, usize) {
+/// its keys begin, and the `Eq`s that fix them.
+fn equal_prefix(
+    index: &IndexMeta,
+    conditions: &[Condition],
+    max: usize,
+) -> (Vec<u8>, usize, Vec<Condition>) {
     let mut prefix = Vec::new();
+    let mut by = Vec::new();
     for (i, field) in index.fields.iter().take(max).enumerate() {
         let equal = conditions.iter().find_map(|c| match c {
             Condition::Compare {
                 field: f,
                 op: Op::Eq,
                 value,
-            } if f == field => key::range_for_in(&Op::Eq, value, index.fields.len()),
+            } if f == field => Some((key::range_for_in(&Op::Eq, value, index.fields.len())?, c)),
             _ => None,
         });
         match equal {
-            Some(range) => prefix.extend(range.start),
-            None => return (prefix, i),
+            Some((range, condition)) => {
+                prefix.extend(range.start);
+                by.push(condition.clone());
+            }
+            None => return (prefix, i, by),
         }
     }
-    (prefix, max)
+    (prefix, max, by)
 }
 
 /// The comparisons on `field` as one range of `index`'s values for it —
-/// relative to where that value starts in a key.
-fn field_range(index: &IndexMeta, conditions: &[Condition], field: &str) -> Option<KeyRange> {
-    conditions
+/// relative to where that value starts in a key — and the comparisons.
+fn field_range(
+    index: &IndexMeta,
+    conditions: &[Condition],
+    field: &str,
+) -> Option<(KeyRange, Vec<Condition>)> {
+    let (ranges, by): (Vec<KeyRange>, Vec<Condition>) = conditions
         .iter()
         .filter_map(|c| match c {
             Condition::Compare {
                 field: f,
                 op,
                 value,
-            } if f == field => key::range_for_in(op, value, index.fields.len()),
+            } if f == field => Some((key::range_for_in(op, value, index.fields.len())?, c.clone())),
             _ => None,
         })
-        .reduce(KeyRange::intersect)
+        .unzip();
+    Some((ranges.into_iter().reduce(KeyRange::intersect)?, by))
 }
 
 impl Filter {
@@ -853,10 +887,7 @@ impl Filter {
     /// else a range on an indexed field. The ranges may hold documents
     /// the filter rejects, never the other way around; the same document
     /// may be in several.
-    pub(crate) fn index_ranges<'a>(
-        &self,
-        indexes: &'a [IndexMeta],
-    ) -> Option<Vec<(&'a IndexMeta, KeyRange)>> {
+    pub(crate) fn index_ranges<'a>(&self, indexes: &'a [IndexMeta]) -> Option<Vec<IndexRange<'a>>> {
         bounds_for_all(&self.conditions, indexes).map(|b| b.ranges)
     }
 
@@ -885,7 +916,7 @@ impl Filter {
         if self.ids().is_some() {
             return None; // a few documents by id beat any walk (SPEC §61)
         }
-        let mut best: Option<(&IndexMeta, Vec<u8>, usize, usize)> = None;
+        let mut best: Option<Walk> = None;
         for index in indexes {
             // A multikey index holds a document once per element, in
             // element order: no order of documents (SPEC §42.3).
@@ -898,7 +929,7 @@ impl Filter {
             let Some(at) = index.fields.iter().position(|f| *f == sort.field) else {
                 continue;
             };
-            let (prefix, equal) = equal_prefix(index, &self.conditions, at);
+            let (prefix, equal, fixing) = equal_prefix(index, &self.conditions, at);
             if equal != at {
                 continue;
             }
@@ -909,12 +940,12 @@ impl Filter {
                 .take_while(|(key, field)| key.field == **field && key.order == sort.order)
                 .count();
             let better =
-                |(_, _, fixed, most): &(_, _, usize, usize)| (at, served) > (*fixed, *most);
+                |(.., fixed, most): &(_, _, _, usize, usize)| (at, served) > (*fixed, *most);
             if best.as_ref().is_none_or(better) {
-                best = Some((index, prefix, at, served));
+                best = Some((index, prefix, fixing, at, served));
             }
         }
-        let (index, prefix, fixed, served) = best?;
+        let (index, prefix, mut by, fixed, served) = best?;
         if fixed == 0 {
             let on_sort_field = |c: &&Condition| matches!(c, Condition::Compare { field, .. } if *field == sort.field);
             let others: Vec<Condition> = self
@@ -927,7 +958,10 @@ impl Filter {
                 return None;
             }
         }
-        let range = field_range(index, &self.conditions, &sort.field);
+        let range = field_range(index, &self.conditions, &sort.field).map(|(range, on_sort)| {
+            by.extend(on_sort);
+            range
+        });
         let range = match fixed {
             0 => range,
             _ => Some(range.map_or_else(|| KeyRange::prefixed(&prefix), |r| r.under(&prefix))),
@@ -935,10 +969,26 @@ impl Filter {
         Some(OrderedRead {
             index,
             range,
+            by,
             fixed,
             served,
         })
     }
+}
+
+/// An index `index_order` could walk: it, the prefix its fixed fields
+/// encode to, the `Eq`s that fix them, how many, and how many sort keys
+/// it serves.
+type Walk<'a> = (&'a IndexMeta, Vec<u8>, Vec<Condition>, usize, usize);
+
+/// A range of an index `find` reads (`Filter::index_ranges`).
+#[derive(Debug)]
+pub(crate) struct IndexRange<'a> {
+    pub index: &'a IndexMeta,
+    pub range: KeyRange,
+    /// The conditions the range comes from, as the index sees them
+    /// (SPEC §94.2): what `explain_run` reports as its bounds.
+    pub by: Vec<Condition>,
 }
 
 /// How `find` reads an index in sort order (`Filter::index_order`).
@@ -947,6 +997,9 @@ pub(crate) struct OrderedRead<'a> {
     pub index: &'a IndexMeta,
     /// The part of it to read — `None` for all of it.
     pub range: Option<KeyRange>,
+    /// The conditions `range` comes from (§94.2): the `Eq`s that fix
+    /// its first fields, the comparisons on the sort field.
+    pub by: Vec<Condition>,
     /// How many of its first fields an `Eq` fixes: the first sort
     /// field is the one after them.
     pub fixed: usize,
@@ -1469,7 +1522,7 @@ mod tests {
     #[test]
     fn exists_and_size_never_bound_an_index() {
         let indexes = [index("nick"), index("tags[*]"), sparse(&["team"])];
-        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].index.name());
         assert_eq!(plan(Filter::new().exists("nick")), None);
         assert_eq!(plan(Filter::new().missing("nick")), None);
         assert_eq!(plan(Filter::new().size("tags[*]", Op::Eq, 0)), None);
@@ -1586,13 +1639,13 @@ mod tests {
             index("scores[*]"),
             index("rows[*][*]"),
         ];
-        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].index.name());
         let f = Filter::new().elem_match(
             "items",
             Condition::eq("sku", "A1") & Condition::gt("qty", 2),
         );
         assert_eq!(plan(f.clone()).as_deref(), Some("items[*].sku"));
-        let range = &f.index_ranges(&indexes).unwrap()[0].1;
+        let range = &f.index_ranges(&indexes).unwrap()[0].range;
         let key = |v: &str| key::secondary(&v.into(), crate::DocId([0; 16])).unwrap();
         assert!(range.contains(&key("A1")) && !range.contains(&key("B2")));
 
@@ -1692,7 +1745,7 @@ mod tests {
             .eq("tags[*]", "a")
             .index_ranges(&indexes)
             .unwrap();
-        assert_eq!(ranges[0].0.name(), "tags[*]");
+        assert_eq!(ranges[0].index.name(), "tags[*]");
     }
 
     fn compound(fields: &[&str]) -> IndexMeta {
@@ -1714,7 +1767,7 @@ mod tests {
             compound(&["status", "created"]),
             compound(&["a", "b", "c"]),
         ];
-        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].index.name());
         let queued = || Filter::new().eq("status", "Queued");
         // One field narrowed either way: the first among equals.
         assert_eq!(plan(queued()).as_deref(), Some("status"));
@@ -1742,7 +1795,7 @@ mod tests {
             .index_ranges(&indexes)
             .unwrap();
         let k = |c: i64| key::compound(&[&1.into(), &2.into(), &c.into()], crate::DocId([0; 16]));
-        assert!(ranges[0].1.contains(&k(2)) && !ranges[0].1.contains(&k(4)));
+        assert!(ranges[0].range.contains(&k(2)) && !ranges[0].range.contains(&k(4)));
     }
 
     /// Read in sort order when the sort field follows fields an `Eq`
@@ -1793,7 +1846,7 @@ mod tests {
     #[test]
     fn a_sparse_index_is_only_used_where_nulls_are_ruled_out() {
         let indexes = [sparse(&["nick"]), sparse(&["tags[*]"])];
-        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].index.name());
         assert_eq!(
             plan(Filter::new().eq("nick", "ada")).as_deref(),
             Some("nick")
@@ -1807,7 +1860,7 @@ mod tests {
         let both = Filter::new().is_null("tags[*]").gt("tags[*]", 3);
         let ranges = both.index_ranges(&indexes).unwrap();
         let five = key::secondary(&Document::Int(5), crate::DocId([0; 16])).unwrap();
-        assert!(ranges[0].1.contains(&five), "{:?}", ranges[0].1);
+        assert!(ranges[0].range.contains(&five), "{:?}", ranges[0].range);
 
         let order = |f: Filter| f.limit(5).index_order(&indexes).map(|o| o.index.name());
         assert_eq!(order(Filter::new().sort_asc("nick")), None);
@@ -1824,7 +1877,7 @@ mod tests {
     #[test]
     fn a_sparse_compound_index_needs_one_field_that_is_not_null() {
         let indexes = [sparse(&["a", "b"])];
-        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].0.name());
+        let plan = |f: Filter| f.index_ranges(&indexes).map(|r| r[0].index.name());
         assert_eq!(plan(Filter::new().eq("a", 1)).as_deref(), Some("(a, b)"));
         assert_eq!(plan(Filter::new().is_null("a")), None);
         assert_eq!(
@@ -1958,13 +2011,13 @@ mod tests {
         let ranges = filter.index_ranges(&indexes).unwrap();
         assert_eq!(ranges.len(), 1);
         let key = key::secondary(&Document::Int(10), crate::DocId([0; 16])).unwrap();
-        assert!(ranges[0].1.contains(&key), "{:?}", ranges[0].1);
+        assert!(ranges[0].range.contains(&key), "{:?}", ranges[0].range);
 
         // An `Eq` among them is the one that bounds.
         let filter = Filter::new().gt("tags[*]", 5).eq("tags[*]", 1);
         let ranges = filter.index_ranges(&indexes).unwrap();
         let key = key::secondary(&Document::Int(1), crate::DocId([0; 16])).unwrap();
-        assert!(ranges[0].1.contains(&key));
+        assert!(ranges[0].range.contains(&key));
     }
 
     #[test]
@@ -2551,7 +2604,7 @@ mod tests {
         let field_of = |f: &Filter| {
             let ranges = f.index_ranges(&indexes)?;
             assert_eq!(ranges.len(), 1, "one range, not a union");
-            Some(ranges[0].0.name())
+            Some(ranges[0].index.name())
         };
 
         // No condition on an indexed field, or only unusable ones.
@@ -2578,7 +2631,7 @@ mod tests {
             cond("age", Op::Gte, Document::Int(10)),
             cond("age", Op::Lte, Document::Int(20)),
         ]);
-        let (_, range) = f.index_ranges(&indexes).unwrap().remove(0);
+        let range = f.index_ranges(&indexes).unwrap().remove(0).range;
         let k = |n| key::secondary(&Document::Int(n), crate::DocId([0; 16])).unwrap();
         assert!(range.contains(&k(15)) && !range.contains(&k(9)) && !range.contains(&k(21)));
     }
@@ -2590,7 +2643,7 @@ mod tests {
         let indexes = [index("age"), index("name")];
         let fields = |f: Filter| -> Option<Vec<String>> {
             let ranges = f.index_ranges(&indexes)?;
-            Some(ranges.iter().map(|(i, _)| i.name()).collect())
+            Some(ranges.iter().map(|r| r.index.name()).collect())
         };
         let ada = || Condition::eq("name", "Ada");
         let young = || Condition::lt("age", 18);
