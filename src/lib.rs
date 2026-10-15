@@ -130,6 +130,16 @@ pub enum Error {
     /// §88) — or a `checkpoint` or `compact` of one. Nothing was changed.
     #[error("the database is open read-only: it can't be written to")]
     ReadOnly,
+    /// A write gave collection `collection` a document that isn't an
+    /// object: a number, a string, an array, a bool or null (SPEC §95).
+    /// Every document is an object, so that it carries its id as `_id`;
+    /// wrap a plain value in a one-field struct or map. The whole batch
+    /// was rolled back.
+    #[non_exhaustive]
+    #[error(
+        "collection {collection:?}: a document must be an object (a struct or a map), not a plain value or an array"
+    )]
+    NotAnObject { collection: String },
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
     #[non_exhaustive]
@@ -189,6 +199,19 @@ pub enum FormatError {
         durability::readable_wal_versions()
     )]
     WalVersion { found: u32 },
+    /// A file of a format before 12 holds a document that isn't an
+    /// object, which this build can't hold (SPEC §95): `id`, in
+    /// `collection`, is the first one found. Open the file with trunkdb
+    /// 0.19.0, delete such documents or wrap each in an object, and open
+    /// it with this build again.
+    #[non_exhaustive]
+    #[error(
+        "collection {collection:?} has a document that isn't an object ({id}), which this build can't hold: open the file with trunkdb 0.19.0, delete or wrap such documents, and open it again"
+    )]
+    NotAnObject {
+        collection: String,
+        id: document::DocId,
+    },
 }
 
 impl FormatError {
@@ -226,6 +249,56 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Helpers shared by tests in several modules.
 #[cfg(test)]
 pub(crate) mod testing {
+    /// A number as a document, for tests that stored plain numbers
+    /// before every document had to be an object (SPEC §95).
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        Hash,
+        serde::Serialize,
+        serde::Deserialize,
+    )]
+    pub struct Num {
+        pub n: i64,
+    }
+
+    pub fn num(n: i64) -> Num {
+        Num { n }
+    }
+
+    impl PartialEq<i64> for Num {
+        fn eq(&self, other: &i64) -> bool {
+            self.n == *other
+        }
+    }
+
+    /// A string as a document, as `Num` is a number.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    pub struct Text {
+        pub s: String,
+    }
+
+    pub fn text(s: impl Into<String>) -> Text {
+        Text { s: s.into() }
+    }
+
+    impl PartialEq<&str> for Text {
+        fn eq(&self, other: &&str) -> bool {
+            self.s == *other
+        }
+    }
+
+    impl PartialEq<str> for Text {
+        fn eq(&self, other: &str) -> bool {
+            self.s == other
+        }
+    }
+
     /// A tiny deterministic random number generator (xorshift) — enough
     /// to shuffle test data without a `rand` dependency.
     pub struct XorShift(pub u64);

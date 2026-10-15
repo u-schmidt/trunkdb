@@ -207,7 +207,16 @@ fn check_collection(
             continue;
         }
         match records.get(*loc) {
-            Ok((id, doc)) if id == expected => documents.push((id, doc, *loc)),
+            Ok((id, doc)) if id == expected => {
+                // A file says format 12 once it is open, and so that
+                // every document is an object (SPEC §95).
+                if !matches!(doc, Document::Object(_)) {
+                    check.problem(format!(
+                        "{name:?}: document {id} isn't an object, which the file's format promises"
+                    ));
+                }
+                documents.push((id, doc, *loc));
+            }
             Ok((id, _)) => check.problem(format!(
                 "{name:?}: the primary index files document {expected} at page {} slot {}, \
                  which holds document {id}",
@@ -462,7 +471,7 @@ mod tests {
         assert_eq!(report.problems, Vec::<String>::new());
         assert_eq!((report.collections, report.documents), (2, 200));
         let info = db.file_info().unwrap();
-        assert_eq!((info.format_version, info.page_size), (11, PAGE_SIZE));
+        assert_eq!((info.format_version, info.page_size), (12, PAGE_SIZE));
         assert_eq!(info.pages, report.pages);
         assert!(info.free_pages > 0, "the deletes freed pages");
 

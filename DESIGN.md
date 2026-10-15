@@ -105,12 +105,14 @@ cell is long enough for its entry [§55](spec/55-fuzzing.md).
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
 shrink until a compaction [§41](spec/41-compaction.md).
 
-**The format version** is 11 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md). A build opens its own format and
-the older ones that are valid files of it (6 to 10), and the first
-page a batch writes stamps them with the current one; it refuses newer
-ones, and older ones that need converting. Opening a 6–9 file with
-secondary indexes checks them once and rebuilds any that a document
-holds an id in, since ids had no key before 10 [§62](spec/62-an-index-key-for-ids.md). Moving between formats is
+**The format version** is 12 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md). A build opens its own format and
+the older ones that are valid files of it (6 to 11), and stamps them
+with the current one at open; it refuses newer ones, and older ones
+that need converting. Opening a 6–9 file with secondary indexes checks
+them once and rebuilds any that a document holds an id in, since ids
+had no key before 10 [§62](spec/62-an-index-key-for-ids.md). Opening a 6–11 file checks that every document
+is an object, by its type byte, and refuses the file, unchanged, if one
+isn't [§95](spec/95-only-objects.md). Moving between formats is
 export and import [§30](spec/30-export-and-import-as-json-lines.md). The history is in the comment on
 `FORMAT_VERSION` in `storage/file.rs`.
 
@@ -193,8 +195,10 @@ it as the tagged JSON an export uses (`{:#}` indented), and
 structs; text, not `serde_json::Value`, so `serde_json` stays out of the
 public API [§71](spec/71-documents-as-json-text.md). `find_with_ids` [§23](spec/23-find-with-ids.md) is gone, and a `cursor`
 hands out `T`, as `find` does: a type that wants its id declares the
-field; one from another crate is wrapped, its fields flattened; a
-document that isn't an object has the id its insert returned [§74](spec/74-find-with-ids-removed.md).
+field; one from another crate is wrapped, its fields flattened [§74](spec/74-find-with-ids-removed.md).
+Every document is an object, so every one has its `_id`: a write of
+anything else fails with `Error::NotAnObject`, and `T` is a struct or a
+map [§95](spec/95-only-objects.md).
 
 **Nesting** is limited to 64 levels, counted as MongoDB counts (the
 document is the first, each object or array inside adds one): deeper

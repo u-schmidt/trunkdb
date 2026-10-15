@@ -160,6 +160,39 @@ impl<'a> Records<'a> {
     }
 }
 
+impl Records<'_> {
+    /// The id of the document at `loc`, and whether it is an object, from
+    /// its encoding's first byte (SPEC §95): nothing decoded, and of an
+    /// overflow chain only its first page read.
+    pub fn is_object(&mut self, loc: RecordLocation) -> std::io::Result<(DocId, bool)> {
+        let page = match &self.page {
+            Some((id, page)) if *id == loc.page => page,
+            _ => {
+                &self
+                    .page
+                    .insert((loc.page, read_data_page(self.store, loc.page)?))
+                    .1
+            }
+        };
+        match Cell::parse(live_cell(page, loc)?)? {
+            Cell::Inline(id, encoded) => Ok((id, crate::document::encodes_object(encoded))),
+            Cell::Overflow { id, first, .. } => {
+                let buf = self.store.read_page(first)?;
+                if buf[0] != PageType::Overflow as u8 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "overflow chain starting at page {first}: not an overflow page — file may be corrupt"
+                        ),
+                    ));
+                }
+                let encoded = &buf[OVERFLOW_HEADER_LEN..];
+                Ok((id, crate::document::encodes_object(encoded)))
+            }
+        }
+    }
+}
+
 /// Replaces the document at `loc`, returning where it lives now. Usually
 /// that's `loc` itself — the cell is rewritten in place, or the page is
 /// compacted around it. If the grown cell doesn't fit on its page at all

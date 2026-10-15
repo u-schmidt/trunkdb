@@ -197,6 +197,12 @@ impl Database {
                 )));
             };
             let (id, doc) = parse_document_line(value, tags).map_err(|e| fail(e.to_string()))?;
+            if !matches!(doc, crate::Document::Object(_)) {
+                // An export from before SPEC §95 may hold one, as `$value`.
+                return Err(fail(
+                    "a document must be an object, not a plain value or an array (SPEC §95)".into(),
+                ));
+            }
             let id = id.unwrap_or_else(|| self.id_gen().generate());
             chunk.push(
                 WriteOp::Insert(collection.name.clone(), id, doc),
@@ -637,9 +643,10 @@ mod tests {
         users.ensure_index("age").unwrap();
         let mut batch = Vec::new();
         for i in 0..2500 {
-            // Top-level documents of every kind, not just objects.
+            // Values of every kind, a whole document's worth: every
+            // document is an object (SPEC §95), so in one field.
             let doc = if i % 10 == 0 {
-                random_value(&mut rng, 3)
+                object(&[("value", random_value(&mut rng, 3))])
             } else {
                 let mut fields = vec![
                     ("age", Document::Int(i % 90)),
@@ -850,6 +857,12 @@ mod tests {
                 3,
                 "`_id` must be",
             ),
+            // How 0.19.0 exported a document that wasn't an object (§95).
+            (
+                format!("{header}{collection}{{\"$value\":5}}\n"),
+                3,
+                "must be an object",
+            ),
             (
                 format!("{header}{collection}{{\"n\":18446744073709551615}}\n"),
                 3,
@@ -902,7 +915,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = open(&dir, "source.trunkdb");
         let ops = (0..2500u128)
-            .map(|i| WriteOp::Insert("c".into(), DocId(i.to_be_bytes()), Document::Int(i as i64)))
+            .map(|i| {
+                let doc = object(&[("n", Document::Int(i as i64))]);
+                WriteOp::Insert("c".into(), DocId(i.to_be_bytes()), doc)
+            })
             .collect();
         source.write_batch(ops).unwrap();
         let text = export_text(&source);
@@ -911,7 +927,7 @@ mod tests {
         // Id 1500 is in the second chunk (documents 1000..2000).
         let id = DocId(1500u128.to_be_bytes());
         target
-            .write_batch(vec![WriteOp::Insert("c".into(), id, Document::Null)])
+            .write_batch(vec![WriteOp::Insert("c".into(), id, object(&[]))])
             .unwrap();
         let err = import_text(&target, &text).unwrap_err();
         assert!(matches!(err, Error::DuplicateId { .. }), "{err:?}");

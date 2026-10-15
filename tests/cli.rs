@@ -68,14 +68,14 @@ fn a_file_it_cannot_read_is_reported_as_before() {
     std::fs::write(&input, EXPORT).unwrap();
     assert!(trunkdb(&["import", &newer, &input]).status.success());
     let mut bytes = std::fs::read(&newer).unwrap();
-    bytes[28..32].copy_from_slice(&12u32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&13u32.to_le_bytes());
     std::fs::write(&newer, &bytes).unwrap();
 
     for (file, message) in [
         (&notes, "not a trunkdb file (bad magic)".to_string()),
         (
             &newer,
-            "file has format 12, newer than this build's 11 — open it with a newer trunkdb"
+            "file has format 13, newer than this build's 12 — open it with a newer trunkdb"
                 .to_string(),
         ),
     ] {
@@ -110,7 +110,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["info", &db]);
     assert!(output.status.success());
     let info = stdout(&output);
-    assert!(info.contains("format 11"), "{info}");
+    assert!(info.contains("format 12"), "{info}");
     assert!(
         info.contains(
             "users: 2 documents, indexes: age, email (unique), nick (sparse), \
@@ -188,8 +188,8 @@ fn compact_shrinks_a_file_once() {
         let database = trunkdb::Database::open(&db).unwrap();
         let docs = database.collection::<trunkdb::Document>("docs");
         for i in 0..300 {
-            docs.insert(trunkdb::Document::String(format!("{i:0>2000}")))
-                .unwrap();
+            let text = trunkdb::Document::String(format!("{i:0>2000}"));
+            docs.insert(object("text", text)).unwrap();
         }
         docs.delete_many(trunkdb::query::Filter::new()).unwrap();
     }
@@ -237,7 +237,7 @@ fn looking_into_a_file_opens_it_read_only() {
     );
     let db = trunkdb::Database::open(&db_path).unwrap();
     db.collection::<trunkdb::Document>("users")
-        .insert(trunkdb::Document::Int(1))
+        .insert(object("n", trunkdb::Document::Int(1)))
         .unwrap();
     drop(db);
     let read_only = trunkdb::OpenOptions::default().read_only(true);
@@ -364,4 +364,9 @@ fn import_stops_at_a_line_over_the_limit_unless_it_is_turned_off() {
         std::fs::remove_file(&big).unwrap();
         let _ = std::fs::remove_file(format!("{big}.wal"));
     }
+}
+
+/// `{field: value}`: every document is an object (SPEC §95).
+fn object(field: &str, value: trunkdb::Document) -> trunkdb::Document {
+    trunkdb::Document::Object([(field.to_string(), value)].into_iter().collect())
 }

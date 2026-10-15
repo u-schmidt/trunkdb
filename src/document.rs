@@ -245,6 +245,12 @@ const TAG_ID: u8 = 8;
 /// `i64`, then the nanoseconds as a `u32`, both little-endian.
 const TAG_DATETIME: u8 = 9;
 
+/// Whether `encoded`, a document as `encode_document` wrote it, is an
+/// object: its first byte, without decoding the rest (SPEC §95).
+pub(crate) fn encodes_object(encoded: &[u8]) -> bool {
+    encoded.first() == Some(&TAG_OBJECT)
+}
+
 /// Encodes a `Document` into bytes: one type tag, then a payload whose
 /// shape depends on the tag — fixed-width for scalars, a `u32` length
 /// prefix + raw bytes for `String`/`Binary`, a `u32` count prefix followed

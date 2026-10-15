@@ -102,6 +102,10 @@ use std::marker::PhantomData;
 /// `db`/`name` — so the catalog/index/data-page logic exists in exactly
 /// one place, not duplicated per `T`.
 ///
+/// Every document is an object (SPEC §95), so `T` is a struct or a map:
+/// a plain value, a sequence or a unit fails its first write with
+/// `Error::NotAnObject`. A plain value goes into a one-field struct.
+///
 /// A `T` can carry its document's id (SPEC §59): every read fills the
 /// field in, and an insert uses it if it's `Some`, or makes one:
 ///
@@ -1387,6 +1391,24 @@ pub(crate) fn apply_write_op(
     store: &mut dyn PageStore,
     op: &WriteOp,
 ) -> crate::Result<()> {
+    if let WriteOp::Insert(collection, _, doc) | WriteOp::Update(collection, _, doc) = op {
+        // Every document is an object, to carry its id as `_id` (SPEC §95).
+        if !matches!(doc, Document::Object(_)) {
+            return Err(crate::Error::NotAnObject {
+                collection: collection.clone(),
+            });
+        }
+    }
+    apply_unchecked(catalog, store, op)
+}
+
+/// `apply_write_op` without its check that the document is an object:
+/// for tests that need a file holding one, as before SPEC §95.
+fn apply_unchecked(
+    catalog: &mut Catalog,
+    store: &mut dyn PageStore,
+    op: &WriteOp,
+) -> crate::Result<()> {
     match op {
         WriteOp::Insert(collection, id, doc) => {
             let meta = get_or_create_meta(catalog, store, collection)?;
@@ -1697,6 +1719,37 @@ fn fill_index(
     Ok(())
 }
 
+/// Makes sure a file of a format before 12 holds only objects (SPEC
+/// §95), in `Database::open`'s batch, before it is stamped 12: every
+/// document of every collection, by the first byte of its encoding.
+/// One that isn't an object fails the open with
+/// `FormatError::NotAnObject`, naming the first found.
+pub(crate) fn only_objects_in_old_file(
+    catalog: &Catalog,
+    store: &crate::storage::FileStore,
+    format: u32,
+) -> crate::Result<()> {
+    if format >= 12 {
+        return Ok(());
+    }
+    let mut names: Vec<&str> = catalog.names().collect();
+    names.sort_unstable();
+    for name in names {
+        let meta = catalog.get(name).expect("a listed collection");
+        let mut records = data::Records::new(store);
+        for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
+            let (id, object) = records.is_object(loc)?;
+            if !object {
+                return Err(crate::Error::Format(crate::FormatError::NotAnObject {
+                    collection: name.to_string(),
+                    id,
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Brings a file from before ids had index keys (format 10, SPEC §62) up
 /// to date, in `Database::open`'s batch: every secondary index that a
 /// document holds an id in is rebuilt in place, and the header is
@@ -1811,6 +1864,12 @@ mod tests {
     use crate::database::Database;
     use serde::{Deserialize, Serialize};
 
+    /// `{"v": value}`: a document holding a value, as every document is
+    /// an object (SPEC §95).
+    fn v(value: Document) -> Document {
+        Document::Object([("v".to_string(), value)].into_iter().collect())
+    }
+
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct User {
         name: String,
@@ -1898,10 +1957,11 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        let id = users.insert(Document::String("Ada".to_string())).unwrap();
+        let ada = v(Document::String("Ada".to_string()));
+        let id = users.insert(ada.clone()).unwrap();
 
         let found = users.get(&id).unwrap();
-        assert_eq!(found, Some(Document::String("Ada".to_string())));
+        assert_eq!(found, Some(with_id(ada, id)));
     }
 
     #[test]
@@ -1928,10 +1988,13 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        let id = users.insert(Document::Int(1)).unwrap();
-        assert!(users.update(&id, Document::Int(2)).unwrap());
+        let id = users.insert(v(Document::Int(1))).unwrap();
+        assert!(users.update(&id, v(Document::Int(2))).unwrap());
 
-        assert_eq!(users.get(&id).unwrap(), Some(Document::Int(2)));
+        assert_eq!(
+            users.get(&id).unwrap(),
+            Some(with_id(v(Document::Int(2)), id))
+        );
     }
 
     #[test]
@@ -1940,7 +2003,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        assert!(!users.update(&DocId([9; 16]), Document::Int(1)).unwrap());
+        assert!(!users.update(&DocId([9; 16]), v(Document::Int(1))).unwrap());
     }
 
     #[test]
@@ -1949,7 +2012,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        let id = users.insert(Document::Int(1)).unwrap();
+        let id = users.insert(v(Document::Int(1))).unwrap();
         assert!(users.delete(&id).unwrap());
 
         assert_eq!(users.get(&id).unwrap(), None);
@@ -2083,14 +2146,57 @@ mod tests {
         );
     }
 
+    /// SPEC §95: every write refuses a document that isn't an object,
+    /// typed or untyped, alone or in a batch, and the batch rolls back.
     #[test]
-    fn non_object_documents_are_unaffected_by_id_merging() {
+    fn every_write_refuses_a_document_that_is_not_an_object() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
+        let ada = users.insert(v(Document::Int(1))).unwrap();
+        let refused = |result: crate::Result<()>| {
+            let Err(crate::Error::NotAnObject { collection }) = result else {
+                panic!("expected NotAnObject, got {result:?}");
+            };
+            assert_eq!(collection, "users");
+        };
 
-        let id = users.insert(Document::Int(42)).unwrap();
-        assert_eq!(users.get(&id).unwrap(), Some(Document::Int(42)));
+        for value in [
+            Document::Int(42),
+            Document::String("Ada".into()),
+            Document::Array(vec![Document::Int(1)]),
+            Document::Null,
+            Document::Bool(true),
+        ] {
+            refused(users.insert(value.clone()).map(drop));
+            refused(users.update(&ada, value.clone()).map(drop));
+            refused(users.upsert(Filter::new().eq("v", 2), value).map(drop));
+        }
+        refused(db.collection::<i64>("users").insert(7).map(drop));
+        refused(db.collection::<Vec<i64>>("users").insert(vec![7]).map(drop));
+
+        // A batch rolls back whole: the object before the number too.
+        let mut batch = db.batch();
+        batch.insert(&users, v(Document::Int(2))).unwrap();
+        batch.insert(&users, Document::Int(3)).unwrap();
+        refused(batch.commit().map(drop));
+        // So does `update_many`, whose closure returned a number for one.
+        users.insert(v(Document::Int(4))).unwrap();
+        let changed = users.update_many(Filter::new(), |doc| {
+            if crate::query::field_value(doc, "v") == Some(&Document::Int(4)) {
+                *doc = Document::Int(4);
+            } else {
+                *doc = v(Document::Int(0));
+            }
+        });
+        refused(changed.map(drop));
+
+        let found = users.find(Filter::new().sort_asc("v")).unwrap();
+        let values: Vec<Option<&Document>> = found
+            .iter()
+            .map(|doc| crate::query::field_value(doc, "v"))
+            .collect();
+        assert_eq!(values, [Some(&Document::Int(1)), Some(&Document::Int(4))]);
     }
 
     #[test]
@@ -2100,7 +2206,9 @@ mod tests {
         let users = db.collection::<Document>("users");
         let posts = db.collection::<Document>("posts");
 
-        let id = users.insert(Document::String("Ada".to_string())).unwrap();
+        let id = users
+            .insert(v(Document::String("Ada".to_string())))
+            .unwrap();
 
         assert_eq!(posts.get(&id).unwrap(), None);
     }
@@ -2145,11 +2253,11 @@ mod tests {
             let db = Database::open(&path).unwrap();
             let docs = db.collection::<Document>("docs");
             let ids: Vec<DocId> = (0..20)
-                .map(|_| docs.insert(Document::Binary(vec![1; 100])).unwrap())
+                .map(|_| docs.insert(v(Document::Binary(vec![1; 100]))).unwrap())
                 .collect();
             for (n, id) in ids.iter().enumerate() {
                 assert!(
-                    docs.update(id, Document::Binary(vec![n as u8; 3000]))
+                    docs.update(id, v(Document::Binary(vec![n as u8; 3000])))
                         .unwrap()
                 );
             }
@@ -2161,7 +2269,7 @@ mod tests {
         for (n, id) in ids.iter().enumerate() {
             assert_eq!(
                 docs.get(id).unwrap(),
-                Some(Document::Binary(vec![n as u8; 3000]))
+                Some(with_id(v(Document::Binary(vec![n as u8; 3000])), *id))
             );
         }
         assert_eq!(docs.find(Filter::default()).unwrap().len(), 20);
@@ -2172,7 +2280,7 @@ mod tests {
             assert!(docs.delete(id).unwrap());
         }
         for _ in 0..20 {
-            docs.insert(Document::Binary(vec![9; 3000])).unwrap();
+            docs.insert(v(Document::Binary(vec![9; 3000]))).unwrap();
         }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
         assert_eq!(docs.find(Filter::default()).unwrap().len(), 20);
@@ -2276,7 +2384,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
         for n in 0..5 {
-            docs.insert(Document::Int(n)).unwrap();
+            docs.insert(v(Document::Int(n))).unwrap();
         }
         let found = |limit: Option<usize>| docs.find(Filter::new().limit(limit)).unwrap().len();
         assert_eq!(found(None), 5);
@@ -2538,33 +2646,6 @@ mod tests {
         assert!(people.update(&id, copy).unwrap());
         let got = people.get(&id).unwrap().unwrap();
         assert_eq!(got.to_string(), text);
-    }
-
-    /// Non-`Object` documents have no `_id` field (SPEC §18): `find`
-    /// returns them as stored, and their ids are what `insert` returned,
-    /// for `get`, `update` and `delete` (§74).
-    #[test]
-    fn non_object_documents_are_found_without_ids() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
-        let values = db.collection::<Document>("values");
-        let a = values.insert(Document::Int(1)).unwrap();
-        let b = values.insert(Document::String("two".to_string())).unwrap();
-
-        let found = values.find(Filter::new()).unwrap();
-        assert_eq!(found.len(), 2);
-        assert!(found.contains(&Document::Int(1)));
-        assert!(found.contains(&Document::String("two".to_string())));
-        assert_eq!(values.get(&a).unwrap(), Some(Document::Int(1)));
-        assert!(values.update(&b, Document::Bool(true)).unwrap());
-        assert_eq!(values.get(&b).unwrap(), Some(Document::Bool(true)));
-
-        assert!(
-            db.collection::<Document>("never_created")
-                .find(Filter::new())
-                .unwrap()
-                .is_empty()
-        );
     }
 
     /// A search field (SPEC §5.3): a case-insensitive
@@ -5024,7 +5105,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 901, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 11);
+        assert_eq!(db.file_info().unwrap().format_version, 12);
         assert!(db.check().unwrap().is_ok());
         let cars = db.collection::<Document>("cars");
         assert_eq!(
@@ -5055,7 +5136,7 @@ mod tests {
         );
         drop((cars, db));
         let reads = records_read(|| drop(Database::open(&path).unwrap()));
-        assert_eq!(reads, 0, "checked once: the file says 11 now");
+        assert_eq!(reads, 0, "checked once: the file says 12 now");
 
         // Indexes, none holding an id: nothing to rebuild, but checked,
         // so the file is stamped, and not checked again.
@@ -5067,13 +5148,13 @@ mod tests {
         drop((notes, db));
         crate::storage::rewrite_format_version(&unkeyed, 9);
         let db = Database::open(&unkeyed).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 11);
+        assert_eq!(db.file_info().unwrap().format_version, 12);
         drop(db);
         let reads = records_read(|| drop(Database::open(&unkeyed).unwrap()));
         assert_eq!(reads, 0);
 
-        // No secondary index: nothing to check, the file stays as it is
-        // until the first write stamps it.
+        // No secondary index: nothing for §62 to check. §95 checks every
+        // document, so the open stamps the file all the same.
         let plain = dir.path().join("plain.trunkdb");
         let db = Database::open(&plain).unwrap();
         db.collection::<Document>("notes")
@@ -5082,11 +5163,118 @@ mod tests {
         drop(db);
         crate::storage::rewrite_format_version(&plain, 9);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 9);
-        db.collection::<Document>("notes")
-            .insert(object(vec![("n", Document::Int(2))]))
+        assert_eq!(db.file_info().unwrap().format_version, 12);
+    }
+
+    /// Stores `doc` in `collection` past the check that it is an object,
+    /// as a build before SPEC §95 could.
+    fn write_unchecked(db: &Database, collection: &str, doc: Document) -> DocId {
+        let id = db.id_gen().generate();
+        let op = WriteOp::Insert(collection.to_string(), id, doc);
+        db.transact(|catalog, store| apply_unchecked(catalog, store, &op))
             .unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 11);
+        id
+    }
+
+    fn read_only(path: &std::path::Path) -> crate::Result<Database> {
+        Database::open_with(path, crate::OpenOptions::default().read_only(true))
+    }
+
+    /// The format version the file on disk says.
+    fn format_on_disk(path: &std::path::Path) -> u32 {
+        let bytes = std::fs::read(path).unwrap();
+        u32::from_le_bytes(bytes[28..32].try_into().unwrap())
+    }
+
+    /// SPEC §95: a file of a format before 12 that holds only objects is
+    /// one of 12. The open checks every document, and stamps it, so the
+    /// check runs once; a read-only open checks too, and stamps nothing.
+    #[test]
+    fn an_older_file_of_objects_is_stamped_12_at_its_first_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("objects.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("docs");
+        for n in 0..300 {
+            docs.insert(object(vec![("n", Document::Int(n))])).unwrap();
+        }
+        // A large one, in an overflow chain.
+        docs.insert(object(vec![("big", Document::String("x".repeat(30_000)))]))
+            .unwrap();
+        db.collection::<Document>("empty")
+            .ensure_index("a")
+            .unwrap();
+        drop((docs, db));
+        crate::storage::rewrite_format_version(&path, 11);
+
+        drop(read_only(&path).unwrap());
+        assert_eq!(format_on_disk(&path), 11, "a read-only open writes nothing");
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 12);
+        assert_eq!(
+            db.collection::<Document>("docs")
+                .count(Filter::new())
+                .unwrap(),
+            301
+        );
+        drop(db);
+        assert_eq!(format_on_disk(&path), 12);
+
+        // An empty file is stamped too.
+        let empty = dir.path().join("empty.trunkdb");
+        drop(Database::open(&empty).unwrap());
+        crate::storage::rewrite_format_version(&empty, 11);
+        drop(Database::open(&empty).unwrap());
+        assert_eq!(format_on_disk(&empty), 12);
+    }
+
+    /// SPEC §95: a file of a format before 12 that holds a document that
+    /// isn't an object can't be opened: both opens name the first one
+    /// found, and the file stays as it was, byte for byte. `check`
+    /// reports one in a file that says 12.
+    #[test]
+    fn an_older_file_with_a_document_that_is_not_an_object_is_refused() {
+        // The collections are checked by name: the one holding it is
+        // checked first, or after one holding only objects.
+        for (bad, value) in [
+            ("aaa", Document::Int(5)),
+            ("docs", Document::String("y".repeat(30_000))), // an overflow chain
+            ("docs", Document::Array(vec![Document::Int(1)])),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mixed.trunkdb");
+            let db = Database::open(&path).unwrap();
+            let docs = db.collection::<Document>(bad);
+            docs.insert(object(vec![("n", Document::Int(1))])).unwrap();
+            db.collection::<Document>("bbb")
+                .insert(object(vec![("n", Document::Int(2))]))
+                .unwrap();
+            let id = write_unchecked(&db, bad, value);
+            docs.insert(object(vec![("n", Document::Int(3))])).unwrap();
+            let report = db.check().unwrap();
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("isn't an object")),
+                "{report:#?}"
+            );
+            drop((docs, db));
+            crate::storage::rewrite_format_version(&path, 11);
+            let before = std::fs::read(&path).unwrap();
+
+            for opened in [Database::open(&path), read_only(&path)] {
+                let Err(crate::Error::Format(crate::FormatError::NotAnObject {
+                    collection,
+                    id: found,
+                })) = opened
+                else {
+                    panic!("expected NotAnObject, got {:?}", opened.err());
+                };
+                assert_eq!((collection.as_str(), found), (bad, id));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "nothing changed");
+        }
     }
 
     /// Ids never collided in a unique index before format 10 (SPEC §62):

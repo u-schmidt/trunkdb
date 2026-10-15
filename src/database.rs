@@ -447,13 +447,19 @@ impl Database {
 
     /// The catalog, loaded in a batch begun here and left staged: on a
     /// fresh file it bootstraps the catalog page, and on an old one it
-    /// keys the ids its indexes lack (SPEC §62). Rolled back on error.
+    /// makes sure every document is an object (SPEC §95), keys the ids
+    /// its indexes lack (SPEC §62), and stamps the current format.
+    /// Rolled back on error.
     fn load_catalog(store: &mut FileStore) -> crate::Result<Catalog> {
         store.begin();
         let loaded = Catalog::load(store)
             .map_err(crate::Error::from)
             .and_then(|catalog| {
+                // Read before anything stamps the header, which §62 may.
+                let format = store.format_version()?;
+                crate::collection::only_objects_in_old_file(&catalog, store, format)?;
                 crate::collection::key_ids_in_old_indexes(&catalog, store)?;
+                store.stamp_format_version()?;
                 Ok(catalog)
             });
         if loaded.is_err() {
@@ -885,6 +891,7 @@ mod tests {
     use crate::document::{DocId, Document};
     use crate::query::Filter;
     use crate::storage::{PAGE_SIZE, PageType};
+    use crate::testing::{Num, num};
     use crate::txn::WriteOp;
     use serde::{Deserialize, Serialize};
 
@@ -955,7 +962,7 @@ mod tests {
             let ops = ids
                 .iter()
                 .enumerate()
-                .map(|(i, id)| WriteOp::Insert("docs".into(), *id, crate::Document::Int(i as i64)))
+                .map(|(i, id)| WriteOp::Insert("docs".into(), *id, value_doc(i as i64)))
                 .collect();
             db.write_batch(ops).unwrap();
             drop(docs);
@@ -967,7 +974,8 @@ mod tests {
             let docs = db.collection::<crate::Document>("docs");
             for _ in 0..2 {
                 for (i, id) in ids.iter().enumerate() {
-                    assert_eq!(docs.get(id).unwrap(), Some(crate::Document::Int(i as i64)));
+                    let want = crate::document::with_id(value_doc(i as i64), *id);
+                    assert_eq!(docs.get(id).unwrap(), Some(want));
                 }
             }
             assert_eq!(db.state().store.cache_size(), size / 8192);
@@ -1020,23 +1028,43 @@ mod tests {
         // A handle to a dropped collection still works: it starts over.
         let gone = db.collection::<Document>("gone");
         assert_eq!(gone.count(Filter::new()).unwrap(), 0);
-        gone.insert(Document::Int(1)).unwrap();
+        gone.insert(value_doc(1)).unwrap();
         assert_eq!(gone.count(Filter::new()).unwrap(), 1);
         assert!(gone.index_names().unwrap().is_empty());
     }
 
-    fn insert(collection: &str, id: u8, value: i64) -> WriteOp {
-        WriteOp::Insert(
-            collection.to_string(),
-            DocId([id; 16]),
-            Document::Int(value),
-        )
+    /// `{"v": value}`: a document holding a number, as every document is
+    /// an object (SPEC §95).
+    fn value_doc(value: i64) -> Document {
+        obj(Document::Int(value))
     }
 
+    /// Document `id` (all 16 bytes `id`) as `insert` stores it and a
+    /// read returns it: `{"_id": ..., "v": value}`.
+    fn stored(id: u8, value: i64) -> (DocId, Document) {
+        let id = DocId([id; 16]);
+        (id, crate::document::with_id(value_doc(value), id))
+    }
+
+    /// `{"v": value}`, for any value.
+    fn obj(value: Document) -> Document {
+        Document::Object([("v".to_string(), value)].into_iter().collect())
+    }
+
+    fn insert(collection: &str, id: u8, value: i64) -> WriteOp {
+        WriteOp::Insert(collection.to_string(), DocId([id; 16]), value_doc(value))
+    }
+
+    /// The value `insert` stored in document `id`, under `v`.
     fn get(db: &Database, collection: &str, id: u8) -> Option<Document> {
-        db.collection::<Document>(collection)
+        let doc = db
+            .collection::<Document>(collection)
             .get(&DocId([id; 16]))
-            .unwrap()
+            .unwrap()?;
+        let Document::Object(mut fields) = doc else {
+            panic!("every document is an object");
+        };
+        fields.shift_remove("v")
     }
 
     /// Where `log_batch_then_crash` stops, mirroring `write_batch`'s steps.
@@ -1338,12 +1366,12 @@ mod tests {
         };
 
         let mut batch = db.batch();
-        batch.insert(&posts, Document::Int(1)).unwrap();
+        batch.insert(&posts, value_doc(1)).unwrap();
         let results: Vec<(&str, crate::Result<()>)> = vec![
             ("write_batch", db.write_batch(vec![insert("posts", 7, 7)])),
             ("an empty write_batch", db.write_batch(Vec::new())),
-            ("insert", posts.insert(Document::Int(1)).map(drop)),
-            ("update", posts.update(&id, Document::Int(2)).map(drop)),
+            ("insert", posts.insert(value_doc(1)).map(drop)),
+            ("update", posts.update(&id, value_doc(2)).map(drop)),
             ("delete", posts.delete(&id).map(drop)),
             ("delete_many", posts.delete_many(Filter::new()).map(drop)),
             ("an index that exists", posts.ensure_index("a").map(drop)),
@@ -1474,21 +1502,21 @@ mod tests {
                  development build), which this build can't read",
             ),
             (
-                12,
+                13,
                 crate::FormatError::Newer {
-                    found: 12,
-                    current: 11,
+                    found: 13,
+                    current: 12,
                 },
-                "file has format 12, newer than this build's 11 — open it with a newer trunkdb",
+                "file has format 13, newer than this build's 12 — open it with a newer trunkdb",
             ),
             (
                 5,
                 crate::FormatError::Older {
                     found: 5,
                     oldest: 6,
-                    current: 11,
+                    current: 12,
                 },
-                "file has format 5, older than this build's 11: export it with the trunkdb \
+                "file has format 5, older than this build's 12: export it with the trunkdb \
                  version that wrote it (`trunkdb export`), and import the export into a new \
                  file with this one",
             ),
@@ -1600,7 +1628,7 @@ mod tests {
         let cases = [
             (insert("users", 1, 2), "duplicate insert"),
             (
-                WriteOp::Update("users".to_string(), missing, Document::Int(3)),
+                WriteOp::Update("users".to_string(), missing, value_doc(3)),
                 "update of a missing id",
             ),
             (
@@ -1608,7 +1636,7 @@ mod tests {
                 "delete of a missing id",
             ),
             (
-                WriteOp::Update("nowhere".to_string(), missing, Document::Int(3)),
+                WriteOp::Update("nowhere".to_string(), missing, value_doc(3)),
                 "update in a missing collection",
             ),
         ];
@@ -1868,7 +1896,7 @@ mod tests {
         db.write_batch(vec![insert("users", 1, 1)]).unwrap();
         let file_len = std::fs::metadata(&path).unwrap().len();
 
-        let large = Document::Binary(vec![0u8; 20_000]); // needs overflow pages
+        let large = obj(Document::Binary(vec![0u8; 20_000])); // needs overflow pages
         let result = db.write_batch(vec![
             insert("posts", 2, 2),
             WriteOp::Insert("posts".to_string(), DocId([3; 16]), large),
@@ -1932,7 +1960,7 @@ mod tests {
     fn pages_waiting_after_one_commit(options: OpenOptions) -> usize {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_with(dir.path().join("test.trunkdb"), options).unwrap();
-        let doc = Document::String("x".into());
+        let doc = obj(Document::String("x".into()));
         db.write_batch(vec![WriteOp::Insert("docs".into(), DocId([1; 16]), doc)])
             .unwrap();
         db.state().store.unwritten_pages()
@@ -1970,12 +1998,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let db = Database::open_with(&path, options).unwrap();
-        let first = Document::String("first".into());
+        let first = obj(Document::String("first".into()));
         db.write_batch(vec![WriteOp::Insert("docs".into(), DocId([1; 16]), first)])
             .unwrap();
         let mut peak = 0;
         for i in 0..200u32 {
-            let doc = Document::String(format!("value {i}"));
+            let doc = obj(Document::String(format!("value {i}")));
             db.write_batch(vec![WriteOp::Update("docs".into(), DocId([1; 16]), doc)])
                 .unwrap();
             peak = peak.max(wal_len(&path));
@@ -2033,7 +2061,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let db = Database::open(&path).unwrap();
-        let big = Document::String("x".repeat(6000));
+        let big = obj(Document::String("x".repeat(6000)));
         let checkpoint_pages = DEFAULT_CHECKPOINT_PAGES;
         let mut waiting = 0;
         for commit in 0..100u8 {
@@ -2111,7 +2139,7 @@ mod tests {
             for round in 0..3i64 {
                 let ops = (1..=30u8)
                     .map(|id| {
-                        let (id, value) = (DocId([id; 16]), big(round, id));
+                        let (id, value) = (DocId([id; 16]), obj(big(round, id)));
                         match round {
                             0 => WriteOp::Insert("docs".into(), id, value),
                             _ => WriteOp::Update("docs".into(), id, value),
@@ -2239,7 +2267,7 @@ mod tests {
             DocId(bytes)
         }
         fn op(i: u32) -> WriteOp {
-            WriteOp::Insert("pings".to_string(), key(i), Document::Int(i as i64))
+            WriteOp::Insert("pings".to_string(), key(i), value_doc(i as i64))
         }
 
         /// Stages inserts from `from` on, one by one, until one splits a
@@ -2336,7 +2364,7 @@ mod tests {
             for i in 0..=committed {
                 assert_eq!(
                     pings.get(&key(i)).unwrap(),
-                    Some(Document::Int(i as i64)),
+                    Some(crate::document::with_id(value_doc(i as i64), key(i))),
                     "document {i} after a cut at {pages_written} of {page_count} pages"
                 );
             }
@@ -2375,11 +2403,11 @@ mod tests {
     #[test]
     fn a_collection_handle_keeps_the_database_open() {
         let (_dir, _path, db) = open_temp();
-        let numbers = db.collection::<i64>("numbers");
+        let numbers = db.collection::<Num>("numbers");
         drop(db);
 
-        let id = numbers.insert(7).unwrap();
-        assert_eq!(numbers.get(&id).unwrap(), Some(7));
+        let id = numbers.insert(num(7)).unwrap();
+        assert_eq!(numbers.get(&id).unwrap(), Some(num(7)));
     }
 
     /// Clones are one open database: the file stays locked until the last
@@ -2388,16 +2416,23 @@ mod tests {
     fn the_file_is_released_when_the_last_handle_drops() {
         let (_dir, path, db) = open_temp();
         let clone = db.clone();
-        let users = db.collection::<i64>("users");
-        let id = clone.collection::<i64>("users").insert(1).unwrap();
-        assert_eq!(users.get(&id).unwrap(), Some(1), "one database, not two");
+        let users = db.collection::<Num>("users");
+        let id = clone.collection::<Num>("users").insert(num(1)).unwrap();
+        assert_eq!(
+            users.get(&id).unwrap(),
+            Some(num(1)),
+            "one database, not two"
+        );
 
         drop(db);
         drop(clone);
         assert!(Database::open(&path).is_err(), "`users` still holds it");
         drop(users);
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.collection::<i64>("users").get(&id).unwrap(), Some(1));
+        assert_eq!(
+            db.collection::<Num>("users").get(&id).unwrap(),
+            Some(num(1))
+        );
     }
 
     #[test]
@@ -2407,10 +2442,10 @@ mod tests {
             .map(|t| {
                 // Moved into the thread — possible only because the handle
                 // borrows nothing (`thread::spawn` needs `'static`).
-                let numbers = db.collection::<i64>("numbers");
+                let numbers = db.collection::<Num>("numbers");
                 std::thread::spawn(move || {
                     for i in 0..10 {
-                        numbers.insert(t * 100 + i).unwrap();
+                        numbers.insert(num(t * 100 + i)).unwrap();
                     }
                 })
             })
@@ -2420,7 +2455,7 @@ mod tests {
         }
 
         let mut all = db
-            .collection::<i64>("numbers")
+            .collection::<Num>("numbers")
             .find(Filter::default())
             .unwrap();
         all.sort();
@@ -2431,7 +2466,7 @@ mod tests {
         drop(db);
         let db = Database::open(&path).unwrap();
         assert_eq!(
-            db.collection::<i64>("numbers")
+            db.collection::<Num>("numbers")
                 .find(Filter::default())
                 .unwrap()
                 .len(),
@@ -2445,15 +2480,15 @@ mod tests {
     #[test]
     fn readers_never_see_half_a_batch() {
         let (_dir, _path, db) = open_temp();
-        let pairs = db.collection::<i64>("pairs");
+        let pairs = db.collection::<Num>("pairs");
         let done = std::sync::atomic::AtomicBool::new(false);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for i in 0..30 {
                     let mut batch = db.batch();
-                    batch.insert(&pairs, i).unwrap();
-                    batch.insert(&pairs, -i).unwrap();
+                    batch.insert(&pairs, num(i)).unwrap();
+                    batch.insert(&pairs, num(-i)).unwrap();
                     batch.commit().unwrap();
                 }
                 done.store(true, std::sync::atomic::Ordering::Release);
@@ -2477,8 +2512,8 @@ mod tests {
     #[test]
     fn a_panic_mid_write_poisons_every_handle() {
         let (_dir, path, db) = open_temp();
-        let numbers = db.collection::<i64>("numbers");
-        let id = numbers.insert(1).unwrap();
+        let numbers = db.collection::<Num>("numbers");
+        let id = numbers.insert(num(1)).unwrap();
 
         let panicked = std::thread::scope(|scope| {
             scope
@@ -2492,10 +2527,13 @@ mod tests {
         assert!(panicked.is_err());
 
         assert!(matches!(numbers.get(&id), Err(crate::Error::Poisoned)));
-        assert!(matches!(numbers.insert(2), Err(crate::Error::Poisoned)));
+        assert!(matches!(
+            numbers.insert(num(2)),
+            Err(crate::Error::Poisoned)
+        ));
         drop((db, numbers));
         let db = Database::open(&path).unwrap();
-        let numbers = db.collection::<i64>("numbers");
+        let numbers = db.collection::<Num>("numbers");
         assert_eq!(numbers.find(Filter::default()).unwrap(), vec![1]);
     }
 
@@ -2713,13 +2751,13 @@ mod tests {
         let (_dir, _path, db) = open_temp();
         db.write_batch(vec![insert("posts", 1, 10), insert("drafts", 5, 50)])
             .unwrap();
-        let before = [(DocId([1; 16]), Document::Int(10))];
+        let before = [stored(1, 10)];
 
         let reading = db.read().unwrap();
         assert_eq!(contents_at(&reading.snapshot(), "posts"), before);
 
         // On this very thread, with the read still open.
-        let update = WriteOp::Update("posts".into(), DocId([1; 16]), Document::Int(11));
+        let update = WriteOp::Update("posts".into(), DocId([1; 16]), value_doc(11));
         db.write_batch(vec![update, insert("posts", 2, 20)])
             .unwrap();
         db.write_batch(vec![insert("authors", 3, 30)]).unwrap();
@@ -2728,7 +2766,7 @@ mod tests {
             .ensure_index("n")
             .unwrap();
         db.checkpoint().unwrap();
-        let big = Document::Binary(vec![7; 30_000]);
+        let big = obj(Document::Binary(vec![7; 30_000]));
         db.collection::<Document>("authors").insert(big).unwrap();
 
         let at = reading.snapshot();
@@ -2736,7 +2774,7 @@ mod tests {
         assert!(at.catalog.get("authors").is_none());
         assert!(at.catalog.indexes("posts").is_empty());
         let drafts = contents_at(&at, "drafts");
-        assert_eq!(drafts, [(DocId([5; 16]), Document::Int(50))]);
+        assert_eq!(drafts, [stored(5, 50)]);
         // The pages as they were, their count and the free list too.
         let pages = at.store.page_count();
         assert!(pages < db.file_info().unwrap().pages);
@@ -2755,15 +2793,15 @@ mod tests {
     #[test]
     fn versions_kept_for_a_read_go_when_it_ends() {
         let (_dir, _path, db) = open_temp();
-        let numbers = db.collection::<i64>("numbers");
-        let id = numbers.insert(0).unwrap();
+        let numbers = db.collection::<Num>("numbers");
+        let id = numbers.insert(num(0)).unwrap();
         db.checkpoint().unwrap();
         let held = |db: &Database| db.inner.pages.versions_held();
         assert_eq!(held(&db), 0);
 
         let reading = db.read().unwrap();
         for n in 1..=20 {
-            assert!(numbers.update(&id, n).unwrap());
+            assert!(numbers.update(&id, num(n)).unwrap());
         }
         let waiting = db.state().store.unwritten_pages();
         // One older version of each page changed, however many commits.
@@ -2771,15 +2809,19 @@ mod tests {
         db.checkpoint().unwrap();
         assert_eq!(held(&db), 2 * waiting, "the read is still open");
         let at = reading.snapshot();
-        assert_eq!(contents_at(&at, "numbers"), [(id, Document::Int(0))]);
+        let zero = crate::serde_bridge::to_document(&num(0)).unwrap();
+        assert_eq!(
+            contents_at(&at, "numbers"),
+            [(id, crate::document::with_id(zero, id))]
+        );
 
         drop(reading);
-        assert!(numbers.update(&id, 21).unwrap());
+        assert!(numbers.update(&id, num(21)).unwrap());
         // The commit drops them from the pages it changes.
         assert_eq!(held(&db), db.state().store.unwritten_pages());
         db.checkpoint().unwrap();
         assert_eq!(held(&db), 0);
-        assert_eq!(numbers.get(&id).unwrap(), Some(21));
+        assert_eq!(numbers.get(&id).unwrap(), Some(num(21)));
     }
 
     /// `compact` rewrites every page, so it can't keep them as they were
@@ -2792,7 +2834,7 @@ mod tests {
         let docs = db.collection::<Document>("docs");
         let ids: Vec<DocId> = (0..300)
             .map(|i| {
-                docs.insert(Document::String("x".repeat(i * 13 % 900)))
+                docs.insert(obj(Document::String("x".repeat(i * 13 % 900))))
                     .unwrap()
             })
             .collect();
@@ -2806,14 +2848,14 @@ mod tests {
             let kept = db.current();
             let count = docs.count(Filter::new()).unwrap();
             for _ in 0..commits_after {
-                docs.insert(Document::Int(1)).unwrap();
+                docs.insert(value_doc(1)).unwrap();
             }
             assert!(matches!(db.compact(), Err(crate::Error::SnapshotOpen)));
             assert_eq!(db.file_info().unwrap().pages, pages);
             let at = kept.reading(&db.inner.pages);
             assert_eq!(contents_at(&at, "docs").len(), count);
             // Refused, not poisoned: writes go on.
-            docs.insert(Document::Int(2)).unwrap();
+            docs.insert(value_doc(2)).unwrap();
         }
 
         let done = std::sync::atomic::AtomicBool::new(false);
@@ -2872,15 +2914,15 @@ mod tests {
     #[test]
     fn writers_take_turns() {
         let (_dir, _path, db) = open_temp();
-        let numbers = db.collection::<i64>("numbers");
+        let numbers = db.collection::<Num>("numbers");
         std::thread::scope(|scope| {
             for thread in 0..4i64 {
                 let (db, numbers) = (&db, &numbers);
                 scope.spawn(move || {
                     for i in 0..25 {
                         let mut batch = db.batch();
-                        batch.insert(numbers, thread * 100 + i).unwrap();
-                        batch.insert(numbers, -(thread * 100 + i)).unwrap();
+                        batch.insert(numbers, num(thread * 100 + i)).unwrap();
+                        batch.insert(numbers, num(-(thread * 100 + i))).unwrap();
                         batch.commit().unwrap();
                     }
                 });
@@ -2888,7 +2930,7 @@ mod tests {
         });
         let mut all = numbers.find(Filter::new()).unwrap();
         assert_eq!(all.len(), 200);
-        assert_eq!(all.iter().sum::<i64>(), 0);
+        assert_eq!(all.iter().map(|x| x.n).sum::<i64>(), 0);
         all.sort();
         all.dedup();
         assert_eq!(all.len(), 199, "each number once, 0 twice");
@@ -2961,7 +3003,7 @@ mod tests {
                         // shrinks under the readers.
                         match round % 10 {
                             3 => {
-                                let big = Document::String("z".repeat(20_000));
+                                let big = obj(Document::String("z".repeat(20_000)));
                                 extra_ids.push(extras.insert(big).unwrap());
                             }
                             7 => {

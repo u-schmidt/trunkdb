@@ -130,6 +130,7 @@ impl Batch {
 #[cfg(test)]
 mod tests {
     use crate::query::{Condition, Filter, Op};
+    use crate::testing::{Text, text};
     use crate::{Database, DocId, Document, Error};
     use serde::{Deserialize, Serialize};
 
@@ -276,12 +277,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let entries = db.collection::<Entry>("entries");
-        let log = db.collection::<String>("log");
+        let log = db.collection::<Text>("log");
         let existing = entries.insert(entry("a", 10)).unwrap();
 
         let mut batch = db.batch();
         batch.update(&entries, &existing, entry("a", 99)).unwrap();
-        let logged = batch.insert(&log, "synced".to_string()).unwrap();
+        let logged = batch.insert(&log, text("synced")).unwrap();
         let missing = DocId([7; 16]);
         batch.update(&entries, &missing, entry("x", 1)).unwrap();
 
@@ -297,17 +298,24 @@ mod tests {
     fn a_value_the_bridge_cant_represent_fails_when_added() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
-        let counters = db.collection::<u64>("counters");
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Counter {
+            count: u64,
+        }
+        let counters = db.collection::<Counter>("counters");
 
         let mut batch = db.batch();
-        batch.insert(&counters, 1).unwrap();
+        batch.insert(&counters, Counter { count: 1 }).unwrap();
         assert!(matches!(
-            batch.insert(&counters, u64::MAX),
+            batch.insert(&counters, Counter { count: u64::MAX }),
             Err(Error::Document(_))
         ));
         assert_eq!(batch.len(), 1, "the failed op wasn't added");
         batch.commit().unwrap();
-        assert_eq!(counters.find(Filter::default()).unwrap(), [1]);
+        assert_eq!(
+            counters.find(Filter::default()).unwrap(),
+            [Counter { count: 1 }]
+        );
     }
 
     #[test]
