@@ -529,10 +529,21 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     documents read, matched and returned, and the time. `find` counts
     the same on every call, at no cost the benchmark shows.
 
-    Items 60–64: not released yet; no change to the database file's
-    format. An older build refuses a WAL this one left after a crash.
+65. **Only objects** (§95): every document is an object, so every
+    document carries its id as `_id`. A write of a number, a string, an
+    array, a bool or null fails with `Error::NotAnObject`, and a
+    `Collection<i64>` with it at its first insert: put the value into a
+    one-field struct. File format 12: an older file is checked once at
+    its first open, every document's type byte read, and stamped 12; one
+    that holds such a document fails the open with
+    `FormatError::NotAnObject`, unchanged, and moves up through 0.19.0.
+
+    Items 60–65: not released yet. File format 12, which still opens
+    6–11 holding only objects; 0.19.0 refuses a file this build has
+    opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with
-    `InvalidData` now gets `Error::Format` instead.
+    `InvalidData` now gets `Error::Format` instead. `Collection<T>` for
+    a `T` that isn't a struct or a map no longer stores anything.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

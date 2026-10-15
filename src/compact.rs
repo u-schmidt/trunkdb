@@ -408,7 +408,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
-        docs.insert(Document::Int(1)).unwrap();
+        docs.insert(v(Document::Int(1))).unwrap();
         assert!(db.drop_collection("docs").unwrap());
         assert_eq!(db.compact().unwrap().pages_after, 2);
         assert!(db.check().unwrap().is_ok());
@@ -511,14 +511,14 @@ mod tests {
         let docs = db.collection::<Document>("docs");
         // About 8 to a page: 2 pages, the second mostly empty.
         let ids: Vec<DocId> = (0..20)
-            .map(|_| docs.insert(Document::String("d".repeat(1000))).unwrap())
+            .map(|_| docs.insert(v(Document::String("d".repeat(1000)))).unwrap())
             .collect();
         for id in &ids[10..] {
             docs.delete(id).unwrap();
         }
         let compacted = db.compact().unwrap();
         assert!(compacted.pages_after < compacted.pages_before);
-        docs.insert(Document::String("small".into())).unwrap();
+        docs.insert(v(Document::String("small".into()))).unwrap();
         assert_eq!(db.file_info().unwrap().pages, compacted.pages_after);
         assert!(db.check().unwrap().is_ok());
     }
@@ -529,14 +529,21 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
         let ids: Vec<DocId> = (0..50)
-            .map(|i| docs.insert(Document::Int(i)).unwrap())
+            .map(|i| docs.insert(v(Document::Int(i))).unwrap())
             .collect();
         for id in &ids[..25] {
             docs.delete(id).unwrap();
         }
         db.compact().unwrap();
         for (i, id) in ids.iter().enumerate().skip(25) {
-            assert_eq!(docs.get(id).unwrap(), Some(Document::Int(i as i64)));
+            let want = crate::document::with_id(v(Document::Int(i as i64)), *id);
+            assert_eq!(docs.get(id).unwrap(), Some(want));
         }
+    }
+
+    /// `{"v": value}`: a document holding a value, as every document is
+    /// an object (SPEC §95).
+    fn v(value: Document) -> Document {
+        Document::Object([("v".to_string(), value)].into_iter().collect())
     }
 }

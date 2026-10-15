@@ -22,18 +22,25 @@ use std::io::Write;
 /// ```
 /// # let dir = tempfile::tempdir().unwrap();
 /// # let db = trunkdb::Database::open(dir.path().join("app.trunkdb"))?;
+/// use serde::{Deserialize, Serialize};
 /// use trunkdb::query::Filter;
 ///
-/// let numbers = db.collection::<i64>("numbers");
-/// numbers.insert(1)?;
+/// #[derive(Debug, PartialEq, Serialize, Deserialize)]
+/// struct Note {
+///     text: String,
+/// }
+/// let note = |text: &str| Note { text: text.into() };
+///
+/// let notes = db.collection::<Note>("notes");
+/// notes.insert(note("first"))?;
 ///
 /// let snapshot = db.snapshot()?;
-/// numbers.insert(2)?; // not in the snapshot
+/// notes.insert(note("second"))?; // not in the snapshot
 ///
-/// let seen = snapshot.collection::<i64>("numbers");
+/// let seen = snapshot.collection::<Note>("notes");
 /// assert_eq!(seen.count(Filter::new())?, 1);
-/// assert_eq!(seen.find(Filter::new())?, [1]);
-/// assert_eq!(numbers.count(Filter::new())?, 2);
+/// assert_eq!(seen.find(Filter::new())?, [note("first")]);
+/// assert_eq!(notes.count(Filter::new())?, 2);
 /// # Ok::<(), trunkdb::Error>(())
 /// ```
 ///
@@ -272,6 +279,7 @@ impl View<Document> {
 mod tests {
     use super::*;
     use crate::IndexOptions;
+    use crate::testing::{Num, Text, num, text};
     use serde::Deserialize;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -312,9 +320,9 @@ mod tests {
     fn a_snapshot_is_one_moment_across_calls_and_collections() {
         let (_dir, _path, db) = open();
         let orders = db.collection::<Order>("orders");
-        let customers = db.collection::<String>("customers");
+        let customers = db.collection::<Text>("customers");
         let mut batch = db.batch();
-        let ann = batch.insert(&customers, "Ann".to_string()).unwrap();
+        let ann = batch.insert(&customers, text("Ann")).unwrap();
         let first = batch.insert(&orders, order("Ann", 10)).unwrap();
         let second = batch.insert(&orders, order("Ann", 20)).unwrap();
         batch.commit().unwrap();
@@ -329,7 +337,7 @@ mod tests {
         assert!(customers.delete(&ann).unwrap());
         orders.ensure_index("customer").unwrap();
         orders.drop_index("total").unwrap();
-        db.collection::<i64>("later").insert(1).unwrap();
+        db.collection::<Num>("later").insert(num(1)).unwrap();
         assert!(db.drop_collection("customers").unwrap());
         db.checkpoint().unwrap();
 
@@ -368,11 +376,11 @@ mod tests {
         assert_eq!(then.count(by_customer).unwrap(), 2);
         // The other collections, as they were.
         assert_eq!(snapshot.collections().unwrap(), ["customers", "orders"]);
-        let customers_then = snapshot.collection::<String>("customers");
+        let customers_then = snapshot.collection::<Text>("customers");
         assert_eq!(customers_then.find(all.clone()).unwrap(), ["Ann"]);
         assert_eq!(
             snapshot
-                .collection::<i64>("later")
+                .collection::<Num>("later")
                 .count(all.clone())
                 .unwrap(),
             0
@@ -412,26 +420,26 @@ mod tests {
     #[test]
     fn clones_and_views_keep_the_same_moment() {
         let (_dir, _path, db) = open();
-        let numbers = db.collection::<i64>("numbers");
-        numbers.insert(1).unwrap();
+        let numbers = db.collection::<Num>("numbers");
+        numbers.insert(num(1)).unwrap();
         let snapshot = db.snapshot().unwrap();
         let clone = snapshot.clone();
-        let view = snapshot.collection::<i64>("numbers");
-        numbers.insert(2).unwrap();
+        let view = snapshot.collection::<Num>("numbers");
+        numbers.insert(num(2)).unwrap();
         drop(snapshot);
-        numbers.insert(3).unwrap();
+        numbers.insert(num(3)).unwrap();
         db.checkpoint().unwrap();
 
         let all = Filter::new();
         assert_eq!(
             clone
-                .collection::<i64>("numbers")
+                .collection::<Num>("numbers")
                 .find(all.clone())
                 .unwrap(),
             [1]
         );
         drop(clone);
-        numbers.insert(4).unwrap();
+        numbers.insert(num(4)).unwrap();
         db.checkpoint().unwrap();
         let cloned_view = view.clone();
         drop(view);
@@ -455,7 +463,7 @@ mod tests {
 
         orders.delete_many(Filter::new().lt("total", 100)).unwrap();
         orders.insert(order("Bob", 1)).unwrap();
-        db.collection::<i64>("more").insert(7).unwrap();
+        db.collection::<Num>("more").insert(num(7)).unwrap();
         db.checkpoint().unwrap();
 
         let mut from_snapshot = Vec::new();
@@ -472,9 +480,9 @@ mod tests {
     #[test]
     fn whatever_keeps_a_snapshot_refuses_compaction() {
         let (_dir, _path, db) = open();
-        let docs = db.collection::<String>("docs");
+        let docs = db.collection::<Text>("docs");
         let ids: Vec<DocId> = (0..300)
-            .map(|i| docs.insert("x".repeat(i * 13 % 900)).unwrap())
+            .map(|i| docs.insert(text("x".repeat(i * 13 % 900))).unwrap())
             .collect();
         for id in &ids[..290] {
             assert!(docs.delete(id).unwrap());
@@ -486,14 +494,14 @@ mod tests {
         let clone = snapshot.clone();
         drop(snapshot);
         assert!(refused(&db));
-        let view = clone.collection::<String>("docs");
+        let view = clone.collection::<Text>("docs");
         drop(clone);
         assert!(refused(&db));
         let cursor = view.cursor(Filter::new()).unwrap();
         drop(view);
         assert!(refused(&db));
         // Refused, not broken: the database writes, and the cursor reads.
-        docs.insert("more".to_string()).unwrap();
+        docs.insert(text("more")).unwrap();
         assert_eq!(cursor.count(), 10);
 
         let compacted = db.compact().unwrap();
@@ -506,9 +514,9 @@ mod tests {
     #[test]
     fn a_snapshot_keeps_the_database_open() {
         let (_dir, path, db) = open();
-        db.collection::<i64>("numbers").insert(1).unwrap();
+        db.collection::<Num>("numbers").insert(num(1)).unwrap();
         let snapshot = db.snapshot().unwrap();
-        let view = snapshot.collection::<i64>("numbers");
+        let view = snapshot.collection::<Num>("numbers");
         drop((db, snapshot));
 
         assert!(Database::open(&path).is_err(), "still open");
@@ -516,7 +524,7 @@ mod tests {
         drop(view);
         let db = Database::open(&path).unwrap();
         assert_eq!(
-            db.collection::<i64>("numbers")
+            db.collection::<Num>("numbers")
                 .count(Filter::new())
                 .unwrap(),
             1
@@ -587,9 +595,9 @@ mod tests {
     #[test]
     fn a_poisoned_database_refuses_snapshots_too() {
         let (_dir, _path, db) = open();
-        db.collection::<i64>("numbers").insert(1).unwrap();
+        db.collection::<Num>("numbers").insert(num(1)).unwrap();
         let snapshot = db.snapshot().unwrap();
-        let view = snapshot.collection::<i64>("numbers");
+        let view = snapshot.collection::<Num>("numbers");
         let panicked = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -624,10 +632,10 @@ mod tests {
 
     /// 200 documents of about a kilobyte each: some thirty pages.
     fn fill(db: &Database) -> Vec<DocId> {
-        let docs = db.collection::<String>("docs");
+        let docs = db.collection::<Text>("docs");
         let mut batch = db.batch();
         let ids = (0..200)
-            .map(|i| batch.insert(&docs, format!("{i:01000}")).unwrap())
+            .map(|i| batch.insert(&docs, text(format!("{i:01000}"))).unwrap())
             .collect();
         batch.commit().unwrap();
         ids
@@ -653,15 +661,15 @@ mod tests {
     fn a_snapshot_kept_past_the_limit_is_too_old() {
         let (_dir, _path, db) = open_with_limit(10);
         let ids = fill(&db);
-        let docs = db.collection::<String>("docs");
+        let docs = db.collection::<Text>("docs");
         let snapshot = db.snapshot().unwrap();
-        let then = snapshot.collection::<String>("docs");
+        let then = snapshot.collection::<Text>("docs");
         let mut cursor = then.cursor(Filter::new()).unwrap();
         assert!(cursor.next().unwrap().is_ok());
 
         // A few pages rewritten: kept, and within the limit.
         for id in &ids[..20] {
-            assert!(docs.update(id, "changed".to_string()).unwrap());
+            assert!(docs.update(id, text("changed")).unwrap());
         }
         let info = db.snapshot_info();
         assert!(
@@ -670,11 +678,14 @@ mod tests {
         );
         assert_eq!(info.ended, 0);
         assert_eq!(then.count(Filter::new()).unwrap(), 200);
-        assert_eq!(then.get(&ids[0]).unwrap(), Some(format!("{:01000}", 0)));
+        assert_eq!(
+            then.get(&ids[0]).unwrap(),
+            Some(text(format!("{:01000}", 0)))
+        );
 
         // All of them: more than ten pages' worth.
         for id in &ids {
-            assert!(docs.update(id, "changed again".to_string()).unwrap());
+            assert!(docs.update(id, text("changed again")).unwrap());
         }
         let info = db.snapshot_info();
         assert!(
@@ -710,11 +721,8 @@ mod tests {
         too_old(then.get(&ids[0]).map(drop));
 
         // The database is as well as ever, and a new snapshot reads.
-        assert_eq!(
-            docs.get(&ids[0]).unwrap(),
-            Some("changed again".to_string())
-        );
-        let now = db.snapshot().unwrap().collection::<String>("docs");
+        assert_eq!(docs.get(&ids[0]).unwrap(), Some(text("changed again")));
+        let now = db.snapshot().unwrap().collection::<Text>("docs");
         assert_eq!(now.count(Filter::new()).unwrap(), 200);
         assert!(db.check().unwrap().is_ok());
 
@@ -730,24 +738,24 @@ mod tests {
     fn the_oldest_snapshot_goes_first() {
         let (_dir, _path, db) = open_with_limit(12);
         let ids = fill(&db);
-        let docs = db.collection::<String>("docs");
+        let docs = db.collection::<Text>("docs");
         let older = db.snapshot().unwrap();
         for id in &ids[..60] {
-            assert!(docs.update(id, "x".to_string()).unwrap());
+            assert!(docs.update(id, text("x")).unwrap());
         }
         let newer = db.snapshot().unwrap();
         for id in &ids[60..110] {
-            assert!(docs.update(id, "y".to_string()).unwrap());
+            assert!(docs.update(id, text("y")).unwrap());
         }
         assert_eq!(db.snapshot_info().ended, 1);
 
         let all = Filter::new();
-        let older = older.collection::<String>("docs");
+        let older = older.collection::<Text>("docs");
         assert!(matches!(
             older.count(all.clone()),
             Err(crate::Error::SnapshotTooOld)
         ));
-        let newer = newer.collection::<String>("docs");
+        let newer = newer.collection::<Text>("docs");
         assert_eq!(newer.count(all.clone()).unwrap(), 200);
         let changed = newer
             .find(all)
@@ -774,9 +782,9 @@ mod tests {
         impl Write for Rewriter {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 if !self.done {
-                    let docs = self.db.collection::<String>("docs");
+                    let docs = self.db.collection::<Text>("docs");
                     for id in &self.ids {
-                        assert!(docs.update(id, "rewritten".to_string()).unwrap());
+                        assert!(docs.update(id, text("rewritten")).unwrap());
                     }
                     self.done = true;
                 }
@@ -807,7 +815,7 @@ mod tests {
     fn an_ended_snapshot_does_not_refuse_compaction() {
         let (_dir, _path, db) = open_with_limit(4);
         let ids = fill(&db);
-        let docs = db.collection::<String>("docs");
+        let docs = db.collection::<Text>("docs");
         let snapshot = db.snapshot().unwrap();
         for id in &ids[..190] {
             assert!(docs.delete(id).unwrap());
@@ -820,7 +828,7 @@ mod tests {
 
         let compacted = db.compact().unwrap();
         assert!(compacted.pages_after < compacted.pages_before);
-        let then = snapshot.collection::<String>("docs");
+        let then = snapshot.collection::<Text>("docs");
         assert!(matches!(
             then.count(Filter::new()),
             Err(crate::Error::SnapshotTooOld)
