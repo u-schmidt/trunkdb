@@ -522,7 +522,14 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `compact` would leave, exactly, without compacting. A sixth of what
     `check` costs. `trunkdb info` prints them.
 
-    Items 60–63: not released yet; no change to the database file's
+64. **Explain with execution statistics** (§94): `explain_run(filter)`
+    runs the query as `find` does and says how: the plan, each index
+    read with the conditions that bound it, how many sort keys the index
+    gave and how many were sorted in memory, and the index entries and
+    documents read, matched and returned, and the time. `find` counts
+    the same on every call, at no cost the benchmark shows.
+
+    Items 60–64: not released yet; no change to the database file's
     format. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with
     `InvalidData` now gets `Error::Format` instead.

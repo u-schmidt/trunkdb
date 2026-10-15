@@ -104,3 +104,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 91. [A batch in several records, and recovery a record at a time (`durability/wal.rs`, `storage/file.rs`, `storage/pages.rs`)](91-a-batch-in-several-records.md)
 92. [Typed format errors (`lib.rs`, `storage/file.rs`, `durability/wal.rs`, `database.rs`)](92-typed-format-errors.md)
 93. [Storage statistics (`stats.rs`, `data.rs`, `index/btree.rs`, `catalog.rs`, `database.rs`, `src/bin/trunkdb.rs`)](93-storage-statistics.md)
+94. [Explain with execution statistics (`explain.rs`, `query.rs`, `collection.rs`, `snapshot.rs`)](94-explain-with-execution-statistics.md)

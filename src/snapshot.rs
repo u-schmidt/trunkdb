@@ -8,7 +8,7 @@ use crate::cursor::Cursor;
 use crate::database::{Committed, Database, ReadGuard};
 use crate::document::{DocId, Document};
 use crate::export::Summary;
-use crate::query::{Filter, QueryPlan};
+use crate::query::{Explained, Filter, QueryPlan};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io::Write;
@@ -200,6 +200,13 @@ impl<T> View<T> {
     /// the indexes the snapshot has: one made since isn't used.
     pub fn explain(&self, filter: &Filter) -> crate::Result<QueryPlan> {
         self.collection.explain(filter)
+    }
+
+    /// Runs `filter` as `find` does and says how — see
+    /// [`Collection::explain_run`]. On the snapshot, so `find` on this
+    /// view returns the documents it counted.
+    pub fn explain_run(&self, filter: Filter) -> crate::Result<Explained> {
+        self.collection.explain_run(filter)
     }
 }
 
