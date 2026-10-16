@@ -489,6 +489,49 @@ impl Filter {
         Some(names)
     }
 
+    /// Whether the entries of an index on `fields` — of the primary index
+    /// for none — decide this filter, and with `sort` its order too (SPEC
+    /// §100.1): every path its conditions name, and with `sort` every
+    /// sort key, is one of `fields` or `_id`, which every key ends with;
+    /// the conditions are comparisons, every `Op`, through `All`, `Any`
+    /// and `Not`. Not `Exists`, which tells a missing field from a null
+    /// one where a key doesn't (§32), nor `Size` or `ElemMatch`, which
+    /// look into arrays. Then `Some`: which of `fields` it names, whose
+    /// values must be exact for an entry to decide. A filter without
+    /// conditions (or sort) names none.
+    pub(crate) fn covered_by(&self, fields: &[String], sort: bool) -> Option<Vec<bool>> {
+        let mut named = vec![false; fields.len()];
+        let mut name = |path: &str| {
+            if path == ID_FIELD {
+                return Some(());
+            }
+            let at = fields.iter().position(|field| field == path)?;
+            named[at] = true;
+            Some(())
+        };
+        fn of(condition: &Condition, name: &mut impl FnMut(&str) -> Option<()>) -> Option<()> {
+            match condition {
+                Condition::Compare { field, .. } => name(field),
+                Condition::All(conditions) | Condition::Any(conditions) => {
+                    conditions.iter().try_for_each(|c| of(c, name))
+                }
+                Condition::Not(condition) => of(condition, name),
+                Condition::Exists { .. } | Condition::Size { .. } | Condition::ElemMatch { .. } => {
+                    None
+                }
+            }
+        }
+        for condition in &self.conditions {
+            of(condition, &mut name)?;
+        }
+        if sort {
+            for key in &self.sort {
+                name(&key.field)?;
+            }
+        }
+        Some(named)
+    }
+
     /// Applies conditions, then sort, then skip, then limit — in that
     /// order, matching SQL's `WHERE` -> `ORDER BY` -> `OFFSET` -> `LIMIT`
     /// (sorting an already-filtered set is both correct and cheaper than
@@ -1110,6 +1153,139 @@ impl OrderedRead<'_> {
     pub fn name(&self) -> String {
         self.index
             .map_or_else(|| ID_FIELD.to_string(), IndexMeta::name)
+    }
+}
+
+/// A read whose index entries decide a filter (SPEC §100): each entry,
+/// where its values are exact, gives a document of the fields the
+/// filter names and `_id`, which matches and sorts as the whole one
+/// does.
+pub(crate) struct Covering<'a> {
+    /// The index's fields — none for the primary index.
+    fields: &'a [String],
+    /// Which of them the filter names (`Filter::covered_by`).
+    named: Vec<bool>,
+    /// Whether it names `_id`: without, the entry's document goes
+    /// without, and a filter that names nothing decides with no work.
+    id: bool,
+}
+
+impl<'a> Covering<'a> {
+    /// For a read of `index` (`None`: the primary index), if its entries
+    /// decide `filter` — and with `sort`, its order. Never a multikey
+    /// index: an entry is one element, not the array (§42). Nor where
+    /// one named field is inside another, `a` and `a.b`: one document
+    /// can't hold both values as the key has them (§31).
+    pub fn new(filter: &Filter, index: Option<&'a IndexMeta>, sort: bool) -> Option<Self> {
+        let fields: &[String] = index.map_or(&[], |index| &index.fields);
+        if fields.iter().any(|field| is_multi(field)) {
+            return None;
+        }
+        let named = filter.covered_by(fields, sort)?;
+        let paths: Vec<&String> = (fields.iter().zip(&named))
+            .filter_map(|(field, named)| named.then_some(field))
+            .collect();
+        let inside = |outer: &str, inner: &str| {
+            inner.len() > outer.len()
+                && inner.starts_with(outer)
+                && inner.as_bytes()[outer.len()] == b'.'
+        };
+        if paths.iter().any(|a| paths.iter().any(|b| inside(a, b))) {
+            return None;
+        }
+        let mut id = filter.conditions.iter().any(names_id);
+        if sort {
+            id |= filter.sort.iter().any(|key| key.field == ID_FIELD);
+        }
+        Some(Covering { fields, named, id })
+    }
+
+    /// The document `key` tells of: the named fields' values at their
+    /// paths, and `_id` if named. `None` if a named value isn't exact
+    /// (`key::decode_part`) — the document must be read — or the key is
+    /// damaged.
+    pub fn entry(&self, key: &[u8]) -> Option<Document> {
+        let mut doc = Document::Object(indexmap::IndexMap::new());
+        self.fill(key, &mut doc)?;
+        Some(doc)
+    }
+
+    /// Whether the document `key` tells of matches `filter` — `None`
+    /// where the entry can't tell (`entry`). `scratch` is filled in
+    /// place, so deciding entry after entry allocates next to nothing.
+    pub fn decide(&self, key: &[u8], filter: &Filter, scratch: &mut Document) -> Option<bool> {
+        self.fill(key, scratch)?;
+        Some(filter.matches(scratch))
+    }
+
+    /// `entry` into `doc`, an object, its slots reused.
+    fn fill(&self, key: &[u8], doc: &mut Document) -> Option<()> {
+        let Document::Object(map) = doc else {
+            *doc = Document::Object(indexmap::IndexMap::new());
+            return self.fill(key, doc);
+        };
+        if self.id {
+            let id = Document::Id(key::doc_id(key));
+            match map.get_mut(ID_FIELD) {
+                Some(slot) => *slot = id,
+                None => {
+                    map.insert(ID_FIELD.to_string(), id);
+                }
+            }
+        }
+        if !self.named.contains(&true) {
+            return Some(());
+        }
+        let mut parts = key::each_part(key::value_part(key));
+        for (field, named) in self.fields.iter().zip(&self.named) {
+            let part = parts.next()?;
+            if *named {
+                let slot = slot(map, field);
+                key::decode_part_into(part, self.fields.len(), slot)?;
+            }
+        }
+        // A damaged key with more values than the index has fields.
+        parts.next().is_none().then_some(())
+    }
+}
+
+/// Whether `condition` names `_id` anywhere.
+fn names_id(condition: &Condition) -> bool {
+    match condition {
+        Condition::Compare { field, .. } => field == ID_FIELD,
+        Condition::All(conditions) | Condition::Any(conditions) => conditions.iter().any(names_id),
+        Condition::Not(condition) => names_id(condition),
+        _ => false,
+    }
+}
+
+/// The value at `path` in `doc`, made if missing, with the objects on the
+/// way: a path inside another named one is ruled out (`Covering::new`),
+/// so whatever is on the way is an object made here.
+fn slot<'d>(doc: &'d mut indexmap::IndexMap<String, Document>, path: &str) -> &'d mut Document {
+    let (name, rest) = match path.split_once('.') {
+        Some((name, rest)) => (name, Some(rest)),
+        None => (path, None),
+    };
+    if !doc.contains_key(name) {
+        let empty = match rest {
+            Some(_) => Document::Object(indexmap::IndexMap::new()),
+            None => Document::Null,
+        };
+        doc.insert(name.to_string(), empty);
+    }
+    let value = doc.get_mut(name).expect("just made");
+    match rest {
+        None => value,
+        Some(rest) => {
+            if !matches!(value, Document::Object(_)) {
+                *value = Document::Object(indexmap::IndexMap::new());
+            }
+            match value {
+                Document::Object(inner) => slot(inner, rest),
+                _ => unreachable!("just made an object"),
+            }
+        }
     }
 }
 
@@ -1980,6 +2156,160 @@ mod tests {
             sparse: true,
             ..compound(fields)
         }
+    }
+
+    /// SPEC §100.1: a read covers a filter whose every path is one of its
+    /// index's fields or `_id`, in comparisons of every kind, nested any
+    /// way — never `Exists`, `Size` or `ElemMatch`, a field it lacks, or a
+    /// multikey index; and its sort keys, when asked, the same way.
+    #[test]
+    fn a_read_covers_only_what_its_entries_hold() {
+        let single = compound(&["a"]);
+        let nested = compound(&["o.p"]);
+        let two = sparse(&["a", "b"]);
+        let multi = compound(&["tags[*]"]);
+        let covers =
+            |f: &Filter, index: Option<&IndexMeta>| Covering::new(f, index, false).is_some();
+        let id = DocId([3; 16]);
+        let a = |op: Op| Condition::compare("a", op, 1);
+        // Every op, also `Ne` and `Contains`, nested every way.
+        for op in [
+            Op::Eq,
+            Op::Ne,
+            Op::Lt,
+            Op::Lte,
+            Op::Gt,
+            Op::Gte,
+            Op::Contains,
+        ] {
+            let f = Filter::new().and(!(a(op.clone()) | Condition::id(id)) & a(Op::Ne));
+            assert!(covers(&f, Some(&single)), "{op:?}");
+            assert!(covers(&f, Some(&two)), "{op:?}");
+            assert!(!covers(&f, Some(&nested)), "{op:?}");
+            assert!(!covers(&f, None), "{op:?}");
+        }
+        assert_eq!(
+            Filter::new().eq("b", 1).covered_by(&two.fields, false),
+            Some(vec![false, true])
+        );
+        // Nothing named: any index, the primary one too.
+        for index in [None, Some(&single), Some(&two)] {
+            assert!(covers(&Filter::new(), index));
+            assert!(covers(&Filter::new().gt("_id", id), index));
+        }
+        // A path is a field of the index as it is: not part of one, nor
+        // what one is part of.
+        assert!(covers(&Filter::new().eq("o.p", 1), Some(&nested)));
+        assert!(!covers(&Filter::new().eq("o", 1), Some(&nested)));
+        assert!(!covers(&Filter::new().eq("o.p.q", 1), Some(&nested)));
+        // Not a field it lacks, anywhere in the filter.
+        let other = Filter::new().any_of([a(Op::Eq), Condition::eq("c", 1)]);
+        assert!(!covers(&other, Some(&two)));
+        assert!(!covers(
+            &Filter::new().and(!Condition::eq("c", 1)),
+            Some(&two)
+        ));
+        // Not what tells missing from null, or looks into arrays.
+        for shape in [
+            Condition::exists("a"),
+            Condition::missing("a"),
+            Condition::size("a", Op::Eq, 0),
+            Condition::elem_match("a", Condition::eq("", 1)),
+        ] {
+            assert!(
+                !covers(&Filter::new().and(shape.clone()), Some(&single)),
+                "{shape:?}"
+            );
+            let nested_in = Filter::new().and(Condition::any([a(Op::Eq), shape.clone()]));
+            assert!(!covers(&nested_in, Some(&single)), "{shape:?}");
+        }
+        // Never a multikey index, whatever the filter.
+        assert!(!covers(&Filter::new().eq("tags[*]", 1), Some(&multi)));
+        assert!(!covers(&Filter::new(), Some(&multi)));
+        // Sort keys count only when asked: the index's fields and `_id`.
+        let sorted = Filter::new().eq("a", 1).sort_desc("b").then_asc("_id");
+        assert!(Covering::new(&sorted, Some(&two), true).is_some());
+        assert!(Covering::new(&sorted, Some(&single), false).is_some());
+        assert!(Covering::new(&sorted, Some(&single), true).is_none());
+        assert_eq!(sorted.covered_by(&two.fields, true), Some(vec![true, true]));
+    }
+
+    /// An entry gives the document of the named fields, at their paths,
+    /// and its `_id` — or nothing, where a named value isn't exact or two
+    /// fields' paths collide.
+    #[test]
+    fn an_entry_gives_the_named_fields_and_its_id() {
+        let id = DocId([5; 16]);
+        let two = compound(&["a", "o.p"]);
+        let key = crate::index::key::compound(&[&Document::Int(4), &Document::from("x")], id);
+        let doc = |f: &Filter| Covering::new(f, Some(&two), false).unwrap().entry(&key);
+        let both = Filter::new()
+            .eq("a", 1)
+            .eq("o.p", "y")
+            .gt("_id", DocId([0; 16]));
+        let Some(Document::Object(mut got)) = doc(&both) else {
+            panic!("no document");
+        };
+        assert_eq!(got.shift_remove("_id"), Some(Document::Id(id)));
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            value_or_null(&Document::Object(got.clone()), "o.p"),
+            &Document::from("x")
+        );
+        assert!(equal(
+            value_or_null(&Document::Object(got), "a"),
+            &Document::Int(4)
+        ));
+        // Only the named ones: an inexact value no filter names is no
+        // obstacle.
+        let long = Document::from("z".repeat(2000));
+        let key = crate::index::key::compound(&[&Document::Int(4), &long], id);
+        let only_a = Filter::new().eq("a", 4);
+        let entry = Covering::new(&only_a, Some(&two), false)
+            .unwrap()
+            .entry(&key);
+        assert!(entry.is_some_and(|doc| only_a.matches(&doc)));
+        let on_p = Filter::new().eq("o.p", "z");
+        assert_eq!(
+            Covering::new(&on_p, Some(&two), false).unwrap().entry(&key),
+            None
+        );
+        // `a` and `a.b` in one index: one document can't hold both as
+        // the key has them, so a filter naming both isn't covered; one
+        // naming either is.
+        let inside = compound(&["a", "a.b"]);
+        let both = Filter::new().eq("a", 1).eq("a.b", Document::Null);
+        assert!(Covering::new(&both, Some(&inside), false).is_none());
+        assert!(Covering::new(&Filter::new().eq("a.b", 1), Some(&inside), false).is_some());
+        let ab = compound(&["ab", "a"]);
+        assert!(Covering::new(&Filter::new().eq("ab", 1).eq("a", 1), Some(&ab), false).is_some());
+        // The primary index: the id alone, and only if named.
+        let primary = Covering::new(&Filter::new().gt("_id", id), None, false).unwrap();
+        let mut only_id = indexmap::IndexMap::new();
+        only_id.insert("_id".to_string(), Document::Id(id));
+        assert_eq!(primary.entry(&id.0), Some(Document::Object(only_id)));
+        let nothing = Covering::new(&Filter::new(), None, false).unwrap();
+        let empty = Document::Object(indexmap::IndexMap::new());
+        assert_eq!(nothing.entry(&id.0), Some(empty));
+        // Deciding entry after entry in one scratch document: each
+        // entry's own values, whatever the one before left.
+        let f = Filter::new().eq("a", 4).eq("o.p", "x");
+        let covering = Covering::new(&f, Some(&two), false).unwrap();
+        let mut scratch = Document::Null;
+        for (a, p, matches) in [
+            (4, "x", true),
+            (4, "y", false),
+            (5, "x", false),
+            (4, "x", true),
+        ] {
+            let key = crate::index::key::compound(&[&Document::Int(a), &Document::from(p)], id);
+            assert_eq!(covering.decide(&key, &f, &mut scratch), Some(matches));
+        }
+        assert_eq!(
+            covering.decide(&key, &f, &mut scratch),
+            None,
+            "the cut string"
+        );
     }
 
     /// A sparse index has no entry for a null (SPEC §44): it bounds only

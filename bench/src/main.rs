@@ -108,6 +108,11 @@ struct Answers {
     newest: Vec<i64>,
     first_by_id: Vec<i64>,
     scanned: usize,
+    counted_tenant: usize,
+    counted_in_range: usize,
+    page: Vec<i64>,
+    by_id_after: Vec<i64>,
+    tenant_by_id: Vec<i64>,
 }
 
 fn main() {
@@ -251,6 +256,60 @@ fn main() {
         let (took, scanned) = time(|| (0..5).map(|_| store.count_tries_above(7)).sum());
         answer.scanned = scanned;
         record("scan: tries > 7, unindexed", Unit::Millis, millis(5, took));
+
+        // Counts and deep pages (SPEC §100), with picks of their own so
+        // the rows after them see the same ones as before.
+        let tenants: Vec<String> = (0..100).map(|k| format!("t{}", k * 37 % 100)).collect();
+        let (took, counted) = time(|| tenants.iter().map(|t| store.count_tenant(t)).sum());
+        answer.counted_tenant = counted;
+        record(
+            &format!("count tenant == x ({} docs)", n / 100),
+            Unit::Millis,
+            millis(tenants.len(), took),
+        );
+        let starts: Vec<i64> = (0..100).map(|k| (k * 997 % (n - 1000)) as i64).collect();
+        let (took, counted) = time(|| {
+            (starts.iter())
+                .map(|&lo| store.count_in_range(lo, lo + 1000))
+                .sum()
+        });
+        answer.counted_in_range = counted;
+        record(
+            "count created in a range (1000 docs)",
+            Unit::Millis,
+            millis(starts.len(), took),
+        );
+        let (took, page) = time(|| {
+            (0..300)
+                .map(|k| store.page(STATUSES[k % 3], 49 * 20, 20))
+                .last()
+                .unwrap_or_default()
+        });
+        answer.page = page;
+        record(
+            "status == x by created, page 50 of 20",
+            Unit::Micros,
+            micros(300, took),
+        );
+        let (took, after) = time(|| (0..100).map(|_| store.by_id_after(5000, 50)).last());
+        answer.by_id_after = after.unwrap_or_default();
+        record(
+            "50 by id after skipping 5000",
+            Unit::Micros,
+            micros(100, took),
+        );
+        let (took, first) = time(|| {
+            (tenants.iter())
+                .map(|t| store.tenant_by_id(t, 20))
+                .last()
+                .unwrap_or_default()
+        });
+        answer.tenant_by_id = first;
+        record(
+            "tenant == x by id, first 20",
+            Unit::Micros,
+            micros(tenants.len(), took),
+        );
 
         let changed: Vec<(Id, Task)> = (0..10_000)
             .map(|_| {

@@ -7,7 +7,7 @@ use crate::explain::Trace;
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::query::{
-    Condition, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork, Update,
+    Condition, Covering, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork, Update,
 };
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
@@ -377,7 +377,9 @@ impl<T> Collection<T> {
     /// documents it read, how many matched and were returned, and how
     /// long it took. The documents are read and checked as `find` would,
     /// then dropped — for them too, run `find` and `explain_run` on one
-    /// `View`.
+    /// `View`. Where an index's entries decide the filter, its read says
+    /// so (`IndexRead::covering`), and the documents they reject or a
+    /// skip passes over aren't read (SPEC §100).
     ///
     /// It is `find` with its counters read out, not a second
     /// implementation: `find` counts the same on every call, and throws
@@ -402,9 +404,17 @@ impl<T> Collection<T> {
     /// assert_eq!(adults.plan, QueryPlan::Index { field: "age".into() });
     /// assert_eq!(adults.reads[0].bounds.len(), 2); // age >= 18, age < 65
     /// // The range holds age 65 too, which the check against the
-    /// // filter leaves out (SPEC §28.3).
-    /// assert_eq!(adults.stats.documents_examined, 48);
+    /// // filter leaves out (SPEC §28.3) — on the index entry, which
+    /// // holds the age, so the document isn't read (SPEC §100).
+    /// assert_eq!(adults.stats.keys_examined, 48);
+    /// assert!(adults.reads[0].covering);
+    /// assert_eq!(adults.stats.documents_examined, 47);
     /// assert_eq!(adults.stats.documents_returned, 47);
+    ///
+    /// // A condition on a field the index lacks: every document read.
+    /// let some = people.explain_run(Filter::new().gte("age", 18).lt("age", 65).ne("name", "x"))?;
+    /// assert!(!some.reads[0].covering);
+    /// assert_eq!(some.stats.documents_examined, 48);
     /// # Ok::<(), trunkdb::Error>(())
     /// ```
     pub fn explain_run(&self, filter: Filter) -> crate::Result<Explained> {
@@ -809,19 +819,22 @@ impl Collection<Document> {
         let at = state.snapshot();
         let trace = Trace::default();
         let count = if filter.conditions.is_empty() {
-            candidate_entries(at.catalog, &at.store, &self.name, &filter, &trace)?.len()
+            candidate_entries(at.catalog, &at.store, &self.name, &filter, &trace)?
+                .0
+                .len()
         } else {
-            let names = filter.fields();
+            let names = filter.fields_with(false);
             read_candidates(
                 at.catalog,
                 &at.store,
                 &self.name,
                 &filter,
                 names.as_deref(),
+                false,
                 &trace,
             )?
             .iter()
-            .filter(|(_stored, fields)| filter.matches(fields))
+            .filter(|(source, fields)| source.decided() || filter.matches(fields))
             .count()
         };
         let count = count.saturating_sub(filter.skip);
@@ -860,16 +873,33 @@ impl Collection<Document> {
         };
         let state = kept.read()?;
         let at = state.snapshot();
-        let entries = candidate_entries(
+        let (entries, indexed) = candidate_entries(
             at.catalog,
             &at.store,
             &self.name,
             &filter,
             &Trace::default(),
         )?;
+        // Where the entries decide (SPEC §100), a rejected one is left
+        // out, and a match is kept as decided: passed over by a skip
+        // unread.
+        let decides = indexed.covering(&filter, false);
+        let mut scratch = Document::Null;
+        let candidates = entries
+            .into_iter()
+            .filter_map(|(key, loc)| {
+                match decides
+                    .as_ref()
+                    .and_then(|c| c.decide(&key, &filter, &mut scratch))
+                {
+                    Some(true) => Some((loc, true)),
+                    Some(false) => None,
+                    None => Some((loc, false)),
+                }
+            })
+            .collect();
         drop(state);
-        let locs = entries.into_iter().map(|(_key, loc)| loc).collect();
-        Ok(Cursor::streaming(kept, locs, filter, convert))
+        Ok(Cursor::streaming(kept, candidates, filter, convert))
     }
 
     /// The document at `loc`, as this handle's commit has it: for a
@@ -893,7 +923,7 @@ impl Collection<Document> {
     pub fn upsert(&self, filter: Filter, doc: Document) -> crate::Result<Upserted> {
         let id_if_new = id_for_insert(&self.db, &doc);
         self.db.transact(|catalog, store| {
-            let names = filter.fields();
+            let names = filter.fields_with(false);
             let trace = Trace::default();
             let matches: Vec<DocId> = read_candidates(
                 catalog,
@@ -901,11 +931,12 @@ impl Collection<Document> {
                 &self.name,
                 &filter,
                 names.as_deref(),
+                false,
                 &trace,
             )?
             .into_iter()
-            .filter(|(_stored, fields)| filter.matches(fields))
-            .map(|(stored, _fields)| stored.id())
+            .filter(|(source, fields)| source.decided() || filter.matches(fields))
+            .map(|(source, _fields)| source.id())
             .collect();
             let (op, outcome) = match matches[..] {
                 [] => (
@@ -997,11 +1028,16 @@ fn find_in(
     trace: &Trace,
 ) -> crate::Result<Vec<Found>> {
     let indexes = catalog.indexes(collection);
+    let mut records = data::Records::new(store);
     if let Some(order) = filter.index_order(indexes) {
-        // Read as far as skip plus limit, then pass over the skipped (SPEC §72).
-        let mut found = read_in_index_order(catalog, store, collection, filter, order, trace)?;
+        // Read as far as skip plus limit, then pass over the skipped (SPEC
+        // §72), unread where their entries decided (§100).
+        let mut found = walk_in_index_order(catalog, store, collection, filter, order, trace)?;
         found.drain(..filter.skip.min(found.len()));
-        return Ok(found.into_iter().map(Found::stored).collect());
+        return found
+            .into_iter()
+            .map(|(source, _fields)| Ok(Found::stored(source.read(&mut records, trace)?)))
+            .collect();
     }
     // Candidates from an index range or by id nearly all match: for a
     // caller that wants whole documents, each is decoded whole once and
@@ -1013,25 +1049,35 @@ fn find_in(
         true => None,
         false => filter.fields(),
     };
-    let mut matches: Vec<Candidate> =
-        read_candidates(catalog, store, collection, filter, names.as_deref(), trace)?
-            .into_iter()
-            .filter(|(_stored, fields)| filter.matches(fields))
-            .collect();
+    let sort = !filter.sort.is_empty();
+    let mut matches: Vec<Candidate> = read_candidates(
+        catalog,
+        store,
+        collection,
+        filter,
+        names.as_deref(),
+        sort,
+        trace,
+    )?
+    .into_iter()
+    .filter(|(source, fields)| source.decided() || filter.matches(fields))
+    .collect();
     trace.matched(matches.len());
-    if !filter.sort.is_empty() {
+    if sort {
         // So equal sort values end up in id order, as they do when read
         // from an index (the sort is stable).
-        matches.sort_unstable_by_key(|(stored, _fields)| stored.id());
+        matches.sort_unstable_by_key(|(source, _fields)| source.id());
     }
-    let arranged = filter.arrange(matches, |(_stored, fields)| fields);
-    Ok(arranged
+    let arranged = filter.arrange(matches, |(_source, fields)| fields);
+    arranged
         .into_iter()
-        .map(|(stored, fields)| Found {
-            stored,
-            whole: whole.then_some(fields),
+        .map(|(source, fields)| {
+            // Only a document read was decoded whole, not an entry's.
+            let whole = (whole && matches!(source, Source::Read(_))).then_some(fields);
+            let stored = source.read(&mut records, trace)?;
+            Ok(Found { stored, whole })
         })
-        .collect())
+        .collect()
 }
 
 /// A match of `find_in`, not decoded yet — or, where it was decoded whole
@@ -1066,9 +1112,43 @@ impl Found {
 
 /// A candidate as `find` checks it (SPEC §99.2): the document as it is
 /// stored, and the fields its filter and sort name, decoded
-/// (`Filter::fields`). The whole document is decoded only for what is
-/// handed out (§99.3).
-type Candidate = (Stored, Document);
+/// (`Filter::fields`) — or, where its index entry decided (SPEC §100),
+/// where it is and its entry's document. The whole document is decoded
+/// only for what is handed out (§99.3).
+type Candidate = (Source, Document);
+
+/// Where a candidate's document is: read, or not yet (SPEC §100).
+enum Source {
+    Read(Stored),
+    /// Its index entry decided: its id and where it is, read only if
+    /// handed out.
+    Entry(DocId, RecordLocation),
+}
+
+impl Source {
+    /// Its entry decided it matches: no need to check it again.
+    fn decided(&self) -> bool {
+        matches!(self, Source::Entry(..))
+    }
+
+    fn id(&self) -> DocId {
+        match self {
+            Source::Read(stored) => stored.id(),
+            Source::Entry(id, _) => *id,
+        }
+    }
+
+    /// The document as it is stored, read now if it wasn't.
+    fn read(self, records: &mut data::Records, trace: &Trace) -> std::io::Result<Stored> {
+        match self {
+            Source::Read(stored) => Ok(stored),
+            Source::Entry(_, loc) => {
+                trace.examined();
+                records.stored(loc)
+            }
+        }
+    }
+}
 
 /// The index entries `find` has to look at for `filter`: the primary
 /// index's entries for the ids it names (SPEC §61), else the secondary
@@ -1076,18 +1156,20 @@ type Candidate = (Stored, Document);
 /// whole primary index. Each entry's key ends with its document's id, and
 /// each document comes once, even if several ranges hold it (an OR
 /// whose branches overlap) or one range holds it several times (a
-/// multikey index, SPEC §42.2).
-fn candidate_entries(
-    catalog: &Catalog,
+/// multikey index, SPEC §42.2). With them, which index they come from,
+/// for deciding by entry (SPEC §100).
+fn candidate_entries<'a>(
+    catalog: &'a Catalog,
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
     trace: &Trace,
-) -> std::io::Result<Vec<(Vec<u8>, RecordLocation)>> {
+) -> std::io::Result<(Vec<Entry>, Indexed<'a>)> {
     let Some(meta) = catalog.get(collection) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Indexed::Primary));
     };
-    if let Some(ids) = filter.ids() {
+    let mut reads = Vec::new();
+    let (entries, indexed) = if let Some(ids) = filter.ids() {
         let by_id = |id: &DocId| Condition::id(*id);
         let bounds = match &ids[..] {
             [id] => vec![by_id(id)],
@@ -1095,6 +1177,7 @@ fn candidate_entries(
         };
         let read = trace.read(crate::document::ID_FIELD.to_string(), bounds, false);
         trace.entries(read, ids.len());
+        reads.push(read);
         let primary = BTreeIndex::new(meta.index_root);
         let mut entries = Vec::new();
         for id in ids {
@@ -1103,29 +1186,81 @@ fn candidate_entries(
                 entries.push((key, loc));
             }
         }
-        return Ok(entries);
-    }
-    match filter.index_ranges(catalog.indexes(collection)) {
-        None => {
-            let read = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
-            let entries = BTreeIndex::new(meta.index_root).scan(store)?;
-            trace.entries(read, entries.len());
-            Ok(entries)
-        }
-        Some(ranges) => {
-            let mut seen = std::collections::HashSet::new();
-            let mut entries = Vec::new();
-            for range in ranges {
-                let read = trace.read(range.index.name(), range.by, false);
-                let found = BTreeIndex::new(range.index.root).range(store, &range.range)?;
-                trace.entries(read, found.len());
-                for entry in found {
-                    if seen.insert(key::doc_id(&entry.0)) {
-                        entries.push(entry);
+        (entries, Indexed::Primary)
+    } else {
+        match filter.index_ranges(catalog.indexes(collection)) {
+            None => {
+                let read = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
+                let entries = BTreeIndex::new(meta.index_root).scan(store)?;
+                trace.entries(read, entries.len());
+                reads.push(read);
+                (entries, Indexed::Primary)
+            }
+            Some(ranges) => {
+                // An OR of no branches has no ranges, and no entries.
+                let first = ranges.first().map(|range| range.index);
+                let indexed = match first {
+                    Some(first) if ranges.iter().all(|r| std::ptr::eq(r.index, first)) => {
+                        Indexed::One(first)
+                    }
+                    _ => Indexed::Several,
+                };
+                // One range of an index with one key per document holds
+                // each once; several ranges, or a multikey index, may
+                // hold one several times.
+                let multikey = ranges[0]
+                    .index
+                    .fields
+                    .iter()
+                    .any(|f| crate::query::is_multi(f));
+                let once = ranges.len() == 1 && !multikey;
+                let mut seen = std::collections::HashSet::new();
+                let mut entries = Vec::new();
+                for range in ranges {
+                    let read = trace.read(range.index.name(), range.by, false);
+                    let found = BTreeIndex::new(range.index.root).range(store, &range.range)?;
+                    trace.entries(read, found.len());
+                    reads.push(read);
+                    if once {
+                        entries = found;
+                        continue;
+                    }
+                    for entry in found {
+                        if seen.insert(key::doc_id(&entry.0)) {
+                            entries.push(entry);
+                        }
                     }
                 }
+                (entries, indexed)
             }
-            Ok(entries)
+        }
+    };
+    if indexed.covering(filter, false).is_some() {
+        reads.into_iter().for_each(|read| trace.covering(read));
+    }
+    Ok((entries, indexed))
+}
+
+/// An index entry: its key, and where its document is.
+type Entry = (Vec<u8>, RecordLocation);
+
+/// Which index `candidate_entries` read.
+#[derive(Clone, Copy)]
+enum Indexed<'a> {
+    Primary,
+    One(&'a IndexMeta),
+    /// Ranges of several, for an OR (SPEC §36.3): no one index holds
+    /// every field the filter names, so their entries decide nothing.
+    Several,
+}
+
+impl<'a> Indexed<'a> {
+    /// `Covering::new` for the index read.
+    fn covering(self, filter: &Filter, sort: bool) -> Option<Covering<'a>> {
+        match self {
+            Indexed::Primary => Covering::new(filter, None, sort),
+            Indexed::One(index) => Covering::new(filter, Some(index), sort),
+            Indexed::Several => None,
         }
     }
 }
@@ -1159,20 +1294,10 @@ fn candidate_entries(
 /// every document has one.
 ///
 /// Each document is checked on the fields the filter and sort name, and
-/// handed out undecoded (SPEC §99).
-fn read_in_index_order(
-    catalog: &Catalog,
-    store: &dyn PageStore,
-    collection: &str,
-    filter: &Filter,
-    order: OrderedRead,
-    trace: &Trace,
-) -> crate::Result<Vec<Stored>> {
-    let found = walk_in_index_order(catalog, store, collection, filter, order, trace)?;
-    Ok(found.into_iter().map(|(stored, _fields)| stored).collect())
-}
-
-/// `read_in_index_order`'s walk, its matches with their fields.
+/// handed out undecoded (SPEC §99). Where the index covers the filter
+/// (SPEC §100), an entry of an exact group decides without its document,
+/// which is read only if handed out: the matches a skip passes over are
+/// never read.
 fn walk_in_index_order(
     catalog: &Catalog,
     store: &dyn PageStore,
@@ -1219,12 +1344,17 @@ fn walk_in_index_order(
     // The primary index gives the whole order: every key exact, nothing
     // unordered (SPEC §96), so only the conditions' fields are looked at.
     let names = filter.fields_with(!primary || in_memory);
+    let decides = Covering::new(filter, order.index, false);
+    if decides.is_some() {
+        trace.covering(walk);
+    }
     let mut records = data::Records::new(store);
+    let mut scratch = Document::Null;
     let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
         trace.examined();
         let stored = records.stored(*loc)?;
         let fields = stored.fields(names.as_deref())?;
-        Ok((stored, fields))
+        Ok((Source::Read(stored), fields))
     };
     // Hands out one group's matching documents; `true` once `limit` are.
     let mut take = |group: Group, results: &mut Vec<Candidate>| -> crate::Result<bool> {
@@ -1237,11 +1367,18 @@ fn walk_in_index_order(
             .iter()
             .all(|part| key::part_is_exact(part, fields));
         if exact && !in_memory {
-            for (_key, loc) in &group {
-                let (id, doc) = read(loc)?;
-                if filter.matches(&doc) {
+            for (key, loc) in &group {
+                let decided = decides
+                    .as_ref()
+                    .and_then(|c| c.decide(key, filter, &mut scratch));
+                let (source, doc) = match decided {
+                    Some(false) => continue,
+                    Some(true) => (Source::Entry(key::doc_id(key), *loc), Document::Null),
+                    None => read(loc)?,
+                };
+                if source.decided() || filter.matches(&doc) {
                     trace.matched(1);
-                    results.push((id, doc));
+                    results.push((source, doc));
                     if results.len() == limit {
                         return Ok(true);
                     }
@@ -1355,11 +1492,11 @@ impl Spans {
         if self.primary {
             return key; // one document, whose id is unique
         }
-        let parts = key::parts(key::value_part(key));
-        let mut len: usize = parts.iter().take(self.at).map(|p| p.len()).sum();
-        for part in parts.iter().take(self.end).skip(self.at) {
+        let mut len = 0;
+        let parts = key::each_part(key::value_part(key)).take(self.end);
+        for (i, part) in parts.enumerate() {
             len += part.len();
-            if !key::part_is_exact(part, self.fields) {
+            if i >= self.at && !key::part_is_exact(part, self.fields) {
                 break;
             }
         }
@@ -1477,27 +1614,58 @@ fn first_only(mut filter: Filter) -> Filter {
     filter
 }
 
-/// The documents behind `candidate_entries`, not yet checked against the
-/// filter — an index range may hold a few that don't match (SPEC §28.3).
+/// The candidates behind `candidate_entries`, not yet checked against
+/// the filter — an index range may hold a few that don't match (SPEC
+/// §28.3) — each with the fields `names` names. Where the index read
+/// covers the filter (SPEC §100), an entry decides instead of its
+/// document: one that matches comes unread (`Source::Entry`), already
+/// checked, and one that doesn't isn't read at all. With `sort`, for a
+/// sort in memory, such a match comes with its entry's document to sort
+/// by; where the index lacks a sort key, it is read for that key.
 fn read_candidates(
     catalog: &Catalog,
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
     names: Option<&[&str]>,
+    sort: bool,
     trace: &Trace,
 ) -> std::io::Result<Vec<Candidate>> {
+    let (entries, indexed) = candidate_entries(catalog, store, collection, filter, trace)?;
+    let decides = indexed.covering(filter, false);
+    let orders = match sort {
+        true => indexed.covering(filter, true),
+        false => None,
+    };
     let mut records = data::Records::new(store);
-    candidate_entries(catalog, store, collection, filter, trace)?
-        .into_iter()
-        .map(|(_key, loc)| {
-            trace.examined();
-            // The id stored in the data cell itself (SPEC §11).
-            let stored = records.stored(loc)?;
-            let fields = stored.fields(names)?;
-            Ok((stored, fields))
-        })
-        .collect()
+    let mut candidates = Vec::new();
+    let mut scratch = Document::Null;
+    for (key, loc) in entries {
+        let decided = decides
+            .as_ref()
+            .and_then(|c| c.decide(&key, filter, &mut scratch));
+        if decided == Some(false) {
+            continue; // rejected by its entry, never read
+        }
+        // A match whose entry also holds the sort keys, or with no sort
+        // to need them, stays unread: its entry's document is all the
+        // sort looks at.
+        let entry = match (decided, &orders) {
+            (Some(true), _) if !sort => Some(Document::Null),
+            (Some(true), Some(orders)) => orders.entry(&key),
+            _ => None,
+        };
+        if let Some(fields) = entry {
+            candidates.push((Source::Entry(key::doc_id(&key), loc), fields));
+            continue;
+        }
+        trace.examined();
+        // The id stored in the data cell itself (SPEC §11).
+        let stored = records.stored(loc)?;
+        let fields = stored.fields(names)?;
+        candidates.push((Source::Read(stored), fields));
+    }
+    Ok(candidates)
 }
 
 /// Maps a single-op write's outcome to `update`/`delete`'s `bool`.
@@ -4092,55 +4260,64 @@ mod tests {
 
     /// SPEC §96: a sort by `_id` with a limit walks the primary index,
     /// either way, from where its `_id` comparisons with an id start it,
-    /// and reads only what it hands out and skips.
+    /// and reads only what it hands out and skips — and, where the filter
+    /// names nothing but `_id`, only what it hands out (SPEC §100).
     #[test]
     fn a_sort_by_id_walks_the_primary_index() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let (docs, ids) = thousand_by_id(&db);
-        let walk = |f: Filter, bounds: Vec<Condition>, backward: bool, read: u64| {
-            let run = docs.explain_run(f.clone()).unwrap();
-            assert_eq!(
-                run.plan,
-                QueryPlan::IndexOrder {
-                    field: "_id".into()
-                },
-                "{f:?}"
-            );
-            let entries = read;
-            let index = "_id".to_string();
-            let expected = crate::explain::IndexRead {
-                index,
-                bounds,
-                backward,
-                entries,
+        // `(entries, read)`: entries walked, documents read. Fewer read
+        // than walked: the walk covered the filter.
+        let walk =
+            |f: Filter, bounds: Vec<Condition>, backward: bool, (entries, read): (u64, u64)| {
+                let run = docs.explain_run(f.clone()).unwrap();
+                assert_eq!(
+                    run.plan,
+                    QueryPlan::IndexOrder {
+                        field: "_id".into()
+                    },
+                    "{f:?}"
+                );
+                let index = "_id".to_string();
+                let covering = f.conditions.iter().all(|c| match c {
+                    Condition::Compare { field, .. } => field == "_id",
+                    _ => false,
+                });
+                assert!(covering || entries == read);
+                let expected = crate::explain::IndexRead {
+                    index,
+                    bounds,
+                    backward,
+                    entries,
+                    covering,
+                };
+                assert_eq!(run.reads, [expected], "{f:?}");
+                assert_eq!(run.stats.documents_examined, read, "{f:?}");
+                let keys = f.sort.len();
+                let sort = SortWork {
+                    from_index: keys,
+                    in_memory: 0,
+                };
+                assert_eq!(run.sort, Some(sort));
+                let found = docs.find_with_ids(f).unwrap();
+                found.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
             };
-            assert_eq!(run.reads, [expected], "{f:?}");
-            assert_eq!(run.stats.documents_examined, read, "{f:?}");
-            let keys = f.sort.len();
-            let sort = SortWork {
-                from_index: keys,
-                in_memory: 0,
-            };
-            assert_eq!(run.sort, Some(sort));
-            let found = docs.find_with_ids(f).unwrap();
-            found.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
-        };
         let first = Filter::new().sort_asc("_id").limit(20);
-        assert_eq!(walk(first, vec![], false, 20), ids[..20]);
+        assert_eq!(walk(first, vec![], false, (20, 20)), ids[..20]);
         let last = Filter::new().sort_desc("_id").limit(20);
         let mut newest = ids[980..].to_vec();
         newest.reverse();
-        assert_eq!(walk(last, vec![], true, 20), newest);
+        assert_eq!(walk(last, vec![], true, (20, 20)), newest);
         // Keyset paging: the 10 after the 500th.
         let after = Condition::gt("_id", ids[500]);
         let next = Filter::new().sort_asc("_id").limit(10).and(after.clone());
-        assert_eq!(walk(next, vec![after], false, 10), ids[501..511]);
+        assert_eq!(walk(next, vec![after], false, (10, 10)), ids[501..511]);
         // Up to and with the 500th, backwards, and a stretch between two.
         let upto = Condition::lte("_id", ids[500]);
         let back = Filter::new().sort_desc("_id").limit(3).and(upto.clone());
         assert_eq!(
-            walk(back, vec![upto], true, 3),
+            walk(back, vec![upto], true, (3, 3)),
             [ids[500], ids[499], ids[498]]
         );
         let (from, before) = (Condition::gte("_id", ids[7]), Condition::lt("_id", ids[9]));
@@ -4149,13 +4326,13 @@ mod tests {
             .limit(5)
             .and(from.clone())
             .and(before.clone());
-        assert_eq!(walk(between, vec![from, before], false, 2), ids[7..9]);
-        // Page 3 of 50: the 100 skipped are read too, not handed out.
+        assert_eq!(walk(between, vec![from, before], false, (2, 2)), ids[7..9]);
+        // Page 3 of 50: the 100 skipped are walked, not read (SPEC §100).
         let page = Filter::new().sort_asc("_id").skip(100).limit(50);
-        assert_eq!(walk(page, vec![], false, 150), ids[100..150]);
+        assert_eq!(walk(page, vec![], false, (150, 50)), ids[100..150]);
         // Keys after `_id` have nothing to order: no two ids tie.
         let more = Filter::new().sort_asc("_id").then_desc("n").limit(4);
-        assert_eq!(walk(more, vec![], false, 4), ids[..4]);
+        assert_eq!(walk(more, vec![], false, (4, 4)), ids[..4]);
         // Other conditions are checked, up to the third match.
         let all = docs.find(Filter::new().sort_asc("_id")).unwrap();
         let high = Filter::new().gt("n", 994);
@@ -4165,13 +4342,14 @@ mod tests {
             .unwrap()
             .0;
         let range = Filter::new().sort_asc("_id").limit(3).gt("n", 994);
-        let found = walk(range, vec![], false, third as u64 + 1);
+        let found = walk(range, vec![], false, (third as u64 + 1, third as u64 + 1));
         assert_eq!(found.len(), 3);
-        // Comparing `_id` with a number, or `ne`, doesn't narrow.
+        // Comparing `_id` with a number, or `ne`, doesn't narrow; the
+        // entries reject what doesn't match, unread.
         let number = Filter::new().sort_asc("_id").limit(3).gt("_id", 5);
-        assert!(walk(number, vec![], false, 1000).is_empty());
+        assert!(walk(number, vec![], false, (1000, 0)).is_empty());
         let ne = Filter::new().sort_asc("_id").limit(3).ne("_id", ids[1]);
-        assert_eq!(walk(ne, vec![], false, 4), [ids[0], ids[2], ids[3]]);
+        assert_eq!(walk(ne, vec![], false, (4, 3)), [ids[0], ids[2], ids[3]]);
         // A collection that doesn't exist walks nothing.
         let none = db.collection::<Document>("none");
         let sorted = Filter::new().sort_desc("_id").limit(3);
@@ -4209,21 +4387,26 @@ mod tests {
         assert_eq!(decoded(&|| typed.find(top()).unwrap().len()), (20, 20));
         let streamed = || typed.cursor(Filter::new().gt("n", 900)).unwrap().count();
         assert_eq!(decoded(&streamed), (99, 99));
-        // Page 3 of 50: 150 read, 50 decoded.
+        // Page 3 of 50: 50 read and decoded; the 100 skipped decided by
+        // their entries (SPEC §100).
         let page = || Filter::new().sort_asc("_id").skip(100).limit(50);
         assert_eq!(decoded(&|| docs.find(page()).unwrap().len()), (50, 50));
-        assert_eq!(records_read(|| drop(typed.find(page()).unwrap())), 150);
+        assert_eq!(records_read(|| drop(typed.find(page()).unwrap())), 50);
         let over = || Filter::new().gt("n", 499);
         assert_eq!(decoded(&|| docs.count(over()).unwrap()), (500, 0));
         assert_eq!(
             decoded(&|| docs.delete_many(Filter::new().lt("n", 10)).unwrap()),
             (10, 0)
         );
-        // From an index range, untyped: each candidate once, whole.
+        // From an index range, untyped, a filter its entries don't decide:
+        // each candidate once, whole.
         docs.ensure_index("n").unwrap();
-        let high = || Filter::new().gte("n", 990).ne("n", 995);
+        let high = || Filter::new().gte("n", 990).ne("n", 995).ne("pad", "");
         assert_eq!(decoded(&|| docs.find(high()).unwrap().len()), (9, 10));
         assert_eq!(decoded(&|| typed.find(high()).unwrap().len()), (9, 9));
+        // One they decide: only the matches (SPEC §100).
+        let decided = || Filter::new().gte("n", 990).ne("n", 995);
+        assert_eq!(decoded(&|| docs.find(decided()).unwrap().len()), (9, 9));
     }
 
     /// SPEC §96.2: the walk by `_id` gives way as a walk on a secondary
@@ -4506,10 +4689,42 @@ mod tests {
             stats.keys_examined >= stats.documents_examined,
             "{f:?}: {run:?}"
         );
-        assert!(
-            stats.documents_matched <= stats.documents_examined,
-            "{f:?}: {run:?}"
-        );
+        // Where entries decide (SPEC §100), a match need not be read;
+        // elsewhere every match was.
+        match run.reads.iter().any(|read| read.covering) {
+            true => assert!(stats.documents_matched <= stats.keys_examined),
+            false => assert!(
+                stats.documents_matched <= stats.documents_examined,
+                "{f:?}: {run:?}"
+            ),
+        }
+        // A read covers exactly where its index holds what the filter
+        // names, and isn't multikey.
+        let indexes = docs.indexes().unwrap();
+        for (i, read) in run.reads.iter().enumerate() {
+            let fields: Vec<String> = match read.index.as_str() {
+                "_id" => Vec::new(),
+                name => indexes
+                    .iter()
+                    .find(|index| index.name() == name)
+                    .map(|index| index.fields().to_vec())
+                    .unwrap(),
+            };
+            let multi = fields.iter().any(|field| crate::query::is_multi(field));
+            let covers = !multi && f.covered_by(&fields, false).is_some();
+            let several = run
+                .reads
+                .iter()
+                .any(|other| other.index != read.index && other.index != "_id");
+            // The scan after a walk for what its index lacks reads
+            // documents (§34.2).
+            let after_walk = i > 0 && read.index == "_id";
+            assert_eq!(
+                read.covering,
+                covers && !several && !after_walk,
+                "{f:?}: {run:?}"
+            );
+        }
         let unlimited = Filter {
             skip: 0,
             limit: None,
@@ -4990,12 +5205,14 @@ mod tests {
         let reads = records_read(|| found = users.find(page(2)).unwrap());
         assert_eq!((reads, ages(&found)), (1000, (40..60).collect()));
 
+        // Walked as far as skip plus limit; the skipped decided by their
+        // entries, unread (SPEC §100).
         users.ensure_index("age").unwrap();
         let reads = records_read(|| found = users.find(page(2)).unwrap());
         assert_eq!(
             (reads, ages(&found)),
-            (60, (40..60).collect()),
-            "skip + limit read"
+            (20, (40..60).collect()),
+            "limit read"
         );
         let desc = by_age(SortOrder::Desc).skip(995).limit(20);
         assert_eq!(ages(&users.find(desc).unwrap()), [4, 3, 2, 1, 0]);
@@ -5027,12 +5244,17 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap().age)
             .collect();
-        let rest: Vec<i64> = users
-            .cursor(under_ten.clone().skip(3).limit(4))
-            .unwrap()
-            .map(|r| r.unwrap().age)
-            .collect();
+        let mut rest: Vec<i64> = Vec::new();
+        let reads = records_read(|| {
+            rest = users
+                .cursor(under_ten.clone().skip(3).limit(4))
+                .unwrap()
+                .map(|r| r.unwrap().age)
+                .collect();
+        });
         assert_eq!((all.len(), &rest[..]), (10, &all[3..7]));
+        // The entries decide: the three skipped aren't read (SPEC §100).
+        assert_eq!(reads, 4);
 
         // `delete_many` deletes the page `find` returns.
         assert_eq!(
@@ -5096,8 +5318,10 @@ mod tests {
             sort: by_age(SortOrder::Asc).sort,
             ..young
         };
+        // The range includes its bound, age 10 (§28.4), whose entry
+        // rejects it unread (SPEC §100).
         let reads = records_read(|| assert_eq!(users.find(young).unwrap().len(), 10));
-        assert_eq!(reads, 11, "a range includes its bound, age 10 (§28.4)");
+        assert_eq!(reads, 10);
 
         // Without such a range, running out means one scan for them —
         // here a document whose age is an array, sorted after the rest.
@@ -5312,6 +5536,316 @@ mod tests {
         assert_nested_filters_agree_with_a_scan(&db.collection("docs"), &mut rng);
     }
 
+    /// SPEC §100: where the entries decide, a document is read only to be
+    /// handed out — and where one entry can't, that document alone.
+    #[test]
+    fn where_entries_decide_only_what_is_handed_out_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("tasks");
+        let ops = (0..2000)
+            .map(|i| {
+                let doc = object(vec![
+                    ("tenant", format!("t{}", i % 10).into()),
+                    ("status", ["Queued", "Done"][i as usize % 2].into()),
+                    ("created", Document::Int(i)),
+                    ("tries", Document::Int(i % 7)),
+                ]);
+                WriteOp::Insert("tasks".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        docs.ensure_index("tenant").unwrap();
+        docs.ensure_index(["status", "created"]).unwrap();
+        let reads = |read: &dyn Fn() -> usize| {
+            let mut n = 0;
+            let read = records_read(|| n = read());
+            (n, read)
+        };
+        let tenant = || Filter::new().eq("tenant", "t3");
+        let found = |f: Filter| reads(&|| docs.find(f.clone()).unwrap().len());
+        // The total behind a page: no document read.
+        assert_eq!(reads(&|| docs.count(tenant()).unwrap()), (200, 0));
+        let queued = Filter::new().eq("status", "Queued").gte("created", 100);
+        assert_eq!(reads(&|| docs.count(queued.clone()).unwrap()), (950, 0));
+        // Page 50 of 20, in index order and in `_id` order: 20 read.
+        let page = |f: Filter| f.skip(49 * 20).limit(20);
+        let by_created = page(Filter::new().eq("status", "Queued").sort_asc("created"));
+        assert_eq!(found(by_created), (20, 20));
+        assert_eq!(found(page(Filter::new().sort_asc("_id"))), (20, 20));
+        // Sorted in memory by `_id`, which every key holds: 20 read.
+        let newest = tenant().sort_desc("_id").limit(20);
+        assert_eq!(found(newest), (20, 20));
+        // Sorted by a key the index lacks: of the 400 in the range, the
+        // entries reject t4's 200 unread, and the matches are read for
+        // the key.
+        let t3_of_two = Filter::new()
+            .gte("tenant", "t3")
+            .lte("tenant", "t4")
+            .ne("tenant", "t4");
+        assert_eq!(found(t3_of_two.sort_asc("tries").limit(5)), (5, 200));
+        // A condition on a field the index lacks: every candidate read.
+        let busy = tenant().gt("tries", 4);
+        let many = (3..2000).step_by(10).filter(|i| i % 7 > 4).count();
+        assert_eq!(found(busy.clone()), (many, 200));
+        assert_eq!(reads(&|| docs.count(busy.clone()).unwrap()), (many, 200));
+        // An unsorted cursor passes over the skipped unread.
+        let streamed = || docs.cursor(tenant().skip(150)).unwrap().count();
+        assert_eq!(reads(&streamed), (50, 50));
+
+        // Values an entry can't tell exactly: their documents alone read.
+        for (i, value) in [
+            Document::from("t3".to_string() + &"x".repeat(2000)),
+            Document::Int(1 << 60),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            docs.insert(object(vec![
+                ("tenant", value.clone()),
+                ("tries", Document::Int(i as i64)),
+            ]))
+            .unwrap();
+            let at_least = Filter::new().gte("tenant", value.clone());
+            let expected = docs.find(at_least.clone()).unwrap().len();
+            // The walk on `tenant` reads the inexact group whole, the
+            // first here, though skipped (§34.2).
+            let inexact = Filter::new()
+                .gte("tenant", value)
+                .sort_asc("tenant")
+                .limit(5)
+                .skip(1);
+            assert_eq!(
+                reads(&|| docs.count(at_least.clone()).unwrap()),
+                (expected, 1)
+            );
+            assert_eq!(found(inexact).1, (expected - 1).min(5) + 1, "{i}");
+        }
+        assert_consistent(&db);
+    }
+
+    /// Conditions mostly on what the indexes of
+    /// `entries_decide_as_the_documents_would` hold — `a`, `b`, `o.p`
+    /// and `_id` — now and then on `c`, which none holds.
+    fn covered_condition(rng: &mut XorShift, depth: usize, ids: &[DocId]) -> Condition {
+        if depth == 0 || rng.below(3) == 0 {
+            let ops = [
+                Op::Eq,
+                Op::Ne,
+                Op::Lt,
+                Op::Lte,
+                Op::Gt,
+                Op::Gte,
+                Op::Contains,
+            ];
+            let op = ops[rng.below(ops.len())].clone();
+            return match rng.below(9) {
+                0..=2 => cond("b", op, random_value(rng)),
+                3 => cond("a", op, Document::Int(rng.below(4) as i64 - 1)),
+                4 | 5 => cond("o.p", op, random_value(rng)),
+                6 | 7 => cond("_id", op, Document::Id(ids[rng.below(ids.len())])),
+                _ => cond("c", op, Document::Int(rng.below(3) as i64)),
+            };
+        }
+        let children = (0..rng.below(4))
+            .map(|_| covered_condition(rng, depth - 1, ids))
+            .collect::<Vec<_>>();
+        match rng.below(5) {
+            0 => Condition::All(children),
+            1 => !covered_condition(rng, depth - 1, ids),
+            _ => Condition::Any(children),
+        }
+    }
+
+    /// SPEC §100: where index entries decide, `find`, `count` and a
+    /// cursor, typed and untyped, give what checking every document gives
+    /// — on one-field, nested, compound and sparse indexes, with `_id` in
+    /// the conditions and the sort, with values that don't decide (cut
+    /// strings, numbers past 2^53, and arrays, objects and NaN in a
+    /// compound key), and skips of every size; and `delete_many` and
+    /// `update_fields` change exactly what `find` returns.
+    #[test]
+    fn entries_decide_as_the_documents_would() {
+        for sparse in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+            let docs = db.collection::<Document>("docs");
+            let options = match sparse {
+                true => IndexOptions::new().sparse(),
+                false => IndexOptions::new(),
+            };
+            docs.ensure_index_with("b", options).unwrap();
+            docs.ensure_index_with(["a", "b"], options).unwrap();
+            docs.ensure_index_with("o.p", options).unwrap();
+            let mut rng = XorShift(0x0100_C0DE_0100_C0DE ^ sparse as u64);
+            let ops = (0..300)
+                .map(|_| {
+                    let mut fields = Vec::new();
+                    match rng.below(5) {
+                        0 => {}
+                        1 => fields.push(("a", Document::Null)),
+                        _ => fields.push(("a", Document::Int(rng.below(3) as i64))),
+                    }
+                    if rng.below(6) != 0 {
+                        fields.push(("b", random_value(&mut rng)));
+                    }
+                    match rng.below(4) {
+                        0 => {}
+                        1 => fields.push(("o", Document::Int(1))),
+                        _ => fields.push(("o", object(vec![("p", random_value(&mut rng))]))),
+                    }
+                    fields.push(("c", Document::Int(rng.below(3) as i64)));
+                    WriteOp::Insert("docs".into(), db.id_gen().generate(), object(fields))
+                })
+                .collect();
+            db.write_batch(ops).unwrap();
+            let mut all = docs.find_with_ids(Filter::default()).unwrap();
+            all.sort_by_key(|(id, _doc)| *id);
+            let all = all;
+            let ids: Vec<DocId> = all.iter().map(|(id, _)| *id).collect();
+            let sorts: [&[(&str, SortOrder)]; 7] = [
+                &[],
+                &[("b", SortOrder::Asc)],
+                &[("b", SortOrder::Desc), ("_id", SortOrder::Desc)],
+                &[("a", SortOrder::Asc), ("b", SortOrder::Asc)],
+                &[("_id", SortOrder::Desc)],
+                &[("o.p", SortOrder::Asc)],
+                &[("c", SortOrder::Asc), ("b", SortOrder::Desc)],
+            ];
+            let random_filter = |rng: &mut XorShift| {
+                let mut f = Filter::new();
+                for _ in 0..rng.below(3) {
+                    f = f.and(covered_condition(rng, 2, &ids));
+                }
+                if rng.below(10) == 0 {
+                    f = f.exists("b"); // never decided by an entry
+                }
+                for (field, order) in sorts[rng.below(sorts.len())] {
+                    f = f.then_by(*field, *order);
+                }
+                f.skip([0, 0, 1, 5, 40, 1000][rng.below(6)])
+                    .limit([None, Some(0), Some(1), Some(5), Some(30)][rng.below(5)])
+            };
+            let (mut covered, mut skipped_unread) = (0, 0);
+            for _ in 0..600 {
+                let f = random_filter(&mut rng);
+                let unlimited = Filter {
+                    skip: 0,
+                    limit: None,
+                    ..f.clone()
+                };
+                let matching: std::collections::HashSet<DocId> = unlimited
+                    .apply_to(all.clone(), |(_, doc)| doc)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let expected: Vec<DocId> = f
+                    .apply_to(all.clone(), |(_, doc)| doc)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let plan = explained(&docs, &f);
+                let run = docs.explain_run(f.clone()).unwrap();
+                if run.reads.iter().any(|read| read.covering) {
+                    covered += 1;
+                    if f.skip > 0 && run.stats.documents_examined <= run.stats.documents_returned {
+                        skipped_unread += 1;
+                    }
+                }
+                let found: Vec<DocId> = docs
+                    .find_with_ids(f.clone())
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let typed = typed_ids(&docs, &f);
+                let streamed: Vec<DocId> = docs
+                    .cursor(f.clone())
+                    .unwrap()
+                    .map(|doc| match doc.unwrap() {
+                        Document::Object(fields) => match fields["_id"] {
+                            Document::Id(id) => id,
+                            _ => panic!("no id"),
+                        },
+                        doc => panic!("not an object: {doc}"),
+                    })
+                    .collect();
+                let count = docs.count(f.clone()).unwrap();
+                assert_eq!(count, expected.len(), "{f:?} via {plan:?}");
+                if f.sort.is_empty() {
+                    // Which matches a skip passes over is unspecified
+                    // without a sort (§72.1): as many, and all matches.
+                    for got in [&found, &typed, &streamed] {
+                        assert_eq!(got.len(), expected.len(), "{f:?} via {plan:?}");
+                        assert!(got.iter().all(|id| matching.contains(id)), "{f:?}");
+                        let unique: std::collections::HashSet<_> = got.iter().collect();
+                        assert_eq!(unique.len(), got.len(), "{f:?}");
+                    }
+                } else {
+                    assert_eq!(found, expected, "{f:?} via {plan:?}");
+                    assert_eq!(typed, expected, "typed: {f:?} via {plan:?}");
+                    assert_eq!(streamed, expected, "cursor: {f:?} via {plan:?}");
+                }
+            }
+            assert!(covered > 150, "{covered} covered");
+            assert!(skipped_unread > 20, "{skipped_unread} skipped unread");
+
+            // Writes change what `find` returns, no more and no less.
+            for _ in 0..40 {
+                let f = random_filter(&mut rng);
+                let before: std::collections::HashSet<DocId> = docs
+                    .find_with_ids(Filter::new())
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let doomed: Vec<DocId> = docs
+                    .find_with_ids(f.clone())
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                if f.sort.is_empty() && (f.skip > 0 || f.limit.is_some()) {
+                    continue; // which ones is unspecified
+                }
+                match rng.below(2) {
+                    0 => {
+                        assert_eq!(docs.delete_many(f.clone()).unwrap(), doomed.len(), "{f:?}");
+                        let after: std::collections::HashSet<DocId> = docs
+                            .find_with_ids(Filter::new())
+                            .unwrap()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect();
+                        let mut gone: Vec<DocId> = before.difference(&after).copied().collect();
+                        gone.sort();
+                        let mut doomed = doomed;
+                        doomed.sort();
+                        assert_eq!(gone, doomed, "{f:?}");
+                    }
+                    _ => {
+                        let marked = Update::new().set("mark", Document::Int(1));
+                        docs.update_fields(Filter::new(), &Update::new().unset("mark"))
+                            .unwrap();
+                        let changed = docs.update_fields(f.clone(), &marked).unwrap();
+                        assert_eq!(changed, doomed.len(), "{f:?}");
+                        let mut marked: Vec<DocId> = docs
+                            .find_with_ids(Filter::new().eq("mark", 1))
+                            .unwrap()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect();
+                        marked.sort();
+                        let mut doomed = doomed;
+                        doomed.sort();
+                        assert_eq!(marked, doomed, "{f:?}");
+                    }
+                }
+            }
+            assert_consistent(&db);
+        }
+    }
+
     /// A reference to another document, a `DocId` field, has an index
     /// key (SPEC §62): a filter on it reads its range of the index, a
     /// sort on it walks the index in the order the ids were made, a
@@ -5346,10 +5880,11 @@ mod tests {
 
         // Made before the third owner: the first two. The range includes
         // the bound itself, as every range does (`key::range_for`), and
-        // the check leaves its 30 out.
+        // the check leaves its 30 out — on the entries, which hold the
+        // ids whole, so no car is read (SPEC §100).
         let earlier = Filter::new().lt("owner", owners[2]);
         let reads = records_read(|| assert_eq!(cars.count(earlier.clone()).unwrap(), 60));
-        assert_eq!(reads, 90);
+        assert_eq!(reads, 0);
 
         let newest = Filter::new().sort_desc("owner").limit(5);
         let field = "owner".to_string();
@@ -6792,8 +7327,9 @@ mod tests {
                 field: "nick".into()
             }
         );
+        // The index's entries answer the count (SPEC §100).
         let reads = records_read(|| assert_eq!(members.count(by_nick).unwrap(), 33));
-        assert_eq!(reads, 33);
+        assert_eq!(reads, 0);
         // Without a nick: not in the index, so a scan finds them.
         let without = Filter::new().is_null("nick");
         assert_eq!(members.explain(&without).unwrap(), QueryPlan::Scan);

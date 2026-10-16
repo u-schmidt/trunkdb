@@ -69,6 +69,8 @@ Rejected:
 - **Skipping index entries without reading their documents:** only
   right where the index answers the whole filter, every condition on
   the sort field and exact. Possible later, as a narrower fast path;
-  paging by the last value serves deep pages better anyway.
+  paging by the last value serves deep pages better anyway. (Done in
+  §100, wherever the index's entries decide the filter: the skipped
+  are walked, not read.)
 - **`page(n, size)` as its own method:** two lines of `skip` and
   `limit`, and it would hide what a deep page costs.

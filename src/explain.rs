@@ -34,6 +34,11 @@ pub struct IndexRead {
     pub backward: bool,
     /// Entries read from it. A lookup by id counts one, found or not.
     pub entries: u64,
+    /// Its entries decide the filter (SPEC §100): every field the
+    /// conditions name is in the index, or is `_id`. A document is then
+    /// read only where an entry can't decide (a string cut to the key, a
+    /// number past 2^53) and to be handed out.
+    pub covering: bool,
 }
 
 /// How a sort was done.
@@ -52,9 +57,11 @@ pub struct SortWork {
 pub struct ExecutionStats {
     /// Index entries read, every read together, the primary index's too.
     pub keys_examined: u64,
-    /// Documents read and checked against the filter.
+    /// Documents read: to be checked against the filter, and, where an
+    /// index entry decided (SPEC §100), to be handed out.
     pub documents_examined: u64,
-    /// Of those, the ones that matched; with a skip, the skipped too.
+    /// The matches, decided by their documents or by their index entries;
+    /// with a skip, the skipped too.
     pub documents_matched: u64,
     /// What `find` would have returned.
     pub documents_returned: u64,
@@ -83,8 +90,14 @@ impl Trace {
             bounds,
             backward,
             entries: 0,
+            covering: false,
         });
         reads.len() - 1
+    }
+
+    /// The read at `at` covers the filter (SPEC §100).
+    pub fn covering(&self, at: usize) {
+        self.reads.borrow_mut()[at].covering = true;
     }
 
     /// `n` more entries read by the read at `at`.
@@ -92,7 +105,7 @@ impl Trace {
         self.reads.borrow_mut()[at].entries += n as u64;
     }
 
-    /// A document read, to be checked.
+    /// A document read, to be checked or handed out.
     pub fn examined(&self) {
         self.examined.set(self.examined.get() + 1);
     }
@@ -169,6 +182,15 @@ mod tests {
             bounds,
             backward: false,
             entries,
+            covering: false,
+        }
+    }
+
+    /// `read`, whose entries decide the filter (SPEC §100).
+    fn covering(index: &str, bounds: Vec<Condition>, entries: u64) -> IndexRead {
+        IndexRead {
+            covering: true,
+            ..read(index, bounds, entries)
         }
     }
 
@@ -200,7 +222,8 @@ mod tests {
         let (people, ids) = people(&db);
         let one = people.explain_run(Filter::new().id(ids[7])).unwrap();
         assert_eq!(one.plan, QueryPlan::ById);
-        assert_eq!(one.reads, [read("_id", vec![Condition::id(ids[7])], 1)]);
+        let by_id = vec![Condition::id(ids[7])];
+        assert_eq!(one.reads, [covering("_id", by_id, 1)]);
         assert_eq!(counts(&one), (1, 1, 1));
 
         let missing = DocId([0xEE; 16]);
@@ -209,7 +232,7 @@ mod tests {
         let run = people.explain_run(three).unwrap();
         wanted.sort();
         let bounds = vec![Condition::any(wanted.iter().map(|id| Condition::id(*id)))];
-        assert_eq!(run.reads, [read("_id", bounds, 3)]);
+        assert_eq!(run.reads, [covering("_id", bounds, 3)]);
         assert_eq!(counts(&run), (2, 2, 2));
     }
 
@@ -248,13 +271,14 @@ mod tests {
         assert_eq!(
             run.reads,
             [
-                read("age", vec![Condition::eq("age", 1)], 2),
-                read("age", vec![Condition::lt("age", 3)], 8),
+                covering("age", vec![Condition::eq("age", 1)], 2),
+                covering("age", vec![Condition::lt("age", 3)], 8),
             ]
         );
-        // The two of age 1 are in both ranges: read twice, examined once.
+        // The two of age 1 are in both ranges: read twice, checked once.
+        // The entries decide (SPEC §100): only the matches are read.
         assert_eq!(run.stats.keys_examined, 10);
-        assert_eq!(counts(&run), (8, 6, 6));
+        assert_eq!(counts(&run), (6, 6, 6));
     }
 
     #[test]
@@ -272,8 +296,8 @@ mod tests {
         );
         // Fixed fields first, in the index's order.
         let bounds = vec![Condition::eq("group", 0), Condition::gt("age", 40)];
-        assert_eq!(run.reads, [read("(group, age)", bounds, 10)]);
-        assert_eq!(counts(&run), (10, 8, 8));
+        assert_eq!(run.reads, [covering("(group, age)", bounds, 10)]);
+        assert_eq!(counts(&run), (8, 8, 8));
     }
 
     #[test]
@@ -318,7 +342,7 @@ mod tests {
         let run = people.explain_run(Filter::new().eq("nick", "x3")).unwrap();
         assert_eq!(
             run.reads,
-            [read("nick", vec![Condition::eq("nick", "x3")], 1)]
+            [covering("nick", vec![Condition::eq("nick", "x3")], 1)]
         );
         let run = people.explain_run(Filter::new().is_null("nick")).unwrap();
         assert_eq!(run.plan, QueryPlan::Scan);
@@ -408,9 +432,10 @@ mod tests {
         assert_eq!(counts(&people.explain_run(f).unwrap()), (100, 50, 5));
 
         people.ensure_index("age").unwrap();
+        // Passed over by their entries, unread (SPEC §100).
         let f = Filter::new().sort_asc("age").skip(10).limit(5);
         let run = people.explain_run(f).unwrap();
-        assert_eq!(counts(&run), (15, 15, 5));
+        assert_eq!(counts(&run), (5, 15, 5));
         assert!(run.stats.keys_examined < 100);
     }
 
@@ -426,7 +451,8 @@ mod tests {
         assert_eq!(run.plan, QueryPlan::Scan, "the index came later");
         assert_eq!(counts(&run), (100, 0, 0));
         let now = people.explain_run(Filter::new().eq("n", 100)).unwrap();
-        assert_eq!(now.reads, [read("n", vec![Condition::eq("n", 100)], 1)]);
+        let bounds = vec![Condition::eq("n", 100)];
+        assert_eq!(now.reads, [covering("n", bounds, 1)]);
     }
 
     #[test]
