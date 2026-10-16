@@ -307,7 +307,9 @@ what it picked (`QueryPlan`):
   whose leading fields an `Eq` fixes gives both the filter and the order
   (`status == "Queued"`, newest first, on `(status, created)`). Sort
   keys the index doesn't serve are sorted in memory within each run of
-  equal served keys [§47](spec/47-sorting-by-several-fields.md).
+  equal served keys [§47](spec/47-sorting-by-several-fields.md). A sort by `_id` walks the primary index,
+  whose order is `_id`'s, and `_id` comparisons with an id narrow the
+  walk exactly [§96](spec/96-sorting-by-id-through-the-primary-index.md).
 
 Every document is checked against the whole filter after an index
 narrows the set, so an index only ever decides how much is read, never

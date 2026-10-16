@@ -106,6 +106,7 @@ struct Answers {
     in_range: usize,
     oldest: Vec<i64>,
     newest: Vec<i64>,
+    first_by_id: Vec<i64>,
     scanned: usize,
 }
 
@@ -242,6 +243,10 @@ fn main() {
             Unit::Micros,
             micros(statuses.len(), took),
         );
+
+        let (took, first) = time(|| (0..100).map(|_| store.first_by_id(50)).last());
+        answer.first_by_id = first.unwrap_or_default();
+        record("first 50 by id", Unit::Micros, micros(100, took));
 
         let (took, scanned) = time(|| (0..5).map(|_| store.count_tries_above(7)).sum());
         answer.scanned = scanned;
