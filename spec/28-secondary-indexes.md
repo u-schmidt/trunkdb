@@ -104,7 +104,9 @@ Bounds include `v`'s own encoding even for the strict ops, since a
 different value may share it; the recheck drops the extras. The
 encoding only has to be monotone (`a < b` ⇒ `key(a) ≤ key(b)`), not
 strictly — which is what makes cutting strings and rounding big `Int`s
-safe.
+safe. (Since §100, an entry whose values are exact decides its
+document's match without the document, where the index holds every
+field the filter names; the rest are still rechecked.)
 
 Rejected: rejecting long values (an error on insert, as the old
 `too_large` did for documents) or hashing them (loses order, so no

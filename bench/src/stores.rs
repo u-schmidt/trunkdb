@@ -28,6 +28,19 @@ pub trait Store {
     fn first_by_id(&self, limit: usize) -> Vec<i64>;
     /// How many tasks have `tries > n`: no index, every document.
     fn count_tries_above(&self, n: i64) -> usize;
+    /// How many tasks the tenant has, counted: no task needs reading
+    /// (SPEC §100).
+    fn count_tenant(&self, tenant: &str) -> usize;
+    /// How many tasks were created in `lo..hi`, counted.
+    fn count_in_range(&self, lo: i64, hi: i64) -> usize;
+    /// `created` of the tasks with `status`, oldest first, after
+    /// skipping `skip`, at most `limit`: a page deep in a list.
+    fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64>;
+    /// `created` of the tasks in id order after skipping `skip`, at
+    /// most `limit`.
+    fn by_id_after(&self, skip: usize, limit: usize) -> Vec<i64>;
+    /// `created` of the tenant's first `limit` tasks in id order.
+    fn tenant_by_id(&self, tenant: &str, limit: usize) -> Vec<i64>;
     /// Bytes on disk.
     fn size(&self) -> u64;
     /// Rebuilds the file as small as it gets; `false` if the store
@@ -195,6 +208,42 @@ impl Store for Trunk {
         self.tasks.count(Filter::new().gt("tries", n)).unwrap()
     }
 
+    fn count_tenant(&self, tenant: &str) -> usize {
+        self.tasks
+            .count(Filter::new().eq("tenant", tenant))
+            .unwrap()
+    }
+
+    fn count_in_range(&self, lo: i64, hi: i64) -> usize {
+        let range = Filter::new().gte("created", lo).lt("created", hi);
+        self.tasks.count(range).unwrap()
+    }
+
+    fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64> {
+        let f = Filter::new()
+            .eq("status", status)
+            .sort_asc("created")
+            .skip(skip)
+            .limit(limit);
+        let found = self.tasks.find(f).unwrap();
+        found.iter().map(|t| t.created).collect()
+    }
+
+    fn by_id_after(&self, skip: usize, limit: usize) -> Vec<i64> {
+        let f = Filter::new().sort_asc("_id").skip(skip).limit(limit);
+        let found = self.tasks.find(f).unwrap();
+        found.iter().map(|t| t.created).collect()
+    }
+
+    fn tenant_by_id(&self, tenant: &str, limit: usize) -> Vec<i64> {
+        let f = Filter::new()
+            .eq("tenant", tenant)
+            .sort_asc("_id")
+            .limit(limit);
+        let found = self.tasks.find(f).unwrap();
+        found.iter().map(|t| t.created).collect()
+    }
+
     fn size(&self) -> u64 {
         file_size(&self.path) + file_size(&self.path.with_extension("trunkdb.wal"))
     }
@@ -250,6 +299,13 @@ impl Sqlite {
             .unwrap()
             .map(|doc| serde_json::from_str(&doc.unwrap()).unwrap())
             .collect()
+    }
+
+    fn count(&self, sql: &str, params: impl rusqlite::Params) -> usize {
+        let mut statement = self.conn.prepare_cached(sql).unwrap();
+        statement
+            .query_row(params, |row| row.get::<_, i64>(0))
+            .unwrap() as usize
     }
 }
 
@@ -360,6 +416,50 @@ impl Store for Sqlite {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap() as usize
+    }
+
+    fn count_tenant(&self, tenant: &str) -> usize {
+        self.count(
+            "SELECT count(*) FROM tasks WHERE tenant = ?",
+            params![tenant],
+        )
+    }
+
+    fn count_in_range(&self, lo: i64, hi: i64) -> usize {
+        self.count(
+            "SELECT count(*) FROM tasks WHERE created >= ? AND created < ?",
+            params![lo, hi],
+        )
+    }
+
+    fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64> {
+        self.docs(
+            "SELECT doc FROM tasks WHERE status = ? ORDER BY created LIMIT ? OFFSET ?",
+            params![status, limit as i64, skip as i64],
+        )
+        .iter()
+        .map(|t| t.created)
+        .collect()
+    }
+
+    fn by_id_after(&self, skip: usize, limit: usize) -> Vec<i64> {
+        self.docs(
+            "SELECT doc FROM tasks ORDER BY id LIMIT ? OFFSET ?",
+            params![limit as i64, skip as i64],
+        )
+        .iter()
+        .map(|t| t.created)
+        .collect()
+    }
+
+    fn tenant_by_id(&self, tenant: &str, limit: usize) -> Vec<i64> {
+        self.docs(
+            "SELECT doc FROM tasks WHERE tenant = ? ORDER BY id LIMIT ?",
+            params![tenant, limit as i64],
+        )
+        .iter()
+        .map(|t| t.created)
+        .collect()
     }
 
     fn size(&self) -> u64 {
@@ -480,14 +580,21 @@ impl Redb {
         tx.commit().unwrap();
     }
 
+    /// How many keys index `which` has in `lo..hi`.
+    fn count(&self, which: usize, lo: &[u8], hi: &[u8]) -> usize {
+        let tx = self.db.begin_read().unwrap();
+        let index = tx.open_table(INDEXES[which]).unwrap();
+        index.range(lo..hi).unwrap().count()
+    }
+
     /// The tasks whose keys in index `which` lie in `lo..hi`, in key
-    /// order or the reverse, at most `limit`.
+    /// order or the reverse, after `skip`, at most `limit`.
     fn through(
         &self,
         which: usize,
         lo: &[u8],
         hi: &[u8],
-        limit: usize,
+        (skip, limit): (usize, usize),
         backward: bool,
     ) -> Vec<Task> {
         let tx = self.db.begin_read().unwrap();
@@ -499,6 +606,7 @@ impl Redb {
             false => Box::new(range),
         };
         entries
+            .skip(skip)
             .take(limit)
             .map(|entry| {
                 let id = id_of(entry.unwrap().0.value());
@@ -535,18 +643,18 @@ impl Store for Redb {
 
     fn by_tenant(&self, tenant: &str) -> usize {
         let lo = tenant_prefix(tenant);
-        self.through(0, &lo, &prefix_end(&lo), usize::MAX, false)
+        self.through(0, &lo, &prefix_end(&lo), (0, usize::MAX), false)
             .len()
     }
 
     fn in_range(&self, lo: i64, hi: i64) -> usize {
-        self.through(1, &sortable(lo), &sortable(hi), usize::MAX, false)
+        self.through(1, &sortable(lo), &sortable(hi), (0, usize::MAX), false)
             .len()
     }
 
     fn oldest(&self, status: &str, limit: usize) -> Vec<i64> {
         let lo = status_prefix(status);
-        self.through(2, &lo, &prefix_end(&lo), limit, false)
+        self.through(2, &lo, &prefix_end(&lo), (0, limit), false)
             .iter()
             .map(|t| t.created)
             .collect()
@@ -554,7 +662,7 @@ impl Store for Redb {
 
     fn newest(&self, status: &str, limit: usize) -> Vec<i64> {
         let lo = status_prefix(status);
-        self.through(2, &lo, &prefix_end(&lo), limit, true)
+        self.through(2, &lo, &prefix_end(&lo), (0, limit), true)
             .iter()
             .map(|t| t.created)
             .collect()
@@ -582,6 +690,43 @@ impl Store for Redb {
                 task.tries > n
             })
             .count()
+    }
+
+    fn count_tenant(&self, tenant: &str) -> usize {
+        let lo = tenant_prefix(tenant);
+        self.count(0, &lo, &prefix_end(&lo))
+    }
+
+    fn count_in_range(&self, lo: i64, hi: i64) -> usize {
+        self.count(1, &sortable(lo), &sortable(hi))
+    }
+
+    fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64> {
+        let lo = status_prefix(status);
+        self.through(2, &lo, &prefix_end(&lo), (skip, limit), false)
+            .iter()
+            .map(|t| t.created)
+            .collect()
+    }
+
+    fn by_id_after(&self, skip: usize, limit: usize) -> Vec<i64> {
+        let tx = self.db.begin_read().unwrap();
+        let tasks = tx.open_table(TASKS).unwrap();
+        (tasks.iter().unwrap().skip(skip).take(limit))
+            .map(|entry| {
+                let task: Task = serde_json::from_slice(entry.unwrap().1.value()).unwrap();
+                task.created
+            })
+            .collect()
+    }
+
+    fn tenant_by_id(&self, tenant: &str, limit: usize) -> Vec<i64> {
+        // The index's keys end with the id: within a tenant, id order.
+        let lo = tenant_prefix(tenant);
+        self.through(0, &lo, &prefix_end(&lo), (0, limit), false)
+            .iter()
+            .map(|t| t.created)
+            .collect()
     }
 
     fn size(&self) -> u64 {
@@ -658,7 +803,7 @@ impl Sled {
         which: usize,
         lo: &[u8],
         hi: &[u8],
-        limit: usize,
+        (skip, limit): (usize, usize),
         backward: bool,
     ) -> Vec<Task> {
         let range = self.indexes[which].range(lo..hi);
@@ -667,6 +812,7 @@ impl Sled {
             false => Box::new(range),
         };
         entries
+            .skip(skip)
             .take(limit)
             .map(|entry| {
                 let id = id_of(&entry.unwrap().0);
@@ -703,18 +849,18 @@ impl Store for Sled {
 
     fn by_tenant(&self, tenant: &str) -> usize {
         let lo = tenant_prefix(tenant);
-        self.through(0, &lo, &prefix_end(&lo), usize::MAX, false)
+        self.through(0, &lo, &prefix_end(&lo), (0, usize::MAX), false)
             .len()
     }
 
     fn in_range(&self, lo: i64, hi: i64) -> usize {
-        self.through(1, &sortable(lo), &sortable(hi), usize::MAX, false)
+        self.through(1, &sortable(lo), &sortable(hi), (0, usize::MAX), false)
             .len()
     }
 
     fn oldest(&self, status: &str, limit: usize) -> Vec<i64> {
         let lo = status_prefix(status);
-        self.through(2, &lo, &prefix_end(&lo), limit, false)
+        self.through(2, &lo, &prefix_end(&lo), (0, limit), false)
             .iter()
             .map(|t| t.created)
             .collect()
@@ -722,7 +868,7 @@ impl Store for Sled {
 
     fn newest(&self, status: &str, limit: usize) -> Vec<i64> {
         let lo = status_prefix(status);
-        self.through(2, &lo, &prefix_end(&lo), limit, true)
+        self.through(2, &lo, &prefix_end(&lo), (0, limit), true)
             .iter()
             .map(|t| t.created)
             .collect()
@@ -745,6 +891,40 @@ impl Store for Sled {
                 task.tries > n
             })
             .count()
+    }
+
+    fn count_tenant(&self, tenant: &str) -> usize {
+        let lo = tenant_prefix(tenant);
+        self.indexes[0].range(lo.clone()..prefix_end(&lo)).count()
+    }
+
+    fn count_in_range(&self, lo: i64, hi: i64) -> usize {
+        self.indexes[1].range(sortable(lo)..sortable(hi)).count()
+    }
+
+    fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64> {
+        let lo = status_prefix(status);
+        self.through(2, &lo, &prefix_end(&lo), (skip, limit), false)
+            .iter()
+            .map(|t| t.created)
+            .collect()
+    }
+
+    fn by_id_after(&self, skip: usize, limit: usize) -> Vec<i64> {
+        (self.tasks.iter().skip(skip).take(limit))
+            .map(|entry| {
+                let task: Task = serde_json::from_slice(&entry.unwrap().1).unwrap();
+                task.created
+            })
+            .collect()
+    }
+
+    fn tenant_by_id(&self, tenant: &str, limit: usize) -> Vec<i64> {
+        let lo = tenant_prefix(tenant);
+        self.through(0, &lo, &prefix_end(&lo), (0, limit), false)
+            .iter()
+            .map(|t| t.created)
+            .collect()
     }
 
     fn size(&self) -> u64 {

@@ -313,9 +313,17 @@ what it picked (`QueryPlan`):
   whose order is `_id`'s, and `_id` comparisons with an id narrow the
   walk exactly [§96](spec/96-sorting-by-id-through-the-primary-index.md).
 
-Every document is checked against the whole filter after an index
-narrows the set, so an index only ever decides how much is read, never
-what matches.
+A document from an index range is checked against the whole filter,
+since a range may hold more than its conditions match. Where the index
+holds every field the filter names, its entries decide instead
+[§100](spec/100-index-entries-that-answer-the-filter.md): an entry's values, decoded from the key with its id,
+are checked, and the document is read only to be handed out, or where
+a value stands for several (a cut string, a number past 2^53). `count`
+then reads no document, a deep page only the page, and a sort by `_id`
+after an index range only what it hands out. `Exists`, `Size`,
+`ElemMatch` and multikey indexes never decide this way. Where entries
+decide, the result follows the index: `check` is what finds an index
+that disagrees with its documents.
 
 A read decodes only what it needs [§99](spec/99-decoding-only-what-a-read-needs.md). A candidate is checked on the
 top-level fields its filter and sort name, decoded alone, every other
@@ -327,8 +335,9 @@ untyped read whose candidates come from an index range or by id decodes
 each whole once and checks that, as they nearly all match.
 
 `explain_run` runs a query and says how it went: the plan, each index
-read with the conditions that bound it, how many sort keys the index
-gave, and the entries and documents examined, matched and returned
+read with the conditions that bound it and whether its entries decided
+the filter, how many sort keys the index gave, and the entries and
+documents examined, matched and returned
 [§94](spec/94-explain-with-execution-statistics.md). It is `find` with its counters read out: every read
 counts, and only `explain_run` keeps the counts.
 
@@ -489,9 +498,11 @@ current table. Each gap had a measured cause, fixed one at a time:
 | Batched inserts | 7.5k/s | B-tree pages changed in place [§52](spec/52-b-tree-pages-changed-in-place.md) |
 | First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
+| Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |
 
-Still behind: in a scan, the small object each document's filtered
-fields are decoded into, and whole 8 KB page images in the WAL for
+Still behind: a walk through an index, at about 300 ns an entry, which
+deep pages pay for every entry they skip; in a scan, the small object
+each document's filtered fields are decoded into, and whole 8 KB page images in the WAL for
 every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md), and a
 changed page is copied once, not twice: `write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md).
 

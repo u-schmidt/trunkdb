@@ -235,10 +235,12 @@ documents:
 | insert, 1000 per commit | 20k/s | 35k/s | 37k/s | 28k/s |
 | one commit | 4.6 ms | 4.6 ms | 4.8 ms | 9.5 ms |
 | get by id | 3.4 µs | 4.4 µs | 1.8 µs | 2.2 µs |
-| 1000 documents by index | 1.4 ms | 1.7 ms | 1.0 ms | 2.4 ms |
-| oldest 20 of a status | 36 µs | 23 µs | 22 µs | 20 µs |
-| first 50 by id | 37 µs | 34 µs | 24 µs | 30 µs |
-| scan, 100,000 for a fifth | 62 ms | 44 ms | 51 ms | 70 ms |
+| 1000 documents by index | 1.0 ms | 2.0 ms | 1.1 ms | 1.9 ms |
+| count of 1000 by index | 0.17 ms | 0.03 ms | 0.04 ms | 0.26 ms |
+| oldest 20 of a status | 24 µs | 24 µs | 16 µs | 22 µs |
+| page 50 of 20 of a status | 0.35 ms | 0.05 ms | 0.04 ms | 0.25 ms |
+| first 50 by id | 36 µs | 37 µs | 24 µs | 31 µs |
+| scan, 100,000 for a fifth | 57 ms | 43 ms | 50 ms | 68 ms |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
 Each gap has a known cause (SPEC §48, in [spec/](spec/README.md)), and the first four are
@@ -247,8 +249,10 @@ lookup by id 32 µs before the page cache (§50), a commit 16 ms before it
 flushed once instead of three times (§51), and batched inserts ran at
 7.5k/s before index pages were changed in place (§52). Reads decode only
 what they need since §99: "first 50 by id" took 70 µs, the scan 168 ms.
-What's left: checkpoints in large batches, and in a scan, the small
-object each document's filtered fields are decoded into.
+Index entries decide what they can since §100: a count by index took
+0.9 ms, page 50 of 20 1.2 ms. What's left: checkpoints in large
+batches; in a scan, the small object each document's filtered fields
+are decoded into; and a walk through an index at about 300 ns an entry.
 
 ```
 cd bench && cargo run --release
@@ -569,7 +573,18 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     fifth of them 62 ms instead of 168; `count` with a filter reads no
     document whole.
 
-    Items 60–69: not released yet. File format 12, which still opens
+70. **Index entries that answer the filter** (§100): where an index
+    holds every field a filter names (or `_id`, which every key ends
+    with), its entries decide the matches, and a document is read only
+    to be handed out. `count` of 1,000 by index reads no document,
+    0.17 ms instead of 0.9; page 50 of 20 reads 20, 0.35 ms instead of
+    1.2; a skip passes over matches unread, in `find` and in a cursor.
+    `IndexRead::covering` in `explain_run` says where entries decided.
+    Not for `exists`, `size`, `elem_match` or multikey indexes. Where
+    entries decide, a damaged index can change a result until
+    `check` finds it.
+
+    Items 60–70: not released yet. File format 12, which still opens
     6–11 holding only objects; 0.19.0 refuses a file this build has
     opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with

@@ -78,9 +78,10 @@ pub fn primary_range(op: &crate::query::Op, id: DocId) -> Option<KeyRange> {
 // The functions below take keys apart that were read from the file. A
 // damaged one gets a cautious answer from them, never a panic (SPEC §55):
 // a key too short for its id, a number cut short or a string without its
-// terminator. Finding the damage is `Database::check`'s job; every document
-// is checked against the filter anyway, so a wrong answer here changes
-// how much is read, not what matches.
+// terminator. Finding the damage is `Database::check`'s job. A wrong
+// answer here mostly changes how much is read; where an entry decides its
+// document's match (SPEC §100), a damaged one can change what matches,
+// until `check` finds it.
 
 /// The document id a key ends with — the whole key for the primary
 /// index, the last 16 bytes for a secondary one. A damaged key shorter
@@ -139,6 +140,76 @@ pub fn part_is_exact(part: &[u8], fields: usize) -> bool {
     }
 }
 
+/// The value one part of a key of `fields` values stands for, where it
+/// stands for exactly one (`part_is_exact`): what an index entry tells
+/// of its document without reading it (SPEC §100). A number comes back
+/// as a `Float`, which below 2^53 is its exact value, so `Filter`
+/// compares it as it would the stored `Int`. `None` for a part that
+/// stands for several values, and for a damaged one.
+#[cfg(test)]
+pub fn decode_part(part: &[u8], fields: usize) -> Option<Document> {
+    let mut value = Document::Null;
+    decode_part_into(part, fields, &mut value)?;
+    Some(value)
+}
+
+/// `decode_part` into `value`, reusing the string it holds, if any:
+/// deciding entry after entry allocates nothing for a string field.
+pub fn decode_part_into(part: &[u8], fields: usize, value: &mut Document) -> Option<()> {
+    if !part_is_exact(part, fields) {
+        return None;
+    }
+    let (&tag, rest) = part.split_first()?;
+    *value = match (tag, rest) {
+        (TAG_NULL, []) => Document::Null,
+        (TAG_BOOL, [0]) => Document::Bool(false),
+        (TAG_BOOL, [1]) => Document::Bool(true),
+        (TAG_NUMBER, rest) => {
+            let sortable = u64::from_be_bytes(rest.try_into().ok()?);
+            // `encode_number` backwards.
+            let bits = match sortable >> 63 {
+                1 => sortable & !(1 << 63),
+                _ => !sortable,
+            };
+            Document::Float(f64::from_bits(bits))
+        }
+        (TAG_STRING, rest) => {
+            let escaped = rest.strip_suffix(&[0, 0])?;
+            let mut text = match std::mem::replace(value, Document::Null) {
+                Document::String(mut text) => {
+                    text.clear();
+                    text
+                }
+                _ => String::new(),
+            };
+            if !escaped.contains(&0) {
+                text.push_str(std::str::from_utf8(escaped).ok()?);
+            } else {
+                let mut bytes = Vec::with_capacity(escaped.len());
+                let mut at = 0;
+                while let Some(&b) = escaped.get(at) {
+                    match b {
+                        0 if escaped.get(at + 1) == Some(&0xFF) => at += 2,
+                        0 => return None, // a terminator inside: damage
+                        _ => at += 1,
+                    }
+                    bytes.push(b);
+                }
+                text.push_str(std::str::from_utf8(&bytes).ok()?);
+            }
+            Document::String(text)
+        }
+        (TAG_ID, rest) => Document::Id(DocId(rest.try_into().ok()?)),
+        (TAG_DATETIME, rest) if rest.len() == 12 => {
+            let seconds = u64::from_be_bytes(rest[..8].try_into().ok()?) ^ (1 << 63);
+            let nanos = u32::from_be_bytes(rest[8..].try_into().ok()?);
+            Document::DateTime(crate::DateTime::from_unix(seconds as i64, nanos)?)
+        }
+        _ => return None,
+    };
+    Some(())
+}
+
 /// Whether one value of a compound key is `TAG_OTHER`: a value that
 /// sorts after everything, whichever the direction (§34.1).
 pub fn is_other(part: &[u8]) -> bool {
@@ -149,9 +220,14 @@ pub fn is_other(part: &[u8]) -> bool {
 /// damaged key, whatever is left when a value runs past the end is one
 /// last part.
 pub fn parts(value_part: &[u8]) -> Vec<&[u8]> {
-    let mut parts = Vec::new();
+    each_part(value_part).collect()
+}
+
+/// `parts`, one at a time, without collecting them.
+pub fn each_part(value_part: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut rest = value_part;
-    while let Some(&tag) = rest.first() {
+    std::iter::from_fn(move || {
+        let &tag = rest.first()?;
         let len = match tag {
             TAG_NULL | TAG_OTHER => 1,
             TAG_BOOL => 2,
@@ -161,10 +237,9 @@ pub fn parts(value_part: &[u8]) -> Vec<&[u8]> {
             _ => string_len(rest).unwrap_or(rest.len()),
         };
         let (part, after) = rest.split_at(len.min(rest.len()));
-        parts.push(part);
         rest = after;
-    }
-    parts
+        Some(part)
+    })
 }
 
 /// An encoded string's length, tag through the `0x00 0x00` terminator (an
@@ -679,6 +754,73 @@ mod tests {
         // And a cut string does share its key with a different one.
         let cut = |tail: &str| key(Document::String("x".repeat(string_budget(1)) + tail));
         assert_eq!(cut("a"), cut("b"));
+    }
+
+    /// SPEC §100: an exact part decodes back to a value `Filter` finds
+    /// equal to the one encoded — the same encoding, the same answer to
+    /// every comparison — alone and in a compound key; an inexact or
+    /// damaged one to nothing.
+    #[test]
+    fn exact_parts_decode_back_to_their_values() {
+        let at = |secs, nanos| Document::DateTime(crate::DateTime::from_unix(secs, nanos).unwrap());
+        let values = [
+            Document::Null,
+            Document::Bool(false),
+            Document::Bool(true),
+            Document::Int(-7),
+            Document::Int((1 << 53) - 1),
+            Document::Float(-0.0),
+            Document::Float(2.5),
+            Document::String(String::new()),
+            Document::String("a\0b\u{FF}ß".into()),
+            Document::String("\0".repeat(string_budget(2) / 2 - 1)),
+            Document::Id(DocId([0; 16])),
+            Document::Id(DocId([0xFF; 16])),
+            at(-1, 999_999_999),
+            at(1_700_000_000, 5),
+        ];
+        let probes = [Document::Int(-7), Document::Float(2.5), Document::Null];
+        for value in &values {
+            for fields in [1, 2] {
+                let encoded = encode_value_in(value, fields).unwrap();
+                let decoded = decode_part(&encoded, fields).unwrap_or_else(|| panic!("{value:?}"));
+                assert_eq!(encode_value_in(&decoded, fields).unwrap(), encoded);
+                assert!(crate::query::equal(&decoded, value), "{value:?}");
+                for probe in probes.iter().chain(&values) {
+                    assert_eq!(
+                        crate::query::compare(&decoded, probe),
+                        crate::query::compare(value, probe),
+                        "{value:?} against {probe:?}"
+                    );
+                }
+            }
+        }
+        for inexact in [
+            Document::Int(1 << 53),
+            Document::Float(f64::INFINITY),
+            Document::String("x".repeat(5000)),
+        ] {
+            assert_eq!(decode_part(&key(inexact), 1), None);
+        }
+        let other = encode_values(&[&Document::Array(vec![]), &Document::Null]);
+        assert_eq!(decode_part(parts(&other)[0], 2), None);
+        // Damage: a bad bool, a short number, a string without its end or
+        // with a zero unescaped, an invalid UTF-8 one, nanoseconds past a
+        // second.
+        for damaged in [
+            &[TAG_BOOL, 2][..],
+            &[TAG_NUMBER, 1, 2],
+            &[TAG_STRING, b'a', 0],
+            &[TAG_STRING, 0, 1, 0, 0],
+            &[TAG_STRING, 0xC3, 0, 0],
+            &[TAG_NULL, 0],
+            &[TAG_ID, 1],
+        ] {
+            assert_eq!(decode_part(damaged, 1), None, "{damaged:?}");
+        }
+        let mut time = key(at(0, 0));
+        time[9..].copy_from_slice(&2_000_000_000u32.to_be_bytes());
+        assert_eq!(decode_part(&time, 1), None);
     }
 
     #[test]

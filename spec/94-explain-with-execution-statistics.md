@@ -87,7 +87,10 @@ Conditions not in `bounds` are still checked on every document read.
 A range may be wider than its conditions. `age < 65` reads the 65s too,
 since the range ends after the value (`key::range_for`), and the check
 leaves them out (§28.3). `explain_run` shows it: the example in its
-documentation examines 48 to return 47.
+documentation examined 48 to return 47. (Since §100, where a read's
+entries decide the filter, `IndexRead::covering` says so: the 65s are
+left out on their entries, unread, and `documents_matched` can exceed
+`documents_examined`.)
 
 To get the conditions, the planner carries them beside each range:
 `IndexRange { index, range, by }` replaces the `(index, range)` pair,

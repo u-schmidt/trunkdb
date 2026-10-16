@@ -37,7 +37,7 @@ All of it is done:
 | 0.17.0 | `find_with_ids` and `find_one_with_id` removed, typed and untyped, and a `cursor` handing out `T` instead of `(DocId, T)` (breaking); the id from the type's `_id` field, a wrapper with `#[serde(flatten)]` for a type from another crate; a free-space map per collection, in memory, so inserts refill the room deletes and updates leave in older data pages | §74–§75 |
 | 0.18.0 | A WAL size limit, `OpenOptions::checkpoint_wal_bytes`, so a large `checkpoint_pages` cannot grow the WAL without bound; a failed log taken back alone, so it no longer empties the WAL along with the batches committed before it (a fix to §51); snapshot reads: a batch is staged, logged, flushed and checkpointed beside the readers, which wait only for its publish, and a page's older versions stay in memory for the snapshots open, so a read keeps its commit to its end and commits wait for no read; `Database::snapshot` and `View<T>`, a snapshot a caller keeps, and a `cursor` that shows the moment it was made (breaking for code that relied on seeing later changes); `OpenOptions::snapshot_memory`, a limit on what snapshots keep, past which the oldest is ended with `Error::SnapshotTooOld`; `compact` takes the database alone and is refused with `Error::SnapshotOpen` while a snapshot is kept | §76–§83 |
 | 0.19.0 | Damaged and hostile input: `trunkdb export` through a temporary file, never over the database or its WAL; damaged header fields recovered from the WAL; a limit on the line an import reads, 256 MiB unless `ImportOptions::max_line_bytes` says otherwise; a WAL header that can't grow the file past its pages; `drop_index` on `_id` refused. A read-only open, `OpenOptions::read_only`: a shared file lock, nothing written, the WAL's batches and the open's own changes kept in memory, every write refused with `Error::ReadOnly`; the `trunkdb` command's `info`, `check` and `export` open read-only; a `checkpoint_pages` past 2^50 no longer overflows the default WAL limit (a fix to §76) | §84–§89 |
-| next | Memory that doesn't grow with the file, steps 1 and 2: the WAL record written from the pages instead of built beside them, compaction in 1.2× the new file's size instead of 3.3×; a batch over 32 MiB logged in several records, each flushed before the next, and crash recovery a record at a time, 37 MB where it took 2.5 GB; no batch size limit, where a batch over 4 GiB was logged with its length cut to 32 bits; WAL version 3, version 2 still recovered. An open of a file this build can't read at all fails with `Error::Format` (not a trunkdb file, a format or WAL version it doesn't read), and `InvalidData` at an open means damage only; `Database::stats`: pages by kind, sizes per collection and index, the WAL, recovery at open, and the pages a `compact` would leave, in `trunkdb info` too; `explain_run`: the plan, each index read and its bounds, how the sort was done, entries and documents examined, matched and returned, and the time. Only objects: a document that isn't one refused by every write with `Error::NotAnObject` (breaking for `Collection<i64>` and the like), file format 12, an older file checked once at open and refused if it holds one; a sort by `_id` with a limit walks the primary index and stops at the limit, `_id` comparisons narrowing the walk; a walk copies only the index entries it hands out, not its whole leaf; documented: on Unix a database dropped while a process starts stays locked until that child's exec; reads decode only what they need: candidates checked on the fields the filter names, only what is handed out decoded whole, typed reads straight into `T` | §90–§99 |
+| next | Memory that doesn't grow with the file, steps 1 and 2: the WAL record written from the pages instead of built beside them, compaction in 1.2× the new file's size instead of 3.3×; a batch over 32 MiB logged in several records, each flushed before the next, and crash recovery a record at a time, 37 MB where it took 2.5 GB; no batch size limit, where a batch over 4 GiB was logged with its length cut to 32 bits; WAL version 3, version 2 still recovered. An open of a file this build can't read at all fails with `Error::Format` (not a trunkdb file, a format or WAL version it doesn't read), and `InvalidData` at an open means damage only; `Database::stats`: pages by kind, sizes per collection and index, the WAL, recovery at open, and the pages a `compact` would leave, in `trunkdb info` too; `explain_run`: the plan, each index read and its bounds, how the sort was done, entries and documents examined, matched and returned, and the time. Only objects: a document that isn't one refused by every write with `Error::NotAnObject` (breaking for `Collection<i64>` and the like), file format 12, an older file checked once at open and refused if it holds one; a sort by `_id` with a limit walks the primary index and stops at the limit, `_id` comparisons narrowing the walk; a walk copies only the index entries it hands out, not its whole leaf; documented: on Unix a database dropped while a process starts stays locked until that child's exec; reads decode only what they need: candidates checked on the fields the filter names, only what is handed out decoded whole, typed reads straight into `T`; index entries that answer the filter decide without their documents, so `count` with conditions reads none, a deep page reads only the page, and a sort by `_id` after an index range only what it hands out, with `IndexRead::covering` in `explain_run` | §90–§100 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -91,17 +91,14 @@ limit is described.
 
 **Queries**
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
-- Index-only reads, what SQL calls a covering index or an index-only
-  scan and MongoDB a covered query: where the index answers the whole
-  filter, every condition on its fields and exact, its entries alone
-  decide. Two places would gain: a skip that passes over index entries
-  without reading their documents, where now a deep page reads every
-  document it skips (§72.3); and `count` with conditions, which now
-  reads every candidate document even when the index already says it
-  matches. Not for returning documents: that needs projection (only
-  some fields back), which trunkdb doesn't have, and a `Collection<T>`
-  wants the whole `T` anyway. Multikey indexes can't answer this way
-  (an entry is one element, not the array), as in MongoDB.
+- A walk through an index for a sort by `_id` after an `Eq` on its
+  fields: within one value, its entries are in id order already, so
+  "tenant == x, newest by id, 20" could stop after 20 entries instead of
+  sorting the tenant's all in memory (§100.9; redb takes 19 µs, trunkdb
+  0.65 ms).
+- A cheaper walk through an index: about 300 ns an entry, the key
+  copied out and entries grouped one by one, so a deep page costs 7× a
+  page in SQLite even where entries decide (§100.9).
 
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).
@@ -154,9 +151,9 @@ limit is described.
   and memory, not reads: a document is stored in one piece, overflow
   pages included (§26), and its encoding records no byte sizes, so
   reaching a field still walks those before it (§11.1), though without
-  allocating them. Projection is also what an index-only `find` would
-  need (see index-only reads under Queries). When a workload asks for
-  it.
+  allocating them. With projection, a `find` whose index covers the
+  filter and the fields selected could return without reading a
+  document, as `count` does since §100. When a workload asks for it.
 - Operators in a `Batch` and in `upsert` (§68.3).
 - More update operators, when asked for: `pull` by a condition on the
   element, `push` of several values at once, `mul`, `pop` (§73.3).

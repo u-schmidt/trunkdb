@@ -110,3 +110,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 97. [A walk that copies only what it hands out (`index/btree.rs`)](97-a-walk-that-copies-only-what-it-hands-out.md)
 98. [A lock held by a starting process (`database.rs`, docs)](98-a-lock-held-by-a-starting-process.md)
 99. [Decoding only what a read needs (`document.rs`, `serde_stored.rs`, `data.rs`, `collection.rs`, `cursor.rs`, `query.rs`)](99-decoding-only-what-a-read-needs.md)
+100. [Index entries that answer the filter (`query.rs`, `collection.rs`, `cursor.rs`, `index/key.rs`, `explain.rs`)](100-index-entries-that-answer-the-filter.md)

@@ -22,7 +22,9 @@ use crate::storage::RecordLocation;
 ///
 /// At creation it takes where every candidate is (from an index range or
 /// the primary index; no documents). Each `next` then reads one document
-/// and checks it against the filter.
+/// and checks it against the filter. Where the index entries decide the
+/// filter (SPEC §100), they did so at creation: the rejected ones aren't
+/// kept, and the matches a skip passes over are never read.
 ///
 /// With a `sort`, nothing can stream: every match has to be read to know
 /// which comes first. Such a cursor runs the whole `find` when it's
@@ -40,8 +42,9 @@ enum Source<T> {
         documents: Collection<Document>,
         /// Where each candidate is, in that same commit: a location
         /// means nothing in another one, where its slot may hold a
-        /// different document (SPEC §20.2).
-        locs: std::vec::IntoIter<RecordLocation>,
+        /// different document (SPEC §20.2). With it, whether its index
+        /// entry decided it matches (SPEC §100): then it isn't checked.
+        candidates: std::vec::IntoIter<(RecordLocation, bool)>,
         filter: Filter,
         /// Matches still to pass over (`Filter::skip`, SPEC §72).
         skipping: usize,
@@ -56,7 +59,7 @@ enum Source<T> {
 impl<T> Cursor<T> {
     pub(crate) fn streaming(
         documents: Collection<Document>,
-        locs: Vec<RecordLocation>,
+        candidates: Vec<(RecordLocation, bool)>,
         filter: Filter,
         convert: fn(Found) -> crate::Result<T>,
     ) -> Self {
@@ -64,7 +67,7 @@ impl<T> Cursor<T> {
         Cursor {
             source: Source::Streaming {
                 documents,
-                locs: locs.into_iter(),
+                candidates: candidates.into_iter(),
                 filter,
                 skipping,
                 remaining,
@@ -91,7 +94,7 @@ impl<T> Iterator for Cursor<T> {
             Source::Collected(results) => results.next().map(Ok),
             Source::Streaming {
                 documents,
-                locs,
+                candidates,
                 filter,
                 skipping,
                 remaining,
@@ -102,14 +105,21 @@ impl<T> Iterator for Cursor<T> {
                 }
                 // Checked on the fields the filter names (SPEC §99.2).
                 let names = filter.fields();
-                for loc in locs.by_ref() {
+                for (loc, decided) in candidates.by_ref() {
+                    if decided && *skipping > 0 {
+                        *skipping -= 1;
+                        continue; // a match passed over unread
+                    }
                     let candidate = documents.stored_at(loc).and_then(|stored| {
+                        if decided {
+                            return Ok((stored, true));
+                        }
                         let fields = stored.fields(names.as_deref())?;
-                        Ok((stored, fields))
+                        Ok((stored, filter.matches(&fields)))
                     });
                     match candidate {
                         Err(e) => return Some(Err(e)),
-                        Ok((stored, fields)) if filter.matches(&fields) => {
+                        Ok((stored, true)) => {
                             if *skipping > 0 {
                                 *skipping -= 1;
                                 continue;
