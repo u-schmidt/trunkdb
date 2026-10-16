@@ -19,7 +19,9 @@ and the OS drops it when the process dies — no stale lock file to clean
 up after a crash, unlike a `.lock` sidecar file with a PID in it.
 Known limits: advisory locks are unreliable on some network file
 systems, and a platform without file locking fails the open (with
-`Unsupported`) rather than silently skipping the lock.
+`Unsupported`) rather than silently skipping the lock. (Since §98: on
+Unix the lock can outlive the last handle by a moment, held by a
+process the application is starting.)
 
 Non-blocking on purpose: waiting for another process that holds a
 database open for its whole lifetime would just hang the caller.

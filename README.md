@@ -551,7 +551,13 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     out the first. A sorted `find` with `limit(1)` takes 3 µs instead of
     18; the first 50 by id 70 µs instead of 82.
 
-    Items 60–67: not released yet. File format 12, which still opens
+68. **A lock held by a starting process** (§98), documented: on Unix, a
+    database dropped while another thread starts a process stays locked
+    until that child's exec, and an open in that moment fails with
+    `WouldBlock`. Keep or clone the handle instead of reopening, or
+    retry briefly.
+
+    Items 60–68: not released yet. File format 12, which still opens
     6–11 holding only objects; 0.19.0 refuses a file this build has
     opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with
