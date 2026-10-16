@@ -440,6 +440,55 @@ impl Filter {
         self.conditions.iter().all(|c| c.matches(doc))
     }
 
+    /// The top-level fields whose values decide whether a document
+    /// matches and where it sorts (SPEC §99.2): the first step of every
+    /// path in the conditions — through `All`, `Any` and `Not`; of an
+    /// `elem_match` its array's path, as the paths inside start at the
+    /// element — and in the sort keys. A document cut down to these
+    /// fields matches and sorts as the whole one does. `None` if a path
+    /// starts at the document itself (empty, or `[*]` first), which needs
+    /// all of it.
+    pub(crate) fn fields(&self) -> Option<Vec<&str>> {
+        self.fields_with(true)
+    }
+
+    /// `fields`, the sort keys' only with `sort`: a walk that gets its
+    /// whole order from an index doesn't look at them (SPEC §99.2).
+    pub(crate) fn fields_with(&self, sort: bool) -> Option<Vec<&str>> {
+        fn add<'a>(path: &'a str, names: &mut Vec<&'a str>) -> Option<()> {
+            let first = path.split(['.', '[']).next().unwrap_or_default();
+            if first.is_empty() {
+                return None;
+            }
+            if !names.contains(&first) {
+                names.push(first);
+            }
+            Some(())
+        }
+        fn of<'a>(condition: &'a Condition, names: &mut Vec<&'a str>) -> Option<()> {
+            match condition {
+                Condition::Compare { field, .. }
+                | Condition::Exists { field }
+                | Condition::Size { field, .. }
+                | Condition::ElemMatch { field, .. } => add(field, names),
+                Condition::All(conditions) | Condition::Any(conditions) => {
+                    conditions.iter().try_for_each(|c| of(c, names))
+                }
+                Condition::Not(condition) => of(condition, names),
+            }
+        }
+        let mut names = Vec::new();
+        for condition in &self.conditions {
+            of(condition, &mut names)?;
+        }
+        if sort {
+            for key in &self.sort {
+                add(&key.field, &mut names)?;
+            }
+        }
+        Some(names)
+    }
+
     /// Applies conditions, then sort, then skip, then limit — in that
     /// order, matching SQL's `WHERE` -> `ORDER BY` -> `OFFSET` -> `LIMIT`
     /// (sorting an already-filtered set is both correct and cheaper than
@@ -1326,6 +1375,43 @@ pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::c
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    /// SPEC §99.2: the top-level field of every path a filter looks at —
+    /// in every kind of condition, nested, and the sort keys — once each;
+    /// none for a path that starts at the document itself.
+    #[test]
+    fn a_filter_names_the_fields_it_looks_at() {
+        let names = |f: Filter| {
+            f.fields()
+                .map(|n| n.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        let f = Filter::new()
+            .eq("a.b", 1)
+            .exists("e")
+            .size("tags[*]", Op::Eq, 2)
+            .elem_match("items", Condition::eq("sku", "A1"))
+            .and(!(Condition::eq("n", 1) | Condition::missing("m.x")))
+            .any_of([Condition::eq("a.c", 2), Condition::gt("z", 0)])
+            .sort_desc("s.t")
+            .then_asc("_id");
+        let want = ["a", "e", "tags", "items", "n", "m", "z", "s", "_id"];
+        assert_eq!(names(f.clone()), Some(want.map(String::from).to_vec()));
+        // The sort keys only when asked.
+        let without_sort = f.fields_with(false).unwrap();
+        assert_eq!(without_sort, ["a", "e", "tags", "items", "n", "m", "z"]);
+        assert_eq!(names(Filter::new()), Some(vec![]));
+        // Inside an element: paths there don't name top-level fields.
+        let inner = Filter::new().elem_match("rows", Condition::eq("", 1));
+        assert_eq!(names(inner), Some(vec!["rows".to_string()]));
+        // From the document itself: all of it.
+        assert_eq!(names(Filter::new().eq("", 1)), None);
+        assert_eq!(names(Filter::new().eq("[*].a", 1)), None);
+        assert_eq!(
+            names(Filter::new().any_of([Condition::exists("[*]")])),
+            None
+        );
+        assert_eq!(names(Filter::new().sort_asc("")), None);
+    }
 
     /// Ids sort after strings, by when they were made, and before the
     /// values nothing orders, which come last in both directions (SPEC

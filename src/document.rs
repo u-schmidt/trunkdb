@@ -232,18 +232,18 @@ impl<T: Into<Document>> From<Option<T>> for Document {
     }
 }
 
-const TAG_NULL: u8 = 0;
-const TAG_BOOL: u8 = 1;
-const TAG_INT: u8 = 2;
-const TAG_FLOAT: u8 = 3;
-const TAG_STRING: u8 = 4;
-const TAG_BINARY: u8 = 5;
-const TAG_ARRAY: u8 = 6;
-const TAG_OBJECT: u8 = 7;
-const TAG_ID: u8 = 8;
+pub(crate) const TAG_NULL: u8 = 0;
+pub(crate) const TAG_BOOL: u8 = 1;
+pub(crate) const TAG_INT: u8 = 2;
+pub(crate) const TAG_FLOAT: u8 = 3;
+pub(crate) const TAG_STRING: u8 = 4;
+pub(crate) const TAG_BINARY: u8 = 5;
+pub(crate) const TAG_ARRAY: u8 = 6;
+pub(crate) const TAG_OBJECT: u8 = 7;
+pub(crate) const TAG_ID: u8 = 8;
 /// A `DateTime` (SPEC §69, file format 11): seconds since 1970 as an
 /// `i64`, then the nanoseconds as a `u32`, both little-endian.
-const TAG_DATETIME: u8 = 9;
+pub(crate) const TAG_DATETIME: u8 = 9;
 
 /// Whether `encoded`, a document as `encode_document` wrote it, is an
 /// object: its first byte, without decoding the rest (SPEC §95).
@@ -380,7 +380,7 @@ pub fn decode_document(bytes: &[u8]) -> std::io::Result<(Document, &[u8])> {
 /// `levels`: how many more objects or arrays may open, this one included
 /// (SPEC §56). A document nested deeper was never written by a trunkdb
 /// with the limit, and decoding it could overflow the stack.
-fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
+pub(crate) fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
     Ok(match take_u8(bytes, "a document's type tag")? {
         TAG_NULL => Document::Null,
         TAG_BOOL => Document::Bool(take_u8(bytes, "a bool")? != 0),
@@ -417,27 +417,122 @@ fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
             Document::Object(entries)
         }
         TAG_ID => Document::Id(DocId(take_array(bytes, "an id")?)),
-        TAG_DATETIME => {
-            let secs = i64::from_le_bytes(take_array(bytes, "a date-time")?);
-            let nanos = u32::from_le_bytes(take_array(bytes, "a date-time")?);
-            let time = DateTime::from_unix(secs, nanos).ok_or_else(|| {
-                corrupt(format_args!("a date-time with {nanos} ns past its second"))
-            })?;
-            Document::DateTime(time)
-        }
+        TAG_DATETIME => Document::DateTime(take_datetime(bytes)?),
         other => return Err(corrupt(format_args!("unknown document type tag {other}"))),
     })
 }
 
 /// `[u32 length][bytes]`.
-fn take_len_prefixed<'a>(bytes: &mut &'a [u8], what: &str) -> std::io::Result<&'a [u8]> {
+pub(crate) fn take_len_prefixed<'a>(bytes: &mut &'a [u8], what: &str) -> std::io::Result<&'a [u8]> {
     let len = take_u32(bytes, what)? as usize;
     take(bytes, len, what)
 }
 
 fn decode_string(bytes: &mut &[u8], what: &str) -> std::io::Result<String> {
+    take_str(bytes, what).map(str::to_string)
+}
+
+/// `[u32 length][UTF-8 bytes]`, borrowed.
+pub(crate) fn take_str<'a>(bytes: &mut &'a [u8], what: &str) -> std::io::Result<&'a str> {
     let raw = take_len_prefixed(bytes, what)?;
-    String::from_utf8(raw.to_vec()).map_err(|_| corrupt(format_args!("bad UTF-8 in {what}")))
+    std::str::from_utf8(raw).map_err(|_| corrupt(format_args!("bad UTF-8 in {what}")))
+}
+
+/// A date-time's encoding, after its tag, checked as `decode_value`
+/// checks it.
+pub(crate) fn take_datetime(bytes: &mut &[u8]) -> std::io::Result<DateTime> {
+    let secs = i64::from_le_bytes(take_array(bytes, "a date-time")?);
+    let nanos = u32::from_le_bytes(take_array(bytes, "a date-time")?);
+    DateTime::from_unix(secs, nanos)
+        .ok_or_else(|| corrupt(format_args!("a date-time with {nanos} ns past its second")))
+}
+
+/// Moves past one encoded value without building it (SPEC §99), checking
+/// what `decode_value` checks — tags, lengths, UTF-8, date-times, the
+/// nesting limit — so a value is damaged for a read that skips it
+/// exactly when it is for one that decodes it.
+pub(crate) fn skip_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<()> {
+    match take_u8(bytes, "a document's type tag")? {
+        TAG_NULL => {}
+        TAG_BOOL => {
+            take_u8(bytes, "a bool")?;
+        }
+        TAG_INT => {
+            take_array::<8>(bytes, "an int")?;
+        }
+        TAG_FLOAT => {
+            take_array::<8>(bytes, "a float")?;
+        }
+        TAG_STRING => {
+            take_str(bytes, "a string")?;
+        }
+        TAG_BINARY => {
+            take_len_prefixed(bytes, "binary")?;
+        }
+        TAG_ARRAY | TAG_OBJECT if levels == 0 => {
+            return Err(corrupt(format_args!(
+                "a document nests deeper than {} levels",
+                Document::MAX_NESTING
+            )));
+        }
+        TAG_ARRAY => {
+            let count = take_u32(bytes, "an array's length")?;
+            for _ in 0..count {
+                skip_value(bytes, levels - 1)?;
+            }
+        }
+        TAG_OBJECT => {
+            let count = take_u32(bytes, "an object's length")?;
+            for _ in 0..count {
+                take_str(bytes, "a key")?;
+                skip_value(bytes, levels - 1)?;
+            }
+        }
+        TAG_ID => {
+            take_array::<16>(bytes, "an id")?;
+        }
+        TAG_DATETIME => {
+            take_datetime(bytes)?;
+        }
+        other => return Err(corrupt(format_args!("unknown document type tag {other}"))),
+    }
+    Ok(())
+}
+
+/// A stored document's top-level fields among `names` only, as an object,
+/// with `id` as `_id` if `names` has it (SPEC §99.2); every other field
+/// is skipped without being built. A path's value depends only on its
+/// top-level field, so a filter or sort that names no other field sees
+/// the same values here as in the whole document. A stored document that
+/// isn't an object (only damage since §95) is decoded whole.
+pub(crate) fn decode_fields(
+    encoded: &[u8],
+    id: DocId,
+    names: &[&str],
+) -> std::io::Result<Document> {
+    if !encodes_object(encoded) {
+        return Ok(with_id(decode_document(encoded)?.0, id));
+    }
+    let mut entries = IndexMap::new();
+    if names.contains(&ID_FIELD) {
+        entries.insert(ID_FIELD.to_string(), Document::Id(id));
+    }
+    if names.iter().all(|name| *name == ID_FIELD) {
+        // No stored field named: nothing to read (SPEC §99.2).
+        return Ok(Document::Object(entries));
+    }
+    let mut bytes = &encoded[1..];
+    let levels = Document::MAX_NESTING - 1;
+    let count = take_u32(&mut bytes, "an object's length")?;
+    for _ in 0..count {
+        let key = take_str(&mut bytes, "a key")?;
+        if key != ID_FIELD && names.contains(&key) {
+            entries.insert(key.to_string(), decode_value(&mut bytes, levels)?);
+        } else {
+            skip_value(&mut bytes, levels)?;
+        }
+    }
+    Ok(Document::Object(entries))
 }
 
 #[cfg(test)]
@@ -449,6 +544,38 @@ mod tests {
         let (decoded, rest) = decode_document(&bytes).unwrap();
         assert_eq!(decoded, doc);
         assert!(rest.is_empty(), "decode must consume every encoded byte");
+    }
+
+    /// SPEC §99.2: decoding some fields is damaged exactly when decoding
+    /// the whole document is, with the same message — in the fields it
+    /// takes and in those it skips.
+    #[test]
+    fn some_fields_are_damaged_when_the_whole_is() {
+        let doc: Document =
+            r#"{"a":1,"s":"héllo","n":[1,{"x":"y"}],"b":true,"t":"txt","bin":null}"#
+                .parse()
+                .unwrap();
+        let encoded = encode_stored(&doc);
+        let id = DocId([3; 16]);
+        let mut cases: Vec<Vec<u8>> = (0..encoded.len()).map(|n| encoded[..n].to_vec()).collect();
+        for at in 0..encoded.len() {
+            for byte in [0xFF, 0x80, 0x0A, 0x00] {
+                let mut altered = encoded.clone();
+                altered[at] = byte;
+                cases.push(altered);
+            }
+        }
+        for bytes in cases {
+            let whole = decode_document(&bytes)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            for names in [&["a"][..], &["t"], &["n", "_id"], &["missing"]] {
+                let some = decode_fields(&bytes, id, names)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                assert_eq!(some, whole, "{names:?} of {bytes:?}");
+            }
+        }
     }
 
     #[test]

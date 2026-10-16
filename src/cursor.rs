@@ -1,4 +1,5 @@
 use crate::collection::Collection;
+use crate::collection::Found;
 use crate::document::Document;
 use crate::query::Filter;
 use crate::storage::RecordLocation;
@@ -45,9 +46,9 @@ enum Source<T> {
         /// Matches still to pass over (`Filter::skip`, SPEC §72).
         skipping: usize,
         remaining: Option<usize>,
-        /// `Document` to `T`: the identity for the untyped path, the
-        /// serde bridge for the typed one.
-        convert: fn(Document) -> crate::Result<T>,
+        /// A match decoded (SPEC §99.3): into a `Document` for the
+        /// untyped path, a `T` for the typed one.
+        convert: fn(Found) -> crate::Result<T>,
     },
     Collected(std::vec::IntoIter<T>),
 }
@@ -57,7 +58,7 @@ impl<T> Cursor<T> {
         documents: Collection<Document>,
         locs: Vec<RecordLocation>,
         filter: Filter,
-        convert: fn(Document) -> crate::Result<T>,
+        convert: fn(Found) -> crate::Result<T>,
     ) -> Self {
         let (skipping, remaining) = (filter.skip, filter.limit);
         Cursor {
@@ -99,10 +100,16 @@ impl<T> Iterator for Cursor<T> {
                 if *remaining == Some(0) {
                     return None;
                 }
+                // Checked on the fields the filter names (SPEC §99.2).
+                let names = filter.fields();
                 for loc in locs.by_ref() {
-                    match documents.record_at(loc) {
+                    let candidate = documents.stored_at(loc).and_then(|stored| {
+                        let fields = stored.fields(names.as_deref())?;
+                        Ok((stored, fields))
+                    });
+                    match candidate {
                         Err(e) => return Some(Err(e)),
-                        Ok(doc) if filter.matches(&doc) => {
+                        Ok((stored, fields)) if filter.matches(&fields) => {
                             if *skipping > 0 {
                                 *skipping -= 1;
                                 continue;
@@ -110,7 +117,7 @@ impl<T> Iterator for Cursor<T> {
                             if let Some(n) = remaining {
                                 *n -= 1;
                             }
-                            return Some(convert(doc));
+                            return Some(convert(Found::from(stored)));
                         }
                         Ok(_) => continue, // a candidate that doesn't match
                     }
