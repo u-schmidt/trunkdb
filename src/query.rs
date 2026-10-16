@@ -1249,6 +1249,91 @@ impl<'a> Covering<'a> {
     }
 }
 
+impl<'a> Covering<'a> {
+    /// The bytes of `key` that decide (SPEC §101.2): its values up to the
+    /// end of the last one the filter names. Two keys that agree on them
+    /// tell of documents the filter can't tell apart. `None` where the
+    /// filter names `_id`, which every key holds a different one of, and
+    /// for a damaged key with fewer values than that.
+    fn deciding_len(&self, key: &[u8]) -> Option<usize> {
+        if self.id {
+            return None;
+        }
+        let Some(last) = self.named.iter().rposition(|named| *named) else {
+            return Some(0); // nothing named: every key decides alike
+        };
+        let mut parts = key::each_part(key::value_part(key));
+        (0..=last).try_fold(0, |len, _| Some(len + parts.next()?.len()))
+    }
+
+    /// Entry after entry with `filter` (SPEC §101.2).
+    pub fn decider(self, filter: &'a Filter) -> Decider<'a> {
+        Decider {
+            covering: self,
+            filter,
+            scratch: Document::Null,
+            last: Vec::new(),
+            decided: None,
+        }
+    }
+}
+
+/// A `Covering` deciding the entries of a walk, one after another (SPEC
+/// §101.2): an entry whose deciding bytes agree with the last decided
+/// one's takes its decision, without a value decoded or a condition
+/// checked. For `tenant == x` that's one decision for the whole range.
+pub(crate) struct Decider<'a> {
+    covering: Covering<'a>,
+    filter: &'a Filter,
+    scratch: Document,
+    /// The deciding bytes of the last entry decided, and how — `None`
+    /// where it couldn't be, or its bytes don't count (`deciding_len`).
+    last: Vec<u8>,
+    decided: Option<bool>,
+}
+
+impl Decider<'_> {
+    /// `Covering::decide` on `key`, or the last decision where `key`
+    /// agrees with it.
+    pub fn decide(&mut self, key: &[u8]) -> Option<bool> {
+        let len = self.covering.deciding_len(key);
+        if let (Some(len), Some(decided)) = (len, self.decided)
+            && key[..len] == self.last[..]
+        {
+            return Some(decided);
+        }
+        #[cfg(test)]
+        DECISIONS.with(|n| n.set(n.get() + 1));
+        let decided = self.covering.decide(key, self.filter, &mut self.scratch);
+        self.decided = len.and(decided);
+        if let (Some(len), Some(_)) = (len, self.decided) {
+            self.last.clear();
+            self.last.extend_from_slice(&key[..len]);
+        }
+        decided
+    }
+
+    /// One decision for every key from `lowest` to `highest`, a leaf's
+    /// ends (SPEC §101.3) — `None` unless they agree on their deciding
+    /// bytes. Keys are in order and every value's encoding ends where it
+    /// ends, whatever follows (§28.1): every key between two that share
+    /// those bytes shares them too, and so the decision.
+    pub fn decide_all(&mut self, lowest: &[u8], highest: &[u8]) -> Option<bool> {
+        let len = self.covering.deciding_len(lowest)?;
+        if highest.get(..len) != Some(&lowest[..len]) {
+            return None;
+        }
+        self.decide(lowest)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entries a `Decider` decided on their values, rather than by the
+    /// last decision (SPEC §101.2), for tests.
+    pub(crate) static DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether `condition` names `_id` anywhere.
 fn names_id(condition: &Condition) -> bool {
     match condition {

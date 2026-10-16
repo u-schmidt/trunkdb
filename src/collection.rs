@@ -7,7 +7,8 @@ use crate::explain::Trace;
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::query::{
-    Condition, Covering, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork, Update,
+    Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork,
+    Update,
 };
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
@@ -818,10 +819,9 @@ impl Collection<Document> {
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
-        let count = if filter.conditions.is_empty() {
-            candidate_entries(at.catalog, &at.store, &self.name, &filter, &trace)?
-                .0
-                .len()
+        let streamed = count_in(at.catalog, &at.store, &self.name, &filter)?;
+        let count = if let Some(count) = streamed {
+            count
         } else {
             let names = filter.fields_with(false);
             read_candidates(
@@ -883,20 +883,16 @@ impl Collection<Document> {
         // Where the entries decide (SPEC §100), a rejected one is left
         // out, and a match is kept as decided: passed over by a skip
         // unread.
-        let decides = indexed.covering(&filter, false);
-        let mut scratch = Document::Null;
+        let mut decides = indexed.covering(&filter, false).map(|c| c.decider(&filter));
         let candidates = entries
             .into_iter()
-            .filter_map(|(key, loc)| {
-                match decides
-                    .as_ref()
-                    .and_then(|c| c.decide(&key, &filter, &mut scratch))
-                {
+            .filter_map(
+                |(key, loc)| match decides.as_mut().and_then(|d| d.decide(&key)) {
                     Some(true) => Some((loc, true)),
                     Some(false) => None,
                     None => Some((loc, false)),
-                }
-            })
+                },
+            )
             .collect();
         drop(state);
         Ok(Cursor::streaming(kept, candidates, filter, convert))
@@ -1030,10 +1026,9 @@ fn find_in(
     let indexes = catalog.indexes(collection);
     let mut records = data::Records::new(store);
     if let Some(order) = filter.index_order(indexes) {
-        // Read as far as skip plus limit, then pass over the skipped (SPEC
-        // §72), unread where their entries decided (§100).
-        let mut found = walk_in_index_order(catalog, store, collection, filter, order, trace)?;
-        found.drain(..filter.skip.min(found.len()));
+        // The skipped matches are passed over by the walk (SPEC §72),
+        // unread where their entries decided (§100), and not kept (§101).
+        let found = walk_in_index_order(catalog, store, collection, filter, order, trace)?;
         return found
             .into_iter()
             .map(|(source, _fields)| Ok(Found::stored(source.read(&mut records, trace)?)))
@@ -1269,7 +1264,7 @@ impl<'a> Indexed<'a> {
 /// index in sort order (`BTreeIndex::walk`, SPEC §49), checks each
 /// document against the whole filter, and stops as soon as `limit`
 /// match — the entries and documents after that are never read. Already
-/// filtered, sorted and limited.
+/// filtered, sorted, skipped and limited.
 ///
 /// Entries are read in groups that share the values of the served sort
 /// keys (`OrderedRead::served`). A group comes in id order, which is sort
@@ -1296,8 +1291,14 @@ impl<'a> Indexed<'a> {
 /// Each document is checked on the fields the filter and sort name, and
 /// handed out undecoded (SPEC §99). Where the index covers the filter
 /// (SPEC §100), an entry of an exact group decides without its document,
-/// which is read only if handed out: the matches a skip passes over are
-/// never read.
+/// which is read only if handed out.
+///
+/// Where the walk's order is the order handed out — forward, or by id;
+/// every served value fixed or served, so that ties are in key order;
+/// nothing sorted in memory or held — an exact group is never collected:
+/// each entry is handed out as it's walked, its key lent from its leaf
+/// (SPEC §101.5). The matches a skip passes over are counted, not kept,
+/// and a leaf whose ends decide it is passed whole (§101.3).
 fn walk_in_index_order(
     catalog: &Catalog,
     store: &dyn PageStore,
@@ -1309,19 +1310,21 @@ fn walk_in_index_order(
     let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
         unreachable!("index_order needs a sort and a limit");
     };
-    let mut results = Vec::new();
+    let mut page = Page {
+        results: Vec::new(),
+        skipped: 0,
+        skip: filter.skip,
+        limit,
+    };
     if limit == 0 {
-        return Ok(results);
+        return Ok(page.results);
     }
-    // The skipped matches come first, so read as far as them too; the
-    // caller passes over them (SPEC §72).
-    let limit = limit.saturating_add(filter.skip);
     let name = order.name();
     let (root, fields, compound) = match order.index {
         Some(index) => (index.root, index.fields.len(), index.is_compound()),
         None => match catalog.get(collection) {
             Some(meta) => (meta.index_root, 1, false),
-            None => return Ok(results),
+            None => return Ok(page.results),
         },
     };
     let primary = order.index.is_none();
@@ -1344,96 +1347,149 @@ fn walk_in_index_order(
     // The primary index gives the whole order: every key exact, nothing
     // unordered (SPEC §96), so only the conditions' fields are looked at.
     let names = filter.fields_with(!primary || in_memory);
-    let decides = Covering::new(filter, order.index, false);
-    if decides.is_some() {
+    let mut decider = Covering::new(filter, order.index, false).map(|c| c.decider(filter));
+    if decider.is_some() {
         trace.covering(walk);
     }
     let mut records = data::Records::new(store);
-    let mut scratch = Document::Null;
     let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
         trace.examined();
         let stored = records.stored(*loc)?;
         let fields = stored.fields(names.as_deref())?;
         Ok((Source::Read(stored), fields))
     };
-    // Hands out one group's matching documents; `true` once `limit` are.
-    let mut take = |group: Group, results: &mut Vec<Candidate>| -> crate::Result<bool> {
+    // One entry of an exact group, handed out in order: decided by its
+    // entry where it can be, else read and checked. `true` once the page
+    // is full.
+    let one = |key: &[u8],
+               loc: RecordLocation,
+               decider: &mut Option<Decider>,
+               read: &mut dyn FnMut(&RecordLocation) -> std::io::Result<Candidate>,
+               page: &mut Page|
+     -> crate::Result<bool> {
+        let (source, doc) = match decider.as_mut().and_then(|d| d.decide(key)) {
+            Some(false) => return Ok(false),
+            Some(true) => (Source::Entry(key::doc_id(key), loc), Document::Null),
+            None => read(&loc)?,
+        };
+        if !source.decided() && !filter.matches(&doc) {
+            return Ok(false);
+        }
+        trace.matched(1);
+        Ok(page.push((source, doc)))
+    };
+    // Hands out one collected group's matches; `true` once the page is
+    // full.
+    let take = |group: &mut Group,
+                decider: &mut Option<Decider>,
+                read: &mut dyn FnMut(&RecordLocation) -> std::io::Result<Candidate>,
+                page: &mut Page|
+     -> crate::Result<bool> {
         // Ties in id order: fields after the served ones would order them
         // otherwise, and a backward walk hands them out last id first.
-        let mut group = group;
         group.sort_by_key(|(key, _)| key::doc_id(key));
-        let exact = spans
-            .values(&group[0].0)
-            .iter()
-            .all(|part| key::part_is_exact(part, fields));
-        if exact && !in_memory {
-            for (key, loc) in &group {
-                let decided = decides
-                    .as_ref()
-                    .and_then(|c| c.decide(key, filter, &mut scratch));
-                let (source, doc) = match decided {
-                    Some(false) => continue,
-                    Some(true) => (Source::Entry(key::doc_id(key), *loc), Document::Null),
-                    None => read(loc)?,
-                };
-                if source.decided() || filter.matches(&doc) {
-                    trace.matched(1);
-                    results.push((source, doc));
-                    if results.len() == limit {
-                        return Ok(true);
-                    }
-                }
-            }
-        } else {
-            let docs = group
-                .iter()
-                .map(|(_key, loc)| read(loc))
-                .collect::<Result<Vec<_>, _>>()?;
-            let unlimited = Filter {
-                skip: 0,
-                limit: None,
-                ..filter.clone()
-            };
-            let found = unlimited.apply_to(docs, |(_id, doc)| doc);
-            trace.matched(found.len());
-            for found in found {
-                results.push(found);
-                if results.len() == limit {
+        if spans.exact(&group[0].0) && !in_memory {
+            for (key, loc) in group.iter() {
+                if one(key, *loc, decider, read, page)? {
                     return Ok(true);
                 }
+            }
+            return Ok(false);
+        }
+        let docs = group
+            .iter()
+            .map(|(_key, loc)| read(loc))
+            .collect::<Result<Vec<_>, _>>()?;
+        let unlimited = Filter {
+            skip: 0,
+            limit: None,
+            ..filter.clone()
+        };
+        let found = unlimited.apply_to(docs, |(_id, doc)| doc);
+        trace.matched(found.len());
+        for found in found {
+            if page.push(found) {
+                return Ok(true);
             }
         }
         Ok(false)
     };
     let mut held = Held::new(backward && compound, spans, first.order);
+    let direct =
+        (!backward || primary) && !in_memory && !held.active && (primary || spans.end == fields);
+    // The group being collected, and the served bytes it shares.
     let mut group: Group = Vec::new();
+    let mut shared: Vec<u8> = Vec::new();
     loop {
-        let entry = entries.next().transpose()?;
-        trace.entries(walk, entry.is_some() as usize);
-        let ends_group = match (&entry, group.first()) {
-            (Some((key, _)), Some((first_key, _))) => spans.group(key) != spans.group(first_key),
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        if ends_group {
-            let next = entry.as_ref().map(|(key, _)| key.as_slice());
-            for ready in held.pass(std::mem::take(&mut group), next) {
-                if take(ready, &mut results)? {
-                    return Ok(results);
+        if direct && group.is_empty() {
+            // A leaf passed whole: its entries all rejected, or all
+            // matches the skip passes over — where the group its last
+            // entry is in, which may go on past it, is exact.
+            let whole = entries.whole_leaf()?.map(|leaf| {
+                let decided = decider
+                    .as_mut()
+                    .and_then(|d| d.decide_all(leaf.lowest, leaf.highest));
+                (decided, leaf.entries, spans.exact(leaf.highest))
+            });
+            let passed = match whole {
+                Some((Some(false), n, _)) => Some(n),
+                Some((Some(true), n, true)) if page.skipped + n <= page.skip => {
+                    trace.matched(n);
+                    page.skipped += n;
+                    Some(n)
                 }
+                _ => None,
+            };
+            if let Some(n) = passed {
+                trace.entries(walk, n);
+                entries.pass_leaf();
+                continue;
             }
         }
-        match entry {
-            Some(entry) => group.push(entry),
-            None => break,
+        let entry = entries.step().transpose()?;
+        trace.entries(walk, usize::from(entry.is_some()));
+        let ends_group =
+            !group.is_empty() && entry.is_none_or(|(key, _)| spans.group(key) != shared.as_slice());
+        if ends_group {
+            let next = entry.map(|(key, _)| key);
+            if held.active {
+                for mut ready in held.pass(std::mem::take(&mut group), next) {
+                    if take(&mut ready, &mut decider, &mut read, &mut page)? {
+                        return Ok(page.results);
+                    }
+                }
+            } else {
+                if take(&mut group, &mut decider, &mut read, &mut page)? {
+                    return Ok(page.results);
+                }
+                group.clear();
+            }
         }
+        let Some((key, loc)) = entry else {
+            break;
+        };
+        if direct && group.is_empty() && spans.exact(key) {
+            if one(key, loc, &mut decider, &mut read, &mut page)? {
+                return Ok(page.results);
+            }
+            continue;
+        }
+        if group.is_empty() {
+            shared.clear();
+            shared.extend_from_slice(spans.group(key));
+        }
+        #[cfg(test)]
+        crate::index::KEYS_COPIED.with(|n| n.set(n.get() + 1));
+        group.push((key.to_vec(), loc));
         // An id is a group of its own (SPEC §96): handed out without
         // reading the next key to see the group end.
-        if primary && take(std::mem::take(&mut group), &mut results)? {
-            return Ok(results);
+        if primary {
+            if take(&mut group, &mut decider, &mut read, &mut page)? {
+                return Ok(page.results);
+            }
+            group.clear();
         }
     }
-    let unordered_after = results.len();
     if unordered_can_match {
         let meta = catalog
             .get(collection)
@@ -1442,6 +1498,7 @@ fn walk_in_index_order(
         let primary = BTreeIndex::new(meta.index_root).scan(store)?;
         let scan = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
         trace.entries(scan, primary.len());
+        let wanted = page.skip.saturating_add(limit);
         for (_key, loc) in primary {
             let (id, doc) = read(&loc)?;
             let value = crate::query::value_or_null(&doc, &first.field);
@@ -1449,7 +1506,7 @@ fn walk_in_index_order(
                 trace.matched(1);
                 unordered.push((id, doc));
                 // Without keys after the first, id order is their order.
-                if !in_memory && unordered_after + unordered.len() == limit {
+                if !in_memory && page.passed() + unordered.len() == wanted {
                     break;
                 }
             }
@@ -1460,10 +1517,40 @@ fn walk_in_index_order(
             limit: None,
             ..filter.clone()
         };
-        results.extend(unlimited.apply_to(unordered, |(_id, doc)| doc));
-        results.truncate(limit);
+        for found in unlimited.apply_to(unordered, |(_id, doc)| doc) {
+            if page.push(found) {
+                break;
+            }
+        }
     }
-    Ok(results)
+    Ok(page.results)
+}
+
+/// The page `walk_in_index_order` hands out (SPEC §101.5): matches in
+/// order, the first `skip` only counted.
+struct Page {
+    results: Vec<Candidate>,
+    skipped: usize,
+    skip: usize,
+    limit: usize,
+}
+
+impl Page {
+    /// The next match in order: passed over while the skip lasts, kept
+    /// after. `true` once `limit` are kept.
+    fn push(&mut self, found: Candidate) -> bool {
+        if self.skipped < self.skip {
+            self.skipped += 1;
+            return false;
+        }
+        self.results.push(found);
+        self.results.len() == self.limit
+    }
+
+    /// Matches so far, skipped or kept.
+    fn passed(&self) -> usize {
+        self.skipped + self.results.len()
+    }
 }
 
 /// Index entries sharing the values of the served sort keys.
@@ -1501,6 +1588,15 @@ impl Spans {
             }
         }
         &key[..len]
+    }
+
+    /// Whether the served values of `key`'s group are each exact: one
+    /// value each, so the group's entries are equal in them.
+    fn exact(&self, key: &[u8]) -> bool {
+        self.primary
+            || key::each_part(self.group(key))
+                .skip(self.at)
+                .all(|part| key::part_is_exact(part, self.fields))
     }
 
     /// The served values a group shares, each on its own.
@@ -1632,18 +1728,15 @@ fn read_candidates(
     trace: &Trace,
 ) -> std::io::Result<Vec<Candidate>> {
     let (entries, indexed) = candidate_entries(catalog, store, collection, filter, trace)?;
-    let decides = indexed.covering(filter, false);
+    let mut decides = indexed.covering(filter, false).map(|c| c.decider(filter));
     let orders = match sort {
         true => indexed.covering(filter, true),
         false => None,
     };
     let mut records = data::Records::new(store);
     let mut candidates = Vec::new();
-    let mut scratch = Document::Null;
     for (key, loc) in entries {
-        let decided = decides
-            .as_ref()
-            .and_then(|c| c.decide(&key, filter, &mut scratch));
+        let decided = decides.as_mut().and_then(|d| d.decide(&key));
         if decided == Some(false) {
             continue; // rejected by its entry, never read
         }
@@ -1666,6 +1759,73 @@ fn read_candidates(
         candidates.push((Source::Read(stored), fields));
     }
     Ok(candidates)
+}
+
+/// `count`'s conditions counted entry by entry as an index is walked,
+/// nothing collected (SPEC §101.4): with no conditions, the primary
+/// index's entries, leaf by leaf; with conditions one range of one index
+/// covers (§100), each entry decided by its run of equal values and each
+/// leaf inside the range whole where its ends decide it, and only an
+/// entry that can't decide read. `None` for every other filter, which
+/// `read_candidates` counts: a lookup by id, a union of ranges, a
+/// multikey index, a filter the entries don't cover.
+fn count_in(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+) -> std::io::Result<Option<usize>> {
+    let Some(meta) = catalog.get(collection) else {
+        return Ok(Some(0));
+    };
+    if filter.conditions.is_empty() {
+        let primary = BTreeIndex::new(meta.index_root);
+        return primary.count(store, KeyRange::everything()).map(Some);
+    }
+    if filter.ids().is_some() {
+        return Ok(None);
+    }
+    let (root, range, index) = match filter.index_ranges(catalog.indexes(collection)) {
+        None => (meta.index_root, KeyRange::everything(), None),
+        Some(mut ranges) if ranges.len() == 1 => {
+            let range = ranges.pop().expect("one");
+            if range.index.fields.iter().any(|f| crate::query::is_multi(f)) {
+                return Ok(None);
+            }
+            (range.index.root, range.range, Some(range.index))
+        }
+        Some(_) => return Ok(None),
+    };
+    let Some(covering) = Covering::new(filter, index, false) else {
+        return Ok(None);
+    };
+    let mut decider = covering.decider(filter);
+    let names = filter.fields_with(false);
+    let mut records = data::Records::new(store);
+    let mut walk = BTreeIndex::new(root).walk(store, range, false);
+    let mut count = 0;
+    loop {
+        let whole = walk
+            .whole_leaf()?
+            .map(|leaf| (decider.decide_all(leaf.lowest, leaf.highest), leaf.entries));
+        if let Some((Some(matches), entries)) = whole {
+            count += if matches { entries } else { 0 };
+            walk.pass_leaf();
+            continue;
+        }
+        let Some(entry) = walk.step() else {
+            return Ok(Some(count));
+        };
+        let (key, loc) = entry?;
+        let matches = match decider.decide(key) {
+            Some(decided) => decided,
+            None => {
+                let fields = records.stored(loc)?.fields(names.as_deref())?;
+                filter.matches(&fields)
+            }
+        };
+        count += usize::from(matches);
+    }
 }
 
 /// Maps a single-op write's outcome to `update`/`delete`'s `bool`.
@@ -5622,6 +5782,178 @@ mod tests {
             assert_eq!(found(inexact).1, (expected - 1).min(5) + 1, "{i}");
         }
         assert_consistent(&db);
+    }
+
+    /// SPEC §101: runs of one value longer than a leaf, ties across leaf
+    /// boundaries, a cut string and a big number inside a run, emptied
+    /// leaves: `find`, `count` and a cursor give what checking every
+    /// document gives, at every skip, in both directions.
+    #[test]
+    fn whole_leaves_decide_as_the_documents_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("g").unwrap();
+        docs.ensure_index("n").unwrap();
+        docs.ensure_index(["g", "n"]).unwrap();
+        let mut rng = XorShift(0x0101_1EAF_0101_1EAF);
+        let ops = (0..6000i64)
+            .map(|i| {
+                let g = match rng.below(400) {
+                    0 => Document::from("b".to_string() + &"x".repeat(3000)),
+                    1 => Document::Int((1 << 60) + i),
+                    k => ["a", "b", "c"][k % 3].into(),
+                };
+                // Ties of three, which a leaf may split.
+                let doc = object(vec![("g", g), ("n", Document::Int(i / 3))]);
+                WriteOp::Insert("docs".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        // A stretch emptied, leaving empty leaves behind (§10.5).
+        let stretch = Filter::new().gte("n", 700).lt("n", 1100);
+        docs.delete_many(stretch).unwrap();
+        let mut all = docs.find_with_ids(Filter::default()).unwrap();
+        all.sort_by_key(|(id, _doc)| *id);
+        let conditions = [
+            Filter::new(),
+            Filter::new().eq("g", "b"),
+            Filter::new().ne("g", "b"),
+            Filter::new().gte("g", "b"),
+            Filter::new().lt("g", "c"),
+            Filter::new().eq("g", "a").gte("n", 300).lt("n", 1500),
+            Filter::new().gte("n", 500).lt("n", 1800),
+            Filter::new().eq("g", "c").ne("n", 100),
+        ];
+        let sorts: [&[(&str, SortOrder)]; 6] = [
+            &[],
+            &[("n", SortOrder::Asc)],
+            &[("n", SortOrder::Desc)],
+            &[("_id", SortOrder::Asc)],
+            &[("_id", SortOrder::Desc)],
+            &[("g", SortOrder::Asc)],
+        ];
+        for _ in 0..300 {
+            let mut f = conditions[rng.below(conditions.len())].clone();
+            for (field, order) in sorts[rng.below(sorts.len())] {
+                f = f.then_by(*field, *order);
+            }
+            let skip = match rng.below(3) {
+                0 => rng.below(20),
+                _ => rng.below(5000),
+            };
+            let f = f.skip(skip).limit([None, Some(1), Some(7)][rng.below(3)]);
+            let expected: Vec<DocId> = f
+                .apply_to(all.clone(), |(_, doc)| doc)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let plan = explained(&docs, &f);
+            assert_eq!(docs.count(f.clone()).unwrap(), expected.len(), "{f:?}");
+            let found: Vec<DocId> = docs
+                .find_with_ids(f.clone())
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            if f.sort.is_empty() {
+                assert_eq!(found.len(), expected.len(), "{f:?} via {plan:?}");
+            } else {
+                assert_eq!(found, expected, "{f:?} via {plan:?}");
+                assert_eq!(typed_ids(&docs, &f), expected, "typed: {f:?}");
+            }
+        }
+        assert_consistent(&db);
+    }
+
+    /// SPEC §101.5: a skip passes over a leaf whole only where the group
+    /// its last entry is in is exact. Numbers past 2^60 share an encoding
+    /// 256 apart, so each such group spans several leaves, and is sorted
+    /// in memory by the true values — here against id order.
+    #[test]
+    fn a_skip_keeps_an_inexact_group_across_leaves_in_its_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index(["g", "n"]).unwrap();
+        let big = |k: i64| Document::Int((1 << 60) + k);
+        let ns = (0..50).map(Document::Int).chain((0..900).rev().map(big));
+        let ops = ns
+            .map(|n| {
+                let doc = object(vec![("g", "b".into()), ("n", n)]);
+                WriteOp::Insert("docs".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        let all = docs.find_with_ids(Filter::default()).unwrap();
+        for skip in (0..950).step_by(7) {
+            let f = Filter::new().eq("g", "b").sort_asc("n").skip(skip).limit(3);
+            let expected: Vec<DocId> = f
+                .apply_to(all.clone(), |(_, doc)| doc)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let found: Vec<DocId> = docs
+                .find_with_ids(f.clone())
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(found, expected, "skip {skip}");
+        }
+    }
+
+    /// SPEC §101: a count and a deep page copy no key, and a run of one
+    /// value is decided once a leaf at most.
+    #[test]
+    fn a_walk_copies_and_decides_only_what_it_must() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("tasks");
+        let ops = (0..5000)
+            .map(|i| {
+                let doc = object(vec![
+                    ("tenant", format!("t{}", i % 5).into()),
+                    ("status", ["Queued", "Done"][i as usize % 2].into()),
+                    ("created", Document::Int(i)),
+                ]);
+                WriteOp::Insert("tasks".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        docs.ensure_index("tenant").unwrap();
+        docs.ensure_index(["status", "created"]).unwrap();
+        let counted = |run: &dyn Fn() -> usize| {
+            let copied = crate::index::KEYS_COPIED.with(|n| n.replace(0));
+            let decided = crate::query::DECISIONS.with(|n| n.replace(0));
+            let found = run();
+            let copied = crate::index::KEYS_COPIED.with(|n| n.replace(copied));
+            let decided = crate::query::DECISIONS.with(|n| n.replace(decided));
+            (found, copied, decided)
+        };
+        let entries = |f: Filter| {
+            let run = docs.explain_run(f).unwrap();
+            run.reads[0].entries as usize
+        };
+        let tenant = Filter::new().eq("tenant", "t3");
+        let (n, copied, decided) = counted(&|| docs.count(tenant.clone()).unwrap());
+        assert_eq!((n, copied), (1000, 0));
+        // A leaf holds well over ten entries of this index.
+        assert!(decided <= entries(tenant.clone()) / 10, "{decided}");
+        assert_eq!(
+            counted(&|| docs.count(Filter::new()).unwrap()),
+            (5000, 0, 0)
+        );
+        let page = Filter::new()
+            .eq("status", "Done")
+            .sort_asc("created")
+            .skip(1000)
+            .limit(20);
+        let (n, copied, _) = counted(&|| docs.find(page.clone()).unwrap().len());
+        assert_eq!((n, copied), (20, 0));
+        let by_id = Filter::new().sort_desc("_id").skip(3000).limit(20);
+        let (n, copied, _) = counted(&|| docs.find(by_id.clone()).unwrap().len());
+        assert_eq!((n, copied), (20, 0));
     }
 
     /// Conditions mostly on what the indexes of

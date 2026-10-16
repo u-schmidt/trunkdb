@@ -110,6 +110,7 @@ struct Answers {
     scanned: usize,
     counted_tenant: usize,
     counted_in_range: usize,
+    counted_all: usize,
     page: Vec<i64>,
     by_id_after: Vec<i64>,
     tenant_by_id: Vec<i64>,
@@ -278,6 +279,14 @@ fn main() {
             "count created in a range (1000 docs)",
             Unit::Millis,
             millis(starts.len(), took),
+        );
+        // The total behind a list with no filter (SPEC §101).
+        let (took, counted) = time(|| (0..20).map(|_| store.count_all()).sum());
+        answer.counted_all = counted;
+        record(
+            &format!("count, no conditions ({n} docs)"),
+            Unit::Millis,
+            millis(20, took),
         );
         let (took, page) = time(|| {
             (0..300)

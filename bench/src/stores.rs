@@ -33,6 +33,9 @@ pub trait Store {
     fn count_tenant(&self, tenant: &str) -> usize;
     /// How many tasks were created in `lo..hi`, counted.
     fn count_in_range(&self, lo: i64, hi: i64) -> usize;
+    /// How many tasks there are, counted: the total behind a list with
+    /// no filter (SPEC §101).
+    fn count_all(&self) -> usize;
     /// `created` of the tasks with `status`, oldest first, after
     /// skipping `skip`, at most `limit`: a page deep in a list.
     fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64>;
@@ -212,6 +215,10 @@ impl Store for Trunk {
         self.tasks
             .count(Filter::new().eq("tenant", tenant))
             .unwrap()
+    }
+
+    fn count_all(&self) -> usize {
+        self.tasks.count(Filter::new()).unwrap()
     }
 
     fn count_in_range(&self, lo: i64, hi: i64) -> usize {
@@ -432,6 +439,10 @@ impl Store for Sqlite {
         )
     }
 
+    fn count_all(&self) -> usize {
+        self.count("SELECT count(*) FROM tasks", params![])
+    }
+
     fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64> {
         self.docs(
             "SELECT doc FROM tasks WHERE status = ? ORDER BY created LIMIT ? OFFSET ?",
@@ -518,7 +529,7 @@ fn id_of(key: &[u8]) -> Id {
 
 // ---- redb ------------------------------------------------------------
 
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 const TASKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tasks");
 const INDEXES: [TableDefinition<&[u8], ()>; 3] = [
@@ -699,6 +710,11 @@ impl Store for Redb {
 
     fn count_in_range(&self, lo: i64, hi: i64) -> usize {
         self.count(1, &sortable(lo), &sortable(hi))
+    }
+
+    fn count_all(&self) -> usize {
+        let tx = self.db.begin_read().unwrap();
+        tx.open_table(TASKS).unwrap().len().unwrap() as usize
     }
 
     fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64> {
@@ -900,6 +916,10 @@ impl Store for Sled {
 
     fn count_in_range(&self, lo: i64, hi: i64) -> usize {
         self.indexes[1].range(sortable(lo)..sortable(hi)).count()
+    }
+
+    fn count_all(&self) -> usize {
+        self.tasks.len()
     }
 
     fn page(&self, status: &str, skip: usize, limit: usize) -> Vec<i64> {
