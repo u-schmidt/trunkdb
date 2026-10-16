@@ -237,7 +237,7 @@ batch fails [§78](spec/78-reads-through-a-snapshot.md).
 compared byte by byte, so the tree knows nothing about documents
 [§28.1](spec/28-secondary-indexes.md). Leaves are linked, so a range read walks along them, and a
 read in sort order is a lazy walk, forward or backward, that stops when
-the caller does [§49](spec/49-a-lazy-b-tree-walk.md). Inserts change a page in place, and only a full
+the caller does [§49](spec/49-a-lazy-b-tree-walk.md), and copies only the entries it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md). Inserts change a page in place, and only a full
 page is rebuilt when it splits; a split is by bytes, since keys differ
 in length [§28.2](spec/28-secondary-indexes.md) [§52](spec/52-b-tree-pages-changed-in-place.md). Keys arriving in order fill their leaves
 instead of leaving them half empty [§41](spec/41-compaction.md). A key is at most a quarter
