@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 /// database, and `Database`, `Collection` and `Batch` are all `Send +
 /// Sync`, so they can go into an app's shared state, a thread, or a
 /// `static`. The file stays open (and locked, §21.1) until the last clone
-/// — including those inside `Collection`s and `Batch`es — is dropped.
+/// — including those inside `Collection`s and `Batch`es — is dropped. On
+/// Unix, a process this one is starting at that moment can hold the lock
+/// a little longer, until its exec (SPEC §98).
 ///
 /// Reads (`get`, `find`) run together, each on the commit that was the
 /// last when it began, to its end (SPEC §80). Write batches run one at a
@@ -360,7 +362,13 @@ impl Database {
     ///   build can read at all — another program's file, or a format it
     ///   doesn't read. Nothing was changed.
     /// - `Error::Io` of kind `WouldBlock`: another open holds the file,
-    ///   in this process or another one.
+    ///   in this process or another one. On Unix, also for a moment after
+    ///   the last handle was dropped, if another thread of this process
+    ///   was starting a process then: the child holds a copy of the file,
+    ///   and its lock, until its exec (SPEC §98). Keep or clone the
+    ///   handle instead of reopening; where an application does reopen
+    ///   while it starts processes, a brief retry tells that moment from
+    ///   a real holder.
     /// - `Error::Io` of kind `InvalidData`: the file is trunkdb's but
     ///   damaged; the message says where.
     /// - `Error::Io` of other kinds: the file system's, such as

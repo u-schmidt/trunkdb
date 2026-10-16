@@ -108,3 +108,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 95. [Only objects (`collection.rs`, `lib.rs`, `storage/file.rs`, `database.rs`, `data.rs`, `document.rs`, `check.rs`, `export.rs`)](95-only-objects.md)
 96. [Sorting by `_id` through the primary index (`query.rs`, `collection.rs`, `index/key.rs`)](96-sorting-by-id-through-the-primary-index.md)
 97. [A walk that copies only what it hands out (`index/btree.rs`)](97-a-walk-that-copies-only-what-it-hands-out.md)
+98. [A lock held by a starting process (`database.rs`, docs)](98-a-lock-held-by-a-starting-process.md)

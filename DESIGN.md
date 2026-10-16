@@ -59,7 +59,9 @@ they come from [§8](spec/08-ownership-one-refcell-boundary-not-one-per-componen
 The database file holds an OS advisory lock (`flock`, `LockFileEx`)
 while it's open, so a second `open` fails at once instead of reading a
 file another process is writing [§21](spec/21-an-exclusive-file-lock-and-a-format-version.md). Within one process, a handle is
-cloned, not opened twice. A read-only open (`OpenOptions::read_only`)
+cloned, not opened twice. On Unix a process the application starts
+holds a copy of the file from its fork to its exec, and with it the
+lock: a database dropped in that moment is still held until the exec [§98](spec/98-a-lock-held-by-a-starting-process.md). A read-only open (`OpenOptions::read_only`)
 takes the lock shared: read-only opens go together, and none goes
 beside an open that writes [§88](spec/88-a-read-only-open.md).
 
