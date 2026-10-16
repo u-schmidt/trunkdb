@@ -111,3 +111,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 98. [A lock held by a starting process (`database.rs`, docs)](98-a-lock-held-by-a-starting-process.md)
 99. [Decoding only what a read needs (`document.rs`, `serde_stored.rs`, `data.rs`, `collection.rs`, `cursor.rs`, `query.rs`)](99-decoding-only-what-a-read-needs.md)
 100. [Index entries that answer the filter (`query.rs`, `collection.rs`, `cursor.rs`, `index/key.rs`, `explain.rs`)](100-index-entries-that-answer-the-filter.md)
+101. [A cheaper walk through an index (`index/btree.rs`, `storage/slotted.rs`, `collection.rs`, `query.rs`)](101-a-cheaper-walk-through-an-index.md)

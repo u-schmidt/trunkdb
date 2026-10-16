@@ -283,6 +283,30 @@ impl BTreeIndex {
     }
 }
 
+impl BTreeIndex {
+    /// How many entries have keys in `range`: a leaf all inside it by
+    /// its slot directory, without looking at a key; only the leaves at
+    /// the range's ends entry by entry (SPEC §101.4).
+    pub fn count(&self, store: &dyn PageStore, range: KeyRange) -> std::io::Result<usize> {
+        let mut walk = self.walk(store, range, false);
+        let mut count = 0;
+        loop {
+            if let Some(leaf) = walk.whole_leaf()? {
+                count += leaf.entries;
+                walk.pass_leaf();
+                continue;
+            }
+            match walk.step() {
+                Some(entry) => {
+                    entry?;
+                    count += 1;
+                }
+                None => return Ok(count),
+            }
+        }
+    }
+}
+
 /// `BTreeIndex::walk`: an iterator of index entries. An I/O error ends
 /// it, after it's been handed out.
 ///
@@ -316,13 +340,13 @@ pub struct Walk<'s> {
 }
 
 impl Walk<'_> {
-    /// The next entry of the current leaf in the walk's direction and in
-    /// the range, its key copied out — `None` when the leaf is used up,
-    /// or the range is, which sets `done`. Keys before the range are
-    /// skipped (forward, before `start`; backward, from `end` on): they
-    /// can only be on the first leaf. A tombstoned slot, which a leaf
-    /// written before §52 may hold, is skipped too.
-    fn next_in_leaf(&mut self) -> Option<(Vec<u8>, RecordLocation)> {
+    /// The slot of the next entry of the current leaf in the walk's
+    /// direction and in the range — `None` when the leaf is used up, or
+    /// the range is, which sets `done`. Keys before the range are skipped
+    /// (forward, before `start`; backward, from `end` on): they can only
+    /// be on the first leaf. A tombstoned slot, which a leaf written
+    /// before §52 may hold, is skipped too.
+    fn next_in_leaf(&mut self) -> Option<u16> {
         let Walk {
             leaf,
             at,
@@ -348,7 +372,7 @@ impl Walk<'_> {
             let Some(cell) = leaf.get_cell(slot) else {
                 continue;
             };
-            let (key, loc) = decode_index_entry(cell);
+            let (key, _loc) = decode_index_entry(cell);
             if end.is_some_and(|end| key >= end) {
                 if !*backward {
                     *done = true; // every later key is past the end too
@@ -363,9 +387,89 @@ impl Walk<'_> {
                 }
                 continue;
             }
-            #[cfg(test)]
-            KEYS_COPIED.with(|n| n.set(n.get() + 1));
-            return Some((key.to_vec(), loc));
+            return Some(slot);
+        }
+    }
+
+    /// The next entry, its key lent from the leaf, not copied (SPEC
+    /// §101.1): it lives until the next step. An I/O error ends the
+    /// walk, after it's been handed out.
+    pub fn step(&mut self) -> Option<std::io::Result<(&[u8], RecordLocation)>> {
+        let slot = loop {
+            if let Some(slot) = self.next_in_leaf() {
+                break slot;
+            }
+            if self.done {
+                return None;
+            }
+            if let Err(e) = self.read_next_leaf() {
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+        let leaf = self.leaf.as_ref().expect("an entry came from it");
+        let cell = leaf.get_cell(slot).expect("a live slot");
+        Some(Ok(decode_index_entry(cell)))
+    }
+
+    /// The leaf the walk is about to enter, if all of it lies inside the
+    /// range and none of it has been handed out (SPEC §101.3): its lowest
+    /// and highest keys and how many live entries it holds. Reads that
+    /// leaf if the current one is used up. `None` anywhere else — the
+    /// first and last leaves of a range, mostly — and for an empty leaf;
+    /// `step` then goes on entry by entry.
+    pub fn whole_leaf(&mut self) -> std::io::Result<Option<WholeLeaf<'_>>> {
+        if self.done {
+            return Ok(None);
+        }
+        let used_up = |walk: &Self| match (&walk.leaf, walk.backward) {
+            (None, _) => true,
+            (Some(_), true) => walk.at == 0,
+            (Some(leaf), false) => walk.at >= leaf.slot_count(),
+        };
+        if used_up(self) {
+            if let Err(e) = self.read_next_leaf() {
+                self.done = true;
+                return Err(e);
+            }
+            if self.done {
+                return Ok(None);
+            }
+        }
+        let Some(leaf) = &self.leaf else {
+            return Ok(None);
+        };
+        let untouched = match self.backward {
+            true => self.at == leaf.slot_count(),
+            false => self.at == 0,
+        };
+        if !untouched {
+            return Ok(None);
+        }
+        let mut live = (0..leaf.slot_count()).filter_map(|slot| leaf.get_cell(slot));
+        let Some(lowest) = live.next() else {
+            return Ok(None);
+        };
+        let highest = live.next_back().unwrap_or(lowest);
+        let entries = leaf.live_cells();
+        let (lowest, _) = decode_index_entry(lowest);
+        let (highest, _) = decode_index_entry(highest);
+        let inside = lowest >= self.range.start.as_slice()
+            && self.range.end.as_deref().is_none_or(|end| highest < end);
+        Ok(inside.then_some(WholeLeaf {
+            lowest,
+            highest,
+            entries,
+        }))
+    }
+
+    /// Passes over the leaf `whole_leaf` just described, all of it.
+    pub fn pass_leaf(&mut self) {
+        if let Some(leaf) = &self.leaf {
+            self.at = match self.backward {
+                true => 0,
+                false => leaf.slot_count(),
+            };
         }
     }
 
@@ -461,20 +565,23 @@ impl Walk<'_> {
 impl Iterator for Walk<'_> {
     type Item = std::io::Result<(Vec<u8>, RecordLocation)>;
 
+    /// `step`, its key copied out (SPEC §97).
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(entry) = self.next_in_leaf() {
-                return Some(Ok(entry));
-            }
-            if self.done {
-                return None;
-            }
-            if let Err(e) = self.read_next_leaf() {
-                self.done = true;
-                return Some(Err(e));
-            }
-        }
+        let entry = self.step()?;
+        #[cfg(test)]
+        KEYS_COPIED.with(|n| n.set(n.get() + 1));
+        Some(entry.map(|(key, loc)| (key.to_vec(), loc)))
     }
+}
+
+/// A leaf all inside a walk's range, untouched (`Walk::whole_leaf`).
+pub struct WholeLeaf<'w> {
+    /// Its lowest key and its highest: every key of the leaf lies
+    /// between them.
+    pub lowest: &'w [u8],
+    pub highest: &'w [u8],
+    /// Its live entries.
+    pub entries: usize,
 }
 
 #[cfg(test)]
@@ -503,24 +610,19 @@ fn too_deep(page_id: PageId) -> std::io::Error {
 /// Reads B-tree page `page_id`, which must be a leaf or a branch whose
 /// cells are all long enough for their entries (SPEC §55): the entry
 /// decoders trust that, so a damaged page is an error here rather than a
-/// panic there.
+/// panic there. The layout check holds the cells' lengths (SPEC §101),
+/// so a page from the cache, checked as it went in, isn't checked again.
 fn read_node(store: &dyn PageStore, page_id: PageId) -> std::io::Result<SlottedPage> {
-    let page = SlottedPage::from_bytes(store.read_page(page_id)?)?;
-    let min = match page.page_type() {
-        PageType::IndexLeaf => MIN_INDEX_ENTRY_LEN,
-        PageType::IndexBranch => MIN_BRANCH_ENTRY_LEN,
-        other => return Err(corrupt_page_type(page_id, other)),
-    };
-    if let Some((slot, cell)) = page.iter_cells().find(|(_slot, cell)| cell.len() < min) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "index page {page_id} slot {slot} is {} bytes, shorter than any entry — file may be corrupt",
-                cell.len()
-            ),
-        ));
+    let page = SlottedPage::from_bytes(store.read_page(page_id)?).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("index page {page_id}: {e} — file may be corrupt"),
+        )
+    })?;
+    match page.page_type() {
+        PageType::IndexLeaf | PageType::IndexBranch => Ok(page),
+        other => Err(corrupt_page_type(page_id, other)),
     }
-    Ok(page)
 }
 
 /// Descends from `root` to the leaf that holds (or would hold) `key`.
@@ -1067,7 +1169,69 @@ mod tests {
             assert_eq!(forward, want, "{range:?}");
             assert_eq!(backward, want, "{range:?}");
             assert_eq!(index.range(&store, &range).unwrap(), want);
+            assert_eq!(index.count(&store, range.clone()).unwrap(), want.len());
+            for backward in [false, true] {
+                let (mut stepped, whole) = by_leaves(&index, &store, &range, backward);
+                if backward {
+                    stepped.reverse();
+                }
+                let stepped_in_want = stepped.iter().all(|entry| want.contains(entry));
+                assert!(stepped_in_want, "{range:?}");
+                assert_eq!(stepped.len() + whole, want.len(), "{range:?}");
+            }
         }
+    }
+
+    /// A walk that passes over every leaf it can whole (SPEC §101.3),
+    /// checking that each lies inside `range`: the entries it stepped
+    /// through, and how many it passed over.
+    fn by_leaves(
+        index: &BTreeIndex,
+        store: &FileStore,
+        range: &KeyRange,
+        backward: bool,
+    ) -> (Vec<(Vec<u8>, RecordLocation)>, usize) {
+        let mut walk = index.walk(store, range.clone(), backward);
+        let (mut stepped, mut whole) = (Vec::new(), 0);
+        loop {
+            if let Some(leaf) = walk.whole_leaf().unwrap() {
+                assert!(leaf.lowest >= range.start.as_slice());
+                assert!(range.end.as_deref().is_none_or(|end| leaf.highest < end));
+                assert!(leaf.lowest <= leaf.highest);
+                whole += leaf.entries;
+                walk.pass_leaf();
+                continue;
+            }
+            match walk.step() {
+                Some(entry) => {
+                    let (key, loc) = entry.unwrap();
+                    stepped.push((key.to_vec(), loc));
+                }
+                None => return (stepped, whole),
+            }
+        }
+    }
+
+    #[test]
+    fn a_count_looks_only_at_the_keys_of_the_leaves_at_its_ends() {
+        let (_dir, mut store, mut index) = fresh();
+        let loc = RecordLocation { page: 1, slot: 0 };
+        let key = |i: u32| format!("{i:05}{}", "x".repeat(40)).into_bytes();
+        for i in 0..5000 {
+            index.insert(&mut store, &key(i), loc).unwrap();
+        }
+        let range = KeyRange {
+            start: key(1000),
+            end: Some(key(4000)),
+        };
+        let (stepped, whole) = by_leaves(&index, &store, &range, false);
+        assert_eq!(stepped.len() + whole, 3000);
+        // Some leaves are passed whole, and of the rest at most the two
+        // at the range's ends are stepped through.
+        assert!(whole > 2000, "{whole}");
+        let per_leaf = crate::storage::USABLE_PAGE_SIZE / key(0).len();
+        assert!(stepped.len() < 2 * per_leaf, "{}", stepped.len());
+        assert_eq!(index.count(&store, range).unwrap(), 3000);
     }
 
     /// How many pages from the root to a leaf, both counted.
@@ -1483,6 +1647,9 @@ mod tests {
             .filter(|i| i % 3 != 0)
             .map(|i| key(i * 2))
             .collect();
+        // Counted whole, the tombstones are left out (SPEC §101.3).
+        let everything = KeyRange::everything();
+        assert_eq!(index.count(&store, everything).unwrap(), expected.len());
 
         for i in (0..400).map(|i| i * 2 + 1) {
             index.insert(&mut store, &key(i), loc).unwrap();

@@ -14,7 +14,7 @@ pub(super) fn encode_index_entry(key: &[u8], location: RecordLocation) -> Vec<u8
 }
 
 /// The shortest leaf cell: an empty key and the location.
-pub(super) const MIN_INDEX_ENTRY_LEN: usize = 10;
+pub(crate) const MIN_INDEX_ENTRY_LEN: usize = 10;
 
 /// Trusts `bytes` to be at least `MIN_INDEX_ENTRY_LEN` long, which
 /// `btree::read_node` checks for every cell of a page it reads.

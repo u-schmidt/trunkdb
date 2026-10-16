@@ -4,11 +4,15 @@ mod btree;
 mod in_memory;
 pub mod key;
 mod leaf;
+pub(crate) use branch::MIN_BRANCH_ENTRY_LEN;
 pub use btree::BTreeIndex;
+#[cfg(test)]
+pub(crate) use btree::KEYS_COPIED;
 pub(crate) use btree::SortedBuild;
 #[cfg(test)]
 pub use in_memory::InMemoryIndex;
 pub use key::KeyRange;
+pub(crate) use leaf::MIN_INDEX_ENTRY_LEN;
 
 use crate::storage::{PageStore, RecordLocation};
 

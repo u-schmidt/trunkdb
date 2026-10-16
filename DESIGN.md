@@ -323,7 +323,10 @@ then reads no document, a deep page only the page, and a sort by `_id`
 after an index range only what it hands out. `Exists`, `Size`,
 `ElemMatch` and multikey indexes never decide this way. Where entries
 decide, the result follows the index: `check` is what finds an index
-that disagrees with its documents.
+that disagrees with its documents. A walk decides a run of equal
+values once, and a leaf inside its range at once where its first and
+last entries agree on what the filter names: counted or skipped by its
+slot directory, its keys never looked at [§101](spec/101-a-cheaper-walk-through-an-index.md).
 
 A read decodes only what it needs [§99](spec/99-decoding-only-what-a-read-needs.md). A candidate is checked on the
 top-level fields its filter and sort name, decoded alone, every other
@@ -499,9 +502,10 @@ current table. Each gap had a measured cause, fixed one at a time:
 | First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |
+| Count of all, of 1000 by index, page 50 of 20 | 7 ms, 0.17 ms, 0.35 ms | a walk that lends its entries and decides whole leaves [§101](spec/101-a-cheaper-walk-through-an-index.md) |
 
-Still behind: a walk through an index, at about 300 ns an entry, which
-deep pages pay for every entry they skip; in a scan, the small object
+Still behind: a path looked up on every document a filter checks,
+which is most of a count over a range of all-different values; in a scan, the small object
 each document's filtered fields are decoded into, and whole 8 KB page images in the WAL for
 every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md), and a
 changed page is copied once, not twice: `write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md).

@@ -111,6 +111,25 @@ impl SlottedPage {
             }
         }
 
+        // An index page's cells are each long enough for an entry, which
+        // the entry decoders trust (SPEC §55). Checked here, with the
+        // rest of the layout, so a page the cache marked isn't checked
+        // again on every step of a walk (SPEC §101).
+        let min_cell = match page_type {
+            PageType::IndexLeaf => crate::index::MIN_INDEX_ENTRY_LEN,
+            PageType::IndexBranch => crate::index::MIN_BRANCH_ENTRY_LEN,
+            _ => 0,
+        };
+        for slot in 0..slot_count {
+            let length = field(Self::slot_offset(slot) + 2) as usize;
+            if length != 0 && length < min_cell {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("slot {slot} is {length} bytes, shorter than any entry"),
+                ));
+            }
+        }
+
         // The cells start inside the page. Found by fuzzing (SPEC §55):
         // with no live slot, the loop above has no cell to catch a
         // data_start past the end, and the next insert wrote there.
@@ -357,6 +376,14 @@ impl SlottedPage {
     /// Whether every slot is tombstoned (or there are none).
     pub fn is_empty(&self) -> bool {
         self.iter_cells().next().is_none()
+    }
+
+    /// How many slots hold a cell, tombstones left out: read from the
+    /// slot directory alone (SPEC §101.3).
+    pub fn live_cells(&self) -> usize {
+        let directory = &self.buf[HEADER_LEN..Self::slot_offset(self.slot_count())];
+        let (slots, _) = directory.as_chunks::<SLOT_LEN>();
+        slots.iter().filter(|slot| slot[2..4] != [0, 0]).count()
     }
 
     pub fn get_cell(&self, slot: u16) -> Option<&[u8]> {

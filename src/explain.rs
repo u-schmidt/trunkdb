@@ -393,9 +393,10 @@ mod tests {
             ("age", false)
         );
         assert!(run.reads[0].bounds.is_empty());
-        // Ages 0, 1 and 2: three groups of two, and the entry that ends
-        // the third.
-        assert_eq!(run.stats.keys_examined, 7);
+        // Ages 0, 1 and 2, two each: ties come in id order, so each entry
+        // is handed out as it's walked, and the walk stops at the fifth
+        // (SPEC §101.5).
+        assert_eq!(run.stats.keys_examined, 5);
         assert_eq!(counts(&run), (5, 5, 5));
 
         let f = Filter::new().gte("age", 45).sort_desc("age").limit(3);
