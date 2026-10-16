@@ -23,7 +23,8 @@ one is used up. An I/O error ends it after it's handed out.
 - A leaf left **empty** by removals (§10: leaves aren't merged) is
   skipped either way.
 - Each leaf's entries in the range are copied out, so a `Walk` borrows
-  only the store and holds no page past its leaf.
+  only the store and holds no page past its leaf. (Since §97 it holds
+  its current leaf and copies an entry only to hand it out.)
 
 `range` is now the forward walk collected, so the eager callers
 (`candidate_entries`, `check`, `compact`, ...) keep their `Vec` and
@@ -123,4 +124,5 @@ checksum and an allocation without a page cache (§48.4).
   a sort is still collected whole (`candidate_entries`), since every
   document in it is read anyway. A cursor still starts from that list.
 - **Each leaf's entries are copied** before they're handed out, which
-  costs an allocation per key.
+  costs an allocation per key. (Since §97, only the entries handed out
+  are.)

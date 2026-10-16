@@ -235,8 +235,8 @@ documents:
 | one commit | 4.6 ms | 4.6 ms | 4.8 ms | 9.5 ms |
 | get by id | 3.9 µs | 4.4 µs | 1.8 µs | 2.2 µs |
 | 1000 documents by index | 2.4 ms | 1.7 ms | 1.0 ms | 2.4 ms |
-| oldest 20 of a status | 47 µs | 23 µs | 22 µs | 20 µs |
-| first 50 by id | 80 µs | 36 µs | 25 µs | 29 µs |
+| oldest 20 of a status | 40 µs | 23 µs | 22 µs | 20 µs |
+| first 50 by id | 70 µs | 36 µs | 25 µs | 29 µs |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
 Each gap has a known cause (SPEC §48, in [spec/](spec/README.md)), and the first four are
@@ -546,7 +546,12 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     of 100,000 by id: 80 µs, where it read and sorted them all in
     189 ms.
 
-    Items 60–66: not released yet. File format 12, which still opens
+67. **A walk that copies only what it hands out** (§97): reading an
+    index in order no longer copies every key of a leaf before handing
+    out the first. A sorted `find` with `limit(1)` takes 3 µs instead of
+    18; the first 50 by id 70 µs instead of 82.
+
+    Items 60–67: not released yet. File format 12, which still opens
     6–11 holding only objects; 0.19.0 refuses a file this build has
     opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with
