@@ -824,6 +824,7 @@ impl Collection<Document> {
             count
         } else {
             let names = filter.fields_with(false);
+            let matcher = filter.matcher();
             read_candidates(
                 at.catalog,
                 &at.store,
@@ -834,7 +835,7 @@ impl Collection<Document> {
                 &trace,
             )?
             .iter()
-            .filter(|(source, fields)| source.decided() || filter.matches(fields))
+            .filter(|(source, fields)| source.decided() || matcher.matches(fields))
             .count()
         };
         let count = count.saturating_sub(filter.skip);
@@ -921,6 +922,7 @@ impl Collection<Document> {
         self.db.transact(|catalog, store| {
             let names = filter.fields_with(false);
             let trace = Trace::default();
+            let matcher = filter.matcher();
             let matches: Vec<DocId> = read_candidates(
                 catalog,
                 store,
@@ -931,7 +933,7 @@ impl Collection<Document> {
                 &trace,
             )?
             .into_iter()
-            .filter(|(source, fields)| source.decided() || filter.matches(fields))
+            .filter(|(source, fields)| source.decided() || matcher.matches(fields))
             .map(|(source, _fields)| source.id())
             .collect();
             let (op, outcome) = match matches[..] {
@@ -1045,6 +1047,7 @@ fn find_in(
         false => filter.fields(),
     };
     let sort = !filter.sort.is_empty();
+    let matcher = filter.matcher();
     let mut matches: Vec<Candidate> = read_candidates(
         catalog,
         store,
@@ -1055,7 +1058,7 @@ fn find_in(
         trace,
     )?
     .into_iter()
-    .filter(|(source, fields)| source.decided() || filter.matches(fields))
+    .filter(|(source, fields)| source.decided() || matcher.matches(fields))
     .collect();
     trace.matched(matches.len());
     if sort {
@@ -1351,6 +1354,7 @@ fn walk_in_index_order(
     if decider.is_some() {
         trace.covering(walk);
     }
+    let matcher = filter.matcher();
     let mut records = data::Records::new(store);
     let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
         trace.examined();
@@ -1372,7 +1376,7 @@ fn walk_in_index_order(
             Some(true) => (Source::Entry(key::doc_id(key), loc), Document::Null),
             None => read(&loc)?,
         };
-        if !source.decided() && !filter.matches(&doc) {
+        if !source.decided() && !matcher.matches(&doc) {
             return Ok(false);
         }
         trace.matched(1);
@@ -1502,7 +1506,7 @@ fn walk_in_index_order(
         for (_key, loc) in primary {
             let (id, doc) = read(&loc)?;
             let value = crate::query::value_or_null(&doc, &first.field);
-            if crate::query::is_unordered(value) && filter.matches(&doc) {
+            if crate::query::is_unordered(value) && matcher.matches(&doc) {
                 trace.matched(1);
                 unordered.push((id, doc));
                 // Without keys after the first, id order is their order.
@@ -1730,7 +1734,7 @@ fn read_candidates(
     let (entries, indexed) = candidate_entries(catalog, store, collection, filter, trace)?;
     let mut decides = indexed.covering(filter, false).map(|c| c.decider(filter));
     let orders = match sort {
-        true => indexed.covering(filter, true),
+        true => indexed.covering(filter, true).map(|c| c.for_sort(filter)),
         false => None,
     };
     let mut records = data::Records::new(store);
@@ -1800,6 +1804,7 @@ fn count_in(
         return Ok(None);
     };
     let mut decider = covering.decider(filter);
+    let matcher = filter.matcher();
     let names = filter.fields_with(false);
     let mut records = data::Records::new(store);
     let mut walk = BTreeIndex::new(root).walk(store, range, false);
@@ -1821,7 +1826,7 @@ fn count_in(
             Some(decided) => decided,
             None => {
                 let fields = records.stored(loc)?.fields(names.as_deref())?;
-                filter.matches(&fields)
+                matcher.matches(&fields)
             }
         };
         count += usize::from(matches);

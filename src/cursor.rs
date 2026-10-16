@@ -105,6 +105,7 @@ impl<T> Iterator for Cursor<T> {
                 }
                 // Checked on the fields the filter names (SPEC §99.2).
                 let names = filter.fields();
+                let matcher = filter.matcher();
                 for (loc, decided) in candidates.by_ref() {
                     if decided && *skipping > 0 {
                         *skipping -= 1;
@@ -115,7 +116,7 @@ impl<T> Iterator for Cursor<T> {
                             return Ok((stored, true));
                         }
                         let fields = stored.fields(names.as_deref())?;
-                        Ok((stored, filter.matches(&fields)))
+                        Ok((stored, matcher.matches(&fields)))
                     });
                     match candidate {
                         Err(e) => return Some(Err(e)),

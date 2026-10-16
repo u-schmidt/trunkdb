@@ -503,9 +503,10 @@ current table. Each gap had a measured cause, fixed one at a time:
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |
 | Count of all, of 1000 by index, page 50 of 20 | 7 ms, 0.17 ms, 0.35 ms | a walk that lends its entries and decides whole leaves [§101](spec/101-a-cheaper-walk-through-an-index.md) |
+| Count of a range, tenant's first 20 by id | 0.14 ms, 0.6 ms | paths parsed once per query, small objects searched without hashing, sort keys looked up once [§102](spec/102-paths-resolved-once-per-query.md) |
 
-Still behind: a path looked up on every document a filter checks,
-which is most of a count over a range of all-different values; in a scan, the small object
+Still behind: an index entry's values decoded to be checked, which is
+most of a count over a range of all-different values; in a scan, the small object
 each document's filtered fields are decoded into, and whole 8 KB page images in the WAL for
 every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md), and a
 changed page is copied once, not twice: `write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md).

@@ -2,6 +2,7 @@ use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
 pub use crate::explain::{ExecutionStats, Explained, IndexRead, SortWork};
 use crate::index::{KeyRange, key};
+use crate::path::Path;
 pub use crate::update::Update;
 
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
@@ -174,20 +175,7 @@ impl Condition {
     }
 
     pub fn matches(&self, doc: &Document) -> bool {
-        match self {
-            Condition::Compare { field, op, value } => compare_matches(field, op, value, doc),
-            Condition::Exists { field } => !present_at(doc, field).is_empty(),
-            Condition::Size { field, op, size } => size_matches(field, op, *size, doc),
-            Condition::ElemMatch { field, condition } => {
-                values_at(doc, field).into_iter().any(|value| match value {
-                    Document::Array(elements) => elements.iter().any(|e| condition.matches(e)),
-                    _ => false,
-                })
-            }
-            Condition::All(conditions) => conditions.iter().all(|c| c.matches(doc)),
-            Condition::Any(conditions) => conditions.iter().any(|c| c.matches(doc)),
-            Condition::Not(condition) => !condition.matches(doc),
-        }
+        Matcher::of(self).matches(doc)
     }
 }
 
@@ -437,7 +425,13 @@ impl Filter {
 
 impl Filter {
     pub fn matches(&self, doc: &Document) -> bool {
-        self.conditions.iter().all(|c| c.matches(doc))
+        self.matcher().matches(doc)
+    }
+
+    /// The conditions with their paths parsed, to check document after
+    /// document (SPEC §102.2).
+    pub(crate) fn matcher(&self) -> Matcher<'_> {
+        Matcher::All(self.conditions.iter().map(Matcher::of).collect())
     }
 
     /// The top-level fields whose values decide whether a document
@@ -548,9 +542,10 @@ impl Filter {
         items: impl IntoIterator<Item = T>,
         doc_of: impl Fn(&T) -> &Document,
     ) -> Vec<T> {
+        let matcher = self.matcher();
         let results: Vec<T> = items
             .into_iter()
-            .filter(|item| self.matches(doc_of(item)))
+            .filter(|item| matcher.matches(doc_of(item)))
             .collect();
         self.arrange(results, doc_of)
     }
@@ -562,17 +557,36 @@ impl Filter {
         mut results: Vec<T>,
         doc_of: impl Fn(&T) -> &Document,
     ) -> Vec<T> {
-        if !self.sort.is_empty() {
+        if self.sort.is_empty() {
+            results.drain(..self.skip.min(results.len()));
+            if let Some(limit) = self.limit {
+                results.truncate(limit);
+            }
+            return results;
+        }
+        // Each item's sort values looked up once, not on every comparison
+        // (SPEC §102.5): `k` per item, side by side.
+        let paths: Vec<Path> = self.sort.iter().map(|key| Path::new(&key.field)).collect();
+        let k = paths.len();
+        let mut order: Vec<usize> = (0..results.len()).collect();
+        {
+            let values: Vec<&Document> = (results.iter())
+                .flat_map(|item| paths.iter().map(|path| path.value_or_null(doc_of(item))))
+                .collect();
+            let of = |i: usize| &values[i * k..(i + 1) * k];
             // Stable: equal in every key, they keep the order they came in.
-            results.sort_by(|a, b| compare_by(&self.sort, doc_of(a), doc_of(b)));
+            order.sort_by(|&a, &b| compare_values(&self.sort, of(a), of(b)));
         }
-
-        results.drain(..self.skip.min(results.len()));
-        if let Some(limit) = self.limit {
-            results.truncate(limit);
-        }
-
-        results
+        let end = match self.limit {
+            Some(limit) => self.skip.saturating_add(limit),
+            None => order.len(),
+        };
+        let wanted = &order[self.skip.min(order.len())..end.min(order.len())];
+        let mut items: Vec<Option<T>> = results.into_iter().map(Some).collect();
+        wanted
+            .iter()
+            .map(|&i| items[i].take().expect("each item once"))
+            .collect()
     }
 }
 
@@ -1168,6 +1182,9 @@ pub(crate) struct Covering<'a> {
     /// Whether it names `_id`: without, the entry's document goes
     /// without, and a filter that names nothing decides with no work.
     id: bool,
+    /// The named fields' paths, parsed (SPEC §102.4); `None` for the
+    /// others.
+    paths: Vec<Option<Path<'a>>>,
 }
 
 impl<'a> Covering<'a> {
@@ -1197,7 +1214,28 @@ impl<'a> Covering<'a> {
         if sort {
             id |= filter.sort.iter().any(|key| key.field == ID_FIELD);
         }
-        Some(Covering { fields, named, id })
+        Some(Covering::naming(fields, named, id))
+    }
+
+    fn naming(fields: &'a [String], named: Vec<bool>, id: bool) -> Self {
+        let paths = (fields.iter().zip(&named))
+            .map(|(field, named)| named.then(|| Path::new(field)))
+            .collect();
+        Covering {
+            fields,
+            named,
+            id,
+            paths,
+        }
+    }
+
+    /// The same read, its entries' documents holding only what `filter`'s
+    /// sort names (SPEC §102.4): for matches the entries decided already,
+    /// kept for a sort in memory, which reads nothing else.
+    pub fn for_sort(self, filter: &Filter) -> Self {
+        let sorts_by = |field: &str| filter.sort.iter().any(|key| key.field == field);
+        let named = self.fields.iter().map(|field| sorts_by(field)).collect();
+        Covering::naming(self.fields, named, sorts_by(ID_FIELD))
     }
 
     /// The document `key` tells of: the named fields' values at their
@@ -1210,12 +1248,13 @@ impl<'a> Covering<'a> {
         Some(doc)
     }
 
-    /// Whether the document `key` tells of matches `filter` — `None`
-    /// where the entry can't tell (`entry`). `scratch` is filled in
-    /// place, so deciding entry after entry allocates next to nothing.
-    pub fn decide(&self, key: &[u8], filter: &Filter, scratch: &mut Document) -> Option<bool> {
+    /// Whether the document `key` tells of matches the filter `matcher`
+    /// was compiled from — `None` where the entry can't tell (`entry`).
+    /// `scratch` is filled in place, so deciding entry after entry
+    /// allocates next to nothing.
+    pub fn decide(&self, key: &[u8], matcher: &Matcher, scratch: &mut Document) -> Option<bool> {
         self.fill(key, scratch)?;
-        Some(filter.matches(scratch))
+        Some(matcher.matches(scratch))
     }
 
     /// `entry` into `doc`, an object, its slots reused.
@@ -1225,23 +1264,16 @@ impl<'a> Covering<'a> {
             return self.fill(key, doc);
         };
         if self.id {
-            let id = Document::Id(key::doc_id(key));
-            match map.get_mut(ID_FIELD) {
-                Some(slot) => *slot = id,
-                None => {
-                    map.insert(ID_FIELD.to_string(), id);
-                }
-            }
+            *crate::path::get_or_insert(map, ID_FIELD) = Document::Id(key::doc_id(key));
         }
         if !self.named.contains(&true) {
             return Some(());
         }
         let mut parts = key::each_part(key::value_part(key));
-        for (field, named) in self.fields.iter().zip(&self.named) {
+        for path in &self.paths {
             let part = parts.next()?;
-            if *named {
-                let slot = slot(map, field);
-                key::decode_part_into(part, self.fields.len(), slot)?;
+            if let Some(path) = path {
+                key::decode_part_into(part, self.fields.len(), path.slot(map))?;
             }
         }
         // A damaged key with more values than the index has fields.
@@ -1270,7 +1302,7 @@ impl<'a> Covering<'a> {
     pub fn decider(self, filter: &'a Filter) -> Decider<'a> {
         Decider {
             covering: self,
-            filter,
+            matcher: filter.matcher(),
             scratch: Document::Null,
             last: Vec::new(),
             decided: None,
@@ -1284,7 +1316,7 @@ impl<'a> Covering<'a> {
 /// checked. For `tenant == x` that's one decision for the whole range.
 pub(crate) struct Decider<'a> {
     covering: Covering<'a>,
-    filter: &'a Filter,
+    matcher: Matcher<'a>,
     scratch: Document,
     /// The deciding bytes of the last entry decided, and how — `None`
     /// where it couldn't be, or its bytes don't count (`deciding_len`).
@@ -1304,7 +1336,7 @@ impl Decider<'_> {
         }
         #[cfg(test)]
         DECISIONS.with(|n| n.set(n.get() + 1));
-        let decided = self.covering.decide(key, self.filter, &mut self.scratch);
+        let decided = self.covering.decide(key, &self.matcher, &mut self.scratch);
         self.decided = len.and(decided);
         if let (Some(len), Some(_)) = (len, self.decided) {
             self.last.clear();
@@ -1344,36 +1376,6 @@ fn names_id(condition: &Condition) -> bool {
     }
 }
 
-/// The value at `path` in `doc`, made if missing, with the objects on the
-/// way: a path inside another named one is ruled out (`Covering::new`),
-/// so whatever is on the way is an object made here.
-fn slot<'d>(doc: &'d mut indexmap::IndexMap<String, Document>, path: &str) -> &'d mut Document {
-    let (name, rest) = match path.split_once('.') {
-        Some((name, rest)) => (name, Some(rest)),
-        None => (path, None),
-    };
-    if !doc.contains_key(name) {
-        let empty = match rest {
-            Some(_) => Document::Object(indexmap::IndexMap::new()),
-            None => Document::Null,
-        };
-        doc.insert(name.to_string(), empty);
-    }
-    let value = doc.get_mut(name).expect("just made");
-    match rest {
-        None => value,
-        Some(rest) => {
-            if !matches!(value, Document::Object(_)) {
-                *value = Document::Object(indexmap::IndexMap::new());
-            }
-            match value {
-                Document::Object(inner) => slot(inner, rest),
-                _ => unreachable!("just made an object"),
-            }
-        }
-    }
-}
-
 /// The value at `path` in `doc` (SPEC §31): a field name, or several
 /// joined by dots — `address.city` is the `city` field of the object in
 /// the `address` field. `None` if a step is missing or isn't an object;
@@ -1381,13 +1383,7 @@ fn slot<'d>(doc: &'d mut indexmap::IndexMap<String, Document>, path: &str) -> &'
 /// itself contains a dot can't be reached by a path. The empty path is
 /// `doc` itself — an element, in `Condition::elem_match` (SPEC §46.1).
 pub(crate) fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Document> {
-    if path.is_empty() {
-        return Some(doc);
-    }
-    path.split('.').try_fold(doc, |value, name| match value {
-        Document::Object(map) => map.get(name),
-        _ => None,
-    })
+    Path::new(path).field_value(doc)
 }
 
 /// The value a condition or sort sees at `path`: a missing field reads
@@ -1414,53 +1410,115 @@ pub(crate) fn is_multi(path: &str) -> bool {
 /// - a path that is empty or starts with `[*]` starts at `doc` itself,
 ///   for an element in `Condition::elem_match` (SPEC §46.1).
 pub(crate) fn values_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> {
-    walk(doc, path, true)
+    Path::new(path).values(doc)
 }
 
-/// The values actually stored at `path` in `doc` (SPEC §45.1): like
-/// `values_at`, but a missing field — or a step into something that isn't
-/// an object — gives nothing instead of a null.
-fn present_at<'a>(doc: &'a Document, path: &str) -> Vec<&'a Document> {
-    walk(doc, path, false)
+/// A filter's conditions with their paths parsed once (SPEC §102.2):
+/// built when a read starts (`Filter::matcher`), then asked about every
+/// document, as `Condition::matches` would be.
+pub(crate) enum Matcher<'f> {
+    /// A comparison on a path with `[*]` holds if it holds for any value
+    /// there (SPEC §42.1) — except `Ne`, which stays what it is
+    /// everywhere: `Eq` negated. So `tags[*] != "x"` means no tag is
+    /// `"x"`. `needle`: a `Contains` string's value, case-folded once.
+    Compare {
+        path: Path<'f>,
+        op: &'f Op,
+        value: &'f Document,
+        needle: Option<String>,
+    },
+    Exists(Path<'f>),
+    Size {
+        path: Path<'f>,
+        op: &'f Op,
+        size: Document,
+    },
+    ElemMatch {
+        path: Path<'f>,
+        condition: Box<Matcher<'f>>,
+    },
+    All(Vec<Matcher<'f>>),
+    Any(Vec<Matcher<'f>>),
+    Not(Box<Matcher<'f>>),
 }
 
-/// `values_at`, or with `missing_is_null` false `present_at`.
-fn walk<'a>(doc: &'a Document, path: &str, missing_is_null: bool) -> Vec<&'a Document> {
-    let missing = missing_is_null.then_some(&Document::Null);
-    let mut values = vec![doc];
-    for (i, step) in path.split('.').enumerate() {
-        let name = step.trim_end_matches("[*]");
-        let fan_outs = (step.len() - name.len()) / 3;
-        if i > 0 || !name.is_empty() {
-            values = values
-                .into_iter()
-                .filter_map(|value| match value {
-                    Document::Object(map) => map.get(name).or(missing),
-                    _ => missing,
-                })
-                .collect();
-        }
-        for _ in 0..fan_outs {
-            values = values
-                .into_iter()
-                .flat_map(|value| match value {
-                    Document::Array(elements) => elements.iter().collect(),
-                    _ => Vec::new(),
-                })
-                .collect();
+impl<'f> Matcher<'f> {
+    pub fn of(condition: &'f Condition) -> Self {
+        match condition {
+            Condition::Compare { field, op, value } => Matcher::Compare {
+                path: Path::new(field),
+                op,
+                value,
+                needle: match (op, value) {
+                    (Op::Contains, Document::String(needle)) => Some(fold_case(needle)),
+                    _ => None,
+                },
+            },
+            Condition::Exists { field } => Matcher::Exists(Path::new(field)),
+            Condition::Size { field, op, size } => Matcher::Size {
+                path: Path::new(field),
+                op,
+                size: Document::Int(*size as i64),
+            },
+            Condition::ElemMatch { field, condition } => Matcher::ElemMatch {
+                path: Path::new(field),
+                condition: Box::new(Matcher::of(condition)),
+            },
+            Condition::All(conditions) => {
+                Matcher::All(conditions.iter().map(Matcher::of).collect())
+            }
+            Condition::Any(conditions) => {
+                Matcher::Any(conditions.iter().map(Matcher::of).collect())
+            }
+            Condition::Not(condition) => Matcher::Not(Box::new(Matcher::of(condition))),
         }
     }
-    values
-}
 
-/// A comparison on a path with `[*]` holds if it holds for any value
-/// there (SPEC §42.1) — except `Ne`, which stays what it is everywhere:
-/// `Eq` negated. So `tags[*] != "x"` means no tag is `"x"`.
-fn compare_matches(field: &str, op: &Op, value: &Document, doc: &Document) -> bool {
-    if is_multi(field) {
-        return any_matches(op, value, values_at(doc, field));
+    pub fn matches(&self, doc: &Document) -> bool {
+        match self {
+            Matcher::Compare {
+                path,
+                op,
+                value,
+                needle,
+            } => {
+                let holds = |v: &Document| match (op, needle) {
+                    (Op::Contains, Some(needle)) => {
+                        matches!(v, Document::String(haystack) if fold_case(haystack).contains(needle.as_str()))
+                    }
+                    _ => value_matches(op, v, value),
+                };
+                match (path.is_multi(), op) {
+                    (false, _) => holds(path.value_or_null(doc)),
+                    (true, Op::Ne) => {
+                        !(path.values(doc).into_iter()).any(|v| value_matches(&Op::Eq, v, value))
+                    }
+                    (true, _) => path.values(doc).into_iter().any(holds),
+                }
+            }
+            Matcher::Exists(path) => !path.present(doc).is_empty(),
+            // The lengths of the arrays at the path — none if it isn't
+            // one; with `[*]`, one per element that is one (SPEC §45.2).
+            Matcher::Size { path, op, size } => {
+                let lengths: Vec<Document> = (path.values(doc).into_iter())
+                    .filter_map(|value| match value {
+                        Document::Array(elements) => Some(Document::Int(elements.len() as i64)),
+                        _ => None,
+                    })
+                    .collect();
+                any_matches(op, size, &lengths)
+            }
+            Matcher::ElemMatch { path, condition } => {
+                path.values(doc).into_iter().any(|value| match value {
+                    Document::Array(elements) => elements.iter().any(|e| condition.matches(e)),
+                    _ => false,
+                })
+            }
+            Matcher::All(matchers) => matchers.iter().all(|m| m.matches(doc)),
+            Matcher::Any(matchers) => matchers.iter().any(|m| m.matches(doc)),
+            Matcher::Not(matcher) => !matcher.matches(doc),
+        }
     }
-    value_matches(op, value_or_null(doc, field), value)
 }
 
 /// `op` against `value` for any of `values` — `Ne` for none being equal.
@@ -1474,20 +1532,6 @@ fn any_matches<'a>(
         Op::Ne => !values.any(|v| value_matches(&Op::Eq, v, value)),
         op => values.any(|v| value_matches(op, v, value)),
     }
-}
-
-/// `Condition::Size` (SPEC §45.2): the lengths of the arrays at `field`
-/// — none if it isn't one; on a path with `[*]`, one per element that
-/// is one — compared as `compare_matches` compares values.
-fn size_matches(field: &str, op: &Op, size: usize, doc: &Document) -> bool {
-    let lengths: Vec<Document> = values_at(doc, field)
-        .into_iter()
-        .filter_map(|value| match value {
-            Document::Array(elements) => Some(Document::Int(elements.len() as i64)),
-            _ => None,
-        })
-        .collect();
-    any_matches(op, &Document::Int(size as i64), &lengths)
 }
 
 /// `field_value op value`, for one value.
@@ -1599,6 +1643,17 @@ pub(crate) fn is_unordered(value: &Document) -> bool {
     sort_rank(value) == UNORDERED
 }
 
+/// `a` against `b` by the sort `keys` — by the first, where that's
+/// equal by the second, and so on (SPEC §47) — on values looked up
+/// already (SPEC §102.5): `a` and `b` hold each item's value for each
+/// key, in order.
+fn compare_values(keys: &[Sort], a: &[&Document], b: &[&Document]) -> std::cmp::Ordering {
+    (keys.iter().zip(a.iter().zip(b)))
+        .map(|(key, (a, b))| sort_order(a, b, key.order))
+        .find(|ord| ord.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
 /// The order a sort puts two field values in (SPEC §34.1) — a total
 /// order, so any sort is well-defined: null (and missing) before bools
 /// before numbers before strings before ids (SPEC §62) before date-times
@@ -1606,18 +1661,6 @@ pub(crate) fn is_unordered(value: &Document) -> bool {
 /// values nothing orders come after all of them in both directions, as
 /// equals. It is the order of an index's keys, so reading an index gives
 /// what sorting in memory gives.
-/// `a` against `b` by the sort `keys` — by the first, where that's
-/// equal by the second, and so on (SPEC §47).
-pub(crate) fn compare_by(keys: &[Sort], a: &Document, b: &Document) -> std::cmp::Ordering {
-    keys.iter()
-        .map(|key| {
-            let (a, b) = (value_or_null(a, &key.field), value_or_null(b, &key.field));
-            sort_order(a, b, key.order)
-        })
-        .find(|ord| ord.is_ne())
-        .unwrap_or(std::cmp::Ordering::Equal)
-}
-
 pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::cmp::Ordering {
     let (rank_a, rank_b) = (sort_rank(a), sort_rank(b));
     if rank_a == UNORDERED || rank_b == UNORDERED {
@@ -1636,6 +1679,353 @@ pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::c
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    /// Paths, matching and sorting as they were before SPEC §102: each
+    /// path taken apart on every call, every step hashed, every sort key
+    /// looked up on every comparison. The reference §102 is checked
+    /// against.
+    mod before_102 {
+        use super::super::{Condition, Document, Sort, any_matches, sort_order, value_matches};
+
+        pub fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Document> {
+            if path.is_empty() {
+                return Some(doc);
+            }
+            path.split('.').try_fold(doc, |value, name| match value {
+                Document::Object(map) => map.get(name),
+                _ => None,
+            })
+        }
+
+        pub fn value_or_null<'a>(doc: &'a Document, path: &str) -> &'a Document {
+            field_value(doc, path).unwrap_or(&Document::Null)
+        }
+
+        pub fn walk<'a>(doc: &'a Document, path: &str, missing_is_null: bool) -> Vec<&'a Document> {
+            let missing = missing_is_null.then_some(&Document::Null);
+            let mut values = vec![doc];
+            for (i, step) in path.split('.').enumerate() {
+                let name = step.trim_end_matches("[*]");
+                let fan_outs = (step.len() - name.len()) / 3;
+                if i > 0 || !name.is_empty() {
+                    values = values
+                        .into_iter()
+                        .filter_map(|value| match value {
+                            Document::Object(map) => map.get(name).or(missing),
+                            _ => missing,
+                        })
+                        .collect();
+                }
+                for _ in 0..fan_outs {
+                    values = values
+                        .into_iter()
+                        .flat_map(|value| match value {
+                            Document::Array(elements) => elements.iter().collect(),
+                            _ => Vec::new(),
+                        })
+                        .collect();
+                }
+            }
+            values
+        }
+
+        pub fn matches(condition: &Condition, doc: &Document) -> bool {
+            match condition {
+                Condition::Compare { field, op, value } => {
+                    if field.contains("[*]") {
+                        return any_matches(op, value, walk(doc, field, true));
+                    }
+                    value_matches(op, value_or_null(doc, field), value)
+                }
+                Condition::Exists { field } => !walk(doc, field, false).is_empty(),
+                Condition::Size { field, op, size } => {
+                    let lengths: Vec<Document> = walk(doc, field, true)
+                        .into_iter()
+                        .filter_map(|value| match value {
+                            Document::Array(elements) => Some(Document::Int(elements.len() as i64)),
+                            _ => None,
+                        })
+                        .collect();
+                    any_matches(op, &Document::Int(*size as i64), &lengths)
+                }
+                Condition::ElemMatch { field, condition } => {
+                    walk(doc, field, true).into_iter().any(|value| match value {
+                        Document::Array(elements) => elements.iter().any(|e| matches(condition, e)),
+                        _ => false,
+                    })
+                }
+                Condition::All(conditions) => conditions.iter().all(|c| matches(c, doc)),
+                Condition::Any(conditions) => conditions.iter().any(|c| matches(c, doc)),
+                Condition::Not(condition) => !matches(condition, doc),
+            }
+        }
+
+        pub fn compare_by(keys: &[Sort], a: &Document, b: &Document) -> std::cmp::Ordering {
+            keys.iter()
+                .map(|key| {
+                    let (a, b) = (value_or_null(a, &key.field), value_or_null(b, &key.field));
+                    sort_order(a, b, key.order)
+                })
+                .find(|ord| ord.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+
+    /// Names from a few letters, the empty one, and ones holding a dot or
+    /// `[*]`, which a path can't reach or reads as a step's end.
+    const NAMES: [&str; 8] = ["a", "b", "c", "", "a.b", "[*]", "a[*]", "b[*]x"];
+
+    fn random_doc(rng: &mut crate::testing::XorShift, depth: usize) -> Document {
+        match rng.below(if depth == 0 { 4 } else { 7 }) {
+            0 => Document::Int(rng.below(5) as i64 - 2),
+            1 => Document::String(["", "a", "Straße", "STRASSE x"][rng.below(4)].to_string()),
+            2 => Document::Null,
+            3 => Document::Float(f64::NAN),
+            4 => Document::Array(
+                (0..rng.below(4))
+                    .map(|_| random_doc(rng, depth - 1))
+                    .collect(),
+            ),
+            _ => Document::Object(
+                (0..rng.below(12))
+                    .map(|_| {
+                        let name = NAMES[rng.below(NAMES.len())].to_string();
+                        (name, random_doc(rng, depth - 1))
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn random_path(rng: &mut crate::testing::XorShift) -> String {
+        let steps = ["a", "b", "c", "", "[*]", "a[*]", "b[*][*]", "c[*]x", "a.b"];
+        (0..rng.below(4))
+            .map(|_| steps[rng.below(steps.len())])
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn random_condition(rng: &mut crate::testing::XorShift, depth: usize) -> Condition {
+        let ops = [
+            Op::Eq,
+            Op::Ne,
+            Op::Lt,
+            Op::Lte,
+            Op::Gt,
+            Op::Gte,
+            Op::Contains,
+        ];
+        let op = ops[rng.below(ops.len())].clone();
+        if depth == 0 || rng.below(3) == 0 {
+            let field = random_path(rng);
+            return match rng.below(8) {
+                0 => Condition::Exists { field },
+                1 => Condition::Size {
+                    field,
+                    op,
+                    size: rng.below(3),
+                },
+                2 => Condition::ElemMatch {
+                    field,
+                    condition: Box::new(random_condition(rng, depth.saturating_sub(1))),
+                },
+                _ => Condition::Compare {
+                    field,
+                    op,
+                    value: random_doc(rng, 0),
+                },
+            };
+        }
+        let children = (0..rng.below(4))
+            .map(|_| random_condition(rng, depth - 1))
+            .collect();
+        match rng.below(3) {
+            0 => Condition::All(children),
+            1 => Condition::Any(children),
+            _ => !random_condition(rng, depth - 1),
+        }
+    }
+
+    /// SPEC §102.1: a parsed path finds what taking it apart on every
+    /// call found, on documents with names a path can't reach.
+    #[test]
+    fn a_parsed_path_finds_what_the_string_did() {
+        let mut rng = crate::testing::XorShift(0x0102_9A74_0102_9A74);
+        let fixed = [
+            "", ".", "..", "[*]", "a", "a.", ".a", "a[*]", "a[*][*]", "a[*]b", "a.b[*]",
+        ];
+        for i in 0..4000 {
+            let doc = random_doc(&mut rng, 4);
+            let path = match fixed.get(i % 40) {
+                Some(path) => path.to_string(),
+                None => random_path(&mut rng),
+            };
+            let parsed = crate::path::Path::new(&path);
+            // The same values in the document, not equal ones: NaN isn't.
+            // A null by value, as a missing field reads as a constant one.
+            let at = |value: &Document| match value {
+                Document::Null => std::ptr::null(),
+                value => value as *const Document,
+            };
+            let all = |values: Vec<&Document>| values.into_iter().map(at).collect::<Vec<_>>();
+            assert_eq!(
+                parsed.field_value(&doc).map(at),
+                before_102::field_value(&doc, &path).map(at),
+                "{path:?} in {doc}"
+            );
+            let (values, present) = (parsed.values(&doc), parsed.present(&doc));
+            assert_eq!(
+                all(values),
+                all(before_102::walk(&doc, &path, true)),
+                "{path:?}"
+            );
+            assert_eq!(
+                all(present),
+                all(before_102::walk(&doc, &path, false)),
+                "{path:?}"
+            );
+            assert_eq!(parsed.is_multi(), path.contains("[*]"), "{path:?}");
+        }
+    }
+
+    /// SPEC §102.2: a compiled condition answers as the condition did,
+    /// on every kind of condition, nested, and on paths of every shape.
+    #[test]
+    fn a_matcher_answers_as_the_conditions_did() {
+        let mut rng = crate::testing::XorShift(0x0102_3A7C_0102_3A7C);
+        let (mut held, mut checked) = (0, 0);
+        for _ in 0..4000 {
+            let condition = random_condition(&mut rng, 3);
+            let matcher = Matcher::of(&condition);
+            for _ in 0..5 {
+                let doc = random_doc(&mut rng, 4);
+                let expected = before_102::matches(&condition, &doc);
+                assert_eq!(matcher.matches(&doc), expected, "{condition:?} on {doc}");
+                assert_eq!(condition.matches(&doc), expected, "{condition:?} on {doc}");
+                held += usize::from(expected);
+                checked += 1;
+            }
+        }
+        // Both answers, plenty of each.
+        assert!(
+            held > checked / 10 && held < checked * 9 / 10,
+            "{held} of {checked}"
+        );
+    }
+
+    /// SPEC §102.3: a name found by scanning a small object, or by hash in
+    /// a larger one, is the one `IndexMap::get` finds.
+    #[test]
+    fn a_field_is_found_by_scan_or_by_hash_alike() {
+        for len in 0..=20 {
+            let map: IndexMap<String, Document> = (0..len)
+                .map(|i| (format!("f{i}"), Document::Int(i as i64)))
+                .collect();
+            for name in (0..=21)
+                .map(|i| format!("f{i}"))
+                .chain(["".into(), "f".into()])
+            {
+                assert_eq!(
+                    crate::path::get(&map, &name),
+                    map.get(&name),
+                    "{len} {name}"
+                );
+            }
+        }
+        // Names that are each other's prefixes, changed or added one after
+        // another, as `IndexMap`'s own entries would be.
+        for len in 0..=12 {
+            let names: Vec<String> = (1..=len).map(|n| "k".repeat(n)).collect();
+            let map: IndexMap<String, Document> = (names.iter().rev())
+                .map(|name| (name.clone(), Document::Int(name.len() as i64)))
+                .collect();
+            let (mut changed, mut expected) = (map.clone(), map);
+            for (i, name) in ["", "kk", "k", "kkkkkkkkkkkkk", "kkkk", "x"]
+                .iter()
+                .enumerate()
+            {
+                *crate::path::get_or_insert(&mut changed, name) = Document::Int(100 + i as i64);
+                *expected.entry(name.to_string()).or_insert(Document::Null) =
+                    Document::Int(100 + i as i64);
+                let order = |m: &IndexMap<String, Document>| m.keys().cloned().collect::<Vec<_>>();
+                assert_eq!(order(&changed), order(&expected), "{len} fields, {name:?}");
+                assert_eq!(changed, expected, "{len} fields, {name:?}");
+            }
+        }
+    }
+
+    /// SPEC §102.5: a sort with its keys looked up once orders, skips and
+    /// limits as comparing every pair by path did — ties stable,
+    /// unordered values last both ways.
+    #[test]
+    fn a_sort_on_values_looked_up_once_orders_as_before() {
+        let mut rng = crate::testing::XorShift(0x0102_5027_0102_5027);
+        let fields = ["a", "b", "a.b", "c[*]", ""];
+        for _ in 0..600 {
+            let items: Vec<(usize, Document)> = (0..rng.below(60))
+                .map(|i| (i, random_doc(&mut rng, 3)))
+                .collect();
+            let mut f = Filter::new();
+            for _ in 0..1 + rng.below(3) {
+                let field = fields[rng.below(fields.len())];
+                f = f.then_by(field, [SortOrder::Asc, SortOrder::Desc][rng.below(2)]);
+            }
+            let f = f
+                .skip([0, 0, 3, 50][rng.below(4)])
+                .limit([None, Some(0), Some(1), Some(7)][rng.below(4)]);
+            let mut expected = items.clone();
+            expected.sort_by(|(_, a), (_, b)| before_102::compare_by(&f.sort, a, b));
+            let expected: Vec<usize> = expected
+                .into_iter()
+                .skip(f.skip)
+                .take(f.limit.unwrap_or(usize::MAX))
+                .map(|(i, _)| i)
+                .collect();
+            let arranged: Vec<usize> = f
+                .arrange(items, |(_, doc)| doc)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(arranged, expected, "{:?}", f.sort);
+        }
+    }
+
+    /// SPEC §102: a read parses its filter's paths once, and a sort looks
+    /// each key up once per item.
+    #[test]
+    fn paths_are_parsed_and_looked_up_once() {
+        let docs: Vec<Document> = (0..1000)
+            .map(|i| {
+                Document::Object(
+                    [
+                        ("n".to_string(), Document::Int(i % 37)),
+                        ("m".to_string(), Document::Int(i)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect();
+        let f = Filter::new()
+            .gte("n", 3)
+            .lt("n", 30)
+            .sort_desc("n")
+            .then_asc("m")
+            .limit(10);
+        let parsed = crate::path::PATHS_PARSED.with(|n| n.replace(0));
+        let looked_up = crate::path::LOOKUPS.with(|n| n.replace(0));
+        let found = f.apply(docs);
+        let parsed = crate::path::PATHS_PARSED.with(|n| n.replace(parsed));
+        let looked_up = crate::path::LOOKUPS.with(|n| n.replace(looked_up));
+        assert_eq!(found.len(), 10);
+        // Two conditions and two sort keys.
+        assert_eq!(parsed, 4);
+        // One per condition checked — the second only where the first
+        // held — and two per match sorted.
+        let first_held = (0..1000).filter(|i| i % 37 >= 3).count();
+        let matched = (0..1000).filter(|i| (3..30).contains(&(i % 37))).count();
+        assert_eq!(looked_up, 1000 + first_held + 2 * matched);
+    }
 
     /// SPEC §99.2: the top-level field of every path a filter looks at —
     /// in every kind of condition, nested, and the sort keys — once each;
@@ -2388,10 +2778,13 @@ mod tests {
             (4, "x", true),
         ] {
             let key = crate::index::key::compound(&[&Document::Int(a), &Document::from(p)], id);
-            assert_eq!(covering.decide(&key, &f, &mut scratch), Some(matches));
+            assert_eq!(
+                covering.decide(&key, &f.matcher(), &mut scratch),
+                Some(matches)
+            );
         }
         assert_eq!(
-            covering.decide(&key, &f, &mut scratch),
+            covering.decide(&key, &f.matcher(), &mut scratch),
             None,
             "the cut string"
         );

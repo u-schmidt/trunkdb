@@ -254,9 +254,11 @@ Index entries decide what they can since §100: a count by index took
 0.9 ms, page 50 of 20 1.2 ms. A walk through an index lends its entries
 and decides a leaf at once where it can since §101: the count of all
 100,000 took 7 ms, a count by index 0.17 ms, page 50 of 20 0.35 ms.
-What's left: checkpoints in large batches; in a scan, the small object
-each document's filtered fields are decoded into; and a path looked up
-on every document a filter checks, most of a range count's 0.14 ms.
+Paths are parsed once per query since §102: a count over a range took
+0.14 ms. What's left: checkpoints in large batches; in a scan, the
+small object each document's filtered fields are decoded into; and an
+index entry's values decoded to be checked, most of a range count's
+0.07 ms.
 
 ```
 cd bench && cargo run --release
@@ -596,7 +598,15 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     instead of 0.17; page 50 of 20 26 µs instead of 350; 50 by id after
     skipping 5,000 38 µs instead of 560. Same results, same file.
 
-    Items 60–71: not released yet. File format 12, which still opens
+72. **Paths resolved once per query** (§102): a filter's paths are
+    parsed when a read starts, not on every document it checks; a field
+    in an object of up to 8 is found by comparing names, without
+    hashing; a sort in memory looks each document's keys up once, not
+    on every comparison. A count over an index range takes 0.07 ms
+    instead of 0.14; "tenant == x, first 20 by id" 0.39 ms instead of
+    0.6. Same results.
+
+    Items 60–72: not released yet. File format 12, which still opens
     6–11 holding only objects; 0.19.0 refuses a file this build has
     opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with
