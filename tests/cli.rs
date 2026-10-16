@@ -2,13 +2,70 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, PoisonError};
+
+/// Held while a process starts, and while a test closes a database
+/// whose file is opened again. On Linux a child holds a copy of every
+/// file descriptor of this process from its fork to its exec, and a
+/// file lock (`flock`) lasts while any copy of its file is open: a
+/// database closed in that window stays locked until the child's exec,
+/// and opening it again fails with `WouldBlock`. The tests run on
+/// threads of one process, so another test's spawn can fall into this
+/// one's close. `spawn` returns only after the exec, so a close that
+/// holds this lock releases the file lock when it returns.
+static SPAWNS: Mutex<()> = Mutex::new(());
+
+/// `command` started, its exec done (`SPAWNS`).
+fn spawn(command: &mut Command) -> Child {
+    let _no_close = SPAWNS.lock().unwrap_or_else(PoisonError::into_inner);
+    command.spawn().unwrap()
+}
+
+/// `db` closed with no child between its fork and its exec, so its file
+/// is free when this returns (`SPAWNS`).
+fn close(db: trunkdb::Database) {
+    let _no_spawn = SPAWNS.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(db);
+}
+
+/// A child started between its fork and its exec holds a copy of a
+/// database's file and its lock; `close` waits for its exec, so the
+/// file opens again right after. Forced here with a child that waits
+/// before its exec (`pre_exec` takes the fork path on every Unix).
+#[cfg(unix)]
+#[test]
+fn a_database_closed_while_a_process_starts_opens_again() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = path(dir.path(), "db.trunkdb");
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trunkdb"));
+    command.arg("--help").stdout(Stdio::null());
+    // SAFETY: sleeps and returns, which is all the child does before
+    // its exec.
+    unsafe {
+        command.pre_exec(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok(())
+        });
+    }
+    let started = std::thread::spawn(move || spawn(&mut command).wait().unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    close(db);
+    let read_only = trunkdb::OpenOptions::default().read_only(true);
+    trunkdb::Database::open_with(&db_path, read_only).unwrap();
+    assert!(started.join().unwrap().success());
+}
 
 fn trunkdb(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_trunkdb"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trunkdb"));
+    command
         .args(args)
-        .output()
-        .unwrap()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(&mut command).wait_with_output().unwrap()
 }
 
 fn stdout(output: &Output) -> String {
@@ -184,15 +241,15 @@ fn check_reports_a_damaged_page_and_fails() {
 fn compact_shrinks_a_file_once() {
     let dir = tempfile::tempdir().unwrap();
     let db = path(dir.path(), "db.trunkdb");
-    {
-        let database = trunkdb::Database::open(&db).unwrap();
-        let docs = database.collection::<trunkdb::Document>("docs");
-        for i in 0..300 {
-            let text = trunkdb::Document::String(format!("{i:0>2000}"));
-            docs.insert(object("text", text)).unwrap();
-        }
-        docs.delete_many(trunkdb::query::Filter::new()).unwrap();
+    let database = trunkdb::Database::open(&db).unwrap();
+    let docs = database.collection::<trunkdb::Document>("docs");
+    for i in 0..300 {
+        let text = trunkdb::Document::String(format!("{i:0>2000}"));
+        docs.insert(object("text", text)).unwrap();
     }
+    docs.delete_many(trunkdb::query::Filter::new()).unwrap();
+    drop(docs);
+    close(database);
     let before = std::fs::metadata(&db).unwrap().len();
 
     let output = trunkdb(&["compact", &db]);
@@ -222,7 +279,7 @@ fn a_file_in_use_is_named_as_such() {
         "{}",
         stderr(&output)
     );
-    drop(db);
+    close(db);
     assert!(trunkdb(&["info", &db_path]).status.success());
 }
 
@@ -239,7 +296,7 @@ fn looking_into_a_file_opens_it_read_only() {
     db.collection::<trunkdb::Document>("users")
         .insert(object("n", trunkdb::Document::Int(1)))
         .unwrap();
-    drop(db);
+    close(db);
     let read_only = trunkdb::OpenOptions::default().read_only(true);
     let db = trunkdb::Database::open_with(&db_path, read_only).unwrap();
 
@@ -254,7 +311,7 @@ fn looking_into_a_file_opens_it_read_only() {
     assert!(std::fs::read_to_string(&out).unwrap().contains("users"));
     let output = trunkdb(&["compact", &db_path]);
     assert!(stderr(&output).contains("in use by another program"));
-    drop(db);
+    close(db);
     assert!(trunkdb(&["compact", &db_path]).status.success());
 }
 
@@ -271,11 +328,7 @@ impl OutputWith for Command {
         &mut self,
         write: impl FnOnce(&mut std::process::ChildStdin) -> std::io::Result<()>,
     ) -> Output {
-        let mut child = self
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn(self.stdout(Stdio::piped()).stderr(Stdio::piped()));
         let mut stdin = child.stdin.take().unwrap();
         write(&mut stdin).unwrap();
         drop(stdin); // end of input
