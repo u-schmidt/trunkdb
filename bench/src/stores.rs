@@ -24,6 +24,8 @@ pub trait Store {
     fn oldest(&self, status: &str, limit: usize) -> Vec<i64>;
     /// `created` of the newest `limit` tasks with `status`.
     fn newest(&self, status: &str, limit: usize) -> Vec<i64>;
+    /// `created` of the first `limit` tasks in id order (SPEC §96).
+    fn first_by_id(&self, limit: usize) -> Vec<i64>;
     /// How many tasks have `tries > n`: no index, every document.
     fn count_tries_above(&self, n: i64) -> usize;
     /// Bytes on disk.
@@ -171,6 +173,16 @@ impl Store for Trunk {
             .eq("status", status)
             .sort_desc("created")
             .limit(limit);
+        self.tasks
+            .find(f)
+            .unwrap()
+            .iter()
+            .map(|t| t.created)
+            .collect()
+    }
+
+    fn first_by_id(&self, limit: usize) -> Vec<i64> {
+        let f = Filter::new().sort_asc("_id").limit(limit);
         self.tasks
             .find(f)
             .unwrap()
@@ -330,6 +342,13 @@ impl Store for Sqlite {
         .iter()
         .map(|t| t.created)
         .collect()
+    }
+
+    fn first_by_id(&self, limit: usize) -> Vec<i64> {
+        self.docs("SELECT doc FROM tasks ORDER BY id LIMIT ?", [limit as i64])
+            .iter()
+            .map(|t| t.created)
+            .collect()
     }
 
     fn count_tries_above(&self, n: i64) -> usize {
@@ -541,6 +560,17 @@ impl Store for Redb {
             .collect()
     }
 
+    fn first_by_id(&self, limit: usize) -> Vec<i64> {
+        let tx = self.db.begin_read().unwrap();
+        let tasks = tx.open_table(TASKS).unwrap();
+        (tasks.iter().unwrap().take(limit))
+            .map(|entry| {
+                let task: Task = serde_json::from_slice(entry.unwrap().1.value()).unwrap();
+                task.created
+            })
+            .collect()
+    }
+
     fn count_tries_above(&self, n: i64) -> usize {
         let tx = self.db.begin_read().unwrap();
         let tasks = tx.open_table(TASKS).unwrap();
@@ -695,6 +725,15 @@ impl Store for Sled {
         self.through(2, &lo, &prefix_end(&lo), limit, true)
             .iter()
             .map(|t| t.created)
+            .collect()
+    }
+
+    fn first_by_id(&self, limit: usize) -> Vec<i64> {
+        (self.tasks.iter().take(limit))
+            .map(|entry| {
+                let task: Task = serde_json::from_slice(&entry.unwrap().1).unwrap();
+                task.created
+            })
             .collect()
     }
 

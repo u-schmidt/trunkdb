@@ -227,7 +227,8 @@ impl Sort {
 /// NOTs, SPEC §36), plus an optional sort, skip and limit. Evaluated by
 /// scanning, or over index ranges when the conditions allow it
 /// (`index_ranges`, SPEC §28.4, §36.3), or by reading an index in sort
-/// order (`index_order`, SPEC §34.2, §47).
+/// order (`index_order`, SPEC §34.2, §47; the primary index for `_id`,
+/// §96).
 ///
 /// Built only through its methods (SPEC §60), so how it holds its parts
 /// isn't part of the API:
@@ -534,7 +535,8 @@ pub enum QueryPlan {
     Index { field: String },
     /// The index on the sort field `field` is read in sort order, and
     /// documents are checked one by one until `limit` of them match; the
-    /// rest are never read (SPEC §34.2).
+    /// rest are never read (SPEC §34.2). For `_id`, the primary index
+    /// (SPEC §96).
     IndexOrder { field: String },
     /// Several index ranges are read — one per branch of an OR, on the
     /// indexes on `fields` — each document once, then checked against
@@ -910,11 +912,17 @@ impl Filter {
     /// first; among indexes fixing as many fields, the one that serves
     /// more keys wins. The rest are sorted in memory, among documents
     /// equal in the served ones.
+    ///
+    /// A sort by `_id` walks the primary index (SPEC §96): see
+    /// `id_order`.
     pub(crate) fn index_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
         let sort = self.sort.first()?;
         self.limit?;
         if self.ids().is_some() {
             return None; // a few documents by id beat any walk (SPEC §61)
+        }
+        if sort.field == ID_FIELD {
+            return self.id_order(indexes);
         }
         let mut best: Option<Walk> = None;
         for index in indexes {
@@ -946,17 +954,8 @@ impl Filter {
             }
         }
         let (index, prefix, mut by, fixed, served) = best?;
-        if fixed == 0 {
-            let on_sort_field = |c: &&Condition| matches!(c, Condition::Compare { field, .. } if *field == sort.field);
-            let others: Vec<Condition> = self
-                .conditions
-                .iter()
-                .filter(|c| !on_sort_field(c))
-                .cloned()
-                .collect();
-            if bounds_for_all(&others, indexes).is_some_and(|b| b.kind != BoundKind::ByRange) {
-                return None;
-            }
+        if fixed == 0 && self.found_by_value(&sort.field, indexes) {
+            return None;
         }
         let range = field_range(index, &self.conditions, &sort.field).map(|(range, on_sort)| {
             by.extend(on_sort);
@@ -967,12 +966,59 @@ impl Filter {
             _ => Some(range.map_or_else(|| KeyRange::prefixed(&prefix), |r| r.under(&prefix))),
         };
         Some(OrderedRead {
-            index,
+            index: Some(index),
             range,
             by,
             fixed,
             served,
         })
+    }
+
+    /// `index_order` for a sort whose first key is `_id` (SPEC §96): the
+    /// primary index, which holds every document in `_id` order — its
+    /// key is the id, and every document an object carrying it as `_id`
+    /// (§95). Ids are unique, so it serves every sort key: no two
+    /// documents tie in the first. The `_id` comparisons with an id
+    /// narrow the walk, exactly; any other condition is only checked.
+    /// Not when the conditions find documents by value, as for any
+    /// walk.
+    fn id_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
+        if self.found_by_value(ID_FIELD, indexes) {
+            return None;
+        }
+        let (ranges, by): (Vec<KeyRange>, Vec<Condition>) = self
+            .conditions
+            .iter()
+            .filter_map(|c| match c {
+                Condition::Compare {
+                    field,
+                    op,
+                    value: Document::Id(id),
+                } if field == ID_FIELD => Some((key::primary_range(op, *id)?, c.clone())),
+                _ => None,
+            })
+            .unzip();
+        Some(OrderedRead {
+            index: None,
+            range: ranges.into_iter().reduce(KeyRange::intersect),
+            by,
+            fixed: 0,
+            served: self.sort.len(),
+        })
+    }
+
+    /// Whether the conditions on fields other than `sort_field` find
+    /// documents by value — an `Eq` on an indexed field, or an OR of
+    /// indexed branches: a few documents found so beat a walk in sort
+    /// order (§34.2).
+    fn found_by_value(&self, sort_field: &str, indexes: &[IndexMeta]) -> bool {
+        let others: Vec<Condition> = self
+            .conditions
+            .iter()
+            .filter(|c| !matches!(c, Condition::Compare { field, .. } if field == sort_field))
+            .cloned()
+            .collect();
+        bounds_for_all(&others, indexes).is_some_and(|b| b.kind != BoundKind::ByRange)
     }
 }
 
@@ -994,7 +1040,8 @@ pub(crate) struct IndexRange<'a> {
 /// How `find` reads an index in sort order (`Filter::index_order`).
 #[derive(Debug)]
 pub(crate) struct OrderedRead<'a> {
-    pub index: &'a IndexMeta,
+    /// `None` for the primary index, in `_id` order (SPEC §96).
+    pub index: Option<&'a IndexMeta>,
     /// The part of it to read — `None` for all of it.
     pub range: Option<KeyRange>,
     /// The conditions `range` comes from (§94.2): the `Eq`s that fix
@@ -1006,6 +1053,15 @@ pub(crate) struct OrderedRead<'a> {
     /// How many sort keys, from the first, its fields give the order of
     /// (SPEC §47) — at least one.
     pub served: usize,
+}
+
+impl OrderedRead<'_> {
+    /// The index's name, as `explain` gives it: `_id` for the primary
+    /// index.
+    pub fn name(&self) -> String {
+        self.index
+            .map_or_else(|| ID_FIELD.to_string(), IndexMeta::name)
+    }
 }
 
 /// The value at `path` in `doc` (SPEC §31): a field name, or several
@@ -1804,7 +1860,7 @@ mod tests {
     #[test]
     fn a_compound_index_gives_the_order_after_its_fixed_fields() {
         let indexes = [index("created"), compound(&["status", "created"])];
-        let order = |f: Filter| f.limit(20).index_order(&indexes).map(|o| o.index.name());
+        let order = |f: Filter| f.limit(20).index_order(&indexes).map(|o| o.name());
         let newest = |f: Filter| f.sort_desc("created");
         assert_eq!(
             order(newest(Filter::new().eq("status", "Queued"))).as_deref(),
@@ -1862,7 +1918,7 @@ mod tests {
         let five = key::secondary(&Document::Int(5), crate::DocId([0; 16])).unwrap();
         assert!(ranges[0].range.contains(&five), "{:?}", ranges[0].range);
 
-        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|o| o.index.name());
+        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|o| o.name());
         assert_eq!(order(Filter::new().sort_asc("nick")), None);
         assert_eq!(
             order(Filter::new().is_not_null("nick").sort_asc("nick")).as_deref(),
@@ -1888,7 +1944,7 @@ mod tests {
             plan(Filter::new().is_null("a").is_not_null("b")).as_deref(),
             Some("(a, b)")
         );
-        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|o| o.index.name());
+        let order = |f: Filter| f.limit(5).index_order(&indexes).map(|o| o.name());
         assert_eq!(order(Filter::new().is_null("a").sort_asc("b")), None);
         assert_eq!(
             order(Filter::new().is_null("a").gt("b", 0).sort_asc("b")).as_deref(),
@@ -1909,7 +1965,7 @@ mod tests {
         let read = |f: Filter| {
             f.limit(10)
                 .index_order(&indexes)
-                .map(|o| (o.index.name(), o.fixed, o.served))
+                .map(|o| (o.name(), o.fixed, o.served))
         };
         let status_created = || Filter::new().sort_asc("status").then_asc("created");
         assert_eq!(
@@ -1961,7 +2017,7 @@ mod tests {
             .limit(10);
         let o = f.index_order(&fixing_or_serving).unwrap();
         assert_eq!(
-            (o.index.name(), o.fixed, o.served),
+            (o.name(), o.fixed, o.served),
             ("(status, created)".into(), 1, 1)
         );
         // `then_*` adds; `sort_*` starts over.

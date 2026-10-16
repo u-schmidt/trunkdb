@@ -56,6 +56,25 @@ pub fn primary(id: DocId) -> Vec<u8> {
     id.0.to_vec()
 }
 
+/// The primary index's keys whose id `op`-compares true against `id`
+/// (SPEC §96) — exactly them, as every primary key is a whole id: the
+/// first key after `id` is `id` with a zero byte added. `None` for `Ne`
+/// and `Contains`.
+pub fn primary_range(op: &crate::query::Op, id: DocId) -> Option<KeyRange> {
+    use crate::query::Op;
+    let at = primary(id);
+    let after = [&at[..], &[0]].concat();
+    let (start, end) = match op {
+        Op::Eq => (at, Some(after)),
+        Op::Gt => (after, None),
+        Op::Gte => (at, None),
+        Op::Lt => (Vec::new(), Some(at)),
+        Op::Lte => (Vec::new(), Some(after)),
+        Op::Ne | Op::Contains => return None,
+    };
+    Some(KeyRange { start, end })
+}
+
 // The functions below take keys apart that were read from the file. A
 // damaged one gets a cautious answer from them, never a panic (SPEC §55):
 // a key too short for its id, a number cut short or a string without its
@@ -540,6 +559,35 @@ mod tests {
             [&keys[4][..], &key(Document::String("x".into()))[..]]
         );
         assert!(part_is_exact(parts[0], 2));
+    }
+
+    /// SPEC §96: an id comparison as a range of the primary index holds
+    /// exactly the ids it holds for — the boundary in or out as the
+    /// comparison says.
+    #[test]
+    fn id_comparisons_are_exact_ranges_of_the_primary_index() {
+        use crate::query::Op;
+        let ids = [[0u8; 16], [5; 16], [5; 16], [6; 16], [0xFF; 16]].map(DocId);
+        let mut ids = ids.to_vec();
+        ids[2].0[15] = 6; // just after [5; 16]
+        let at = DocId([5; 16]);
+        let held = |op: Op| -> Vec<DocId> {
+            let range = primary_range(&op, at).unwrap();
+            ids.iter()
+                .copied()
+                .filter(|id| range.contains(&primary(*id)))
+                .collect()
+        };
+        let [zero, five, after_five, six, last] = ids[..] else {
+            unreachable!()
+        };
+        assert_eq!(held(Op::Eq), [five]);
+        assert_eq!(held(Op::Gt), [after_five, six, last]);
+        assert_eq!(held(Op::Gte), [five, after_five, six, last]);
+        assert_eq!(held(Op::Lt), [zero]);
+        assert_eq!(held(Op::Lte), [zero, five]);
+        assert!(primary_range(&Op::Ne, at).is_none());
+        assert!(primary_range(&Op::Contains, at).is_none());
     }
 
     /// Ids have a key since format 10 (SPEC §62): 16 bytes after their

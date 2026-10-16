@@ -743,8 +743,9 @@ impl Collection<Document> {
     ///
     /// With a `sort` and a `limit`, and an index on the sort field, it
     /// reads that index in order instead and stops after `skip` plus
-    /// `limit` matches (SPEC §34.2, §72). Equal sort values come in id
-    /// order either way.
+    /// `limit` matches (SPEC §34.2, §72). Sorted by `_id`, that is the
+    /// primary index, and `gt("_id", last)` starts it after `last`
+    /// (SPEC §96). Equal sort values come in id order either way.
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<Document>> {
         Ok(self
             .matches_with_ids(&filter)?
@@ -755,8 +756,9 @@ impl Collection<Document> {
 
     /// The first match, reading no further than it: the first in `sort`
     /// order if the filter has one, any match otherwise. `None` if nothing
-    /// matches. With a `sort` on an indexed field this reads one index
-    /// entry's worth of documents, not every match (SPEC §34.2).
+    /// matches. With a `sort` on an indexed field, or on `_id`, this reads
+    /// one index entry's worth of documents, not every match (SPEC §34.2,
+    /// §96).
     pub fn find_one(&self, filter: Filter) -> crate::Result<Option<Document>> {
         self.cursor(first_only(filter))?.next().transpose()
     }
@@ -915,7 +917,7 @@ fn plan_for(filter: &Filter, indexes: &[IndexMeta]) -> QueryPlan {
     }
     if let Some(order) = filter.index_order(indexes) {
         return QueryPlan::IndexOrder {
-            field: order.index.name(),
+            field: order.name(),
         };
     }
     match filter.index_ranges(indexes) {
@@ -1044,6 +1046,10 @@ fn candidate_entries(
 /// unordered values too, under a tag of their own that sorts last:
 /// right for an ascending walk, and a descending one holds those groups
 /// back until it has passed what they must follow (`Held`).
+///
+/// The primary index, for a sort by `_id` (SPEC §96), leaves most of
+/// that idle: each key is one id, a group of its own and exact, and
+/// every document has one.
 fn read_in_index_order(
     catalog: &Catalog,
     store: &dyn PageStore,
@@ -1062,18 +1068,30 @@ fn read_in_index_order(
     // The skipped matches come first, so read as far as them too; the
     // caller passes over them (SPEC §72).
     let limit = limit.saturating_add(filter.skip);
-    let index = order.index;
-    let unordered_can_match = order.range.is_none() && !index.is_compound();
+    let name = order.name();
+    let (root, fields, compound) = match order.index {
+        Some(index) => (index.root, index.fields.len(), index.is_compound()),
+        None => match catalog.get(collection) {
+            Some(meta) => (meta.index_root, 1, false),
+            None => return Ok(results),
+        },
+    };
+    let primary = order.index.is_none();
+    let unordered_can_match = order.range.is_none() && !compound && !primary;
     let backward = first.order == SortOrder::Desc;
-    let walk = trace.read(index.name(), order.by, backward);
-    let mut entries = BTreeIndex::new(index.root).walk(
+    let walk = trace.read(name, order.by, backward);
+    let mut entries = BTreeIndex::new(root).walk(
         store,
         order.range.unwrap_or_else(KeyRange::everything),
         backward,
     );
-    let fields = index.fields.len();
     let (at, end) = (order.fixed, order.fixed + order.served);
-    let spans = Spans { at, end, fields };
+    let spans = Spans {
+        at,
+        end,
+        fields,
+        primary,
+    };
     let in_memory = filter.sort.len() > order.served;
     let mut records = data::Records::new(store);
     let mut read = |loc: &RecordLocation| {
@@ -1122,7 +1140,7 @@ fn read_in_index_order(
         }
         Ok(false)
     };
-    let mut held = Held::new(backward && index.is_compound(), spans, first.order);
+    let mut held = Held::new(backward && compound, spans, first.order);
     let mut group: Group = Vec::new();
     loop {
         let entry = entries.next().transpose()?;
@@ -1143,6 +1161,11 @@ fn read_in_index_order(
         match entry {
             Some(entry) => group.push(entry),
             None => break,
+        }
+        // An id is a group of its own (SPEC §96): handed out without
+        // reading the next key to see the group end.
+        if primary && take(std::mem::take(&mut group), &mut results)? {
+            return Ok(results);
         }
     }
     let unordered_after = results.len();
@@ -1189,6 +1212,8 @@ struct Spans {
     /// Fixed fields and served keys.
     end: usize,
     fields: usize,
+    /// The primary index (SPEC §96): a key is an id, not values.
+    primary: bool,
 }
 
 impl Spans {
@@ -1199,6 +1224,9 @@ impl Spans {
     /// A damaged key with fewer values than the index has fields groups
     /// by the ones it has (SPEC §55).
     fn group<'k>(&self, key: &'k [u8]) -> &'k [u8] {
+        if self.primary {
+            return key; // one document, whose id is unique
+        }
         let parts = key::parts(key::value_part(key));
         let mut len: usize = parts.iter().take(self.at).map(|p| p.len()).sum();
         for part in parts.iter().take(self.end).skip(self.at) {
@@ -1212,6 +1240,9 @@ impl Spans {
 
     /// The served values a group shares, each on its own.
     fn values<'k>(&self, key: &'k [u8]) -> Vec<&'k [u8]> {
+        if self.primary {
+            return Vec::new(); // an id, exact
+        }
         let shared = self.group(key);
         key::parts(shared).into_iter().skip(self.at).collect()
     }
@@ -3766,17 +3797,36 @@ mod tests {
     /// values tie a lot — with a range on `v` and no limit, candidates
     /// come in `v`'s order, and only the id order of ties makes the
     /// result match.
-    fn random_sorted_filter(rng: &mut XorShift) -> Filter {
+    ///
+    /// Sometimes sorted by `_id` (SPEC §96), first or after `v`, and
+    /// compared with one of `ids` or an id no document has: one or
+    /// two comparisons, `ne` or one with a number, none of which an
+    /// `Eq` makes a lookup by id.
+    fn random_sorted_filter(rng: &mut XorShift, ids: &[DocId]) -> Filter {
         let ops = [Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
-        let conditions = match rng.below(6) {
+        let some_id = |rng: &mut XorShift| match rng.below(4) {
+            0 => Document::Id(DocId(
+                rng.next().to_be_bytes().repeat(2).try_into().unwrap(),
+            )),
+            _ => Document::Id(ids[rng.below(ids.len())]),
+        };
+        let ranges = [Op::Lt, Op::Lte, Op::Gt, Op::Gte, Op::Ne];
+        let mut conditions = match rng.below(8) {
             0 => vec![cond("v", ops[rng.below(5)].clone(), random_value(rng))],
             1 => vec![cond("w", Op::Eq, Document::Int(rng.below(3) as i64))],
             2 => vec![cond("v", Op::Ne, random_value(rng))],
             3 => vec![cond("pad", Op::Eq, Document::String(String::new()))],
+            4 => (0..1 + rng.below(2))
+                .map(|_| cond("_id", ranges[rng.below(5)].clone(), some_id(rng)))
+                .collect(),
+            5 => vec![cond("_id", ranges[rng.below(5)].clone(), Document::Int(3))],
             _ => vec![],
         };
+        if rng.below(6) == 0 {
+            conditions.push(cond("_id", ranges[rng.below(4)].clone(), some_id(rng)));
+        }
         let order = [SortOrder::Asc, SortOrder::Desc][rng.below(2)];
-        let field = ["v", "v", "w"][rng.below(3)].to_string();
+        let field = ["v", "v", "w", "_id", "_id"][rng.below(5)].to_string();
         let limits = [
             None,
             Some(0),
@@ -3788,9 +3838,22 @@ mod tests {
             Some(1000),
         ];
         let skips = [0, 0, 0, 1, 3, 25, 1000];
+        let mut sort = vec![crate::query::Sort { field, order }];
+        if rng.below(4) == 0 {
+            // `_id` after `w`, which ties a lot, or keys after `_id`,
+            // which never ties.
+            let field = match sort[0].field.as_str() {
+                "_id" => "w",
+                _ => "_id",
+            };
+            sort.push(crate::query::Sort {
+                field: field.to_string(),
+                order: [SortOrder::Asc, SortOrder::Desc][rng.below(2)],
+            });
+        }
         Filter {
             conditions,
-            sort: vec![crate::query::Sort { field, order }],
+            sort,
             skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
         }
@@ -3803,9 +3866,10 @@ mod tests {
         assert_consistent(docs.db());
         let mut all = docs.find_with_ids(Filter::default()).unwrap();
         all.sort_by_key(|(id, _doc)| *id);
+        let ids: Vec<DocId> = all.iter().map(|(id, _)| *id).collect();
         let mut plans = std::collections::HashSet::new();
-        for _ in 0..300 {
-            let f = random_sorted_filter(rng);
+        for _ in 0..500 {
+            let f = random_sorted_filter(rng, &ids);
             let expected: Vec<DocId> = f
                 .apply_to(all.clone(), |(_, doc)| doc)
                 .into_iter()
@@ -3824,6 +3888,7 @@ mod tests {
         for plan in [
             r#"IndexOrder { field: "v" }"#,
             r#"IndexOrder { field: "w" }"#,
+            r#"IndexOrder { field: "_id" }"#,
             r#"Index { field: "v" }"#,
             r#"Index { field: "w" }"#,
             "Scan",
@@ -3867,6 +3932,162 @@ mod tests {
         }
         let db = Database::open(&path).unwrap();
         assert_sorted_finds_agree_with_memory(&db.collection("docs"), &mut rng);
+    }
+
+    /// 1,000 documents `{n, group}`, `n` from 0 and `group` its last
+    /// digit, both indexed — and their ids, in id order.
+    fn thousand_by_id(db: &Database) -> (Collection<Document>, Vec<DocId>) {
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("n").unwrap();
+        docs.ensure_index("group").unwrap();
+        let mut ids = Vec::new();
+        for batch in 0..10 {
+            let ops = (0..100)
+                .map(|i| {
+                    let n = Document::Int(batch * 100 + i);
+                    let group = Document::Int(i % 10);
+                    let id = db.id_gen().generate();
+                    ids.push(id);
+                    WriteOp::Insert("docs".into(), id, object(vec![("n", n), ("group", group)]))
+                })
+                .collect();
+            db.write_batch(ops).unwrap();
+        }
+        ids.sort();
+        (docs, ids)
+    }
+
+    /// SPEC §96: a sort by `_id` with a limit walks the primary index,
+    /// either way, from where its `_id` comparisons with an id start it,
+    /// and reads only what it hands out and skips.
+    #[test]
+    fn a_sort_by_id_walks_the_primary_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (docs, ids) = thousand_by_id(&db);
+        let walk = |f: Filter, bounds: Vec<Condition>, backward: bool, read: u64| {
+            let run = docs.explain_run(f.clone()).unwrap();
+            assert_eq!(
+                run.plan,
+                QueryPlan::IndexOrder {
+                    field: "_id".into()
+                },
+                "{f:?}"
+            );
+            let entries = read;
+            let index = "_id".to_string();
+            let expected = crate::explain::IndexRead {
+                index,
+                bounds,
+                backward,
+                entries,
+            };
+            assert_eq!(run.reads, [expected], "{f:?}");
+            assert_eq!(run.stats.documents_examined, read, "{f:?}");
+            let keys = f.sort.len();
+            let sort = SortWork {
+                from_index: keys,
+                in_memory: 0,
+            };
+            assert_eq!(run.sort, Some(sort));
+            let found = docs.find_with_ids(f).unwrap();
+            found.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        };
+        let first = Filter::new().sort_asc("_id").limit(20);
+        assert_eq!(walk(first, vec![], false, 20), ids[..20]);
+        let last = Filter::new().sort_desc("_id").limit(20);
+        let mut newest = ids[980..].to_vec();
+        newest.reverse();
+        assert_eq!(walk(last, vec![], true, 20), newest);
+        // Keyset paging: the 10 after the 500th.
+        let after = Condition::gt("_id", ids[500]);
+        let next = Filter::new().sort_asc("_id").limit(10).and(after.clone());
+        assert_eq!(walk(next, vec![after], false, 10), ids[501..511]);
+        // Up to and with the 500th, backwards, and a stretch between two.
+        let upto = Condition::lte("_id", ids[500]);
+        let back = Filter::new().sort_desc("_id").limit(3).and(upto.clone());
+        assert_eq!(
+            walk(back, vec![upto], true, 3),
+            [ids[500], ids[499], ids[498]]
+        );
+        let (from, before) = (Condition::gte("_id", ids[7]), Condition::lt("_id", ids[9]));
+        let between = Filter::new()
+            .sort_asc("_id")
+            .limit(5)
+            .and(from.clone())
+            .and(before.clone());
+        assert_eq!(walk(between, vec![from, before], false, 2), ids[7..9]);
+        // Page 3 of 50: the 100 skipped are read too, not handed out.
+        let page = Filter::new().sort_asc("_id").skip(100).limit(50);
+        assert_eq!(walk(page, vec![], false, 150), ids[100..150]);
+        // Keys after `_id` have nothing to order: no two ids tie.
+        let more = Filter::new().sort_asc("_id").then_desc("n").limit(4);
+        assert_eq!(walk(more, vec![], false, 4), ids[..4]);
+        // Other conditions are checked, up to the third match.
+        let all = docs.find(Filter::new().sort_asc("_id")).unwrap();
+        let high = Filter::new().gt("n", 994);
+        let third = (all.iter().enumerate())
+            .filter(|(_, doc)| high.matches(doc))
+            .nth(2)
+            .unwrap()
+            .0;
+        let range = Filter::new().sort_asc("_id").limit(3).gt("n", 994);
+        let found = walk(range, vec![], false, third as u64 + 1);
+        assert_eq!(found.len(), 3);
+        // Comparing `_id` with a number, or `ne`, doesn't narrow.
+        let number = Filter::new().sort_asc("_id").limit(3).gt("_id", 5);
+        assert!(walk(number, vec![], false, 1000).is_empty());
+        let ne = Filter::new().sort_asc("_id").limit(3).ne("_id", ids[1]);
+        assert_eq!(walk(ne, vec![], false, 4), [ids[0], ids[2], ids[3]]);
+        // A collection that doesn't exist walks nothing.
+        let none = db.collection::<Document>("none");
+        let sorted = Filter::new().sort_desc("_id").limit(3);
+        assert!(none.find(sorted).unwrap().is_empty());
+    }
+
+    /// SPEC §96.2: the walk by `_id` gives way as a walk on a secondary
+    /// index does (§34.2) — to ids named, to an `Eq` or an OR on indexed
+    /// fields, and without a limit — but not to a range.
+    #[test]
+    fn finding_by_id_or_by_value_beats_the_walk_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (docs, ids) = thousand_by_id(&db);
+        let by_id = |f: Filter| docs.explain(&f.sort_asc("_id").limit(5)).unwrap();
+        let field = |name: &str| name.to_string();
+        assert_eq!(by_id(Filter::new().eq("_id", ids[3])), QueryPlan::ById);
+        // Two ids looked up, not a walk the OR can't narrow.
+        let two = Filter::new().any_of([Condition::id(ids[3]), Condition::id(ids[900])]);
+        let run = docs.explain_run(two.sort_asc("_id").limit(5)).unwrap();
+        assert_eq!(run.plan, QueryPlan::ById);
+        assert_eq!(run.stats.documents_examined, 2);
+        let sort = SortWork {
+            from_index: 0,
+            in_memory: 1,
+        };
+        assert_eq!(run.sort, Some(sort));
+        let group = Filter::new().eq("group", 3);
+        assert_eq!(
+            by_id(group),
+            QueryPlan::Index {
+                field: field("group")
+            }
+        );
+        let either = [Condition::eq("group", 1), Condition::eq("n", 2)];
+        let fields = vec![field("group"), field("n")];
+        assert_eq!(
+            by_id(Filter::new().any_of(either)),
+            QueryPlan::IndexUnion { fields }
+        );
+        let range = Filter::new().gt("n", 10);
+        assert_eq!(
+            by_id(range),
+            QueryPlan::IndexOrder {
+                field: field("_id")
+            }
+        );
+        let unlimited = Filter::new().sort_asc("_id");
+        assert_eq!(docs.explain(&unlimited).unwrap(), QueryPlan::Scan);
     }
 
     /// A document for compound indexes (SPEC §43): `a` has few values (or
@@ -6517,6 +6738,7 @@ mod tests {
             at: 1,
             end: 3,
             fields: 3,
+            primary: false,
         };
         let queued = Document::String("Queued".into());
         let one = key::compound(&[&queued], DocId([1; 16]));
