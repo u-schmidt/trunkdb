@@ -1,6 +1,6 @@
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::Cursor;
-use crate::data;
+use crate::data::{self, Stored};
 use crate::database::{Committed, Database, ReadGuard};
 use crate::document::{DocId, Document, encode_document, with_id};
 use crate::explain::Trace;
@@ -424,7 +424,7 @@ impl<T> Collection<T> {
             }
         };
         let trace = Trace::default();
-        let found = find_in(at.catalog, &at.store, &self.name, &filter, &trace)?;
+        let found = find_in(at.catalog, &at.store, &self.name, &filter, true, &trace)?;
         Ok(trace.explained(plan, sort, found.len(), started.elapsed()))
     }
 }
@@ -446,8 +446,8 @@ where
     }
 
     pub fn get(&self, id: &DocId) -> crate::Result<Option<T>> {
-        match self.as_document().get(id)? {
-            Some(document) => Ok(Some(from_document(document)?)),
+        match self.as_document().stored(id)? {
+            Some(stored) => Ok(Some(stored.deserialize()?)),
             None => Ok(None),
         }
     }
@@ -495,9 +495,9 @@ where
 
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<T>> {
         self.as_document()
-            .find(filter)?
-            .into_iter()
-            .map(from_document)
+            .matches_found(&filter, false)?
+            .iter()
+            .map(|found| found.stored.deserialize())
             .collect()
     }
 
@@ -514,7 +514,8 @@ where
 
     /// A streaming `find` — see `Cursor`.
     pub fn cursor(&self, filter: Filter) -> crate::Result<Cursor<T>> {
-        self.as_document().cursor_converting(filter, from_document)
+        self.as_document()
+            .cursor_converting(filter, false, |found| found.stored.deserialize())
     }
 
     /// Replaces the one document matching `filter`, or inserts `doc` if
@@ -578,6 +579,15 @@ impl Collection<Document> {
     }
 
     pub fn get(&self, id: &DocId) -> crate::Result<Option<Document>> {
+        match self.stored(id)? {
+            Some(stored) => Ok(Some(stored.decode()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The document `id` as it is stored, for `get` to decode as a
+    /// `Document` or a `T` (SPEC §99).
+    fn stored(&self, id: &DocId) -> crate::Result<Option<Stored>> {
         let state = self.read()?;
         let at = state.snapshot();
         let Some(meta) = at.catalog.get(&self.name) else {
@@ -588,8 +598,7 @@ impl Collection<Document> {
         let Some(loc) = index.lookup(&at.store, &key::primary(*id))? else {
             return Ok(None);
         };
-        let (_id, doc) = data::get_record(&at.store, loc)?;
-        Ok(Some(doc))
+        Ok(Some(data::Records::new(&at.store).stored(loc)?))
     }
 
     /// `false` if there's no document `id` — for a single op that's an
@@ -690,9 +699,10 @@ impl Collection<Document> {
         mut change: impl FnMut(DocId, Document) -> crate::Result<Document>,
     ) -> crate::Result<usize> {
         self.db.transact(|catalog, store| {
-            let found = find_in(catalog, store, &self.name, &filter, &Trace::default())?;
+            let found = find_in(catalog, store, &self.name, &filter, true, &Trace::default())?;
             let mut changed = 0;
-            for (id, old) in found {
+            for found in found {
+                let (id, old) = (found.stored.id(), found.decode()?);
                 let new = with_id(change(id, old.clone())?, id);
                 // By encoding, not `==`: a NaN isn't equal to itself, and
                 // a document holding one would never count as unchanged.
@@ -714,9 +724,17 @@ impl Collection<Document> {
     /// isn't created.
     pub fn delete_many(&self, filter: Filter) -> crate::Result<usize> {
         self.db.transact(|catalog, store| {
-            let doomed = find_in(catalog, store, &self.name, &filter, &Trace::default())?;
-            for (id, _doc) in &doomed {
-                apply_write_op(catalog, store, &WriteOp::Delete(self.name.clone(), *id))?;
+            let doomed = find_in(
+                catalog,
+                store,
+                &self.name,
+                &filter,
+                false,
+                &Trace::default(),
+            )?;
+            for found in &doomed {
+                let op = WriteOp::Delete(self.name.clone(), found.stored.id());
+                apply_write_op(catalog, store, &op)?;
             }
             Ok(doomed.len())
         })
@@ -725,9 +743,27 @@ impl Collection<Document> {
     /// Every match with the id of its cell: what `find` and a sorted
     /// `cursor` read.
     fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
+        self.matches_found(filter, true)?
+            .into_iter()
+            .map(|found| Ok((found.stored.id(), found.decode()?)))
+            .collect()
+    }
+
+    /// Every match, in `find`'s order, for the caller to decode as a
+    /// `Document` or a `T` (SPEC §99.3) — `whole_from_index` as in
+    /// `find_in`.
+    fn matches_found(&self, filter: &Filter, whole_from_index: bool) -> crate::Result<Vec<Found>> {
         let state = self.read()?;
         let at = state.snapshot();
-        find_in(at.catalog, &at.store, &self.name, filter, &Trace::default())
+        let trace = Trace::default();
+        find_in(
+            at.catalog,
+            &at.store,
+            &self.name,
+            filter,
+            whole_from_index,
+            &trace,
+        )
     }
 
     /// Every document matching `filter`. An `Object` document carries its
@@ -775,10 +811,18 @@ impl Collection<Document> {
         let count = if filter.conditions.is_empty() {
             candidate_entries(at.catalog, &at.store, &self.name, &filter, &trace)?.len()
         } else {
-            read_candidates(at.catalog, &at.store, &self.name, &filter, &trace)?
-                .iter()
-                .filter(|(_id, doc)| filter.matches(doc))
-                .count()
+            let names = filter.fields();
+            read_candidates(
+                at.catalog,
+                &at.store,
+                &self.name,
+                &filter,
+                names.as_deref(),
+                &trace,
+            )?
+            .iter()
+            .filter(|(_stored, fields)| filter.matches(fields))
+            .count()
         };
         let count = count.saturating_sub(filter.skip);
         Ok(filter.limit.map_or(count, |limit| count.min(limit)))
@@ -789,21 +833,22 @@ impl Collection<Document> {
     /// it was when the cursor was made, and keeps that moment until it's
     /// dropped — see `Cursor`.
     pub fn cursor(&self, filter: Filter) -> crate::Result<Cursor<Document>> {
-        self.cursor_converting(filter, Ok)
+        self.cursor_converting(filter, true, |found| Ok(found.decode()?))
     }
 
-    /// `cursor`, converting each document with `convert` — the typed
-    /// path's `cursor` passes the serde bridge.
+    /// `cursor`, decoding each match with `convert` — into a `Document`,
+    /// or a `T` for the typed path (SPEC §99.3).
     fn cursor_converting<T>(
         &self,
         filter: Filter,
-        convert: fn(Document) -> crate::Result<T>,
+        whole_from_index: bool,
+        convert: fn(Found) -> crate::Result<T>,
     ) -> crate::Result<Cursor<T>> {
         if !filter.sort.is_empty() {
-            let results = self.matches_with_ids(&filter)?;
+            let results = self.matches_found(&filter, whole_from_index)?;
             let converted = results
                 .into_iter()
-                .map(|(_id, doc)| convert(doc))
+                .map(convert)
                 .collect::<crate::Result<Vec<_>>>()?;
             return Ok(Cursor::collected(converted));
         }
@@ -829,14 +874,13 @@ impl Collection<Document> {
 
     /// The document at `loc`, as this handle's commit has it: for a
     /// cursor, which took `loc` from an index of the same commit.
-    pub(crate) fn record_at(&self, loc: RecordLocation) -> crate::Result<Document> {
+    pub(crate) fn stored_at(&self, loc: RecordLocation) -> crate::Result<Stored> {
         debug_assert!(
             self.at.is_some(),
             "a location is only good within one commit"
         );
         let state = self.read()?;
-        let (_id, doc) = data::get_record(&state.snapshot().store, loc)?;
-        Ok(doc)
+        Ok(data::Records::new(&state.snapshot().store).stored(loc)?)
     }
 
     /// Replaces the one document matching `filter`'s conditions (keeping
@@ -849,12 +893,20 @@ impl Collection<Document> {
     pub fn upsert(&self, filter: Filter, doc: Document) -> crate::Result<Upserted> {
         let id_if_new = id_for_insert(&self.db, &doc);
         self.db.transact(|catalog, store| {
-            let matches: Vec<DocId> =
-                read_candidates(catalog, store, &self.name, &filter, &Trace::default())?
-                    .into_iter()
-                    .filter(|(_id, candidate)| filter.matches(candidate))
-                    .map(|(id, _candidate)| id)
-                    .collect();
+            let names = filter.fields();
+            let trace = Trace::default();
+            let matches: Vec<DocId> = read_candidates(
+                catalog,
+                store,
+                &self.name,
+                &filter,
+                names.as_deref(),
+                &trace,
+            )?
+            .into_iter()
+            .filter(|(_stored, fields)| filter.matches(fields))
+            .map(|(stored, _fields)| stored.id())
+            .collect();
             let (op, outcome) = match matches[..] {
                 [] => (
                     WriteOp::Insert(self.name.clone(), id_if_new, doc),
@@ -884,9 +936,9 @@ impl Collection<Document> {
 impl<T: Serialize + DeserializeOwned> Collection<T> {
     pub(crate) fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, T)>> {
         self.as_document()
-            .matches_with_ids(&filter)?
-            .into_iter()
-            .map(|(id, document)| Ok((id, from_document(document)?)))
+            .matches_found(&filter, false)?
+            .iter()
+            .map(|found| Ok((found.stored.id(), found.stored.deserialize()?)))
             .collect()
     }
 
@@ -941,27 +993,82 @@ fn find_in(
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
+    whole_from_index: bool,
     trace: &Trace,
-) -> crate::Result<Vec<(DocId, Document)>> {
-    if let Some(order) = filter.index_order(catalog.indexes(collection)) {
+) -> crate::Result<Vec<Found>> {
+    let indexes = catalog.indexes(collection);
+    if let Some(order) = filter.index_order(indexes) {
         // Read as far as skip plus limit, then pass over the skipped (SPEC §72).
         let mut found = read_in_index_order(catalog, store, collection, filter, order, trace)?;
         found.drain(..filter.skip.min(found.len()));
-        return Ok(found);
+        return Ok(found.into_iter().map(Found::stored).collect());
     }
-    let mut matches: Vec<(DocId, Document)> =
-        read_candidates(catalog, store, collection, filter, trace)?
+    // Candidates from an index range or by id nearly all match: for a
+    // caller that wants whole documents, each is decoded whole once and
+    // checked on that, rather than on its fields and then again whole
+    // (SPEC §99.2). A scan's are mostly rejected, and checked on fields.
+    let whole =
+        whole_from_index && (filter.ids().is_some() || filter.index_ranges(indexes).is_some());
+    let names = match whole {
+        true => None,
+        false => filter.fields(),
+    };
+    let mut matches: Vec<Candidate> =
+        read_candidates(catalog, store, collection, filter, names.as_deref(), trace)?
             .into_iter()
-            .filter(|(_id, doc)| filter.matches(doc))
+            .filter(|(_stored, fields)| filter.matches(fields))
             .collect();
     trace.matched(matches.len());
     if !filter.sort.is_empty() {
         // So equal sort values end up in id order, as they do when read
         // from an index (the sort is stable).
-        matches.sort_unstable_by_key(|(id, _doc)| *id);
+        matches.sort_unstable_by_key(|(stored, _fields)| stored.id());
     }
-    Ok(filter.arrange(matches, |(_id, doc)| doc))
+    let arranged = filter.arrange(matches, |(_stored, fields)| fields);
+    Ok(arranged
+        .into_iter()
+        .map(|(stored, fields)| Found {
+            stored,
+            whole: whole.then_some(fields),
+        })
+        .collect())
 }
+
+/// A match of `find_in`, not decoded yet — or, where it was decoded whole
+/// to be checked, with that document (`whole`).
+pub(crate) struct Found {
+    pub(crate) stored: Stored,
+    whole: Option<Document>,
+}
+
+impl From<Stored> for Found {
+    fn from(stored: Stored) -> Self {
+        Found::stored(stored)
+    }
+}
+
+impl Found {
+    fn stored(stored: Stored) -> Self {
+        Found {
+            stored,
+            whole: None,
+        }
+    }
+
+    /// The whole document, decoded now unless it already was.
+    pub(crate) fn decode(self) -> std::io::Result<Document> {
+        match self.whole {
+            Some(document) => Ok(document),
+            None => self.stored.decode(),
+        }
+    }
+}
+
+/// A candidate as `find` checks it (SPEC §99.2): the document as it is
+/// stored, and the fields its filter and sort name, decoded
+/// (`Filter::fields`). The whole document is decoded only for what is
+/// handed out (§99.3).
+type Candidate = (Stored, Document);
 
 /// The index entries `find` has to look at for `filter`: the primary
 /// index's entries for the ids it names (SPEC §61), else the secondary
@@ -1050,6 +1157,9 @@ fn candidate_entries(
 /// The primary index, for a sort by `_id` (SPEC §96), leaves most of
 /// that idle: each key is one id, a group of its own and exact, and
 /// every document has one.
+///
+/// Each document is checked on the fields the filter and sort name, and
+/// handed out undecoded (SPEC §99).
 fn read_in_index_order(
     catalog: &Catalog,
     store: &dyn PageStore,
@@ -1057,7 +1167,20 @@ fn read_in_index_order(
     filter: &Filter,
     order: OrderedRead,
     trace: &Trace,
-) -> crate::Result<Vec<(DocId, Document)>> {
+) -> crate::Result<Vec<Stored>> {
+    let found = walk_in_index_order(catalog, store, collection, filter, order, trace)?;
+    Ok(found.into_iter().map(|(stored, _fields)| stored).collect())
+}
+
+/// `read_in_index_order`'s walk, its matches with their fields.
+fn walk_in_index_order(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    order: OrderedRead,
+    trace: &Trace,
+) -> crate::Result<Vec<Candidate>> {
     let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
         unreachable!("index_order needs a sort and a limit");
     };
@@ -1093,13 +1216,18 @@ fn read_in_index_order(
         primary,
     };
     let in_memory = filter.sort.len() > order.served;
+    // The primary index gives the whole order: every key exact, nothing
+    // unordered (SPEC §96), so only the conditions' fields are looked at.
+    let names = filter.fields_with(!primary || in_memory);
     let mut records = data::Records::new(store);
-    let mut read = |loc: &RecordLocation| {
+    let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
         trace.examined();
-        records.get(*loc)
+        let stored = records.stored(*loc)?;
+        let fields = stored.fields(names.as_deref())?;
+        Ok((stored, fields))
     };
     // Hands out one group's matching documents; `true` once `limit` are.
-    let mut take = |group: Group, results: &mut Vec<(DocId, Document)>| -> crate::Result<bool> {
+    let mut take = |group: Group, results: &mut Vec<Candidate>| -> crate::Result<bool> {
         // Ties in id order: fields after the served ones would order them
         // otherwise, and a backward walk hands them out last id first.
         let mut group = group;
@@ -1356,15 +1484,18 @@ fn read_candidates(
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
+    names: Option<&[&str]>,
     trace: &Trace,
-) -> std::io::Result<Vec<(DocId, Document)>> {
+) -> std::io::Result<Vec<Candidate>> {
     let mut records = data::Records::new(store);
     candidate_entries(catalog, store, collection, filter, trace)?
         .into_iter()
-        // The id stored in the data cell itself (SPEC §11).
         .map(|(_key, loc)| {
             trace.examined();
-            records.get(loc)
+            // The id stored in the data cell itself (SPEC §11).
+            let stored = records.stored(loc)?;
+            let fields = stored.fields(names)?;
+            Ok((stored, fields))
         })
         .collect()
 }
@@ -3883,6 +4014,8 @@ mod tests {
                 .map(|(id, _)| id)
                 .collect();
             assert_eq!(found, expected, "{f:?} via {plan:?}");
+            // Typed (SPEC §99): matched on fields, deserialized last.
+            assert_eq!(typed_ids(docs, &f), expected, "{f:?} via {plan:?}");
             plans.insert(format!("{plan:?}"));
         }
         for plan in [
@@ -4043,6 +4176,54 @@ mod tests {
         let none = db.collection::<Document>("none");
         let sorted = Filter::new().sort_desc("_id").limit(3);
         assert!(none.find(sorted).unwrap().is_empty());
+    }
+
+    /// SPEC §99.3: a read decodes whole only the documents it hands out —
+    /// after the filter, a sort in memory, `skip` and `limit` — and `count`
+    /// and `delete_many` none. Untyped, candidates from an index range are
+    /// decoded whole once and checked on that (§99.2).
+    #[test]
+    fn only_what_is_handed_out_is_decoded_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let typed = db.collection::<IdOnly>("docs");
+        let ops = (0..1000)
+            .map(|i| {
+                let doc = object(vec![
+                    ("n", Document::Int(i)),
+                    ("pad", "x".repeat(50).into()),
+                ]);
+                WriteOp::Insert("docs".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        let decoded = |read: &dyn Fn() -> usize| {
+            crate::data::DECODED.with(|n| n.set(0));
+            let handed_out = read();
+            (handed_out, crate::data::DECODED.with(|n| n.get()))
+        };
+        // Sorted in memory by an unindexed field: 1,000 checked on `n`.
+        let top = || Filter::new().sort_desc("n").limit(20);
+        assert_eq!(decoded(&|| docs.find(top()).unwrap().len()), (20, 20));
+        assert_eq!(decoded(&|| typed.find(top()).unwrap().len()), (20, 20));
+        let streamed = || typed.cursor(Filter::new().gt("n", 900)).unwrap().count();
+        assert_eq!(decoded(&streamed), (99, 99));
+        // Page 3 of 50: 150 read, 50 decoded.
+        let page = || Filter::new().sort_asc("_id").skip(100).limit(50);
+        assert_eq!(decoded(&|| docs.find(page()).unwrap().len()), (50, 50));
+        assert_eq!(records_read(|| drop(typed.find(page()).unwrap())), 150);
+        let over = || Filter::new().gt("n", 499);
+        assert_eq!(decoded(&|| docs.count(over()).unwrap()), (500, 0));
+        assert_eq!(
+            decoded(&|| docs.delete_many(Filter::new().lt("n", 10)).unwrap()),
+            (10, 0)
+        );
+        // From an index range, untyped: each candidate once, whole.
+        docs.ensure_index("n").unwrap();
+        let high = || Filter::new().gte("n", 990).ne("n", 995);
+        assert_eq!(decoded(&|| docs.find(high()).unwrap().len()), (9, 10));
+        assert_eq!(decoded(&|| typed.find(high()).unwrap().len()), (9, 9));
     }
 
     /// SPEC §96.2: the walk by `_id` gives way as a walk on a secondary
@@ -4226,6 +4407,9 @@ mod tests {
                 let expected = ids(f.apply_to(all.clone(), |(_, doc)| doc));
                 let plan = explained(docs, &f);
                 let found = ids(docs.find_with_ids(f.clone()).unwrap());
+                // Typed (SPEC §99), the same documents the same way.
+                let typed = typed_ids(docs, &f).into_iter();
+                assert_eq!(ids(typed.map(|id| (id, Document::Null)).collect()), found);
                 if f.sort.is_empty() && (f.limit.is_some() || f.skip > 0) {
                     // Which documents a skip or limit without a sort keeps
                     // isn't promised: any that match, as many as they allow.
@@ -4388,6 +4572,41 @@ mod tests {
             }
         }
         plan
+    }
+
+    /// Only a document's id: any document reads as one, every other
+    /// field skipped (SPEC §99.4).
+    #[derive(Serialize, Deserialize)]
+    struct IdOnly {
+        #[serde(rename = "_id")]
+        id: DocId,
+    }
+
+    /// The ids `docs` finds for `f` through the typed path, from `find`
+    /// and from `cursor`, which must agree.
+    fn typed_ids(docs: &Collection<Document>, f: &Filter) -> Vec<DocId> {
+        let typed = docs.db().collection::<IdOnly>(&docs.name);
+        let found: Vec<DocId> = typed
+            .find(f.clone())
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        let streamed: Vec<DocId> = typed
+            .cursor(f.clone())
+            .unwrap()
+            .map(|d| d.unwrap().id)
+            .collect();
+        if !f.sort.is_empty() || (f.limit.is_none() && f.skip == 0) {
+            let sorted = |mut ids: Vec<DocId>| {
+                if f.sort.is_empty() {
+                    ids.sort();
+                }
+                ids
+            };
+            assert_eq!(sorted(streamed), sorted(found.clone()), "{f:?}");
+        }
+        found
     }
 
     fn records_read(f: impl FnOnce()) -> usize {

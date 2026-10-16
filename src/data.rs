@@ -161,6 +161,42 @@ impl<'a> Records<'a> {
 }
 
 impl Records<'_> {
+    /// The document at `loc` as it is stored, undecoded (SPEC §99.1): an
+    /// inline one shares its page with the cache, an overflowing one is
+    /// put together from its chain, as `get` does.
+    pub fn stored(&mut self, loc: RecordLocation) -> std::io::Result<Stored> {
+        #[cfg(test)]
+        RECORDS_READ.with(|n| n.set(n.get() + 1));
+        let page = match &self.page {
+            Some((id, page)) if *id == loc.page => page,
+            _ => {
+                &self
+                    .page
+                    .insert((loc.page, read_data_page(self.store, loc.page)?))
+                    .1
+            }
+        };
+        match Cell::parse(live_cell(page, loc)?)? {
+            Cell::Inline(id, _) => Ok(Stored {
+                id,
+                bytes: StoredBytes::Inline {
+                    page: page.clone(),
+                    slot: loc.slot,
+                },
+            }),
+            Cell::Overflow { id, len, first } => {
+                let mut encoded = Vec::with_capacity((len as usize).min(1 << 20));
+                walk_chain(self.store, first, len, |_page, bytes| {
+                    encoded.extend_from_slice(bytes)
+                })?;
+                Ok(Stored {
+                    id,
+                    bytes: StoredBytes::Overflow(encoded),
+                })
+            }
+        }
+    }
+
     /// The id of the document at `loc`, and whether it is an object, from
     /// its encoding's first byte (SPEC §95): nothing decoded, and of an
     /// overflow chain only its first page read.
@@ -191,6 +227,72 @@ impl Records<'_> {
             }
         }
     }
+}
+
+/// A document as its cell stores it, with the id of the cell (SPEC
+/// §99.1): what a read carries until it knows what it needs of it — the
+/// fields its filter and sort name (`fields`), and only for what it hands
+/// out, the whole document (`decode`).
+#[derive(Clone)]
+pub struct Stored {
+    id: DocId,
+    bytes: StoredBytes,
+}
+
+#[derive(Clone)]
+enum StoredBytes {
+    /// In a cell of this page, which is the cache's, shared, not copied.
+    Inline { page: SlottedPage, slot: u16 },
+    /// Put together from an overflow chain.
+    Overflow(Vec<u8>),
+}
+
+impl Stored {
+    pub fn id(&self) -> DocId {
+        self.id
+    }
+
+    /// The encoded document (`document::encode_stored`).
+    pub fn encoded(&self) -> &[u8] {
+        match &self.bytes {
+            StoredBytes::Inline { page, slot } => {
+                let cell = page.get_cell(*slot).expect("a live cell when stored");
+                &cell[CELL_HEADER_LEN..]
+            }
+            StoredBytes::Overflow(encoded) => encoded,
+        }
+    }
+
+    /// The whole document, its id as `_id`, as `Records::get` gives it.
+    pub fn decode(&self) -> std::io::Result<Document> {
+        #[cfg(test)]
+        DECODED.with(|n| n.set(n.get() + 1));
+        Ok(with_id(decode(self.encoded())?, self.id))
+    }
+
+    /// The document as a `T`, straight from its encoding (SPEC §99.4),
+    /// as `from_document(self.decode())` would give it.
+    pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> crate::Result<T> {
+        #[cfg(test)]
+        DECODED.with(|n| n.set(n.get() + 1));
+        Ok(crate::serde_stored::from_stored(self.encoded(), self.id)?)
+    }
+
+    /// Its top-level fields among `names` (`document::decode_fields`);
+    /// `None` for the whole document.
+    pub fn fields(&self, names: Option<&[&str]>) -> std::io::Result<Document> {
+        match names {
+            Some(names) => crate::document::decode_fields(self.encoded(), self.id, names),
+            None => self.decode(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many documents were decoded whole from a `Stored` on this
+    /// thread (SPEC §99.3): a read decodes only what it hands out.
+    pub(crate) static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Replaces the document at `loc`, returning where it lives now. Usually

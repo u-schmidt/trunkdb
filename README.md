@@ -71,6 +71,7 @@ src/
 ├── update.rs          Update: set, unset and inc on dotted paths
 ├── document.rs        Document and DocId: the schema-less value type
 ├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document
+├── serde_stored.rs    a stored document straight into T, for typed reads
 ├── json.rs            tagged JSON <-> Document, lossless
 ├── id.rs              IdGenerator + UuidV7Generator
 ├── catalog.rs         collections and their indexes (page 1)
@@ -196,8 +197,8 @@ let summaries = db.collection::<UserSummary>("users").find(Filter::new().eq("tea
 Read through it, never write: `update`, `upsert` and `insert` store the
 whole value, so a `UserSummary` written back replaces the user and
 drops every field it lacks. To change some fields, use `update_fields`.
-Each document is still read and decoded in full; only the result is
-smaller.
+A typed read decodes each document straight into the type, so the
+fields a summary doesn't declare are skipped, not built (SPEC §99).
 
 ## Building
 
@@ -233,19 +234,21 @@ documents:
 |---|---:|---:|---:|---:|
 | insert, 1000 per commit | 20k/s | 35k/s | 37k/s | 28k/s |
 | one commit | 4.6 ms | 4.6 ms | 4.8 ms | 9.5 ms |
-| get by id | 3.9 µs | 4.4 µs | 1.8 µs | 2.2 µs |
-| 1000 documents by index | 2.4 ms | 1.7 ms | 1.0 ms | 2.4 ms |
-| oldest 20 of a status | 40 µs | 23 µs | 22 µs | 20 µs |
-| first 50 by id | 70 µs | 36 µs | 25 µs | 29 µs |
+| get by id | 3.4 µs | 4.4 µs | 1.8 µs | 2.2 µs |
+| 1000 documents by index | 1.4 ms | 1.7 ms | 1.0 ms | 2.4 ms |
+| oldest 20 of a status | 36 µs | 23 µs | 22 µs | 20 µs |
+| first 50 by id | 37 µs | 34 µs | 24 µs | 30 µs |
+| scan, 100,000 for a fifth | 62 ms | 44 ms | 51 ms | 70 ms |
 | file size after compact | 33 MB | 22 MB | 30 MB | — |
 
 Each gap has a known cause (SPEC §48, in [spec/](spec/README.md)), and the first four are
 fixed: "oldest 20" took 19 ms before the lazy B-tree walk (§49), a
 lookup by id 32 µs before the page cache (§50), a commit 16 ms before it
 flushed once instead of three times (§51), and batched inserts ran at
-7.5k/s before index pages were changed in place (§52). What's left:
-checkpoints in large batches, decoding in scans, and a copy per page
-read.
+7.5k/s before index pages were changed in place (§52). Reads decode only
+what they need since §99: "first 50 by id" took 70 µs, the scan 168 ms.
+What's left: checkpoints in large batches, and in a scan, the small
+object each document's filtered fields are decoded into.
 
 ```
 cd bench && cargo run --release
@@ -557,7 +560,16 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `WouldBlock`. Keep or clone the handle instead of reopening, or
     retry briefly.
 
-    Items 60–68: not released yet. File format 12, which still opens
+69. **Decoding only what a read needs** (§99): a candidate is checked on
+    the fields its filter and sort name, decoded alone, and only the
+    documents handed out are decoded whole, after sort, skip and limit.
+    A typed read decodes straight into `T`, no `Document` in between,
+    skipping the fields `T` lacks; the same values and errors as before.
+    The first 50 by id: 37 µs instead of 69; a scan of 100,000 for a
+    fifth of them 62 ms instead of 168; `count` with a filter reads no
+    document whole.
+
+    Items 60–69: not released yet. File format 12, which still opens
     6–11 holding only objects; 0.19.0 refuses a file this build has
     opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with

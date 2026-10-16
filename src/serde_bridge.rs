@@ -86,7 +86,7 @@ impl DocumentError {
     // trait in scope (and without the two trait impls below — which serde
     // itself calls via generic dispatch — becoming ambiguous with each
     // other for that call).
-    fn custom(msg: impl fmt::Display) -> Self {
+    pub(crate) fn custom(msg: impl fmt::Display) -> Self {
         DocumentError(msg.to_string())
     }
 }

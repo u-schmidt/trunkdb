@@ -109,3 +109,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 96. [Sorting by `_id` through the primary index (`query.rs`, `collection.rs`, `index/key.rs`)](96-sorting-by-id-through-the-primary-index.md)
 97. [A walk that copies only what it hands out (`index/btree.rs`)](97-a-walk-that-copies-only-what-it-hands-out.md)
 98. [A lock held by a starting process (`database.rs`, docs)](98-a-lock-held-by-a-starting-process.md)
+99. [Decoding only what a read needs (`document.rs`, `serde_stored.rs`, `data.rs`, `collection.rs`, `cursor.rs`, `query.rs`)](99-decoding-only-what-a-read-needs.md)

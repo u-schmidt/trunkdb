@@ -35,7 +35,7 @@ them are real now; `InMemoryIndex` remains, for tests.
 | Layer | Trait | Implementation | Code |
 |---|---|---|---|
 | Pages | `PageStore` | `FileStore`: the writer's staged pages and header, over `Pages`: the file, checksums, the page cache and the committed pages [§77](spec/77-the-committed-pages-apart-from-the-writers.md) | `storage/` |
-| Documents | — | the `Document` enum, its byte encoding, the serde bridge, tagged JSON | `document.rs`, `serde_bridge.rs`, `json.rs`, `decode.rs` |
+| Documents | — | the `Document` enum, its byte encoding, the serde bridge, typed reads from the encoding, tagged JSON | `document.rs`, `serde_bridge.rs`, `serde_stored.rs`, `json.rs`, `decode.rs` |
 | Ids | `IdGenerator` | `UuidV7Generator` | `id.rs` |
 | Indexes | `Index` | `BTreeIndex`, for the primary index and every secondary one | `index/` |
 | Transactions | `TransactionManager` | `GlobalLockTxnManager`: one batch at a time, all or nothing | `txn/` |
@@ -317,6 +317,15 @@ Every document is checked against the whole filter after an index
 narrows the set, so an index only ever decides how much is read, never
 what matches.
 
+A read decodes only what it needs [§99](spec/99-decoding-only-what-a-read-needs.md). A candidate is checked on the
+top-level fields its filter and sort name, decoded alone, every other
+field skipped with the same checks; it is carried as it is stored, its
+page shared with the cache, and decoded whole only if it is handed out,
+after sort, skip and limit. A typed read decodes straight into `T`
+(`serde_stored.rs`), giving it exactly what the serde bridge would. An
+untyped read whose candidates come from an index range or by id decodes
+each whole once and checks that, as they nearly all match.
+
 `explain_run` runs a query and says how it went: the plan, each index
 read with the conditions that bound it, how many sort keys the index
 gave, and the entries and documents examined, matched and returned
@@ -478,9 +487,12 @@ current table. Each gap had a measured cause, fixed one at a time:
 | Lookup by id | 32 µs | a page cache, 256 MiB by default, CLOCK eviction [§50](spec/50-a-page-cache.md) |
 | One commit | 16 ms | one flush per commit; write-back at checkpoints [§51](spec/51-one-flush-per-commit.md) |
 | Batched inserts | 7.5k/s | B-tree pages changed in place [§52](spec/52-b-tree-pages-changed-in-place.md) |
+| First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
+| First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 
-Still behind: full scans (decoding), and whole 8 KB page images in the
-WAL for every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md), and a
+Still behind: in a scan, the small object each document's filtered
+fields are decoded into, and whole 8 KB page images in the WAL for
+every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md), and a
 changed page is copied once, not twice: `write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md).
 
 ## 13. How it's tested
