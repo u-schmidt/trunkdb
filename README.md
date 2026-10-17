@@ -19,8 +19,10 @@ conditions on array elements and on whether a field exists, overflow pages for d
 than a page, export/import as JSON Lines, a checksum on every page so a
 damaged one is an error instead of garbage, compaction that rebuilds the file
 into as few pages as it needs, a page-image write-ahead log making
-every write crash-safe, and atomic multi-collection batch writes
-(typed and untyped) with real rollback are all real and tested — not stubs. Still deliberately out of scope for v0:
+every write crash-safe, atomic multi-collection batch writes
+(typed and untyped) with real rollback, snapshots, read-only opens, and
+`explain_run` and `stats` to see how a query ran and where a file's
+space goes are all real and tested — not stubs. Still deliberately out of scope for v0:
 a cost-based query planner, and concurrent writers (`Database` is a
 cloneable, thread-safe handle; reads run together, writes one at a
 time beside them, and neither waits for the other, but for a `compact`,
@@ -67,9 +69,14 @@ src/
 ├── cursor.rs          Cursor: streaming find, of one moment
 ├── snapshot.rs        Snapshot and View<T>: the database at one
 │                        moment, to keep reading
-├── query.rs           Filter, Condition, Sort; the planner
+├── query.rs           Filter, Condition, Sort; the planner; index
+│                        entries deciding a filter
+├── path.rs            field paths, parsed once per query
+├── explain.rs         explain and explain_run: how a query ran
+├── stats.rs           Database::stats: where a file's space goes
 ├── update.rs          Update: set, unset and inc on dotted paths
 ├── document.rs        Document and DocId: the schema-less value type
+├── datetime.rs        DateTime, what Document::DateTime holds
 ├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document
 ├── serde_stored.rs    a stored document straight into T, for typed reads
 ├── json.rs            tagged JSON <-> Document, lossless
@@ -83,6 +90,7 @@ src/
 │   │                    header, the file lock
 │   ├── pages.rs       Pages: the file, checksums, the committed
 │   │                    pages, shared by readers and the writer
+│   ├── page.rs        Page: a page's bytes, shared, copied on change
 │   ├── snapshot.rs    SnapshotStore: the pages as of one commit
 │   ├── slotted.rs     SlottedPage: slot directory + cells
 │   ├── cache.rs       PageCache: CLOCK eviction
@@ -105,6 +113,7 @@ src/
 ├── export.rs          Database::export/import (JSON Lines)
 ├── check.rs           Database::check: consistency check
 ├── compact.rs         Database::compact: rebuild, file shrinks
+├── fuzzing.rs         hooks for fuzz/, behind a feature, hidden
 └── bin/trunkdb.rs     the `trunkdb` command (info, check, compact,
                          export, import)
 tests/                 the command line, and a time-series-shaped
@@ -224,42 +233,60 @@ it open.
 
 ## Performance
 
-Not fast yet, and measured so it can get there. `bench/` runs one
-document workload against trunkdb, SQLite, redb and sled: same
-documents and ids, same three indexes, durable commits everywhere, and
-the same answers checked across all four. On an M1 Pro with 100,000
-documents:
+Reads are level with SQLite, redb and sled or ahead of them; writes and
+compaction are still behind. `bench/` runs one document workload
+against trunkdb and the three others: same documents and ids, same three
+indexes, durable commits everywhere, and the same answers checked
+across all four. On an
+M1 Pro with 100,000 documents, the median of three runs (0.19.0 with
+§90–§104):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 20k/s | 35k/s | 37k/s | 28k/s |
-| one commit | 4.6 ms | 4.6 ms | 4.8 ms | 9.5 ms |
-| get by id | 2.3 µs | 4.5 µs | 2.4 µs | 2.3 µs |
-| 1000 documents by index | 1.0 ms | 2.0 ms | 1.1 ms | 1.9 ms |
-| count of 1000 by index | 0.02 ms | 0.03 ms | 0.04 ms | 0.26 ms |
-| count of all 100,000 | 0.08 ms | 0.01 ms | 0.00 ms | 24 ms |
-| oldest 20 of a status | 18 µs | 23 µs | 16 µs | 21 µs |
-| page 50 of 20 of a status | 0.03 ms | 0.05 ms | 0.04 ms | 0.25 ms |
-| first 50 by id | 33 µs | 35 µs | 23 µs | 30 µs |
-| scan, 100,000 for a fifth | 57 ms | 43 ms | 50 ms | 68 ms |
-| file size after compact | 33 MB | 22 MB | 30 MB | — |
+| insert, 1000 per commit | 22k/s | 42k/s | 37k/s | 28k/s |
+| one commit | 4.7 ms | 4.9 ms | 5.0 ms | 10.2 ms |
+| get by id | 2.5 µs | 17 µs | 2.1 µs | 3.1 µs |
+| 1000 documents by index | 0.98 ms | 2.1 ms | 1.2 ms | 2.1 ms |
+| count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.28 ms |
+| count of a range of 1000 | 0.01 ms | 0.02 ms | 0.03 ms | 0.37 ms |
+| count of all 100,000 | 0.09 ms | 0.02 ms | 0.00 ms | 25 ms |
+| oldest 20 of a status | 19 µs | 25 µs | 16 µs | 22 µs |
+| page 50 of 20 of a status | 27 µs | 58 µs | 47 µs | 277 µs |
+| first 50 by id | 33 µs | 40 µs | 25 µs | 33 µs |
+| 50 by id after skipping 5000 | 40 µs | 133 µs | 160 µs | 1.1 ms |
+| a tenant's first 20 by id | 23 µs | 1.3 ms | 21 µs | 23 µs |
+| scan, 100,000 for a fifth | 64 ms | 49 ms | 52 ms | 70 ms |
+| update, 1000 per commit | 9.1k/s | 12k/s | 17k/s | 21k/s |
+| delete, 1000 per commit | 15k/s | 17k/s | 21k/s | 33k/s |
+| compact | 1.1 s | 0.19 s | 0.44 s | — |
+| file size after compact | 31 MB | 22 MB | 30 MB | — |
 
-Each gap has a known cause (SPEC §48, in [spec/](spec/README.md)), and the first four are
-fixed: "oldest 20" took 19 ms before the lazy B-tree walk (§49), a
-lookup by id 32 µs before the page cache (§50), a commit 16 ms before it
-flushed once instead of three times (§51), and batched inserts ran at
-7.5k/s before index pages were changed in place (§52). Reads decode only
-what they need since §99: "first 50 by id" took 70 µs, the scan 168 ms.
-Index entries decide what they can since §100: a count by index took
-0.9 ms, page 50 of 20 1.2 ms. A walk through an index lends its entries
-and decides a leaf at once where it can since §101: the count of all
-100,000 took 7 ms, a count by index 0.17 ms, page 50 of 20 0.35 ms.
-Paths are parsed once per query since §102: a count over a range took
-0.14 ms. A sort by `_id` after an `Eq` walks the index in id order
-since §103: "tenant == x by id, first 20" took 0.38 ms. Index entries
-are matched on their bytes since §104: a count over a range took 0.07
-ms. What's left: checkpoints in large batches; and in a scan, the small
-object each document's filtered fields are decoded into.
+Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
+- **Through an index, reads are fast:** a count reads no document, and
+  counts a leaf at a time where its ends decide it (§100, §101, §104).
+  A page by index reads only the page, and a deep one skips leaves
+  whole. A sort by `_id` walks the primary index, or the range an `Eq`
+  fixes (§96, §103).
+- **Still behind:**
+  - the count of all documents, which trunkdb counts leaf by leaf where
+    the others keep a total;
+  - a scan, 1.3× SQLite: each document's filtered fields are decoded
+    into a small object to be checked;
+  - "first 50 by id", 1.3× redb.
+- **Writes are about half as fast:** nearly every batch of 1,000 crosses
+  the default checkpoint threshold once the indexes are large (§53).
+  Compaction inserts its entries one by one (§48.4), and its file is
+  1.4× SQLite's.
+
+How it got here, earliest first: "oldest 20" took 19 ms before the lazy
+B-tree walk (§49); a lookup by id 32 µs before the page cache (§50); a
+commit 16 ms before one flush per commit (§51); batched inserts 7.5k/s
+before index pages were changed in place (§52). In October 2026,
+§96–§104 took "first 50 by id" from 189 ms to 33 µs, a scan from 168 ms
+to 64, a count by index from 0.9 ms to 0.01, page 50 of 20 from 1.2 ms
+to 27 µs, a tenant's first 20 by id from 0.6 ms to 23 µs, and a count of
+a range from 0.14 ms to 0.01. `explain_run` (§94) says how any query of
+yours ran.
 
 ```
 cd bench && cargo run --release
