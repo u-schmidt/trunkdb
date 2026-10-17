@@ -256,10 +256,10 @@ and decides a leaf at once where it can since §101: the count of all
 100,000 took 7 ms, a count by index 0.17 ms, page 50 of 20 0.35 ms.
 Paths are parsed once per query since §102: a count over a range took
 0.14 ms. A sort by `_id` after an `Eq` walks the index in id order
-since §103: "tenant == x by id, first 20" took 0.38 ms. What's left: checkpoints in large batches; in a scan, the
-small object each document's filtered fields are decoded into; and an
-index entry's values decoded to be checked, most of a range count's
-0.07 ms.
+since §103: "tenant == x by id, first 20" took 0.38 ms. Index entries
+are matched on their bytes since §104: a count over a range took 0.07
+ms. What's left: checkpoints in large batches; and in a scan, the small
+object each document's filtered fields are decoded into.
 
 ```
 cd bench && cargo run --release
@@ -617,7 +617,17 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     23 µs instead of 380; `explain` says `IndexOrder` for it where it
     said `Index`. Same results.
 
-    Items 60–73: not released yet. File format 12, which still opens
+74. **Index entries matched on their bytes** (§104): where an index
+    holds what a filter names, an entry is decided by comparing its
+    key's bytes with the conditions' values, encoded the same way,
+    instead of decoding it into a document; only `contains` on a string
+    and a cut value equal to the condition's still decode. A leaf whose
+    ends both match a filter that accepts one interval (comparisons, in
+    ANDs, on the index's fields in order) is counted or skipped whole.
+    A count over an index range of 1,000 different values takes 15 µs
+    instead of 73; SQLite takes 21–30. Same results.
+
+    Items 60–74: not released yet. File format 12, which still opens
     6–11 holding only objects; 0.19.0 refuses a file this build has
     opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with

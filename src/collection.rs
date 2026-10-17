@@ -6243,6 +6243,99 @@ mod tests {
         assert_eq!(run.stats.documents_returned, 20);
     }
 
+    /// SPEC §104: a count over a range of different values decides on
+    /// the entries' bytes, filling no document, and counts the leaves
+    /// inside the range whole; a deep page by such a range passes them;
+    /// a compound key's value no key encodes decides unread.
+    #[test]
+    fn a_range_is_decided_on_bytes_and_its_inner_leaves_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("tasks");
+        let ops = (0..5000)
+            .map(|i| {
+                let doc = object(vec![
+                    ("status", ["Queued", "Done"][i as usize % 2].into()),
+                    ("created", Document::Int(i)),
+                ]);
+                WriteOp::Insert("tasks".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        docs.ensure_index("created").unwrap();
+        docs.ensure_index(["status", "created"]).unwrap();
+        let counted = |run: &dyn Fn() -> usize| {
+            let decided = crate::query::DECISIONS.with(|n| n.replace(0));
+            let filled = crate::query::FILLS.with(|n| n.replace(0));
+            let copied = crate::index::KEYS_COPIED.with(|n| n.replace(0));
+            let mut found = 0;
+            let read = records_read(|| found = run());
+            let decided = crate::query::DECISIONS.with(|n| n.replace(decided));
+            let filled = crate::query::FILLS.with(|n| n.replace(filled));
+            let copied = crate::index::KEYS_COPIED.with(|n| n.replace(copied));
+            (found, read, decided, filled, copied)
+        };
+        // 2,000 different values, in leaves of a few hundred entries.
+        let range = Filter::new().gte("created", 1000).lt("created", 3000);
+        let entries = docs.explain_run(range.clone()).unwrap().reads[0].entries as usize;
+        let (n, read, decided, filled, _) = counted(&|| docs.count(range.clone()).unwrap());
+        assert_eq!((n, read, filled), (2000, 0, 0));
+        assert!(decided < entries / 2, "{decided} of {entries}");
+        // Fixed by `status`, ranged on `created`, on the compound index.
+        let done = range.clone().eq("status", "Done");
+        let (n, read, decided, filled, _) = counted(&|| docs.count(done.clone()).unwrap());
+        assert_eq!((n, read, filled), (1000, 0, 0));
+        assert!(decided < 500, "{decided}");
+        // `ne` accepts two intervals: decided entry by entry, on bytes.
+        let gap = range.clone().ne("created", 2000);
+        let (n, _, decided, filled, _) = counted(&|| docs.count(gap.clone()).unwrap());
+        assert_eq!((n, filled), (1999, 0));
+        assert!(decided >= 2000, "{decided}");
+        // Page 50 of 20 by the range: the skip passes whole leaves.
+        let page = Filter::new()
+            .gte("created", 1000)
+            .sort_asc("created")
+            .skip(980)
+            .limit(20);
+        let (n, read, _, filled, copied) = counted(&|| docs.find(page.clone()).unwrap().len());
+        assert_eq!((n, read, filled, copied), (20, 20, 0, 0));
+        // A value no key encodes, in a compound key: decided, unread.
+        docs.insert(object(vec![
+            ("status", "Done".into()),
+            ("created", Document::Array(vec![Document::Int(1)])),
+        ]))
+        .unwrap();
+        let some = Filter::new().eq("status", "Done").ne("created", 7);
+        let (n, read, _, filled, _) = counted(&|| docs.count(some.clone()).unwrap());
+        // 2,500 done, one more, less created 7.
+        assert_eq!((n, read, filled), (2500, 0, 0));
+        // A leaf of the walk's range whose ends both fail, with matches
+        // between: the range holds the bounds' own encodings (§28.3), so
+        // a leaf from a run of 10s to a run of 12s lies inside it.
+        let edges = db.collection::<Document>("edges");
+        edges.ensure_index("v").unwrap();
+        let ops = (0..2000)
+            .map(|i| Document::Int(if i < 1000 { 10 } else { 12 }))
+            .chain((0..5).map(|_| Document::Int(11)))
+            .map(|v| {
+                WriteOp::Insert(
+                    "edges".into(),
+                    db.id_gen().generate(),
+                    object(vec![("v", v)]),
+                )
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        let between = Filter::new().gt("v", 10).lt("v", 12);
+        assert_eq!(edges.count(between.clone()).unwrap(), 5);
+        assert_eq!(edges.find(between).unwrap().len(), 5);
+        // `contains` on a string needs the text.
+        let named = Filter::new().eq("status", "Done").contains("status", "ON");
+        let (n, _, _, filled, _) = counted(&|| docs.count(named.clone()).unwrap());
+        assert_eq!(n, 2501);
+        assert!(filled > 0);
+    }
+
     /// Conditions mostly on what the indexes of
     /// `entries_decide_as_the_documents_would` hold — `a`, `b`, `o.p`
     /// and `_id` — now and then on `c`, which none holds.

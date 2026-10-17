@@ -216,6 +216,50 @@ pub fn is_other(part: &[u8]) -> bool {
     part.first() == Some(&TAG_OTHER)
 }
 
+/// `value`, encoded as one of `fields` values of a key encodes it, to
+/// compare parts with (`compare_part`) — `None` for what no key holds
+/// (arrays, objects, binary, NaN).
+pub fn encode_for(value: &Document, fields: usize) -> Option<Vec<u8>> {
+    encode_value_in(value, fields)
+}
+
+/// How the value a key's `part` stands for compares with the one
+/// `encoded` encodes (`encode_for`, with the key's `fields`), as
+/// `query::compare` would compare them — from the bytes alone (SPEC
+/// §104.1). The encoding orders values of one type, not strictly:
+/// `a < b` implies `enc(a) <= enc(b)`. So encodings that differ order
+/// their values as the bytes do, exact or not; equal ones mean equal
+/// values only where the part is exact.
+///
+/// `Some(None)`: they don't compare — different types, or a value no
+/// key encodes (`TAG_OTHER`, or `encoded` `None`), which compares with
+/// nothing. `None`: the bytes can't tell, equal but not exact; or a
+/// damaged, empty part.
+pub fn compare_part(
+    part: &[u8],
+    encoded: Option<&[u8]>,
+    fields: usize,
+) -> Option<Option<std::cmp::Ordering>> {
+    let &tag = part.first()?;
+    let Some(encoded) = encoded else {
+        return Some(None);
+    };
+    if tag == TAG_OTHER || encoded.first() != Some(&tag) {
+        return Some(None);
+    }
+    match part.cmp(encoded) {
+        std::cmp::Ordering::Equal => {
+            part_is_exact(part, fields).then_some(Some(std::cmp::Ordering::Equal))
+        }
+        ord => Some(Some(ord)),
+    }
+}
+
+/// Whether `part` encodes a string, which `Op::Contains` needs.
+pub fn is_string(part: &[u8]) -> bool {
+    part.first() == Some(&TAG_STRING)
+}
+
 /// A compound key's value part, split into its values' encodings. In a
 /// damaged key, whatever is left when a value runs past the end is one
 /// last part.

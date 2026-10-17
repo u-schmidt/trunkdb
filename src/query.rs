@@ -1336,11 +1336,14 @@ impl<'a> Covering<'a> {
         (0..=last).try_fold(0, |len, _| Some(len + parts.next()?.len()))
     }
 
-    /// Entry after entry with `filter` (SPEC §101.2).
+    /// Entry after entry with `filter` (SPEC §101.2), on the bytes of
+    /// its entries where they tell (§104).
     pub fn decider(self, filter: &'a Filter) -> Decider<'a> {
+        let on_bytes = EntryMatcher::new(filter, self.fields);
         Decider {
             covering: self,
             matcher: filter.matcher(),
+            on_bytes,
             scratch: Document::Null,
             last: Vec::new(),
             decided: None,
@@ -1355,6 +1358,9 @@ impl<'a> Covering<'a> {
 pub(crate) struct Decider<'a> {
     covering: Covering<'a>,
     matcher: Matcher<'a>,
+    /// The filter on the entries' bytes (SPEC §104), tried before
+    /// `matcher` on the entry's values.
+    on_bytes: EntryMatcher<'a>,
     scratch: Document,
     /// The deciding bytes of the last entry decided, and how — `None`
     /// where it couldn't be, or its bytes don't count (`deciding_len`).
@@ -1374,7 +1380,11 @@ impl Decider<'_> {
         }
         #[cfg(test)]
         DECISIONS.with(|n| n.set(n.get() + 1));
-        let decided = self.covering.decide(key, &self.matcher, &mut self.scratch);
+        let decided = self.on_bytes.matches(key).or_else(|| {
+            #[cfg(test)]
+            FILLS.with(|n| n.set(n.get() + 1));
+            self.covering.decide(key, &self.matcher, &mut self.scratch)
+        });
         self.decided = len.and(decided);
         if let (Some(len), Some(_)) = (len, self.decided) {
             self.last.clear();
@@ -1388,13 +1398,211 @@ impl Decider<'_> {
     /// bytes. Keys are in order and every value's encoding ends where it
     /// ends, whatever follows (§28.1): every key between two that share
     /// those bytes shares them too, and so the decision.
+    ///
+    /// Or, for a filter that accepts one interval of keys, true where
+    /// both ends match on their bytes (SPEC §104.4): every key between
+    /// them does.
     pub fn decide_all(&mut self, lowest: &[u8], highest: &[u8]) -> Option<bool> {
-        let len = self.covering.deciding_len(lowest)?;
-        if highest.get(..len) != Some(&lowest[..len]) {
+        let len = self.covering.deciding_len(lowest);
+        if let Some(len) = len
+            && highest.get(..len) == Some(&lowest[..len])
+        {
+            return self.decide(lowest);
+        }
+        if !self.on_bytes.interval {
             return None;
         }
-        self.decide(lowest)
+        let on_bytes = |key: &[u8]| {
+            #[cfg(test)]
+            DECISIONS.with(|n| n.set(n.get() + 1));
+            self.on_bytes.matches(key)
+        };
+        (on_bytes(lowest) == Some(true) && on_bytes(highest) == Some(true)).then_some(true)
     }
+}
+
+/// A filter compiled against an index's fields, deciding an entry on its
+/// key's bytes (SPEC §104.2): each comparison with its value encoded as
+/// the key encodes it (`key::compare_part`). `None` where the bytes
+/// can't tell — `contains` on a string, an inexact part equal to the
+/// value — and the entry's values decide instead.
+pub(crate) struct EntryMatcher<'f> {
+    /// The filter's conditions, all holding; `None` if one isn't
+    /// a comparison, an AND, an OR or a NOT.
+    all: Option<Vec<OnBytes<'f>>>,
+    fields: usize,
+    /// Whether the filter accepts one interval of keys (SPEC §104.4):
+    /// comparisons, nested in ANDs only, other than `ne` and
+    /// `contains`, on the index's fields, each after fields an `eq`
+    /// among them fixes.
+    pub interval: bool,
+}
+
+/// One condition of an `EntryMatcher`.
+enum OnBytes<'f> {
+    /// `op` with `value`, encoded (`None` where no key holds it), on
+    /// the key's part `at` — `None` for the id at its end.
+    Compare {
+        at: Option<usize>,
+        op: &'f Op,
+        value: &'f Document,
+        encoded: Option<Vec<u8>>,
+    },
+    All(Vec<OnBytes<'f>>),
+    Any(Vec<OnBytes<'f>>),
+    Not(Box<OnBytes<'f>>),
+}
+
+impl<'f> EntryMatcher<'f> {
+    pub fn new(filter: &'f Filter, fields: &[String]) -> Self {
+        let n = fields.len();
+        fn of<'f>(c: &'f Condition, fields: &[String]) -> Option<OnBytes<'f>> {
+            let all =
+                |cs: &'f [Condition]| cs.iter().map(|c| of(c, fields)).collect::<Option<Vec<_>>>();
+            Some(match c {
+                Condition::Compare { field, op, value } => {
+                    let at = match field == ID_FIELD {
+                        true => None,
+                        false => Some(fields.iter().position(|f| f == field)?),
+                    };
+                    let encoded = match at {
+                        Some(_) => key::encode_for(value, fields.len()),
+                        None => None,
+                    };
+                    OnBytes::Compare {
+                        at,
+                        op,
+                        value,
+                        encoded,
+                    }
+                }
+                Condition::All(cs) => OnBytes::All(all(cs)?),
+                Condition::Any(cs) => OnBytes::Any(all(cs)?),
+                Condition::Not(c) => OnBytes::Not(Box::new(of(c, fields)?)),
+                Condition::Exists { .. } | Condition::Size { .. } | Condition::ElemMatch { .. } => {
+                    return None;
+                }
+            })
+        }
+        let all: Option<Vec<OnBytes>> = filter.conditions.iter().map(|c| of(c, fields)).collect();
+        let interval = all.as_deref().is_some_and(is_interval);
+        EntryMatcher {
+            all,
+            fields: n,
+            interval,
+        }
+    }
+
+    /// Whether the entry `key` stands for matches, as far as its bytes
+    /// tell (SPEC §104.2).
+    pub fn matches(&self, key: &[u8]) -> Option<bool> {
+        let all = self.all.as_ref()?;
+        let mut parts: [&[u8]; key::MAX_COMPOUND_FIELDS] = [&[]; key::MAX_COMPOUND_FIELDS];
+        let mut each = key::each_part(key::value_part(key));
+        for part in parts.iter_mut().take(self.fields) {
+            *part = each.next()?;
+        }
+        if each.next().is_some() {
+            return None; // damaged: more values than fields
+        }
+        let entry = Entry {
+            parts: &parts[..self.fields],
+            key,
+            fields: self.fields,
+        };
+        all_of(all, &entry)
+    }
+}
+
+/// An entry's key, taken apart.
+struct Entry<'k> {
+    parts: &'k [&'k [u8]],
+    key: &'k [u8],
+    fields: usize,
+}
+
+impl OnBytes<'_> {
+    fn matches(&self, entry: &Entry) -> Option<bool> {
+        match self {
+            OnBytes::Compare {
+                at,
+                op,
+                value,
+                encoded,
+            } => {
+                let Some(at) = at else {
+                    let ord = match value {
+                        Document::Id(id) => Some(key::doc_id(entry.key).cmp(id)),
+                        _ => None,
+                    };
+                    return Some(!matches!(op, Op::Contains) && holds(op, ord));
+                };
+                let part = entry.parts[*at];
+                if let Op::Contains = op {
+                    // Case folding needs the text (SPEC §25).
+                    return match (key::is_string(part), value) {
+                        (true, Document::String(_)) => None,
+                        _ => Some(false),
+                    };
+                }
+                let ord = key::compare_part(part, encoded.as_deref(), entry.fields)?;
+                Some(holds(op, ord))
+            }
+            OnBytes::All(all) => all_of(all, entry),
+            OnBytes::Any(any) => {
+                let mut undecided = false;
+                for c in any {
+                    match c.matches(entry) {
+                        Some(true) => return Some(true),
+                        None => undecided = true,
+                        Some(false) => {}
+                    }
+                }
+                (!undecided).then_some(false)
+            }
+            OnBytes::Not(c) => c.matches(entry).map(|m| !m),
+        }
+    }
+}
+
+/// Every one of `all` holds, three-valued: a false one decides, else an
+/// undecided one leaves it undecided.
+fn all_of(all: &[OnBytes], entry: &Entry) -> Option<bool> {
+    let mut undecided = false;
+    for c in all {
+        match c.matches(entry) {
+            Some(false) => return Some(false),
+            None => undecided = true,
+            Some(true) => {}
+        }
+    }
+    (!undecided).then_some(true)
+}
+
+/// Whether `all`, all holding, accept one interval of keys (SPEC §104.4):
+/// a key between two that match on their bytes matches too.
+fn is_interval(all: &[OnBytes]) -> bool {
+    let mut compares = Vec::new();
+    fn flat<'f>(all: &[OnBytes<'f>], out: &mut Vec<(usize, &'f Op)>) -> bool {
+        all.iter().all(|c| match c {
+            OnBytes::Compare {
+                at: Some(at), op, ..
+            } if matches!(op, Op::Eq | Op::Lt | Op::Lte | Op::Gt | Op::Gte) => {
+                out.push((*at, *op));
+                true
+            }
+            OnBytes::All(inner) => flat(inner, out),
+            _ => false,
+        })
+    }
+    flat(all, &mut compares)
+        && compares.iter().all(|(at, _)| {
+            (0..*at).all(|before| {
+                compares
+                    .iter()
+                    .any(|(i, op)| *i == before && **op == Op::Eq)
+            })
+        })
 }
 
 #[cfg(test)]
@@ -1402,6 +1610,9 @@ thread_local! {
     /// Entries a `Decider` decided on their values, rather than by the
     /// last decision (SPEC §101.2), for tests.
     pub(crate) static DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Entries the bytes didn't decide, their values put into a document
+    /// to be checked (SPEC §104.3), for tests.
+    pub(crate) static FILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether `condition` names `_id` anywhere.
@@ -1582,7 +1793,13 @@ fn value_matches(op: &Op, field_value: &Document, value: &Document) -> bool {
             _ => false,
         };
     }
-    let ord = compare(field_value, value);
+    holds(op, compare(field_value, value))
+}
+
+/// Whether `op` holds of two values that compare as `ord` (`compare`):
+/// what `value_matches` and an entry decided on its bytes (SPEC §104.2)
+/// answer. Not for `Op::Contains`.
+fn holds(op: &Op, ord: Option<std::cmp::Ordering>) -> bool {
     match (op, ord) {
         (Op::Eq, Some(std::cmp::Ordering::Equal)) => true,
         (Op::Ne, ord) => ord != Some(std::cmp::Ordering::Equal),
@@ -2669,6 +2886,242 @@ mod tests {
             sparse: true,
             ..compound(fields)
         }
+    }
+
+    /// Values chosen to share encodings, or to sit next to each other in
+    /// them (SPEC §104.7): numbers past 2^53 a few apart, `Int` beside
+    /// `Float`, strings cut alike in a key of one field and of three,
+    /// and what no key encodes.
+    fn colliding_values() -> Vec<Document> {
+        let big = 1i64 << 60;
+        let long = |n: usize, end: &str| Document::from("y".repeat(n) + end);
+        let id = |n: u8| Document::Id(crate::DocId([n; 16]));
+        let time = |s: i64, n: u32| Document::DateTime(crate::DateTime::from_unix(s, n).unwrap());
+        vec![
+            Document::Null,
+            Document::Bool(false),
+            Document::Bool(true),
+            Document::Int(-1),
+            Document::Int(0),
+            Document::Int(3),
+            Document::Int(big),
+            Document::Int(big + 1),
+            Document::Int(big + 300),
+            Document::Int(i64::MAX),
+            Document::Int(i64::MIN),
+            Document::Float(-0.0),
+            Document::Float(2.5),
+            Document::Float(3.0),
+            Document::Float(big as f64),
+            Document::Float(f64::INFINITY),
+            Document::Float(f64::NEG_INFINITY),
+            Document::Float(f64::NAN),
+            "".into(),
+            "a".into(),
+            "a\0".into(),
+            "ab".into(),
+            "Straße".into(),
+            long(340, "1"),
+            long(340, "2"),
+            long(2000, "1"),
+            long(2000, "2"),
+            id(1),
+            id(2),
+            time(0, 0),
+            time(0, 1),
+            time(-5, 0),
+            Document::Array(vec![Document::Int(1)]),
+            Document::Object(IndexMap::new()),
+            Document::Binary(vec![1]),
+        ]
+    }
+
+    /// A random condition on `fields` and `_id`, values from `values`.
+    fn byte_condition(
+        rng: &mut crate::testing::XorShift,
+        depth: usize,
+        fields: &[&str],
+        values: &[Document],
+    ) -> Condition {
+        if depth == 0 || rng.below(3) == 0 {
+            let ops = [
+                Op::Eq,
+                Op::Ne,
+                Op::Lt,
+                Op::Lte,
+                Op::Gt,
+                Op::Gte,
+                Op::Contains,
+            ];
+            let field = match rng.below(fields.len() + 1) {
+                i if i < fields.len() => fields[i],
+                _ => ID_FIELD,
+            };
+            let op = ops[rng.below(ops.len())].clone();
+            return Condition::compare(field, op, values[rng.below(values.len())].clone());
+        }
+        let children = (0..rng.below(4))
+            .map(|_| byte_condition(rng, depth - 1, fields, values))
+            .collect();
+        match rng.below(3) {
+            0 => Condition::All(children),
+            1 => Condition::Any(children),
+            _ => !byte_condition(rng, depth - 1, fields, values),
+        }
+    }
+
+    /// A document with `values` at `fields` (a missing one now and then)
+    /// and `id`, and its key in an index on `fields` — `None` where a
+    /// one-field index holds no entry for it.
+    fn entry_of(
+        fields: &[&str],
+        values: &[Option<Document>],
+        id: crate::DocId,
+    ) -> (Document, Option<Vec<u8>>) {
+        let mut doc = IndexMap::new();
+        doc.insert(ID_FIELD.to_string(), Document::Id(id));
+        let mut doc = Document::Object(doc);
+        for (field, value) in fields.iter().zip(values) {
+            if let (Some(value), Document::Object(map)) = (value, &mut doc) {
+                *Path::new(field).slot(map) = value.clone();
+            }
+        }
+        let at: Vec<&Document> = fields.iter().map(|f| value_or_null(&doc, f)).collect();
+        let key = match at.len() {
+            0 => Some(key::primary(id)),
+            1 => key::secondary(at[0], id),
+            _ => Some(key::compound(&at, id)),
+        };
+        (doc, key)
+    }
+
+    /// SPEC §104.1, §104.2: where an entry's bytes decide a filter, they
+    /// decide it as its document does — on the primary index, one field,
+    /// a nested one, and compound keys of two and three, whose strings
+    /// are cut shorter; and they decide most of the time.
+    #[test]
+    fn entries_decide_on_their_bytes_as_their_documents_do() {
+        let mut rng = crate::testing::XorShift(0x0104_B17E_0104_B17E);
+        let values = colliding_values();
+        let indexes: [&[&str]; 5] = [&[], &["a"], &["o.p"], &["a", "b"], &["a", "o.p", "c"]];
+        let (mut decided, mut asked) = (0, 0);
+        for fields in indexes {
+            let names: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+            for _ in 0..1500 {
+                let conditions = (0..1 + rng.below(2))
+                    .map(|_| byte_condition(&mut rng, 3, fields, &values))
+                    .collect();
+                let filter = Filter {
+                    conditions,
+                    ..Filter::default()
+                };
+                let on_bytes = EntryMatcher::new(&filter, &names);
+                let matcher = filter.matcher();
+                for _ in 0..8 {
+                    let at: Vec<Option<Document>> = (0..fields.len())
+                        .map(|_| match rng.below(10) {
+                            0 => None,
+                            _ => Some(values[rng.below(values.len())].clone()),
+                        })
+                        .collect();
+                    let id = crate::DocId([[1, 2, 7][rng.below(3)]; 16]);
+                    let (doc, Some(key)) = entry_of(fields, &at, id) else {
+                        continue;
+                    };
+                    asked += 1;
+                    if let Some(answer) = on_bytes.matches(&key) {
+                        decided += 1;
+                        assert_eq!(answer, matcher.matches(&doc), "{filter:?} on {doc}");
+                    }
+                }
+            }
+        }
+        assert!(decided > asked * 3 / 4, "{decided} of {asked}");
+    }
+
+    /// SPEC §104.4: for a filter that accepts one interval of keys, every
+    /// key between two that match on their bytes matches — and only such
+    /// filters count as one.
+    #[test]
+    fn keys_between_two_matching_ends_of_an_interval_match() {
+        let mut rng = crate::testing::XorShift(0x0104_1A7E_0104_1A7E);
+        let encoded: Vec<Document> = colliding_values()
+            .into_iter()
+            .filter(|v| key::encode_value(v).is_some())
+            .collect();
+        // One type at a time, so that ranges hold, and all of them.
+        let kinds: [fn(&Document) -> bool; 3] = [
+            |v| matches!(v, Document::Int(_) | Document::Float(_)),
+            |v| matches!(v, Document::String(_)),
+            |_| true,
+        ];
+        let mut intervals = 0;
+        for (kind, fields) in (kinds.iter()).flat_map(|k| [(k, &["a"][..]), (k, &["a", "b"])]) {
+            let values: Vec<Document> = encoded.iter().filter(|v| kind(v)).cloned().collect();
+            let close =
+                |rng: &mut crate::testing::XorShift| values[rng.below(values.len())].clone();
+            let names: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
+            let mut entries: Vec<(Vec<u8>, Document)> = (0..400)
+                .filter_map(|i| {
+                    let at = fields
+                        .iter()
+                        .map(|_| Some(close(&mut rng)))
+                        .collect::<Vec<_>>();
+                    let (doc, key) = entry_of(fields, &at, crate::DocId([i as u8; 16]));
+                    Some((key?, doc))
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for _ in 0..600 {
+                let range = [Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
+                let kind = rng.below(7);
+                let mut on = |field: &str, ops: &[Op]| {
+                    Condition::compare(field, ops[rng.below(ops.len())].clone(), close(&mut rng))
+                };
+                let (conditions, interval) = match kind {
+                    0 => (vec![on("a", &range), on("a", &range)], true),
+                    1 if fields.len() == 2 => (vec![on("b", &range), on("a", &[Op::Eq])], true),
+                    2 => (
+                        vec![Condition::All(vec![on("a", &range), on("a", &range)])],
+                        true,
+                    ),
+                    3 => (vec![on("a", &range), on("a", &[Op::Ne])], false),
+                    4 => (
+                        vec![Condition::Any(vec![on("a", &range), on("a", &range)])],
+                        false,
+                    ),
+                    5 => (vec![!on("a", &range)], false),
+                    _ if fields.len() == 2 => (vec![on("b", &range), on("a", &range[1..])], false),
+                    _ => (
+                        vec![
+                            on("a", &range),
+                            Condition::gt(ID_FIELD, crate::DocId([9; 16])),
+                        ],
+                        false,
+                    ),
+                };
+                let filter = Filter {
+                    conditions,
+                    ..Filter::default()
+                };
+                let on_bytes = EntryMatcher::new(&filter, &names);
+                let matcher = filter.matcher();
+                assert_eq!(on_bytes.interval, interval, "{filter:?}");
+                if !on_bytes.interval {
+                    continue;
+                }
+                let ends: Vec<usize> = (0..entries.len())
+                    .filter(|&i| on_bytes.matches(&entries[i].0) == Some(true))
+                    .collect();
+                if let (Some(&first), Some(&last)) = (ends.first(), ends.last()) {
+                    intervals += 1;
+                    for (key, doc) in &entries[first..=last] {
+                        assert!(matcher.matches(doc), "{filter:?}: {doc} in {key:?}");
+                    }
+                }
+            }
+        }
+        assert!(intervals > 300, "{intervals}");
     }
 
     /// SPEC §103.2: a sort by `_id` after `Eq`s walks the range they find
