@@ -113,3 +113,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 100. [Index entries that answer the filter (`query.rs`, `collection.rs`, `cursor.rs`, `index/key.rs`, `explain.rs`)](100-index-entries-that-answer-the-filter.md)
 101. [A cheaper walk through an index (`index/btree.rs`, `storage/slotted.rs`, `collection.rs`, `query.rs`)](101-a-cheaper-walk-through-an-index.md)
 102. [Paths resolved once per query (`path.rs`, `query.rs`, `collection.rs`, `cursor.rs`)](102-paths-resolved-once-per-query.md)
+103. [An `Eq`-fixed index walked in id order (`query.rs`, `collection.rs`)](103-an-eq-fixed-index-walked-in-id-order.md)
