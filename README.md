@@ -237,9 +237,8 @@ Reads are level with SQLite, redb and sled or ahead of them; writes and
 compaction are still behind. `bench/` runs one document workload
 against trunkdb and the three others: same documents and ids, same three
 indexes, durable commits everywhere, and the same answers checked
-across all four. On an
-M1 Pro with 100,000 documents, the median of three runs (0.19.0 with
-§90–§104):
+across all four. On an M1 Pro with 100,000 documents, the median of
+three runs (0.20.0):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
@@ -654,12 +653,14 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     A count over an index range of 1,000 different values takes 15 µs
     instead of 73; SQLite takes 21–30. Same results.
 
-    Items 60–74: not released yet. File format 12, which still opens
-    6–11 holding only objects; 0.19.0 refuses a file this build has
-    opened. An older build refuses a WAL this one left after a crash.
-    Code that caught a foreign or unreadable file as `Error::Io` with
-    `InvalidData` now gets `Error::Format` instead. `Collection<T>` for
-    a `T` that isn't a struct or a map no longer stores anything.
+    Items 60–74 → 0.20.0: file format 12, which still opens 6–11
+    holding only objects; 0.19.0 refuses a file 0.20.0 has opened, and
+    a WAL 0.20.0 left after a crash. Breaking: `Collection<T>` for a `T`
+    that isn't a struct or a map no longer stores anything (§95); code
+    that caught a foreign or unreadable file as `Error::Io` with
+    `InvalidData` gets `Error::Format` instead (§92). `explain` says
+    `IndexOrder` where a sort by `_id` after an `Eq` now walks the index
+    (§103). Exports as in 0.14.0.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
