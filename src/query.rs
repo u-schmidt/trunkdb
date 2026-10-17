@@ -1077,6 +1077,7 @@ impl Filter {
             by,
             fixed,
             served,
+            by_id: false,
         })
     }
 
@@ -1086,13 +1087,14 @@ impl Filter {
     /// (§95). Ids are unique, so it serves every sort key: no two
     /// documents tie in the first. The `_id` comparisons with an id
     /// narrow the walk, exactly; any other condition is only checked.
-    /// Not when the conditions find documents by value, as for any
-    /// walk.
+    ///
+    /// Where the conditions find documents by value, the range they find
+    /// them by is walked instead, if `Eq`s fix every field of its index
+    /// (SPEC §103): its keys then differ only in the id they end with, so
+    /// they're in id order too. The `_id` comparisons narrow it the same
+    /// way, under the fixed values. Otherwise no walk, as for any sort.
     fn id_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
-        if self.found_by_value(ID_FIELD, indexes) {
-            return None;
-        }
-        let (ranges, by): (Vec<KeyRange>, Vec<Condition>) = self
+        let (ranges, mut by): (Vec<KeyRange>, Vec<Condition>) = self
             .conditions
             .iter()
             .filter_map(|c| match c {
@@ -1104,13 +1106,45 @@ impl Filter {
                 _ => None,
             })
             .unzip();
+        let on_id = ranges.into_iter().reduce(KeyRange::intersect);
+        if !self.found_by_value(ID_FIELD, indexes) {
+            return Some(OrderedRead {
+                index: None,
+                range: on_id,
+                by,
+                fixed: 0,
+                served: self.sort.len(),
+                by_id: true,
+            });
+        }
+        let index = self.fixed_whole(indexes)?;
+        let (prefix, _, mut fixing) = equal_prefix(index, &self.conditions, index.fields.len());
+        fixing.append(&mut by);
+        let range = on_id.map_or_else(|| KeyRange::prefixed(&prefix), |r| r.under(&prefix));
         Some(OrderedRead {
-            index: None,
-            range: ranges.into_iter().reduce(KeyRange::intersect),
-            by,
-            fixed: 0,
+            index: Some(index),
+            range: Some(range),
+            by: fixing,
+            fixed: index.fields.len(),
             served: self.sort.len(),
+            by_id: true,
         })
+    }
+
+    /// The index the range read takes (`index_ranges`), if that is one
+    /// range and an `Eq` fixes each of the index's fields (SPEC §103.2):
+    /// walked, it reads what the range read would, in id order. Never
+    /// another index, which might hold many more documents.
+    fn fixed_whole<'a>(&self, indexes: &'a [IndexMeta]) -> Option<&'a IndexMeta> {
+        let ranges = self.index_ranges(indexes)?;
+        let [read] = &ranges[..] else {
+            return None; // an OR: several ranges, each in id order
+        };
+        // A sparse one only where the conditions keep its nulls out
+        // (§44): `index_ranges` checked.
+        let index = read.index;
+        let (_, equal, _) = equal_prefix(index, &self.conditions, index.fields.len());
+        (equal == index.fields.len()).then_some(index)
     }
 
     /// Whether the conditions on fields other than `sort_field` find
@@ -1159,6 +1193,10 @@ pub(crate) struct OrderedRead<'a> {
     /// How many sort keys, from the first, its fields give the order of
     /// (SPEC §47) — at least one.
     pub served: usize,
+    /// Whether it's walked in id order, each key one document's (SPEC
+    /// §96, §103): the primary index, or a range of one whose `Eq`s
+    /// fix every field.
+    pub by_id: bool,
 }
 
 impl OrderedRead<'_> {
@@ -2631,6 +2669,144 @@ mod tests {
             sparse: true,
             ..compound(fields)
         }
+    }
+
+    /// SPEC §103.2: a sort by `_id` after `Eq`s walks the range they find
+    /// the documents by, where they fix every field of its index — and
+    /// only that range, the one `index_ranges` reads.
+    #[test]
+    fn an_eq_fixing_its_index_whole_is_walked_by_id() {
+        let indexes = [
+            index("tenant"),
+            index("status"),
+            compound(&["status", "created"]),
+            compound(&["a", "b"]),
+            index("tags[*]"),
+            sparse(&["s"]),
+        ];
+        let walked = |f: Filter, order: SortOrder| {
+            let f = match order {
+                SortOrder::Asc => f.sort_asc("_id"),
+                SortOrder::Desc => f.sort_desc("_id"),
+            };
+            f.then_asc("tenant").limit(20).index_order(&indexes)
+        };
+        for order in [SortOrder::Asc, SortOrder::Desc] {
+            let name = |f: Filter| walked(f, order).map(|o| (o.name(), o.fixed, o.served));
+            let one = name(Filter::new().eq("tenant", "x"));
+            assert_eq!(one, Some(("tenant".to_string(), 1, 2)));
+            let o = walked(Filter::new().eq("tenant", "x"), order).unwrap();
+            assert!(o.by_id && o.index.is_some());
+            // Two `Eq`s on indexed fields: the range the range read takes.
+            let both = Filter::new().eq("status", "y").eq("tenant", "x");
+            let read = both.index_ranges(&indexes).unwrap()[0].index.name();
+            assert_eq!(name(both).map(|n| n.0), Some(read));
+            // A compound index fixed whole is walked; fixed in part, not.
+            let ab = name(Filter::new().eq("b", 2).eq("a", 1));
+            assert_eq!(ab, Some(("(a, b)".to_string(), 2, 2)));
+            assert_eq!(name(Filter::new().eq("a", 1)), None);
+            assert_eq!(name(Filter::new().eq("a", 1).gt("b", 1)), None);
+            // `(status, created)` beats `status` in the range read, and
+            // isn't fixed whole.
+            assert_eq!(name(Filter::new().eq("status", "y").gt("created", 1)), None);
+            // A multikey path, by an `Eq` on it.
+            let tags = name(Filter::new().eq("tags[*]", "t"));
+            assert_eq!(tags, Some(("tags[*]".to_string(), 1, 2)));
+            // An OR: several ranges, not walked.
+            let either = [Condition::eq("tenant", "x"), Condition::eq("tenant", "z")];
+            assert_eq!(name(Filter::new().any_of(either)), None);
+            // A sparse index lacks the nulls an `Eq` on null finds: it
+            // finds nothing by value, so the primary index is walked.
+            let null = name(Filter::new().eq("s", Document::Null));
+            assert_eq!(null, Some(("_id".to_string(), 0, 2)));
+            assert_eq!(
+                name(Filter::new().eq("s", 1)),
+                Some(("s".to_string(), 1, 2))
+            );
+            // Without an `Eq` on an indexed field: the primary index.
+            let primary = walked(Filter::new().gt("tenant", "x"), order).unwrap();
+            assert!(primary.by_id && primary.index.is_none());
+        }
+        // Without a limit, or with ids: no walk.
+        let unlimited = Filter::new().eq("tenant", "x").sort_asc("_id");
+        assert!(unlimited.index_order(&indexes).is_none());
+        let id = crate::DocId([7; 16]);
+        let named = Filter::new()
+            .eq("tenant", "x")
+            .eq("_id", id)
+            .sort_asc("_id");
+        assert!(named.limit(20).index_order(&indexes).is_none());
+        // A sort on another field than `_id` walks no range by id.
+        let other = Filter::new()
+            .eq("status", "y")
+            .sort_asc("created")
+            .limit(20);
+        assert!(!other.index_order(&indexes).unwrap().by_id);
+    }
+
+    /// SPEC §103.3: `_id` comparisons with an id narrow the walk to the
+    /// ids they hold, under the fixed values: exactly, as on the primary
+    /// index; `ne`, and a comparison with what isn't an id, don't.
+    #[test]
+    fn id_comparisons_narrow_a_walk_under_its_fixed_values() {
+        let indexes = [index("tenant"), compound(&["a", "b"])];
+        let id = |n: u8| crate::DocId([n; 16]);
+        let k = |tenant: &str, n: u8| key::secondary(&tenant.into(), id(n)).unwrap();
+        let range = |f: Filter| {
+            let order = f.eq("tenant", "x").sort_desc("_id").limit(20);
+            order.index_order(&indexes).unwrap().range.unwrap()
+        };
+        let holds = |range: &KeyRange| (1..=9).filter(|&n| range.contains(&k("x", n))).collect();
+        let held: Vec<u8> = holds(&range(Filter::new()));
+        assert_eq!(held, (1..=9).collect::<Vec<_>>());
+        let cases: [(Filter, Vec<u8>); 7] = [
+            (Filter::new().gt("_id", id(4)), vec![5, 6, 7, 8, 9]),
+            (Filter::new().gte("_id", id(4)), vec![4, 5, 6, 7, 8, 9]),
+            (Filter::new().lt("_id", id(4)), vec![1, 2, 3]),
+            (Filter::new().lte("_id", id(4)), vec![1, 2, 3, 4]),
+            (
+                Filter::new().gt("_id", id(2)).lt("_id", id(6)),
+                vec![3, 4, 5],
+            ),
+            (Filter::new().ne("_id", id(4)), (1..=9).collect()),
+            (Filter::new().gt("_id", "4"), (1..=9).collect()),
+        ];
+        for (filter, expected) in cases {
+            let range = range(filter);
+            assert_eq!(holds(&range), expected);
+            // Never another tenant's ids.
+            assert!(
+                ["w", "xx", "y", ""]
+                    .iter()
+                    .all(|t| (0..=255).all(|n| !range.contains(&k(t, n))))
+            );
+        }
+        // The walk reports the `Eq` and the comparisons it's bounded by.
+        let order = Filter::new()
+            .gt("_id", id(4))
+            .eq("tenant", "x")
+            .sort_asc("_id")
+            .limit(20);
+        let by = order.index_order(&indexes).unwrap().by;
+        assert_eq!(
+            by,
+            vec![Condition::eq("tenant", "x"), Condition::gt("_id", id(4))]
+        );
+        // On a compound index, under both fixed values.
+        let order = Filter::new()
+            .eq("a", 1)
+            .eq("b", 2)
+            .lt("_id", id(4))
+            .sort_asc("_id");
+        let range = order
+            .limit(20)
+            .index_order(&indexes)
+            .unwrap()
+            .range
+            .unwrap();
+        let k = |a: i64, b: i64, n: u8| key::compound(&[&a.into(), &b.into()], id(n));
+        assert!(range.contains(&k(1, 2, 3)) && !range.contains(&k(1, 2, 4)));
+        assert!(!range.contains(&k(1, 3, 3)) && !range.contains(&k(2, 2, 3)));
     }
 
     /// SPEC §100.1: a read covers a filter whose every path is one of its

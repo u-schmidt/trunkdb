@@ -255,7 +255,8 @@ Index entries decide what they can since §100: a count by index took
 and decides a leaf at once where it can since §101: the count of all
 100,000 took 7 ms, a count by index 0.17 ms, page 50 of 20 0.35 ms.
 Paths are parsed once per query since §102: a count over a range took
-0.14 ms. What's left: checkpoints in large batches; in a scan, the
+0.14 ms. A sort by `_id` after an `Eq` walks the index in id order
+since §103: "tenant == x by id, first 20" took 0.38 ms. What's left: checkpoints in large batches; in a scan, the
 small object each document's filtered fields are decoded into; and an
 index entry's values decoded to be checked, most of a range count's
 0.07 ms.
@@ -606,7 +607,17 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     instead of 0.14; "tenant == x, first 20 by id" 0.39 ms instead of
     0.6. Same results.
 
-    Items 60–72: not released yet. File format 12, which still opens
+73. **An `Eq`-fixed index walked in id order** (§103): a sort by `_id`
+    with a limit, after `Eq`s that fix every field of the index the
+    filter is read by, walks that index's range in id order, forward or
+    backward, and stops at the limit, instead of sorting every match in
+    memory. Within one value an index's keys differ only in the id they
+    end with. `_id` comparisons narrow the walk, so paging by the last
+    id works within one value too. "tenant == x, newest 20 by id" takes
+    23 µs instead of 380; `explain` says `IndexOrder` for it where it
+    said `Index`. Same results.
+
+    Items 60–73: not released yet. File format 12, which still opens
     6–11 holding only objects; 0.19.0 refuses a file this build has
     opened. An older build refuses a WAL this one left after a crash.
     Code that caught a foreign or unreadable file as `Error::Io` with

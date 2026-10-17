@@ -504,6 +504,7 @@ current table. Each gap had a measured cause, fixed one at a time:
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |
 | Count of all, of 1000 by index, page 50 of 20 | 7 ms, 0.17 ms, 0.35 ms | a walk that lends its entries and decides whole leaves [§101](spec/101-a-cheaper-walk-through-an-index.md) |
 | Count of a range, tenant's first 20 by id | 0.14 ms, 0.6 ms | paths parsed once per query, small objects searched without hashing, sort keys looked up once [§102](spec/102-paths-resolved-once-per-query.md) |
+| Tenant's first 20 by id | 0.38 ms | the `Eq`-fixed range walked in id order, which its keys are in [§103](spec/103-an-eq-fixed-index-walked-in-id-order.md) |
 
 Still behind: an index entry's values decoded to be checked, which is
 most of a count over a range of all-different values; in a scan, the small object
