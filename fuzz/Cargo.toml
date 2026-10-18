@@ -14,6 +14,10 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 trunkdb = { path = "..", features = ["fuzzing"] }
 
+# `cargo fuzz` builds with `--cfg fuzzing`, and so does the smoke run.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 # Its own workspace, like `bench/`.
 [workspace]
 members = ["."]
@@ -42,6 +46,13 @@ bench = false
 [[bin]]
 name = "import"
 path = "fuzz_targets/import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "queries"
+path = "fuzz_targets/queries.rs"
 test = false
 doc = false
 bench = false

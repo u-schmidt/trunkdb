@@ -119,8 +119,9 @@ src/
 tests/                 the command line, and a time-series-shaped
                          workload through the public API
 bench/                 against SQLite, redb and sled (its own crate)
-fuzz/                  fuzz targets: damaged files, WALs and exports
-                         (its own crate, nightly)
+fuzz/                  fuzz targets: damaged files, WALs and exports,
+                         and queries against a model (its own crate,
+                         nightly; a smoke run on stable)
 ```
 
 ## Usage
@@ -661,6 +662,19 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `InvalidData` gets `Error::Format` instead (§92). `explain` says
     `IndexOrder` where a sort by `_id` after an `Eq` now walks the index
     (§103). Exports as in 0.14.0.
+
+75. **A differential fuzz target for queries** (§105): `fuzz/`'s
+    `queries` target reads any bytes as a program of index changes,
+    writes, compactions, reopens, snapshots and reads, and checks every
+    read, through `find`, typed reads, the cursor, `find_one`, `count`
+    and `explain_run`, against the filter applied in memory. A smoke run
+    on stable runs it on random programs in CI. It found a leak: a
+    current data page emptied by deletes, given up for a new one when a
+    large document didn't fit beside its slot directory, was never freed
+    (`check` reported it, `compact` reclaims it); now it is. And the
+    other fuzz targets' starting database hadn't built since §95.
+
+    Item 75: not released yet; nothing changes in the API or the file.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

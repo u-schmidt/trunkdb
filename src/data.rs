@@ -466,8 +466,17 @@ fn place_cell(
     store.write_page(page_id, page.into_page())?;
     let old = std::mem::replace(current, page_id);
     if old != 0 {
-        // No longer current: whatever room it has left goes into the map.
-        note_room(free, *current, old, &read_data_page(store, old)?);
+        // No longer current: freed if it holds nothing, as `write_or_free`
+        // frees any other page left empty; else its room goes into the
+        // map. An emptied current page can still turn a cell away: its
+        // slot directory stays (SPEC §105.6).
+        let page = read_data_page(store, old)?;
+        if page.is_empty() {
+            free.remove(old);
+            store.free_page(old)?;
+        } else {
+            note_room(free, *current, old, &page);
+        }
     }
 
     Ok(RecordLocation {
@@ -1034,6 +1043,37 @@ mod tests {
         // 2,000 on b's, too few for c.
         let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(2500)).unwrap();
         assert_eq!(c.page, a.page);
+    }
+
+    /// SPEC §105.6: a current page emptied by deletes keeps its slot
+    /// directory, so a document as large as fits on a fresh page doesn't
+    /// fit there. It goes to a new page, and the old one, no longer
+    /// current and holding nothing, is freed: before, it went into the
+    /// free-space map and belonged to nothing, a page `check` called
+    /// leaked.
+    #[test]
+    fn an_emptied_current_page_given_up_for_a_new_one_is_freed() {
+        let (_dir, mut store) = store();
+        let mut current = 0;
+        let mut free = FreeSpace::default();
+        let small: Vec<RecordLocation> = (0..40)
+            .map(|n| insert_record(&mut store, &mut current, &mut free, id(n), &blob(10)).unwrap())
+            .collect();
+        let emptied = current;
+        assert!(small.iter().all(|loc| loc.page == emptied));
+        for loc in small {
+            delete_record(&mut store, current, &mut free, loc).unwrap();
+        }
+        assert_eq!(current, emptied, "the current page stays, empty");
+        let large = blob(largest_inline_blob());
+        let at = insert_record(&mut store, &mut current, &mut free, id(99), &large).unwrap();
+        assert_ne!(at.page, emptied, "the directory left no room for it");
+        assert_eq!(current, at.page);
+        assert!(
+            store.free_pages().unwrap().contains(&emptied),
+            "the emptied page is free"
+        );
+        assert_eq!(free.find(1), None, "and not in the map");
     }
 
     #[test]

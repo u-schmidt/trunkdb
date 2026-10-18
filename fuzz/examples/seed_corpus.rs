@@ -1,7 +1,9 @@
 //! Writes starting inputs for the fuzz targets into `corpus/` (SPEC §55):
 //! a whole database for `open_raw`, a valid WAL for `recover_wal`, an
 //! export for `import`. Without them, random bytes rarely get past a
-//! file's first check. `cargo run --example seed_corpus` from `fuzz/`.
+//! file's first check. For `queries`, programs long enough for their 64
+//! steps (SPEC §105.4): libFuzzer's own inputs start short. `cargo run
+//! --example seed_corpus` from `fuzz/`.
 
 use trunkdb::fuzzing::USABLE_PAGE_SIZE;
 use trunkdb_fuzz::ALL;
@@ -46,4 +48,19 @@ fn main() {
     let mut export = Vec::new();
     db.export(&mut export).unwrap();
     write("import", "export.jsonl", &export);
+
+    // queries: programs of 4 to 20 KB, as the smoke run makes them.
+    let mut rng: u64 = 0x0105_5EED_0105_5EED;
+    for n in 0..16 {
+        let len = 4096 + n * 1024;
+        let program: Vec<u8> = (0..len)
+            .map(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng as u8
+            })
+            .collect();
+        write("queries", &format!("program-{n:02}"), &program);
+    }
 }

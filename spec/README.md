@@ -115,3 +115,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 102. [Paths resolved once per query (`path.rs`, `query.rs`, `collection.rs`, `cursor.rs`)](102-paths-resolved-once-per-query.md)
 103. [An `Eq`-fixed index walked in id order (`query.rs`, `collection.rs`)](103-an-eq-fixed-index-walked-in-id-order.md)
 104. [Index entries matched on their bytes (`query.rs`, `index/key.rs`)](104-index-entries-matched-on-their-bytes.md)
+105. [A differential fuzz target for queries (`fuzz/`)](105-a-differential-fuzz-target-for-queries.md)

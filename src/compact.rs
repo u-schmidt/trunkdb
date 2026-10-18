@@ -34,7 +34,9 @@ impl Database {
     /// for the reads under way, and new ones wait until it is committed.
     ///
     /// `Error::SnapshotOpen` if a snapshot is kept open: every page
-    /// changes, and none can be kept as it was (SPEC §80.5).
+    /// changes, and none can be kept as it was (SPEC §80.5). A file
+    /// already as small as a compaction would make it is left as it is,
+    /// and that is `Ok` beside a snapshot too: nothing changes for it.
     pub fn compact(&self) -> crate::Result<Compacted> {
         self.transact(|catalog, store| {
             let pages_before = store.page_count();

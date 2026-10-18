@@ -62,7 +62,7 @@ jobs:
       - run: cargo run --release --manifest-path bench/Cargo.toml -- 20000
 
   fuzz:
-    name: Fuzz targets (build and lint; fuzzing runs by hand, SPEC §55)
+    name: Fuzz targets (build, lint, random queries programs; guided fuzzing runs by hand, SPEC §55, §105)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -74,3 +74,17 @@ jobs:
           workspaces: fuzz
       - run: cargo fmt --check --manifest-path fuzz/Cargo.toml
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+      # The targets' valid database builds (SPEC §55.1): a write it makes
+      # that trunkdb came to refuse (§95) left them all panicking, unseen.
+      - run: cargo run --release --manifest-path fuzz/Cargo.toml --example seed_corpus
+      # The `queries` target on random programs, on stable (SPEC §105.4),
+      # from a new seed each run. A failing program names its seed and is
+      # kept as an artifact, for `cargo fuzz run queries <file>`.
+      - run: cargo run --release --manifest-path fuzz/Cargo.toml --example queries_smoke -- 400 ${{ github.run_id }}
+        env:
+          RUSTFLAGS: --cfg fuzzing
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queries-program
+          path: fuzz/artifacts/queries/

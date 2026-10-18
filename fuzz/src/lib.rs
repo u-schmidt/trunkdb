@@ -5,6 +5,8 @@
 //! A target's only rule is that trunkdb doesn't panic or hang: any
 //! `Err` is a correct answer to damaged input.
 
+pub mod queries;
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -87,9 +89,13 @@ pub fn base() -> &'static [u8] {
             );
             notes.insert(doc).unwrap();
         }
+        // Every document an object since SPEC §95: a plain number here
+        // made every target that starts from this database panic, which
+        // building and linting the fuzz crate in CI couldn't show (§105).
         let scratch = db.collection::<Document>("scratch");
         for n in 0..30i64 {
-            scratch.insert(Document::Int(n)).unwrap();
+            let doc = Document::Object([("n".to_string(), Document::Int(n))].into_iter().collect());
+            scratch.insert(doc).unwrap();
         }
         db.drop_collection("scratch").unwrap();
         db.checkpoint().unwrap();

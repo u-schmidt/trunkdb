@@ -222,6 +222,9 @@ bytes: in memory only, learned from writes (a page gets in with a
 quarter of it free, and stays until less than 256 bytes are left), and
 rolled back with the catalog it lives in. It starts empty at open, so
 space freed in an earlier session comes back by a compaction [§75](spec/75-a-free-space-map.md).
+A page left with no documents goes back to the file's free list, unless
+it is the current page; one that stops being current is freed then, if
+it holds nothing [§105](spec/105-a-differential-fuzz-target-for-queries.md).
 
 **Large documents** keep only a pointer in their cell: the length and
 the first of a chain of overflow pages [§26](spec/26-overflow-pages-and-u32-lengths.md). Lengths are `u32`.
@@ -525,8 +528,16 @@ changed page is copied once, not twice: `write_page` takes the `Page` [§67](spe
 - **Fuzzing** (`fuzz/`): damaged databases, WALs and exports, millions
   of them, where anything but a panic or a hang is a correct answer. Each
   crash it found became a test in the library [§55](spec/55-fuzzing.md).
+- **Differential fuzzing** (`fuzz/`, the `queries` target): any bytes as
+  a program of index changes, writes, compactions, reopens, snapshots
+  and reads on a valid database, every read through every way of reading
+  held against the filter applied in memory to a model of what is
+  stored. It catches 33 of the 36 hand-made mutations of §100–§104 that
+  change answers [§105](spec/105-a-differential-fuzz-target-for-queries.md).
 - **Mutation checks:** each section breaks its own code on purpose in a
   handful of ways and lists them; every one has to fail a test.
 - **CI** runs the tests on Linux, macOS and Windows, clippy with
   warnings as errors, fmt, the minimum Rust version (1.89), a short
-  benchmark run, and keeps the fuzz crate compiling (it doesn't fuzz).
+  benchmark run, and the fuzz crate: compiling, building the targets'
+  database, and the `queries` target on 400 random programs from a new
+  seed each run (guided fuzzing runs by hand).
