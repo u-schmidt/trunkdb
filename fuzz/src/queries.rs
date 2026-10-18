@@ -8,7 +8,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use trunkdb::query::{Condition, Filter, Op, SortOrder, Update};
+use trunkdb::query::{Aggregate, Condition, Filter, Op, SortOrder, Update};
 use trunkdb::{Database, DocId, Document, Error, IndexOptions, Upserted};
 
 /// Steps a program runs at most, and documents it keeps at most.
@@ -64,6 +64,9 @@ const SELECTED: [&str; 13] = [
     "",
     "missing.x",
 ];
+/// Paths an aggregate groups by and sums up (SPEC §107): the documents'
+/// fields, without `[*]`.
+const AGGREGATED: [&str; 7] = ["a", "aa", "b", "c", "o.p", "tags", "z"];
 const SORT_KEYS: [&str; 6] = ["a", "b", "o.p", "c", "tags", "_id"];
 const OPS: [Op; 7] = [
     Op::Eq,
@@ -122,9 +125,12 @@ pub struct Ran {
     /// Results `explain_run` counted as answered from their index
     /// entries (SPEC §106.5).
     pub answered: u64,
+    /// Matches `explain_aggregate` counted as aggregated from their
+    /// index entries (SPEC §107.5).
+    pub aggregated: u64,
 }
 
-pub const STEP_NAMES: [&str; 14] = [
+pub const STEP_NAMES: [&str; 15] = [
     "ensure index",
     "drop index",
     "insert",
@@ -139,6 +145,7 @@ pub const STEP_NAMES: [&str; 14] = [
     "reopen",
     "snapshot",
     "read",
+    "aggregate",
 ];
 
 /// A document read through a typed collection: only its id (SPEC §99).
@@ -395,6 +402,7 @@ impl Run<'_> {
             10 => self.compact(),
             11 => self.reopen(),
             12 => self.keep_snapshot(),
+            14 => self.aggregate(),
             _ => {
                 let query = self.query();
                 self.read(&query);
@@ -731,6 +739,83 @@ impl Run<'_> {
                     .collect(),
             ),
         }
+    }
+
+    /// Rule 2 for an aggregate (SPEC §107): `aggregate` answers as
+    /// `Aggregate::apply` does on the model's matches. Half the time its
+    /// filter neither sorts nor limits and its fields are an existing
+    /// index's, so that the entries may answer (§107.5).
+    fn aggregate(&mut self) {
+        // A skip or a limit picks among matches only in a total order.
+        let mut query = self.query().unselected().total();
+        if self.program.one_in(2) {
+            query.sort.clear();
+            query.skip = 0;
+            query.limit = None;
+        }
+        let index_fields: Vec<&'static str> = match self.indexes.is_empty() {
+            false if self.program.one_in(2) => {
+                let at = self.program.below(self.indexes.len());
+                let index = *self.indexes.keys().nth(at).expect("in range");
+                INDEXES[index]
+                    .iter()
+                    .copied()
+                    .filter(|f| !f.contains('['))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let fields: Vec<&'static str> = match index_fields.is_empty() {
+            true => AGGREGATED.to_vec(),
+            false => index_fields,
+        };
+        let mut aggregate = Aggregate::new();
+        let mut grouped = Vec::new();
+        for _ in 0..self.program.below(3) {
+            let field = fields[self.program.below(fields.len())];
+            if !grouped.contains(&field) {
+                grouped.push(field);
+                aggregate = aggregate.group_by(field);
+            }
+        }
+        for c in 0..1 + self.program.below(3) {
+            let name = format!("c{c}");
+            let path = fields[self.program.below(fields.len())];
+            aggregate = match self.program.below(5) {
+                0 => aggregate.count(name),
+                1 => aggregate.sum(path, name),
+                2 => aggregate.min(path, name),
+                3 => aggregate.max(path, name),
+                _ => aggregate.avg(path, name),
+            };
+        }
+        if self.program.one_in(4) {
+            aggregate = aggregate.sort_desc("c0").limit(1 + self.program.below(3));
+        }
+        let filter = query.filter();
+        let matches = self.expected(&self.model, &filter);
+        let expected = aggregate.apply(matches).unwrap();
+        let docs = self.docs();
+        let found = docs.aggregate(filter.clone(), &aggregate).unwrap();
+        let agree =
+            found.len() == expected.len() && found.iter().zip(&expected).all(|(a, b)| same(a, b));
+        if !agree {
+            let text = |rows: &[Document]| rows.iter().map(canonical).collect::<Vec<_>>();
+            assert_eq!(
+                text(&found),
+                text(&expected),
+                "{}: aggregate {filter:?} {aggregate:?}",
+                self.at()
+            );
+        }
+        let run = docs.explain_aggregate(filter.clone(), &aggregate).unwrap();
+        assert_eq!(
+            run.stats.documents_returned as usize,
+            expected.len(),
+            "{}",
+            self.at()
+        );
+        self.ran.aggregated += run.stats.from_entries;
     }
 
     // --- Index steps ---

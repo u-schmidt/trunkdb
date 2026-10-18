@@ -1,3 +1,4 @@
+pub use crate::aggregate::Aggregate;
 use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
 pub use crate::explain::{ExecutionStats, Explained, IndexRead, SortWork};

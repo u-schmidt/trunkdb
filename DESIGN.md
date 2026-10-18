@@ -24,8 +24,8 @@ a small sync app replaced MongoDB with it [§5](spec/05-reference-workloads.md).
 
 Deliberately not there: a cost-based planner, joins, several writers
 at once, several processes on one file, encryption and schema
-validation [§6](spec/06-v0-feature-set.md). Aggregates were on that list, and are being
-looked at again [§106.7](spec/106-projection-a-select-of-fields.md).
+validation [§6](spec/06-v0-feature-set.md). Aggregates were on that list; they came
+back in [§107](spec/107-aggregates.md).
 
 ## 2. Layers
 
@@ -353,6 +353,18 @@ fits the key, an id, a date-time. A number is keyed as a float and a
 missing field as null, so those are read from the document. Writes work
 on whole documents, whatever is selected.
 
+**Aggregates** (`aggregate`, with an `Aggregate`) put the documents a
+filter finds in groups by the values of some paths, and per group count,
+sum, average, or find the smallest and largest value
+[§107](spec/107-aggregates.md). A missing field groups with null, values a
+filter finds equal are one group, and sums are exact (a fixed-point
+integer as wide as every float), so the plan doesn't change the answer.
+Where an index holds every path the aggregate reads, its entries are
+aggregated without their documents for `count`, `avg`, `min` and `max`,
+a document read only for a value the key doesn't hold as stored (a
+group's or an extreme's number); a walk counts whole leaves of a group.
+Without conditions, an index is walked only if it holds every document.
+
 `explain_run` runs a query and says how it went: the plan, each index
 read with the conditions that bound it and whether its entries decided
 the filter, how many sort keys the index gave, and the entries and
@@ -466,7 +478,8 @@ more than four.
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** only through `Filter`'s methods; `limit` takes an `Option`
-  too [§60](spec/60-a-smaller-public-api.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md).
+  too [§60](spec/60-a-smaller-public-api.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md);
+  `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.

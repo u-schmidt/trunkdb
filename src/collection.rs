@@ -1,3 +1,4 @@
+use crate::aggregate::{Aggregate, Groups, Kind, Order};
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
@@ -419,6 +420,49 @@ impl<T> Collection<T> {
     /// assert_eq!(some.stats.documents_examined, 48);
     /// # Ok::<(), trunkdb::Error>(())
     /// ```
+    /// The documents `find(filter)` would return, put in groups and
+    /// summed up as `aggregate` says — SQL's `GROUP BY` (SPEC §107). One
+    /// row per group, a document of the group's values and each column;
+    /// see `Aggregate`. `Document::into_value` makes a row a struct.
+    ///
+    /// Each match is decoded only on the fields the aggregate reads.
+    /// Where an index's entries decide the filter and hold every field
+    /// the aggregate reads, they are aggregated without their documents
+    /// for `count`, `avg`, `min` and `max`; `sum` reads its numbers from
+    /// the documents, as a key doesn't keep whether a number was an
+    /// `Int` or a `Float` (§107.5). Without conditions, an index whose
+    /// entries hold every document and every such field is walked
+    /// instead of every document. Refused, before anything is read, as
+    /// `Aggregate` says.
+    pub fn aggregate(&self, filter: Filter, aggregate: &Aggregate) -> crate::Result<Vec<Document>> {
+        let state = self.read()?;
+        let at = state.snapshot();
+        let trace = Trace::default();
+        let (rows, _plan) = aggregate_in(
+            at.catalog, &at.store, &self.name, &filter, aggregate, &trace,
+        )?;
+        Ok(rows)
+    }
+
+    /// Runs `aggregate` as `aggregate` does and says how (SPEC §107.6),
+    /// as `explain_run` does for `find`: the plan, the index reads, the
+    /// documents read, the matches aggregated from their entries alone
+    /// (`from_entries`), the groups, and the rows (`documents_returned`).
+    pub fn explain_aggregate(
+        &self,
+        filter: Filter,
+        aggregate: &Aggregate,
+    ) -> crate::Result<Explained> {
+        let started = std::time::Instant::now();
+        let state = self.read()?;
+        let at = state.snapshot();
+        let trace = Trace::default();
+        let (rows, plan) = aggregate_in(
+            at.catalog, &at.store, &self.name, &filter, aggregate, &trace,
+        )?;
+        Ok(trace.explained(plan, None, None, rows.len(), started.elapsed()))
+    }
+
     pub fn explain_run(&self, filter: Filter) -> crate::Result<Explained> {
         let started = std::time::Instant::now();
         let state = self.read()?;
@@ -853,29 +897,13 @@ impl Collection<Document> {
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
         let state = self.read()?;
         let at = state.snapshot();
-        let trace = Trace::default();
-        let streamed = count_in(at.catalog, &at.store, &self.name, &filter)?;
-        let count = if let Some(count) = streamed {
-            count
-        } else {
-            let names = filter.fields_with(false);
-            let matcher = filter.matcher();
-            read_candidates(
-                at.catalog,
-                &at.store,
-                &self.name,
-                &filter,
-                names.as_deref(),
-                Wants::default(),
-                &trace,
-            )?
-            .0
-            .iter()
-            .filter(|(source, fields)| source.decided() || matcher.matches(fields))
-            .count()
-        };
-        let count = count.saturating_sub(filter.skip);
-        Ok(filter.limit.map_or(count, |limit| count.min(limit)))
+        Ok(count_matches(
+            at.catalog,
+            &at.store,
+            &self.name,
+            &filter,
+            &Trace::default(),
+        )?)
     }
 
     /// A streaming `find`: yields matches one at a time, holding only
@@ -1921,6 +1949,342 @@ fn read_candidates(
 struct Wants<'s> {
     sort: bool,
     select: Option<&'s Selection>,
+}
+
+/// What `count` gives for `filter`: counted as an index is walked where
+/// it can be (`count_in`), else from the candidates.
+fn count_matches(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    trace: &Trace,
+) -> std::io::Result<usize> {
+    let count = match count_in(catalog, store, collection, filter)? {
+        Some(count) => count,
+        None => {
+            let names = filter.fields_with(false);
+            let matcher = filter.matcher();
+            read_candidates(
+                catalog,
+                store,
+                collection,
+                filter,
+                names.as_deref(),
+                Wants::default(),
+                trace,
+            )?
+            .0
+            .iter()
+            .filter(|(source, fields)| source.decided() || matcher.matches(fields))
+            .count()
+        }
+    };
+    let count = count.saturating_sub(filter.skip);
+    Ok(filter.limit.map_or(count, |limit| count.min(limit)))
+}
+
+/// `Collection::aggregate` against a catalog and store the caller has
+/// locked (SPEC §107): from index entries where they hold the answer
+/// (`aggregate_by_entries`), else from the documents `find_in` finds,
+/// each decoded on the paths the aggregate reads. With the plan it
+/// followed.
+fn aggregate_in(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    aggregate: &Aggregate,
+    trace: &Trace,
+) -> crate::Result<(Vec<Document>, QueryPlan)> {
+    aggregate.check()?;
+    let indexes = catalog.indexes(collection);
+    let mut groups = Groups::new(aggregate);
+    // Counts alone, of every match: `count`'s.
+    let counts_only = aggregate.columns.iter().all(|c| c.kind == Kind::Count);
+    if aggregate.group_by.is_empty() && counts_only {
+        let n = count_matches(catalog, store, collection, filter, trace)?;
+        trace.matched(n);
+        if n > 0 {
+            groups.add_counted(Vec::new(), n as u64, Order::id(DocId::NIL), None);
+        }
+        trace.groups(1);
+        return Ok((
+            groups.finish(|_| unreachable!("counts only"))?,
+            plan_for(filter, indexes),
+        ));
+    }
+    if let Some(plan) =
+        aggregate_by_entries(catalog, store, collection, filter, &mut groups, trace)?
+    {
+        trace.groups(groups.len());
+        let paths = aggregate.paths();
+        let selection = Selection::new(paths.iter().copied());
+        let mut records = data::Records::new(store);
+        let rows = groups.finish(|loc| {
+            trace.examined();
+            let stored = records.stored(loc)?;
+            selection.decode(stored.encoded(), stored.id())
+        })?;
+        return Ok((rows, plan));
+    }
+    let paths = aggregate.paths();
+    let selection = Selection::new(paths.iter().copied());
+    let found = find_in(
+        catalog,
+        store,
+        collection,
+        filter,
+        false,
+        Some(&selection),
+        trace,
+    )?;
+    for found in found {
+        let id = found.id();
+        let doc = found.decode(Some(&selection))?;
+        groups.add_document(&doc, Order::id(id), None);
+    }
+    trace.groups(groups.len());
+    let rows = groups.finish(|_| unreachable!("every value from its document"))?;
+    Ok((rows, plan_for(filter, indexes)))
+}
+
+/// An aggregate from index entries (SPEC §107.5), into `groups`: where
+/// it has no `sum`, the filter no sort, skip or limit, and one index
+/// holds every path it reads, exactly, and isn't multikey — read in the
+/// range the filter's plan reads, if the entries decide the filter; or,
+/// without conditions, whole, if it holds every document. Each match is
+/// aggregated from its entry where the values it needs are exact, and
+/// from its document otherwise; a leaf whose ends share their group is
+/// counted whole where every column is a `count`. `None` where the
+/// entries can't serve, and nothing was read.
+fn aggregate_by_entries(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    groups: &mut Groups,
+    trace: &Trace,
+) -> crate::Result<Option<QueryPlan>> {
+    let aggregate = groups.aggregate();
+    let picks = filter.skip > 0 || filter.limit.is_some() || !filter.sort.is_empty();
+    if picks || filter.ids().is_some() || aggregate.columns.iter().any(|c| c.kind == Kind::Sum) {
+        return Ok(None);
+    }
+    let paths = aggregate.paths();
+    let holds = |index: &IndexMeta| {
+        !index.fields.iter().any(|f| crate::query::is_multi(f))
+            && paths
+                .iter()
+                .all(|path| index.fields.iter().any(|f| f == path))
+    };
+    let indexes = catalog.indexes(collection);
+    // Only an index that holds every path can answer: the planner is
+    // offered those, so `tenant == x` averaging `tries` reads `(tenant,
+    // tries)` rather than the `tenant` index `find` would take.
+    let holding: Vec<IndexMeta> = indexes.iter().filter(|i| holds(i)).cloned().collect();
+    let (index, range, bounds, plan) = if filter.conditions.is_empty() {
+        // An index that holds every document: a compound one, or one
+        // whose entries are as many as the documents (§107.5, rule 4).
+        let documents = || count_in(catalog, store, collection, filter);
+        let mut every: Option<&IndexMeta> = None;
+        let group_count = aggregate.group_by.len();
+        let leading = |index: &IndexMeta| {
+            index.fields.len() >= group_count
+                && (index.fields[..group_count].iter()).all(|f| aggregate.group_by.contains(f))
+        };
+        let mut candidates: Vec<&IndexMeta> = indexes
+            .iter()
+            .filter(|index| holds(index) && !index.sparse)
+            .collect();
+        candidates.sort_by_key(|index| !leading(index));
+        for index in candidates {
+            let whole =
+                index.is_compound() || Some(index_entries(store, index.root)?) == documents()?;
+            if whole {
+                every = Some(index);
+                break;
+            }
+        }
+        let Some(index) = every else {
+            return Ok(None);
+        };
+        let plan = QueryPlan::IndexOrder {
+            field: index.name(),
+        };
+        (index, KeyRange::everything(), Vec::new(), plan)
+    } else {
+        let Some(ranges) = filter.index_ranges(&holding) else {
+            return Ok(None);
+        };
+        let [range] = &ranges[..] else {
+            return Ok(None);
+        };
+        if Covering::new(filter, Some(range.index), false).is_none() {
+            return Ok(None);
+        }
+        let plan = QueryPlan::Index {
+            field: range.index.name(),
+        };
+        (range.index, range.range.clone(), range.by.clone(), plan)
+    };
+    let fields = index.fields.len();
+    let at = |path: &str| index.fields.iter().position(|f| f == path).expect("held");
+    let group_at: Vec<usize> = aggregate.group_by.iter().map(|p| at(p)).collect();
+    let column_at: Vec<Option<usize>> = (aggregate.columns.iter())
+        .map(|c| c.path.as_deref().map(at))
+        .collect();
+    let counts_only = aggregate.columns.iter().all(|c| c.kind == Kind::Count);
+    // The bytes up to the last group field: a leaf whose ends agree on
+    // them is in one group (keys are in order, values prefix-free).
+    let through = group_at.iter().max().map_or(0, |last| last + 1);
+    let mut decider = Covering::new(filter, Some(index), false).map(|c| c.decider(filter));
+    let read = trace.read(index.name(), bounds, false);
+    if decider.is_some() || filter.conditions.is_empty() {
+        trace.covering(read);
+    }
+    let matcher = filter.matcher();
+    let mut records = data::Records::new(store);
+    let mut walk = BTreeIndex::new(index.root).walk(store, range, false);
+    // The bytes of the last entry's key up to its last group value, when
+    // that entry went to a group from its key.
+    let mut last_group: Option<Vec<u8>> = None;
+    // A value from a key, and whether it is the value as stored.
+    let value_of = |part: &[u8]| -> Option<(Document, bool)> {
+        if !key::part_is_exact(part, fields) {
+            return None;
+        }
+        let mut value = Document::Null;
+        key::decode_part_into(part, fields, &mut value)?;
+        let stored = !matches!(value, Document::Float(_));
+        Some((value, stored))
+    };
+    loop {
+        if counts_only
+            && !group_at.is_empty()
+            && let Some(leaf) = walk.whole_leaf()?
+        {
+            let decided = match &mut decider {
+                Some(decider) => decider.decide_all(leaf.lowest, leaf.highest),
+                None => Some(true),
+            };
+            let (low, high) = (prefix(leaf.lowest, through), prefix(leaf.highest, through));
+            let group = match (decided, low, high) {
+                (Some(true), Some(low), Some(high)) if low == high => {
+                    let parts = key::parts(key::value_part(leaf.lowest));
+                    (group_at.iter())
+                        .map(|&i| value_of(parts[i]).filter(|(_, stored)| *stored))
+                        .map(|v| v.map(|(value, _)| value))
+                        .collect::<Option<Vec<Document>>>()
+                }
+                _ => None,
+            };
+            if let Some(group) = group {
+                let n = leaf.entries;
+                let order = Order::id(key::doc_id(leaf.lowest));
+                trace.entries(read, n);
+                trace.matched(n);
+                (0..n).for_each(|_| trace.answered_from_entry());
+                groups.add_counted(group, n as u64, order, None);
+                last_group = low.map(<[u8]>::to_vec);
+                #[cfg(test)]
+                LEAVES_COUNTED.with(|c| c.set(c.get() + 1));
+                walk.pass_leaf();
+                continue;
+            }
+        }
+        let Some(entry) = walk.step() else {
+            break;
+        };
+        let (key, loc) = entry?;
+        trace.entries(read, 1);
+        let decided = match &mut decider {
+            Some(decider) => decider.decide(key),
+            None => Some(true),
+        };
+        if decided == Some(false) {
+            continue;
+        }
+        let parts = key::parts(key::value_part(key));
+        let values = (decided == Some(true) && parts.len() == fields).then(|| {
+            (column_at.iter())
+                .map(|at| match at {
+                    None => Some(None),
+                    Some(i) => value_of(parts[*i]).map(Some),
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+        let id = key::doc_id(key);
+        if let Some(Some(values)) = values {
+            // Entries come in key order: one whose bytes up to the last
+            // group value are the last one's is in its group.
+            let through = prefix(key, through);
+            if last_group.is_some() && through == last_group.as_deref() {
+                trace.matched(1);
+                trace.answered_from_entry();
+                groups.add_entry_to_last(values, Order::id(id), loc);
+                continue;
+            }
+            let group = (group_at.iter())
+                .map(|&i| value_of(parts[i]))
+                .collect::<Option<Vec<_>>>();
+            if let (Some(group), Some(through)) = (group, through) {
+                trace.matched(1);
+                trace.answered_from_entry();
+                groups.add_entry(group, values, Order::id(id), loc);
+                let last = last_group.get_or_insert_with(Vec::new);
+                last.clear();
+                last.extend_from_slice(through);
+                continue;
+            }
+        }
+        last_group = None;
+        // An entry that can't tell: its document, checked unless the
+        // entry decided.
+        trace.examined();
+        let doc = records.stored(loc)?.decode()?;
+        if decided.is_none() && !matcher.matches(&doc) {
+            continue;
+        }
+        trace.matched(1);
+        groups.add_document(&doc, Order::id(id), None);
+    }
+    Ok(Some(plan))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Leaves an aggregate counted whole (SPEC §107.5), on this thread.
+    static LEAVES_COUNTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The bytes of `key`'s first `n` values; `None` for a damaged key with
+/// fewer.
+fn prefix(key: &[u8], n: usize) -> Option<&[u8]> {
+    let mut parts = key::each_part(key::value_part(key));
+    let len = (0..n).try_fold(0, |len, _| Some(len + parts.next()?.len()))?;
+    Some(&key[..len])
+}
+
+/// How many entries the index at `root` has, counted leaf by leaf
+/// (SPEC §101.4).
+fn index_entries(store: &dyn PageStore, root: PageId) -> std::io::Result<usize> {
+    let mut walk = BTreeIndex::new(root).walk(store, KeyRange::everything(), false);
+    let mut n = 0;
+    loop {
+        if let Some(leaf) = walk.whole_leaf()? {
+            n += leaf.entries;
+            walk.pass_leaf();
+            continue;
+        }
+        match walk.step() {
+            Some(entry) => {
+                entry?;
+                n += 1;
+            }
+            None => return Ok(n),
+        }
+    }
 }
 
 /// `count`'s conditions counted entry by entry as an index is walked,
@@ -4509,6 +4873,7 @@ mod tests {
             // Typed (SPEC §99): matched on fields, deserialized last.
             assert_eq!(typed_ids(docs, &f), expected, "{f:?} via {plan:?}");
             selection_agrees(docs, &f, rng);
+            aggregate_agrees(docs, &f, rng);
             plans.insert(format!("{plan:?}"));
         }
         for plan in [
@@ -4921,6 +5286,7 @@ mod tests {
                 let typed = typed_ids(docs, &f).into_iter();
                 assert_eq!(ids(typed.map(|id| (id, Document::Null)).collect()), found);
                 selection_agrees(docs, &f, rng);
+                aggregate_agrees(docs, &f, rng);
                 if f.sort.is_empty() && (f.limit.is_some() || f.skip > 0) {
                     // Which documents a skip or limit without a sort keeps
                     // isn't promised: any that match, as many as they allow.
@@ -5290,6 +5656,85 @@ mod tests {
             "{s:?}: {selected:?} against {plain:?}"
         );
         selected.stats.from_entries
+    }
+
+    /// SPEC §107: a random aggregate of what `f` finds gives, through
+    /// `aggregate` and a `View`, what `Aggregate::apply` gives on `find`'s
+    /// documents; half the time on one index's fields, which its entries
+    /// may answer (§107.5). Returns how many matches came from entries.
+    fn aggregate_agrees(docs: &Collection<Document>, f: &Filter, rng: &mut XorShift) -> u64 {
+        use crate::query::Aggregate;
+        let whole = docs.find_with_ids(f.clone()).unwrap();
+        let indexes = docs.indexes().unwrap();
+        let pool: Vec<String> = match rng.below(2) {
+            0 if !indexes.is_empty() => {
+                let index = &indexes[rng.below(indexes.len())];
+                index.fields().to_vec()
+            }
+            _ => selectable(docs, &whole),
+        };
+        let pool: Vec<String> = (pool.into_iter())
+            .filter(|p| !p.is_empty() && !p.contains("[*]") && p != "_id")
+            .collect();
+        if pool.is_empty() {
+            return 0;
+        }
+        let pick = |rng: &mut XorShift| pool[rng.below(pool.len())].clone();
+        let mut aggregate = Aggregate::new();
+        let mut grouped: Vec<String> = Vec::new();
+        for _ in 0..rng.below(3) {
+            let path = pick(rng);
+            let clash = |g: &String| {
+                g == &path
+                    || g.starts_with(&format!("{path}."))
+                    || path.starts_with(&format!("{g}."))
+            };
+            if !grouped.iter().any(clash) {
+                aggregate = aggregate.group_by(path.clone());
+                grouped.push(path);
+            }
+        }
+        for c in 0..1 + rng.below(3) {
+            let name = format!("c{c}");
+            aggregate = match rng.below(5) {
+                0 => aggregate.count(name),
+                1 => aggregate.sum(pick(rng), name),
+                2 => aggregate.min(pick(rng), name),
+                3 => aggregate.max(pick(rng), name),
+                _ => aggregate.avg(pick(rng), name),
+            };
+        }
+        if rng.below(3) == 0 {
+            aggregate = aggregate.sort_desc("c0").limit(1 + rng.below(4));
+        }
+        let expected: Vec<String> = (aggregate.apply(whole.into_iter().map(|(_, d)| d)).unwrap())
+            .iter()
+            .map(Document::to_string)
+            .collect();
+        let text =
+            |rows: Vec<Document>| -> Vec<String> { rows.iter().map(Document::to_string).collect() };
+        let found = text(docs.aggregate(f.clone(), &aggregate).unwrap());
+        assert_eq!(found, expected, "{f:?} {aggregate:?}");
+        let view = docs
+            .db()
+            .snapshot()
+            .unwrap()
+            .collection::<Document>(&docs.name);
+        assert_eq!(
+            text(view.aggregate(f.clone(), &aggregate).unwrap()),
+            expected
+        );
+        let run = docs.explain_aggregate(f.clone(), &aggregate).unwrap();
+        assert_eq!(
+            run.stats.documents_returned,
+            expected.len() as u64,
+            "{run:?}"
+        );
+        assert!(
+            run.stats.from_entries <= run.stats.documents_matched,
+            "{run:?}"
+        );
+        run.stats.from_entries
     }
 
     fn records_read(f: impl FnOnce()) -> usize {
@@ -6171,6 +6616,7 @@ mod tests {
                 assert_eq!(typed_ids(&docs, &f), expected, "typed: {f:?}");
             }
             selection_agrees(&docs, &f, &mut rng);
+            aggregate_agrees(&docs, &f, &mut rng);
         }
         assert_consistent(&db);
     }
@@ -6368,6 +6814,7 @@ mod tests {
                 assert_eq!(found, expected, "{f:?} via {plan:?}");
                 assert_eq!(typed_ids(docs, &f), expected, "typed: {f:?}");
                 selection_agrees(docs, &f, rng);
+                aggregate_agrees(docs, &f, rng);
             }
         };
         check(&docs, &mut rng);
@@ -6737,6 +7184,7 @@ mod tests {
                     .limit([None, Some(0), Some(1), Some(5), Some(30)][rng.below(5)])
             };
             let (mut covered, mut skipped_unread, mut answered) = (0, 0, 0);
+            let mut aggregated = 0;
             for _ in 0..600 {
                 let f = random_filter(&mut rng);
                 let unlimited = Filter {
@@ -6770,6 +7218,7 @@ mod tests {
                     .collect();
                 let typed = typed_ids(&docs, &f);
                 answered += selection_agrees(&docs, &f, &mut rng);
+                aggregated += aggregate_agrees(&docs, &f, &mut rng);
                 let streamed: Vec<DocId> = docs
                     .cursor(f.clone())
                     .unwrap()
@@ -6802,6 +7251,8 @@ mod tests {
             assert!(skipped_unread > 20, "{skipped_unread} skipped unread");
             // Results answered from their entries (SPEC §106.5).
             assert!(answered > 100, "{answered} answered from entries");
+            // Mostly sorted or limited: aggregated from documents.
+            let _ = aggregated;
 
             // Writes change what `find` returns, no more and no less.
             for _ in 0..40 {
@@ -9310,5 +9761,257 @@ mod tests {
         ));
         assert_eq!(docs.delete_many(odd().sort_asc("b").limit(2)).unwrap(), 2);
         assert_eq!(docs.count(Filter::new()).unwrap(), 8);
+    }
+
+    // --- Aggregates (SPEC §107) ---
+
+    /// SPEC §107.5: random aggregates of random filters the entries can
+    /// serve — conditions on an index's fields, no sort or limit, columns
+    /// on its fields — give what the documents give, through a compound
+    /// index, a single-field one and a sparse one, with values of every
+    /// kind: `Int` and `Float`, cut strings, null and missing, arrays,
+    /// NaN. Most matches come from their entries.
+    #[test]
+    fn aggregates_from_entries_agree_with_the_documents() {
+        use crate::query::Aggregate;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index(["s", "t"]).unwrap();
+        docs.ensure_index(["s", "n"]).unwrap();
+        docs.ensure_index("n").unwrap();
+        docs.ensure_index_with("t", IndexOptions::new().sparse())
+            .unwrap();
+        let mut rng = XorShift(0x0107_E27E);
+        let long = "z".repeat(600);
+        let value = |rng: &mut XorShift| -> Option<Document> {
+            Some(match rng.below(12) {
+                0 => return None,
+                1 => Document::Null,
+                2 => Document::Int(rng.below(4) as i64),
+                3 => Document::Float(rng.below(4) as f64),
+                4 => Document::Float(-0.0),
+                5 => Document::Float(f64::NAN),
+                6 => Document::Int(1 << 60),
+                7 => Document::String(format!("{long}{}", rng.below(3))),
+                8 => Document::Array(vec![Document::Int(1)]),
+                9 => Document::Bool(rng.below(2) == 0),
+                _ => Document::String(["a", "b", "c"][rng.below(3)].into()),
+            })
+        };
+        let mut batch = db.batch();
+        for _ in 0..600 {
+            let mut fields = Vec::new();
+            for name in ["s", "t", "n"] {
+                if let Some(v) = value(&mut rng) {
+                    fields.push((name, v));
+                }
+            }
+            batch.insert(&docs, object(fields)).unwrap();
+        }
+        batch.commit().unwrap();
+        let (mut from_entries, mut matched) = (0, 0);
+        let fields = ["s", "t", "n"];
+        for _ in 0..400 {
+            let field = fields[rng.below(3)];
+            let f = match rng.below(4) {
+                0 => Filter::new(),
+                1 => Filter::new().eq(field, value(&mut rng).unwrap_or(Document::Null)),
+                2 => Filter::new().gte(field, Document::String("b".into())),
+                _ => Filter::new()
+                    .lt(field, Document::Int(2))
+                    .ne(field, Document::Int(0)),
+            };
+            let mut aggregate = Aggregate::new();
+            let groups = rng.below(3);
+            for g in fields.iter().skip(rng.below(3)).take(groups) {
+                aggregate = aggregate.group_by(*g);
+            }
+            for c in 0..1 + rng.below(3) {
+                let path = fields[rng.below(3)];
+                let name = format!("c{c}");
+                aggregate = match rng.below(4) {
+                    0 => aggregate.count(name),
+                    1 => aggregate.min(path, name),
+                    2 => aggregate.max(path, name),
+                    _ => aggregate.avg(path, name),
+                };
+            }
+            let expected: Vec<String> = (aggregate.apply(docs.find(f.clone()).unwrap()).unwrap())
+                .iter()
+                .map(Document::to_string)
+                .collect();
+            let found: Vec<String> = (docs.aggregate(f.clone(), &aggregate).unwrap())
+                .iter()
+                .map(Document::to_string)
+                .collect();
+            assert_eq!(found, expected, "{f:?} {aggregate:?}");
+            let run = docs.explain_aggregate(f.clone(), &aggregate).unwrap();
+            from_entries += run.stats.from_entries;
+            matched += run.stats.documents_matched;
+        }
+        // A third of the values are ones a key can't hand out.
+        assert!(
+            from_entries * 4 > matched,
+            "{from_entries} of {matched} from entries"
+        );
+    }
+
+    /// SPEC §107.5: what the entries answer, and what reads documents.
+    #[test]
+    fn an_aggregate_reads_documents_only_where_entries_cannot_tell() {
+        use crate::query::Aggregate;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Document>("tasks");
+        tasks.ensure_index(["status", "created"]).unwrap();
+        tasks.ensure_index(["tenant", "tries"]).unwrap();
+        tasks.ensure_index("tries").unwrap();
+        let mut batch = db.batch();
+        for n in 0..3000i64 {
+            let created = crate::DateTime::from_unix(1_700_000_000 + n, 0).unwrap();
+            batch
+                .insert(
+                    &tasks,
+                    object(vec![
+                        (
+                            "status",
+                            Document::String(["Queued", "Running", "Done"][n as usize % 3].into()),
+                        ),
+                        ("created", Document::DateTime(created)),
+                        ("tenant", Document::String(format!("t{}", n % 10))),
+                        ("tries", Document::Int(n % 7)),
+                    ]),
+                )
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        let run = |f: Filter, a: &Aggregate| {
+            let run = tasks.explain_aggregate(f.clone(), a).unwrap();
+            let expected = a.apply(tasks.find(f.clone()).unwrap()).unwrap();
+            assert_eq!(tasks.aggregate(f, a).unwrap(), expected);
+            run
+        };
+        // Per status: three runs of the compound index, no document, its
+        // leaves counted whole.
+        let per_status = Aggregate::new().group_by("status").count("n");
+        LEAVES_COUNTED.with(|c| c.set(0));
+        let r = run(Filter::new(), &per_status);
+        let leaves = LEAVES_COUNTED.with(|c| c.get());
+        assert!(leaves > 5, "{leaves} leaves counted whole");
+        assert_eq!(
+            r.plan,
+            QueryPlan::IndexOrder {
+                field: "(status, created)".into()
+            }
+        );
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.from_entries),
+            (0, 3000),
+            "{r:?}"
+        );
+        assert_eq!(r.stats.groups, 3);
+        // The newest per status: a date-time, from the entries.
+        let newest = per_status.clone().max("created", "newest");
+        let r = run(Filter::new(), &newest);
+        assert_eq!(r.stats.documents_examined, 0, "{r:?}");
+        // Per tenant, average and fewest tries: numbers. The average from
+        // the entries; the fewest read from their one document each.
+        let tries = Aggregate::new()
+            .group_by("tenant")
+            .avg("tries", "avg")
+            .min("tries", "least");
+        let r = run(Filter::new().gte("tenant", "t5"), &tries);
+        assert_eq!(
+            r.plan,
+            QueryPlan::Index {
+                field: "(tenant, tries)".into()
+            }
+        );
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.groups),
+            (5, 5),
+            "{r:?}"
+        );
+        // Grouped by a number: one document per group, for `5` or `5.0`.
+        let by_tries = Aggregate::new().group_by("tries").count("n");
+        let r = run(Filter::new(), &by_tries);
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.groups),
+            (7, 7),
+            "{r:?}"
+        );
+        assert_eq!(
+            r.plan,
+            QueryPlan::IndexOrder {
+                field: "tries".into()
+            }
+        );
+        // `sum` reads every document.
+        let sum = Aggregate::new().group_by("tenant").sum("tries", "total");
+        let r = run(Filter::new().eq("tenant", "t1"), &sum);
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.from_entries),
+            (300, 0),
+            "{r:?}"
+        );
+        // An index `find` would take for `tenant == x` doesn't hold
+        // `tries`: the compound one that does is read instead.
+        tasks.ensure_index("tenant").unwrap();
+        let average = Aggregate::new().avg("tries", "avg");
+        let r = run(Filter::new().eq("tenant", "t1"), &average);
+        assert_eq!(
+            r.plan,
+            QueryPlan::Index {
+                field: "(tenant, tries)".into()
+            }
+        );
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.from_entries),
+            (0, 300),
+            "{r:?}"
+        );
+        tasks.drop_index("tenant").unwrap();
+        // A single-field index without every document isn't walked: an
+        // array of tries isn't in it. The compound one holds it, as a
+        // value of its own, read from its document.
+        tasks
+            .insert(object(vec![(
+                "tries",
+                Document::Array(vec![Document::Int(1)]),
+            )]))
+            .unwrap();
+        let r = run(Filter::new(), &by_tries);
+        assert_eq!(
+            r.plan,
+            QueryPlan::IndexOrder {
+                field: "(tenant, tries)".into()
+            }
+        );
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.groups),
+            (8, 8),
+            "{r:?}"
+        );
+        tasks.drop_index(["tenant", "tries"]).unwrap();
+        let r = run(Filter::new(), &by_tries);
+        assert_eq!(r.plan, QueryPlan::Scan, "{r:?}");
+        assert_eq!(r.stats.groups, 8);
+        // A sorted, limited filter: aggregated from its documents.
+        let newest_20 = Filter::new()
+            .eq("status", "Done")
+            .sort_desc("created")
+            .limit(20);
+        let r = run(newest_20, &per_status);
+        assert_eq!(r.stats.groups, 1);
+        assert_eq!(
+            run(
+                Filter::new().eq("status", "Done").limit(20),
+                &Aggregate::new().count("n")
+            )
+            .stats
+            .documents_returned,
+            1
+        );
     }
 }

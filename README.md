@@ -237,6 +237,40 @@ drops every field it lacks. To change some fields, use `update_fields`.
 A typed read decodes each document straight into the type, so the
 fields a summary doesn't declare are skipped, not built (SPEC §99).
 
+### Counting and summing by group
+
+`aggregate` puts the documents a filter finds in groups and sums them up,
+as SQL's `GROUP BY` does (SPEC §107):
+
+```rust
+use trunkdb::query::{Aggregate, Condition};
+
+let per_status = db.collection::<Document>("tasks").aggregate(
+    Filter::new().eq("tenant", "t1"),
+    &Aggregate::new()
+        .group_by("status")
+        .count("n")
+        .avg("tries", "average_tries")
+        .max("created", "newest")
+        .having(Condition::gt("n", 10))
+        .sort_desc("n"),
+)?;
+// [{"status": "Done", "n": 340, "average_tries": 4.5, "newest": ...}, ...]
+```
+
+- The filter picks the documents, sort and limit included, as for
+  `find`; the rows have the group's values and each column, no `_id`.
+- A missing field groups with `null`; `5` and `5.0` are one group.
+- `sum` and `avg` add only numbers, exactly, in any order; `min` and
+  `max` pass over nulls.
+- Without `group_by`, one row of everything, even of nothing.
+
+Where an index holds the fields an aggregate reads, its entries answer
+`count`, `avg`, `min` and `max` without reading the documents: "tasks
+per status" on `(status, created)` counts the index's leaves. `sum`
+reads its numbers from the documents, as the key doesn't keep whether
+a number is an `Int` or a `Float`. `explain_aggregate` says how it ran.
+
 ## Building
 
 ```
@@ -320,6 +354,7 @@ cd bench && cargo run --release
 cd bench && cargo run --release --bin reader_wait   # readers while a writer commits
 cd bench && cargo run --release --bin long_read     # one long snapshot beside single writes
 cd bench && cargo run --release --bin select        # reads with a selection (§106)
+cd bench && cargo run --release --bin aggregate     # aggregates by group (§107)
 ```
 
 ## Roadmap (short version)
@@ -712,7 +747,16 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     names the selection. Writes ignore it, `update_many` too. Aggregates
     are no longer "not planned": §106.7 takes them up again.
 
-    Items 75–76: not released yet. `Filter::select`, and the new fields
+77. **Aggregates** (§107): `Collection::aggregate(filter, &Aggregate)`,
+    the documents the filter finds put in groups (`group_by`), with a
+    `count`, `sum`, `min`, `max` and `avg` per group, then `having`, a
+    row sort, `skip` and `limit`; `Aggregate::apply` the same in memory.
+    Sums are exact in any order. Index entries answer `count`, `avg`,
+    `min` and `max` where the index holds the fields, and a walk counts
+    whole leaves of a group. `explain_aggregate` says how it ran, with
+    the groups it made.
+
+    Items 75–77: not released yet. `Filter::select`, and the new fields
     of `Explained` and `ExecutionStats`, which are `#[non_exhaustive]`,
     are additions; nothing changes in the file.
 

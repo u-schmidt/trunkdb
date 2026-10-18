@@ -65,6 +65,7 @@ fn main() {
                 }
                 total.plans.extend(ran.plans);
                 total.answered += ran.answered;
+                total.aggregated += ran.aggregated;
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -83,6 +84,7 @@ fn main() {
         println!("  {name:14} {n}");
     }
     println!("  answered from entries (§106.5): {}", total.answered);
+    println!("  aggregated from entries (§107.5): {}", total.aggregated);
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

@@ -2,6 +2,7 @@
 //! A from-scratch, learning-first take on the LiteDB idea in Rust: no
 //! tables, no joins, no schema migrations.
 
+mod aggregate;
 mod batch;
 mod catalog;
 mod check;

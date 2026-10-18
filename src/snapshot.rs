@@ -8,7 +8,7 @@ use crate::cursor::Cursor;
 use crate::database::{Committed, Database, ReadGuard};
 use crate::document::{DocId, Document};
 use crate::export::Summary;
-use crate::query::{Explained, Filter, QueryPlan};
+use crate::query::{Aggregate, Explained, Filter, QueryPlan};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io::Write;
@@ -214,6 +214,22 @@ impl<T> View<T> {
     /// view returns the documents it counted.
     pub fn explain_run(&self, filter: Filter) -> crate::Result<Explained> {
         self.collection.explain_run(filter)
+    }
+
+    /// The groups of what `find(filter)` returns on the snapshot — see
+    /// [`Collection::aggregate`].
+    pub fn aggregate(&self, filter: Filter, aggregate: &Aggregate) -> crate::Result<Vec<Document>> {
+        self.collection.aggregate(filter, aggregate)
+    }
+
+    /// Runs `aggregate` and says how — see
+    /// [`Collection::explain_aggregate`].
+    pub fn explain_aggregate(
+        &self,
+        filter: Filter,
+        aggregate: &Aggregate,
+    ) -> crate::Result<Explained> {
+        self.collection.explain_aggregate(filter, aggregate)
     }
 }
 
