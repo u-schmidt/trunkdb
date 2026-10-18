@@ -15,6 +15,9 @@ pub struct Explained {
     pub reads: Vec<IndexRead>,
     /// How the results were put in order; `None` without a sort.
     pub sort: Option<SortWork>,
+    /// The paths the filter selects (SPEC §106), as given; `None`
+    /// without a selection: whole documents.
+    pub select: Option<Vec<String>>,
     pub stats: ExecutionStats,
 }
 
@@ -65,6 +68,10 @@ pub struct ExecutionStats {
     pub documents_matched: u64,
     /// What `find` would have returned.
     pub documents_returned: u64,
+    /// Of those, the ones built from their index entries, their
+    /// documents never read (SPEC §106.5): where the entries decide the
+    /// filter and hold every selected field.
+    pub from_entries: u64,
     /// Wall-clock time of the whole call. It includes waiting for pages
     /// from disk, so a second run usually takes less (SPEC §94.4); the
     /// counts are the same every run on one snapshot.
@@ -79,6 +86,7 @@ pub(crate) struct Trace {
     reads: RefCell<Vec<IndexRead>>,
     examined: Cell<u64>,
     matched: Cell<u64>,
+    from_entries: Cell<u64>,
 }
 
 impl Trace {
@@ -110,6 +118,11 @@ impl Trace {
         self.examined.set(self.examined.get() + 1);
     }
 
+    /// A result built from its index entry, its document unread.
+    pub fn answered_from_entry(&self) {
+        self.from_entries.set(self.from_entries.get() + 1);
+    }
+
     /// `n` documents checked that matched.
     pub fn matched(&self, n: usize) {
         self.matched.set(self.matched.get() + n as u64);
@@ -119,6 +132,7 @@ impl Trace {
         self,
         plan: QueryPlan,
         sort: Option<SortWork>,
+        select: Option<Vec<String>>,
         returned: usize,
         elapsed: Duration,
     ) -> Explained {
@@ -130,10 +144,12 @@ impl Trace {
                 documents_examined: self.examined.get(),
                 documents_matched: self.matched.get(),
                 documents_returned: returned as u64,
+                from_entries: self.from_entries.get(),
                 elapsed,
             },
             reads,
             sort,
+            select,
         }
     }
 }

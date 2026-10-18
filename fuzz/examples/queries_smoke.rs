@@ -64,6 +64,7 @@ fn main() {
                     *all += one;
                 }
                 total.plans.extend(ran.plans);
+                total.answered += ran.answered;
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -81,6 +82,7 @@ fn main() {
     for (name, n) in STEP_NAMES.iter().zip(total.steps) {
         println!("  {name:14} {n}");
     }
+    println!("  answered from entries (§106.5): {}", total.answered);
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

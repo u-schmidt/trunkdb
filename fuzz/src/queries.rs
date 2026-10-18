@@ -47,6 +47,23 @@ const PATHS: [&str; 11] = [
     "_id",
     "z",
 ];
+/// Paths a read selects (SPEC §106): the conditions' paths, the whole
+/// document, a path inside `o.p`.
+const SELECTED: [&str; 13] = [
+    "a",
+    "aa",
+    "b",
+    "c",
+    "o",
+    "o.p",
+    "o.p.q",
+    "tags",
+    "tags[*].k",
+    "_id",
+    "z",
+    "",
+    "missing.x",
+];
 const SORT_KEYS: [&str; 6] = ["a", "b", "o.p", "c", "tags", "_id"];
 const OPS: [Op; 7] = [
     Op::Eq,
@@ -102,6 +119,9 @@ pub struct Ran {
     pub steps: [usize; STEP_NAMES.len()],
     /// The plans `explain_run` reported, by name.
     pub plans: BTreeSet<String>,
+    /// Results `explain_run` counted as answered from their index
+    /// entries (SPEC §106.5).
+    pub answered: u64,
 }
 
 pub const STEP_NAMES: [&str; 14] = [
@@ -137,6 +157,8 @@ struct Query {
     sort: Vec<(&'static str, SortOrder)>,
     skip: usize,
     limit: Option<usize>,
+    /// The paths selected (SPEC §106); `None`: whole documents.
+    select: Option<Vec<&'static str>>,
 }
 
 impl Query {
@@ -144,13 +166,24 @@ impl Query {
         self.matching().skip(self.skip).limit(self.limit)
     }
 
-    /// Its conditions and sort, without skip and limit.
+    /// Its conditions, sort and selection, without skip and limit.
     fn matching(&self) -> Filter {
         let mut filter = self.conditions_only();
         for (key, order) in &self.sort {
             filter = filter.then_by(*key, *order);
         }
-        filter
+        match &self.select {
+            Some(paths) => filter.select(paths.iter().copied()),
+            None => filter,
+        }
+    }
+
+    /// The same query handing out whole documents.
+    fn unselected(&self) -> Self {
+        Query {
+            select: None,
+            ..self.clone()
+        }
     }
 
     fn conditions_only(&self) -> Filter {
@@ -291,6 +324,7 @@ pub fn run(input: &[u8]) -> Ran {
         sort: Vec::new(),
         skip: 0,
         limit: None,
+        select: None,
     };
     for at in 0..run.snapshots.len() {
         run.read_snapshot(at, &everything);
@@ -579,11 +613,13 @@ impl Run<'_> {
             4 => Some(1 + self.program.below(20)),
             _ => Some(n + 1 + self.program.below(4)),
         };
+        let select = self.selection(None);
         Query {
             conditions,
             sort,
             skip,
             limit,
+            select,
         }
     }
 
@@ -672,11 +708,28 @@ impl Run<'_> {
             0 => None,
             _ => Some(1 + self.program.below(30)),
         };
+        let select = self.selection(Some(fields));
         Query {
             conditions,
             sort,
             skip,
             limit,
+            select,
+        }
+    }
+
+    /// What a read selects, half the time (SPEC §106): some of `index`'s
+    /// fields, whose entries may answer it (§106.5), or any of
+    /// `SELECTED`.
+    fn selection(&mut self, index: Option<&'static [&'static str]>) -> Option<Vec<&'static str>> {
+        match (self.program.below(4), index) {
+            (0 | 1, _) => None,
+            (2, Some(fields)) => Some(fields[..1 + self.program.below(fields.len())].to_vec()),
+            _ => Some(
+                (0..self.program.below(4))
+                    .map(|_| SELECTED[self.program.below(SELECTED.len())])
+                    .collect(),
+            ),
         }
     }
 
@@ -1017,6 +1070,18 @@ impl Run<'_> {
         let expected = self.expected(&self.model, filter);
         let explained = docs.explain_run(filter.clone()).unwrap();
         self.ran.plans.insert(plan_name(&explained.plan));
+        self.ran.answered += explained.stats.from_entries;
+        if query.select.is_some() {
+            // A selection reads the documents the same filter does, less
+            // those answered from their entries (SPEC §106.5).
+            let whole = docs.explain_run(query.unselected().filter()).unwrap();
+            assert_eq!(
+                explained.stats.documents_examined + explained.stats.from_entries,
+                whole.stats.documents_examined,
+                "{}: {filter:?} read {explained:?}, unselected {whole:?}",
+                self.at()
+            );
+        }
         let answers = Answers {
             find: docs.find(filter.clone()).unwrap(),
             typed: typed

@@ -22,9 +22,10 @@ real workloads shaped what it needs: a time-series workload of many
 small documents queried by time, and a large-document desktop workload;
 a small sync app replaced MongoDB with it [§5](spec/05-reference-workloads.md).
 
-Deliberately not there: a cost-based planner, joins, aggregates,
-several writers at once, several processes on one file, encryption and
-schema validation [§6](spec/06-v0-feature-set.md).
+Deliberately not there: a cost-based planner, joins, several writers
+at once, several processes on one file, encryption and schema
+validation [§6](spec/06-v0-feature-set.md). Aggregates were on that list, and are being
+looked at again [§106.7](spec/106-projection-a-select-of-fields.md).
 
 ## 2. Layers
 
@@ -277,8 +278,8 @@ documents it covers, so it can't disagree with them after a crash.
 
 ## 8. Queries
 
-A `Filter` holds a tree of conditions, a list of sort keys, a skip and
-a limit, applied in that order [§72](spec/72-skip-for-paging.md)
+A `Filter` holds a tree of conditions, a list of sort keys, a skip, a
+limit and a selection, applied in that order [§72](spec/72-skip-for-paging.md)
 [§35](spec/35-a-filter-builder.md) [§36](spec/36-or-not-and-nesting.md) [§47](spec/47-sorting-by-several-fields.md):
 
 - **comparisons** (`eq`, `ne`, `lt`, `lte`, `gt`, `gte`) and a
@@ -340,10 +341,23 @@ after sort, skip and limit. A typed read decodes straight into `T`
 untyped read whose candidates come from an index range or by id decodes
 each whole once and checks that, as they nearly all match.
 
+A selection (`select`) cuts what a read hands out down to `_id` and the
+paths it names, in the order named, nested as stored, after the filter,
+sort, skip and limit have run on whole documents
+[§106](spec/106-projection-a-select-of-fields.md). It is decoded from the
+stored document in one walk, the rest skipped with the same checks
+(`select.rs`). Where an index's entries decide the filter and hold every
+selected path, a match is built from its entry and its document never
+read, if each selected value is held as stored: a bool, a string that
+fits the key, an id, a date-time. A number is keyed as a float and a
+missing field as null, so those are read from the document. Writes work
+on whole documents, whatever is selected.
+
 `explain_run` runs a query and says how it went: the plan, each index
 read with the conditions that bound it and whether its entries decided
 the filter, how many sort keys the index gave, and the entries and
-documents examined, matched and returned
+documents examined, matched and returned, and how many results came
+from index entries
 [§94](spec/94-explain-with-execution-statistics.md). It is `find` with its counters read out: every read
 counts, and only `explain_run` keeps the counts.
 
@@ -452,7 +466,7 @@ more than four.
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** only through `Filter`'s methods; `limit` takes an `Option`
-  too [§60](spec/60-a-smaller-public-api.md).
+  too [§60](spec/60-a-smaller-public-api.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.
@@ -509,6 +523,7 @@ current table. Each gap had a measured cause, fixed one at a time:
 | Count of a range, tenant's first 20 by id | 0.14 ms, 0.6 ms | paths parsed once per query, small objects searched without hashing, sort keys looked up once [§102](spec/102-paths-resolved-once-per-query.md) |
 | Tenant's first 20 by id | 0.38 ms | the `Eq`-fixed range walked in id order, which its keys are in [§103](spec/103-an-eq-fixed-index-walked-in-id-order.md) |
 | Count of a range | 0.07 ms | entries matched on their bytes, leaves inside the interval counted whole [§104](spec/104-index-entries-matched-on-their-bytes.md) |
+| Two fields of 1000 by index, untyped | 1.6 ms | a selection decoded alone, 1.05 ms, or answered from index entries, 0.7 ms [§106](spec/106-projection-a-select-of-fields.md) |
 
 Still behind: in a scan, the small object each document's filtered
 fields are decoded into, and whole 8 KB page images in the WAL for

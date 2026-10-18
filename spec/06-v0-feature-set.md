@@ -26,7 +26,8 @@ only.
 - A real (cost-based) query planner; secondary indexes were added
   later (§28), with a fixed rule for when to use one
 - Joins, aggregates (GROUP BY/COUNT-style — left to application code,
-  per §5.1); OR/nested conditions were added later (§36)
+  per §5.1; aggregates reconsidered, §106.7); OR/nested conditions
+  were added later (§36)
 - Concurrent multi-process access; concurrent writers (batches are
   serialized, §27)
 - Compaction/vacuum (added later, §41), encryption, schema

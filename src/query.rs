@@ -3,6 +3,7 @@ use crate::document::{DocId, Document, ID_FIELD};
 pub use crate::explain::{ExecutionStats, Explained, IndexRead, SortWork};
 use crate::index::{KeyRange, key};
 use crate::path::Path;
+use crate::select::Selection;
 pub use crate::update::Update;
 
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
@@ -240,6 +241,9 @@ pub struct Filter {
     /// limit (SPEC §72). 0: none.
     pub(crate) skip: usize,
     pub(crate) limit: Option<usize>,
+    /// The paths a read hands out, besides `_id` (SPEC §106); `None`:
+    /// whole documents.
+    pub(crate) select: Option<Vec<String>>,
 }
 
 /// Building a filter one call at a time (SPEC §35) — every condition is
@@ -421,6 +425,58 @@ impl Filter {
         self.skip = n;
         self
     }
+
+    /// Hands out only these fields of each match, and its `_id` (SPEC
+    /// §106), as a SQL column list does:
+    ///
+    /// ```
+    /// use trunkdb::query::Filter;
+    ///
+    /// let names = Filter::new().eq("team", "core").select(["name", "address.city"]);
+    /// // [{"_id": ..., "name": "Ada", "address": {"city": "London"}}, ...]
+    /// # let _ = names;
+    /// ```
+    ///
+    /// - `_id` always comes first, selected or not.
+    /// - The paths follow in the order first selected, nested as stored:
+    ///   `address.city` and `address.zip` give one `address` with both.
+    /// - A missing field is left out; a stored `null` is handed out.
+    /// - A path doesn't walk into arrays, as conditions don't (SPEC §31):
+    ///   if `address` isn't an object, `address.city` selects nothing. A
+    ///   step ending in `[*]` selects its array whole: `items[*].sku`
+    ///   gives `items`.
+    /// - A path inside one selected whole adds nothing; the empty path
+    ///   selects the whole document.
+    /// - `select([] as [&str; 0])` hands out `_id` alone.
+    ///
+    /// A second call adds to the first. Conditions and sort keys see the
+    /// whole document: a field they name needn't be selected. A typed
+    /// read deserializes `T` from the selection, so a field of `T`
+    /// outside it is missing to `T`.
+    ///
+    /// Only what reads hand out changes: `find`, `find_one`, `cursor`,
+    /// and `explain_run`'s counts. `count` and the writes ignore it —
+    /// `update_many` too, which writes back what its closure is given and
+    /// so is given the whole document.
+    ///
+    /// It saves decoding: the fields not selected are skipped, not built.
+    /// Where an index's entries decide the filter (SPEC §100) and hold
+    /// every selected field, a match is handed out from its entry without
+    /// reading its document — for booleans, strings that fit the key, ids
+    /// and date-times; a number or a null is read from the document,
+    /// whose type and presence the key doesn't keep (§106.5).
+    pub fn select<S: Into<String>>(mut self, paths: impl IntoIterator<Item = S>) -> Self {
+        let select = self.select.get_or_insert_with(Vec::new);
+        select.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// The selection, parsed (SPEC §106.4); `None` without one, or where
+    /// it selects the whole document.
+    pub(crate) fn selection(&self) -> Option<Selection> {
+        let selection = Selection::new(self.select.as_ref()?.iter().map(String::as_str));
+        (!selection.is_whole()).then_some(selection)
+    }
 }
 
 impl Filter {
@@ -529,14 +585,23 @@ impl Filter {
     /// Applies conditions, then sort, then skip, then limit — in that
     /// order, matching SQL's `WHERE` -> `ORDER BY` -> `OFFSET` -> `LIMIT`
     /// (sorting an already-filtered set is both correct and cheaper than
-    /// sorting everything first).
+    /// sorting everything first). Then cuts each result down to the
+    /// selection (`select`, SPEC §106).
     pub fn apply(&self, docs: impl IntoIterator<Item = Document>) -> Vec<Document> {
-        self.apply_to(docs, |doc| doc)
+        let found = self.apply_to(docs, |doc| doc);
+        match self.selection() {
+            Some(selection) => found
+                .into_iter()
+                .map(|doc| selection.project(doc))
+                .collect(),
+            None => found,
+        }
     }
 
     /// `apply` for items that carry a document rather than being one —
     /// e.g. `(DocId, Document)` pairs, so `delete_many` keeps each id
-    /// with its document through filtering, sorting and limiting.
+    /// with its document through filtering, sorting and limiting. The
+    /// items come back as they were: a selection isn't applied.
     pub fn apply_to<T>(
         &self,
         items: impl IntoIterator<Item = T>,
@@ -3733,6 +3798,7 @@ mod tests {
             }],
             skip: 1,
             limit: Some(5),
+            select: None,
         };
         // `Filter` has no `PartialEq` (a `Float` NaN isn't equal to itself).
         assert_eq!(format!("{built:?}"), format!("{spelled_out:?}"));
@@ -4133,6 +4199,7 @@ mod tests {
             }],
             skip: 0,
             limit: Some(2),
+            select: None,
         };
 
         assert_eq!(

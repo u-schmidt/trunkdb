@@ -1,5 +1,5 @@
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
-use crate::cursor::Cursor;
+use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
 use crate::database::{Committed, Database, ReadGuard};
 use crate::document::{DocId, Document, encode_document, with_id};
@@ -10,6 +10,7 @@ use crate::query::{
     Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork,
     Update,
 };
+use crate::select::{Answer, Selection};
 use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
 use serde::Serialize;
@@ -435,8 +436,23 @@ impl<T> Collection<T> {
             }
         };
         let trace = Trace::default();
-        let found = find_in(at.catalog, &at.store, &self.name, &filter, true, &trace)?;
-        Ok(trace.explained(plan, sort, found.len(), started.elapsed()))
+        let select = filter.selection();
+        let found = find_in(
+            at.catalog,
+            &at.store,
+            &self.name,
+            &filter,
+            true,
+            select.as_ref(),
+            &trace,
+        )?;
+        Ok(trace.explained(
+            plan,
+            sort,
+            filter.select.clone(),
+            found.len(),
+            started.elapsed(),
+        ))
     }
 }
 
@@ -505,10 +521,11 @@ where
     }
 
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<T>> {
+        let select = filter.selection();
         self.as_document()
-            .matches_found(&filter, false)?
-            .iter()
-            .map(|found| found.stored.deserialize())
+            .matches_found(&filter, false, select.as_ref())?
+            .into_iter()
+            .map(|found| found.deserialize(select.as_ref()))
             .collect()
     }
 
@@ -526,7 +543,7 @@ where
     /// A streaming `find` — see `Cursor`.
     pub fn cursor(&self, filter: Filter) -> crate::Result<Cursor<T>> {
         self.as_document()
-            .cursor_converting(filter, false, |found| found.stored.deserialize())
+            .cursor_converting(filter, false, |found, select| found.deserialize(select))
     }
 
     /// Replaces the one document matching `filter`, or inserts `doc` if
@@ -710,10 +727,20 @@ impl Collection<Document> {
         mut change: impl FnMut(DocId, Document) -> crate::Result<Document>,
     ) -> crate::Result<usize> {
         self.db.transact(|catalog, store| {
-            let found = find_in(catalog, store, &self.name, &filter, true, &Trace::default())?;
+            // The whole documents, whatever is selected: what `change`
+            // returns is written back (SPEC §106.3).
+            let found = find_in(
+                catalog,
+                store,
+                &self.name,
+                &filter,
+                true,
+                None,
+                &Trace::default(),
+            )?;
             let mut changed = 0;
             for found in found {
-                let (id, old) = (found.stored.id(), found.decode()?);
+                let (id, old) = (found.id(), found.decode(None)?);
                 let new = with_id(change(id, old.clone())?, id);
                 // By encoding, not `==`: a NaN isn't equal to itself, and
                 // a document holding one would never count as unchanged.
@@ -741,10 +768,11 @@ impl Collection<Document> {
                 &self.name,
                 &filter,
                 false,
+                None,
                 &Trace::default(),
             )?;
             for found in &doomed {
-                let op = WriteOp::Delete(self.name.clone(), found.stored.id());
+                let op = WriteOp::Delete(self.name.clone(), found.id());
                 apply_write_op(catalog, store, &op)?;
             }
             Ok(doomed.len())
@@ -754,16 +782,22 @@ impl Collection<Document> {
     /// Every match with the id of its cell: what `find` and a sorted
     /// `cursor` read.
     fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
-        self.matches_found(filter, true)?
+        let select = filter.selection();
+        self.matches_found(filter, true, select.as_ref())?
             .into_iter()
-            .map(|found| Ok((found.stored.id(), found.decode()?)))
+            .map(|found| Ok((found.id(), found.decode(select.as_ref())?)))
             .collect()
     }
 
     /// Every match, in `find`'s order, for the caller to decode as a
     /// `Document` or a `T` (SPEC §99.3) — `whole_from_index` as in
     /// `find_in`.
-    fn matches_found(&self, filter: &Filter, whole_from_index: bool) -> crate::Result<Vec<Found>> {
+    fn matches_found(
+        &self,
+        filter: &Filter,
+        whole_from_index: bool,
+        select: Option<&Selection>,
+    ) -> crate::Result<Vec<Found>> {
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
@@ -773,6 +807,7 @@ impl Collection<Document> {
             &self.name,
             filter,
             whole_from_index,
+            select,
             &trace,
         )
     }
@@ -831,9 +866,10 @@ impl Collection<Document> {
                 &self.name,
                 &filter,
                 names.as_deref(),
-                false,
+                Wants::default(),
                 &trace,
             )?
+            .0
             .iter()
             .filter(|(source, fields)| source.decided() || matcher.matches(fields))
             .count()
@@ -847,7 +883,7 @@ impl Collection<Document> {
     /// it was when the cursor was made, and keeps that moment until it's
     /// dropped — see `Cursor`.
     pub fn cursor(&self, filter: Filter) -> crate::Result<Cursor<Document>> {
-        self.cursor_converting(filter, true, |found| Ok(found.decode()?))
+        self.cursor_converting(filter, true, |found, select| Ok(found.decode(select)?))
     }
 
     /// `cursor`, decoding each match with `convert` — into a `Document`,
@@ -856,13 +892,14 @@ impl Collection<Document> {
         &self,
         filter: Filter,
         whole_from_index: bool,
-        convert: fn(Found) -> crate::Result<T>,
+        convert: Convert<T>,
     ) -> crate::Result<Cursor<T>> {
+        let select = filter.selection();
         if !filter.sort.is_empty() {
-            let results = self.matches_found(&filter, whole_from_index)?;
+            let results = self.matches_found(&filter, whole_from_index, select.as_ref())?;
             let converted = results
                 .into_iter()
-                .map(convert)
+                .map(|found| convert(found, select.as_ref()))
                 .collect::<crate::Result<Vec<_>>>()?;
             return Ok(Cursor::collected(converted));
         }
@@ -883,20 +920,24 @@ impl Collection<Document> {
         )?;
         // Where the entries decide (SPEC §100), a rejected one is left
         // out, and a match is kept as decided: passed over by a skip
-        // unread.
+        // unread. Where they may answer the selection (§106.5), with its
+        // key.
         let mut decides = indexed.covering(&filter, false).map(|c| c.decider(&filter));
+        let answer = answer_for(select.as_ref(), indexed, &filter);
         let candidates = entries
             .into_iter()
             .filter_map(
                 |(key, loc)| match decides.as_mut().and_then(|d| d.decide(&key)) {
-                    Some(true) => Some((loc, true)),
+                    Some(true) => Some(Pending::Matched(loc, answer.is_some().then_some(key))),
                     Some(false) => None,
-                    None => Some((loc, false)),
+                    None => Some(Pending::Unchecked(loc)),
                 },
             )
             .collect();
         drop(state);
-        Ok(Cursor::streaming(kept, candidates, filter, convert))
+        Ok(Cursor::streaming(
+            kept, candidates, filter, select, answer, convert,
+        ))
     }
 
     /// The document at `loc`, as this handle's commit has it: for a
@@ -929,9 +970,10 @@ impl Collection<Document> {
                 &self.name,
                 &filter,
                 names.as_deref(),
-                false,
+                Wants::default(),
                 &trace,
             )?
+            .0
             .into_iter()
             .filter(|(source, fields)| source.decided() || matcher.matches(fields))
             .map(|(source, _fields)| source.id())
@@ -965,9 +1007,9 @@ impl Collection<Document> {
 impl<T: Serialize + DeserializeOwned> Collection<T> {
     pub(crate) fn find_with_ids(&self, filter: Filter) -> crate::Result<Vec<(DocId, T)>> {
         self.as_document()
-            .matches_found(&filter, false)?
-            .iter()
-            .map(|found| Ok((found.stored.id(), found.stored.deserialize()?)))
+            .matches_found(&filter, false, filter.selection().as_ref())?
+            .into_iter()
+            .map(|found| Ok((found.id(), found.deserialize(filter.selection().as_ref())?)))
             .collect()
     }
 
@@ -1023,6 +1065,7 @@ fn find_in(
     collection: &str,
     filter: &Filter,
     whole_from_index: bool,
+    select: Option<&Selection>,
     trace: &Trace,
 ) -> crate::Result<Vec<Found>> {
     let indexes = catalog.indexes(collection);
@@ -1030,36 +1073,39 @@ fn find_in(
     if let Some(order) = filter.index_order(indexes) {
         // The skipped matches are passed over by the walk (SPEC §72),
         // unread where their entries decided (§100), and not kept (§101).
-        let found = walk_in_index_order(catalog, store, collection, filter, order, trace)?;
+        let found = walk_in_index_order(catalog, store, collection, filter, order, select, trace)?;
         return found
             .into_iter()
-            .map(|(source, _fields)| Ok(Found::stored(source.read(&mut records, trace)?)))
+            .map(|(source, _fields)| Ok(source.found(&mut records, None, trace)?))
             .collect();
     }
     // Candidates from an index range or by id nearly all match: for a
     // caller that wants whole documents, each is decoded whole once and
     // checked on that, rather than on its fields and then again whole
     // (SPEC §99.2). A scan's are mostly rejected, and checked on fields.
-    let whole =
-        whole_from_index && (filter.ids().is_some() || filter.index_ranges(indexes).is_some());
+    // A selection is decoded from the stored document after the check.
+    let whole = whole_from_index
+        && select.is_none()
+        && (filter.ids().is_some() || filter.index_ranges(indexes).is_some());
     let names = match whole {
         true => None,
         false => filter.fields(),
     };
     let sort = !filter.sort.is_empty();
     let matcher = filter.matcher();
-    let mut matches: Vec<Candidate> = read_candidates(
+    let (candidates, answer) = read_candidates(
         catalog,
         store,
         collection,
         filter,
         names.as_deref(),
-        sort,
+        Wants { sort, select },
         trace,
-    )?
-    .into_iter()
-    .filter(|(source, fields)| source.decided() || matcher.matches(fields))
-    .collect();
+    )?;
+    let mut matches: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|(source, fields)| source.decided() || matcher.matches(fields))
+        .collect();
     trace.matched(matches.len());
     if sort {
         // So equal sort values end up in id order, as they do when read
@@ -1071,18 +1117,39 @@ fn find_in(
         .into_iter()
         .map(|(source, fields)| {
             // Only a document read was decoded whole, not an entry's.
-            let whole = (whole && matches!(source, Source::Read(_))).then_some(fields);
-            let stored = source.read(&mut records, trace)?;
-            Ok(Found { stored, whole })
+            let whole = whole && matches!(source, Source::Read(_));
+            let mut found = source.found(&mut records, answer.as_ref(), trace)?;
+            if whole {
+                found.decoded = Some(fields);
+            }
+            Ok(found)
         })
         .collect()
 }
 
+/// How a read answers `select` from the entries of the index it read
+/// (SPEC §106.5) — `None` unless those entries decide its filter and hold
+/// every selected path.
+fn answer_for(select: Option<&Selection>, indexed: Indexed, filter: &Filter) -> Option<Answer> {
+    let select = select?;
+    indexed.covering(filter, false)?;
+    match indexed {
+        Indexed::Primary => Answer::new(select, &[]),
+        Indexed::One(index) => Answer::new(select, &index.fields),
+        Indexed::Several => None,
+    }
+}
+
 /// A match of `find_in`, not decoded yet — or, where it was decoded whole
-/// to be checked, with that document (`whole`).
+/// to be checked, with that document; or, where its index entry answered
+/// the selection (SPEC §106.5), with that result and no document at all.
 pub(crate) struct Found {
-    pub(crate) stored: Stored,
-    whole: Option<Document>,
+    id: DocId,
+    /// `None` where the entry answered.
+    stored: Option<Stored>,
+    /// The whole document, decoded to be checked; or, without `stored`,
+    /// the selection built from the entry.
+    decoded: Option<Document>,
 }
 
 impl From<Stored> for Found {
@@ -1094,16 +1161,47 @@ impl From<Stored> for Found {
 impl Found {
     fn stored(stored: Stored) -> Self {
         Found {
-            stored,
-            whole: None,
+            id: stored.id(),
+            stored: Some(stored),
+            decoded: None,
         }
     }
 
-    /// The whole document, decoded now unless it already was.
-    pub(crate) fn decode(self) -> std::io::Result<Document> {
-        match self.whole {
-            Some(document) => Ok(document),
-            None => self.stored.decode(),
+    /// A result its index entry gave (SPEC §106.5): already the selection.
+    pub(crate) fn answered(id: DocId, selected: Document) -> Self {
+        Found {
+            id,
+            stored: None,
+            decoded: Some(selected),
+        }
+    }
+
+    pub(crate) fn id(&self) -> DocId {
+        self.id
+    }
+
+    /// The document as handed out: whole, or cut down to `select` (SPEC
+    /// §106), decoded now unless it already was.
+    pub(crate) fn decode(self, select: Option<&Selection>) -> std::io::Result<Document> {
+        match (self.stored, self.decoded, select) {
+            (None, Some(selected), _) => Ok(selected),
+            (_, Some(whole), None) => Ok(whole),
+            (_, Some(whole), Some(select)) => Ok(select.project(whole)),
+            (Some(stored), None, None) => stored.decode(),
+            (Some(stored), None, Some(select)) => select.decode(stored.encoded(), stored.id()),
+            (None, None, _) => unreachable!("a match is stored or answered"),
+        }
+    }
+
+    /// The document as a `T`: straight from its encoding (SPEC §99.4),
+    /// or with a selection, from the selection through the bridge.
+    pub(crate) fn deserialize<T: DeserializeOwned>(
+        self,
+        select: Option<&Selection>,
+    ) -> crate::Result<T> {
+        match (&self.stored, &self.decoded, select) {
+            (Some(stored), None, None) => stored.deserialize(),
+            _ => from_document(self.decode(select)?),
         }
     }
 }
@@ -1119,30 +1217,48 @@ type Candidate = (Source, Document);
 enum Source {
     Read(Stored),
     /// Its index entry decided: its id and where it is, read only if
-    /// handed out.
-    Entry(DocId, RecordLocation),
+    /// handed out — and its key, where the read's selection may be
+    /// answered from it (SPEC §106.5).
+    Entry(DocId, RecordLocation, Option<Vec<u8>>),
+    /// Its index entry decided, and answered the selection.
+    Answered(DocId, Document),
 }
 
 impl Source {
     /// Its entry decided it matches: no need to check it again.
     fn decided(&self) -> bool {
-        matches!(self, Source::Entry(..))
+        !matches!(self, Source::Read(_))
     }
 
     fn id(&self) -> DocId {
         match self {
             Source::Read(stored) => stored.id(),
-            Source::Entry(id, _) => *id,
+            Source::Entry(id, ..) | Source::Answered(id, _) => *id,
         }
     }
 
-    /// The document as it is stored, read now if it wasn't.
-    fn read(self, records: &mut data::Records, trace: &Trace) -> std::io::Result<Stored> {
+    /// The match as handed out: its document read now if it wasn't, or
+    /// its result from its key where `answer` can build it there.
+    fn found(
+        self,
+        records: &mut data::Records,
+        answer: Option<&Answer>,
+        trace: &Trace,
+    ) -> std::io::Result<Found> {
         match self {
-            Source::Read(stored) => Ok(stored),
-            Source::Entry(_, loc) => {
+            Source::Read(stored) => Ok(Found::stored(stored)),
+            Source::Answered(id, selected) => {
+                trace.answered_from_entry();
+                Ok(Found::answered(id, selected))
+            }
+            Source::Entry(id, loc, key) => {
+                let answered = key.zip(answer).and_then(|(key, answer)| answer.entry(&key));
+                if let Some(selected) = answered {
+                    trace.answered_from_entry();
+                    return Ok(Found::answered(id, selected));
+                }
                 trace.examined();
-                records.stored(loc)
+                Ok(Found::stored(records.stored(loc)?))
             }
         }
     }
@@ -1311,6 +1427,7 @@ fn walk_in_index_order(
     collection: &str,
     filter: &Filter,
     order: OrderedRead,
+    select: Option<&Selection>,
     trace: &Trace,
 ) -> crate::Result<Vec<Candidate>> {
     let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
@@ -1359,6 +1476,12 @@ fn walk_in_index_order(
     if decider.is_some() {
         trace.covering(walk);
     }
+    // A match its entry decided, and kept for the page, is answered from
+    // its entry where it can be (SPEC §106.5).
+    let fields_of = order.index.map_or(&[][..], |index| &index.fields[..]);
+    let answer = select
+        .filter(|_| decider.is_some())
+        .and_then(|select| Answer::new(select, fields_of));
     let matcher = filter.matcher();
     let mut records = data::Records::new(store);
     let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
@@ -1378,7 +1501,16 @@ fn walk_in_index_order(
      -> crate::Result<bool> {
         let (source, doc) = match decider.as_mut().and_then(|d| d.decide(key)) {
             Some(false) => return Ok(false),
-            Some(true) => (Source::Entry(key::doc_id(key), loc), Document::Null),
+            Some(true) => {
+                let id = key::doc_id(key);
+                let answered = (answer.as_ref())
+                    .filter(|_| page.keeps())
+                    .and_then(|answer| answer.entry(key));
+                match answered {
+                    Some(selected) => (Source::Answered(id, selected), Document::Null),
+                    None => (Source::Entry(id, loc, None), Document::Null),
+                }
+            }
             None => read(&loc)?,
         };
         if !source.decided() && !matcher.matches(&doc) {
@@ -1554,6 +1686,11 @@ impl Page {
         }
         self.results.push(found);
         self.results.len() == self.limit
+    }
+
+    /// Whether the next match is kept, not passed over.
+    fn keeps(&self) -> bool {
+        self.skipped >= self.skip
     }
 
     /// Matches so far, skipped or kept.
@@ -1734,15 +1871,19 @@ fn read_candidates(
     collection: &str,
     filter: &Filter,
     names: Option<&[&str]>,
-    sort: bool,
+    wants: Wants,
     trace: &Trace,
-) -> std::io::Result<Vec<Candidate>> {
+) -> std::io::Result<(Vec<Candidate>, Option<Answer>)> {
+    let Wants { sort, select } = wants;
     let (entries, indexed) = candidate_entries(catalog, store, collection, filter, trace)?;
     let mut decides = indexed.covering(filter, false).map(|c| c.decider(filter));
     let orders = match sort {
         true => indexed.covering(filter, true).map(|c| c.for_sort(filter)),
         false => None,
     };
+    // Where the entries may answer the selection (SPEC §106.5), a match
+    // keeps its key, to be answered from if it's handed out.
+    let answer = answer_for(select, indexed, filter);
     let mut records = data::Records::new(store);
     let mut candidates = Vec::new();
     for (key, loc) in entries {
@@ -1759,7 +1900,9 @@ fn read_candidates(
             _ => None,
         };
         if let Some(fields) = entry {
-            candidates.push((Source::Entry(key::doc_id(&key), loc), fields));
+            let id = key::doc_id(&key);
+            let key = answer.is_some().then_some(key);
+            candidates.push((Source::Entry(id, loc, key), fields));
             continue;
         }
         trace.examined();
@@ -1768,7 +1911,16 @@ fn read_candidates(
         let fields = stored.fields(names)?;
         candidates.push((Source::Read(stored), fields));
     }
-    Ok(candidates)
+    Ok((candidates, answer))
+}
+
+/// What a caller of `read_candidates` wants of the matches besides
+/// their decision: their sort keys, for a sort in memory, and their keys
+/// where the selection may be answered from them (SPEC §106.5).
+#[derive(Clone, Copy, Default)]
+struct Wants<'s> {
+    sort: bool,
+    select: Option<&'s Selection>,
 }
 
 /// `count`'s conditions counted entry by entry as an index is walked,
@@ -4326,6 +4478,7 @@ mod tests {
             sort,
             skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
+            select: None,
         }
     }
 
@@ -4355,6 +4508,7 @@ mod tests {
             assert_eq!(found, expected, "{f:?} via {plan:?}");
             // Typed (SPEC §99): matched on fields, deserialized last.
             assert_eq!(typed_ids(docs, &f), expected, "{f:?} via {plan:?}");
+            selection_agrees(docs, &f, rng);
             plans.insert(format!("{plan:?}"));
         }
         for plan in [
@@ -4696,6 +4850,7 @@ mod tests {
             sort,
             skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
+            select: None,
         }
     }
 
@@ -4765,6 +4920,7 @@ mod tests {
                 // Typed (SPEC §99), the same documents the same way.
                 let typed = typed_ids(docs, &f).into_iter();
                 assert_eq!(ids(typed.map(|id| (id, Document::Null)).collect()), found);
+                selection_agrees(docs, &f, rng);
                 if f.sort.is_empty() && (f.limit.is_some() || f.skip > 0) {
                     // Which documents a skip or limit without a sort keeps
                     // isn't promised: any that match, as many as they allow.
@@ -4994,6 +5150,146 @@ mod tests {
             assert_eq!(sorted(streamed), sorted(found.clone()), "{f:?}");
         }
         found
+    }
+
+    /// The keys of a document read through the typed path, values
+    /// skipped: what a typed read with a selection was given (SPEC §106.2).
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct Keys(std::collections::BTreeMap<String, serde::de::IgnoredAny>);
+
+    impl Serialize for Keys {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            unreachable!("only read")
+        }
+    }
+
+    /// Paths to select from among `docs`' documents (SPEC §106): their
+    /// fields and the fields one level inside, its indexes' fields, `_id`,
+    /// a missing field, a step into an array, the document itself.
+    fn selectable(docs: &Collection<Document>, found: &[(DocId, Document)]) -> Vec<String> {
+        let mut paths: Vec<String> = ["_id", "missing", "missing.x", "tags[*].x", ""]
+            .map(String::from)
+            .into();
+        for (_id, doc) in found.iter().take(8) {
+            let Document::Object(map) = doc else { continue };
+            for (key, value) in map {
+                paths.push(key.clone());
+                if let Document::Object(inner) = value {
+                    paths.extend(inner.keys().map(|k| format!("{key}.{k}")));
+                }
+            }
+        }
+        for index in docs.indexes().unwrap() {
+            paths.extend(index.fields().iter().cloned());
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// SPEC §106: `f` with a random selection hands out, on every route,
+    /// the documents `f` finds, each cut down to the selection — and reads
+    /// no document more, the ones answered from their entries fewer.
+    /// Half the time the selection is one index's fields, which its
+    /// entries may answer (§106.5). Returns how many results came from
+    /// entries.
+    fn selection_agrees(docs: &Collection<Document>, f: &Filter, rng: &mut XorShift) -> u64 {
+        let whole = docs.find_with_ids(f.clone()).unwrap();
+        let indexes = docs.indexes().unwrap();
+        let chosen: Vec<String> = match rng.below(2) {
+            0 if !indexes.is_empty() => {
+                let index = &indexes[rng.below(indexes.len())];
+                let mut fields: Vec<String> = index.fields().to_vec();
+                fields.truncate(1 + rng.below(fields.len()));
+                fields
+            }
+            _ => {
+                let pool = selectable(docs, &whole);
+                (0..rng.below(4))
+                    .map(|_| pool[rng.below(pool.len())].clone())
+                    .collect()
+            }
+        };
+        let s = f.clone().select(chosen.iter().map(String::as_str));
+        let selection = crate::select::Selection::new(chosen.iter().map(String::as_str));
+        let cut = |doc: Document| selection.project(doc).to_string();
+        let expected: Vec<String> = whole.iter().map(|(_, doc)| cut(doc.clone())).collect();
+        let text = |found: Vec<Document>| -> Vec<String> {
+            found.iter().map(Document::to_string).collect()
+        };
+        let in_order = !f.sort.is_empty() || (f.limit.is_none() && f.skip == 0);
+        let sorted = |mut texts: Vec<String>| {
+            if f.sort.is_empty() {
+                texts.sort();
+            }
+            texts
+        };
+        assert_eq!(text(docs.find(s.clone()).unwrap()), expected, "{s:?}");
+        let view = docs
+            .db()
+            .snapshot()
+            .unwrap()
+            .collection::<Document>(&docs.name);
+        assert_eq!(text(view.find(s.clone()).unwrap()), expected, "view: {s:?}");
+        let streamed: Vec<Document> = docs
+            .cursor(s.clone())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        if in_order {
+            assert_eq!(
+                sorted(text(streamed)),
+                sorted(expected.clone()),
+                "cursor: {s:?}"
+            );
+        } else {
+            assert_eq!(streamed.len(), expected.len(), "cursor: {s:?}");
+        }
+        let one = docs.find_one(s.clone()).unwrap().map(|doc| doc.to_string());
+        match f.sort.is_empty() {
+            false => assert_eq!(one.as_ref(), expected.first(), "find_one: {s:?}"),
+            true => assert_eq!(one.is_some(), !expected.is_empty(), "find_one: {s:?}"),
+        }
+        // Typed: `T` given the selection's fields, and nothing else.
+        let typed = docs.db().collection::<Keys>(&docs.name);
+        let keys = |doc: &str| -> Vec<String> {
+            match doc.parse::<Document>().unwrap() {
+                Document::Object(map) => {
+                    let mut keys: Vec<String> = map.keys().cloned().collect();
+                    keys.sort();
+                    keys
+                }
+                _ => Vec::new(),
+            }
+        };
+        let typed_keys: Vec<Vec<String>> = (typed.find(s.clone()).unwrap().into_iter())
+            .map(|Keys(map)| map.into_keys().collect())
+            .collect();
+        let expected_keys: Vec<Vec<String>> = expected.iter().map(|doc| keys(doc)).collect();
+        assert_eq!(typed_keys, expected_keys, "typed: {s:?}");
+        let typed_ids: Vec<DocId> = (docs.db().collection::<IdOnly>(&docs.name))
+            .find(s.clone())
+            .unwrap()
+            .iter()
+            .map(|d| d.id)
+            .collect();
+        let ids: Vec<DocId> = whole.iter().map(|(id, _)| *id).collect();
+        assert_eq!(typed_ids, ids, "typed ids: {s:?}");
+        // The same reads, less the documents answered from their entries.
+        let (plain, selected) = (
+            docs.explain_run(f.clone()).unwrap(),
+            docs.explain_run(s.clone()).unwrap(),
+        );
+        assert_eq!(selected.select.as_deref(), Some(&chosen[..]));
+        assert_eq!(selected.stats.documents_returned, expected.len() as u64);
+        assert_eq!(plain.stats.from_entries, 0);
+        assert_eq!(
+            selected.stats.documents_examined + selected.stats.from_entries,
+            plain.stats.documents_examined,
+            "{s:?}: {selected:?} against {plain:?}"
+        );
+        selected.stats.from_entries
     }
 
     fn records_read(f: impl FnOnce()) -> usize {
@@ -5874,6 +6170,7 @@ mod tests {
                 assert_eq!(found, expected, "{f:?} via {plan:?}");
                 assert_eq!(typed_ids(&docs, &f), expected, "typed: {f:?}");
             }
+            selection_agrees(&docs, &f, &mut rng);
         }
         assert_consistent(&db);
     }
@@ -6070,6 +6367,7 @@ mod tests {
                     .collect();
                 assert_eq!(found, expected, "{f:?} via {plan:?}");
                 assert_eq!(typed_ids(docs, &f), expected, "typed: {f:?}");
+                selection_agrees(docs, &f, rng);
             }
         };
         check(&docs, &mut rng);
@@ -6438,7 +6736,7 @@ mod tests {
                 f.skip([0, 0, 1, 5, 40, 1000][rng.below(6)])
                     .limit([None, Some(0), Some(1), Some(5), Some(30)][rng.below(5)])
             };
-            let (mut covered, mut skipped_unread) = (0, 0);
+            let (mut covered, mut skipped_unread, mut answered) = (0, 0, 0);
             for _ in 0..600 {
                 let f = random_filter(&mut rng);
                 let unlimited = Filter {
@@ -6471,6 +6769,7 @@ mod tests {
                     .map(|(id, _)| id)
                     .collect();
                 let typed = typed_ids(&docs, &f);
+                answered += selection_agrees(&docs, &f, &mut rng);
                 let streamed: Vec<DocId> = docs
                     .cursor(f.clone())
                     .unwrap()
@@ -6501,6 +6800,8 @@ mod tests {
             }
             assert!(covered > 150, "{covered} covered");
             assert!(skipped_unread > 20, "{skipped_unread} skipped unread");
+            // Results answered from their entries (SPEC §106.5).
+            assert!(answered > 100, "{answered} answered from entries");
 
             // Writes change what `find` returns, no more and no less.
             for _ in 0..40 {
@@ -8678,5 +8979,336 @@ mod tests {
         for key in 0..5 {
             assert_eq!(users.count(name_is(&format!("user {key}"))).unwrap(), 1);
         }
+    }
+
+    // --- Projection (SPEC §106) ---
+
+    /// SPEC §106.2: what a selection hands out, through `find`, `cursor`,
+    /// `find_one`, a `View` and the typed path.
+    #[test]
+    fn a_selection_hands_out_what_it_names_on_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<Document>("users");
+        for json in [
+            r#"{"name":"Ada","team":"core","address":{"zip":"N1","city":"London"},"n":null}"#,
+            r#"{"name":"Bo","team":"core","address":"somewhere","tags":[{"x":1}]}"#,
+            r#"{"team":"web","address":{"zip":"10115"}}"#,
+        ] {
+            users.insert(json.parse().unwrap()).unwrap();
+        }
+        // Each document as text, its id (checked to be one) as `"ID"`.
+        let texts = |found: Vec<Document>| -> Vec<String> {
+            (found.into_iter())
+                .map(|doc| {
+                    let Document::Object(mut map) = doc else {
+                        panic!("{doc}")
+                    };
+                    assert!(matches!(map.first(), Some((key, Document::Id(_))) if key == "_id"));
+                    map["_id"] = Document::String("ID".into());
+                    Document::Object(map).to_string()
+                })
+                .collect()
+        };
+        let by_name = || Filter::new().sort_asc("name");
+        // `_id` first, then the selection's order, nested as stored; a
+        // missing field left out, a stored null kept; a path that stops
+        // early selects nothing.
+        assert_eq!(
+            texts(
+                users
+                    .find(by_name().select(["address.city", "name", "n"]))
+                    .unwrap()
+            ),
+            [
+                r#"{"_id":"ID"}"#,
+                r#"{"_id":"ID","address":{"city":"London"},"name":"Ada","n":null}"#,
+                r#"{"_id":"ID","name":"Bo"}"#,
+            ]
+        );
+        // A second `select` adds; `[*]` selects the array whole.
+        let more = by_name().select(["name"]).select(["tags[*].x"]);
+        assert_eq!(
+            texts(users.find(more.clone()).unwrap()),
+            [
+                r#"{"_id":"ID"}"#,
+                r#"{"_id":"ID","name":"Ada"}"#,
+                r#"{"_id":"ID","name":"Bo","tags":[{"x":1}]}"#,
+            ]
+        );
+        let streamed: Vec<Document> = users
+            .cursor(more.clone())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(texts(streamed), texts(users.find(more.clone()).unwrap()));
+        let view = db.snapshot().unwrap().collection::<Document>("users");
+        assert_eq!(
+            texts(view.find(more.clone()).unwrap()),
+            texts(users.find(more.clone()).unwrap())
+        );
+        assert_eq!(
+            texts(users.find_one(more.clone()).unwrap().into_iter().collect()),
+            [r#"{"_id":"ID"}"#]
+        );
+        // Unsorted, through a streaming cursor; `_id` alone.
+        let core = || Filter::new().eq("team", "core");
+        let streamed: Vec<Document> = (users.cursor(core().select([] as [&str; 0])).unwrap())
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(texts(streamed), [r#"{"_id":"ID"}"#; 2]);
+        // Conditions and sort keys see the whole document.
+        assert_eq!(
+            texts(
+                users
+                    .find(core().sort_desc("name").select(["address"]))
+                    .unwrap()
+            ),
+            [
+                r#"{"_id":"ID","address":"somewhere"}"#,
+                r#"{"_id":"ID","address":{"zip":"N1","city":"London"}}"#,
+            ]
+        );
+
+        // Typed: a field of `T` outside the selection is missing to it.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Summary {
+            name: Option<String>,
+            team: Option<String>,
+        }
+        let typed = db.collection::<Summary>("users");
+        let summary = |name: &str| Summary {
+            name: Some(name.to_string()),
+            team: None,
+        };
+        let named = || by_name().gt("name", "A").select(["name"]);
+        assert_eq!(
+            typed.find(named()).unwrap(),
+            [summary("Ada"), summary("Bo")]
+        );
+        let streamed: Vec<Summary> = typed.cursor(named()).unwrap().map(Result::unwrap).collect();
+        assert_eq!(streamed, [summary("Ada"), summary("Bo")]);
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Strict {
+            name: String,
+            team: String,
+        }
+        let strict = db.collection::<Strict>("users");
+        assert_eq!(strict.find(named().select(["team"])).unwrap().len(), 2);
+        let err = strict.find(named()).unwrap_err();
+        assert!(matches!(err, crate::Error::Document(_)), "{err}");
+        assert!(err.to_string().contains("missing field `team`"), "{err}");
+    }
+
+    /// SPEC §106.5: a match is handed out from its index entry where
+    /// every selected value is held as stored — a bool, a string that
+    /// fits the key, an id, a date-time — and read from its document
+    /// otherwise: a number, which the key holds as a float, a null,
+    /// which a missing field is keyed as too, a cut string.
+    #[test]
+    fn results_from_entries_hand_out_values_as_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let long = "x".repeat(2000);
+        let kinds: [(&str, Document, bool); 10] = [
+            ("bool", Document::Bool(true), true),
+            ("string", Document::String("abc".into()), true),
+            ("cut", Document::String(long.clone()), false),
+            ("int", Document::Int(5), false),
+            ("float", Document::Float(5.0), false),
+            ("negative_zero", Document::Float(-0.0), false),
+            ("huge", Document::Int(1 << 60), false),
+            ("id", Document::Id(DocId([9; 16])), true),
+            (
+                "date",
+                Document::DateTime(crate::DateTime::from_unix(1_700_000_000, 5).unwrap()),
+                true,
+            ),
+            ("null", Document::Null, false),
+        ];
+        for (kind, value, answered) in kinds {
+            let docs = db.collection::<Document>(kind);
+            docs.ensure_index("v").unwrap();
+            for w in 0..3 {
+                docs.insert(object(vec![("v", value.clone()), ("w", Document::Int(w))]))
+                    .unwrap();
+            }
+            docs.insert(object(vec![("w", Document::Int(9))])).unwrap(); // `v` missing
+            let filters = [
+                Filter::new().eq("v", value.clone()),
+                Filter::new()
+                    .eq("v", value.clone())
+                    .sort_asc("_id")
+                    .limit(10),
+                Filter::new().sort_asc("v").limit(10),
+                Filter::new().eq("v", value.clone()).skip(1),
+            ];
+            for f in filters {
+                let s = f.clone().select(["v"]);
+                let selection = crate::select::Selection::new(["v"]);
+                let expected: Vec<String> = (docs.find(f.clone()).unwrap().into_iter())
+                    .map(|doc| selection.project(doc).to_string())
+                    .collect();
+                let found: Vec<String> = docs
+                    .find(s.clone())
+                    .unwrap()
+                    .iter()
+                    .map(Document::to_string)
+                    .collect();
+                assert_eq!(found, expected, "{kind}: {s:?}");
+                let streamed: Vec<String> = (docs.cursor(s.clone()).unwrap())
+                    .map(|doc| doc.unwrap().to_string())
+                    .collect();
+                assert_eq!(streamed, expected, "{kind}: cursor {s:?}");
+                // Each result with `v` came from its entry, or none did.
+                let with_v = expected
+                    .iter()
+                    .filter(|doc| doc.contains(r#""v":"#))
+                    .count() as u64;
+                let run = docs.explain_run(s.clone()).unwrap();
+                let from_entries = if answered { with_v } else { 0 };
+                assert_eq!(
+                    run.stats.from_entries, from_entries,
+                    "{kind}: {s:?}: {run:?}"
+                );
+            }
+        }
+        // A missing field stays missing, a null null: neither from a key.
+        let docs = db.collection::<Document>("null");
+        let found: Vec<String> = (docs.find(
+            Filter::new()
+                .eq("v", Document::Null)
+                .sort_asc("w")
+                .select(["v"]),
+        ))
+        .unwrap()
+        .iter()
+        .map(|doc| {
+            doc.to_string()
+                .split_once(',')
+                .map_or("{}".into(), |(_, rest)| rest.to_string())
+        })
+        .collect();
+        assert_eq!(
+            found,
+            [r#""v":null}"#; 3]
+                .map(String::from)
+                .into_iter()
+                .chain(["{}".into()])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// SPEC §106.5: the page a list shows, from a compound index's
+    /// entries alone: `(status, created)` answers "the newest queued,
+    /// their status and creation", and `_id` alone a whole scan, without
+    /// a document read.
+    #[test]
+    fn a_page_of_a_compound_index_is_answered_without_a_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Document>("tasks");
+        tasks.ensure_index(["status", "created"]).unwrap();
+        let mut batch = db.batch();
+        for n in 0..500i64 {
+            let created = crate::DateTime::from_unix(1_700_000_000 + (n * 7919) % 500, 0).unwrap();
+            let task = object(vec![
+                (
+                    "status",
+                    Document::String(["Queued", "Done"][n as usize % 2].into()),
+                ),
+                ("created", Document::DateTime(created)),
+                ("tries", Document::Int(n % 7)),
+            ]);
+            batch.insert(&tasks, task).unwrap();
+        }
+        batch.commit().unwrap();
+        let newest = || {
+            Filter::new()
+                .eq("status", "Queued")
+                .sort_desc("created")
+                .skip(40)
+                .limit(20)
+        };
+        let page = newest().select(["status", "created"]);
+        let run = tasks.explain_run(page.clone()).unwrap();
+        assert_eq!(run.stats.documents_returned, 20);
+        assert_eq!(
+            (run.stats.from_entries, run.stats.documents_examined),
+            (20, 0),
+            "{run:?}"
+        );
+        let selection = crate::select::Selection::new(["status", "created"]);
+        let expected: Vec<String> = (tasks.find(newest()).unwrap().into_iter())
+            .map(|doc| selection.project(doc).to_string())
+            .collect();
+        let found: Vec<String> = tasks
+            .find(page.clone())
+            .unwrap()
+            .iter()
+            .map(Document::to_string)
+            .collect();
+        assert_eq!(found, expected);
+        // A number selected too: read from the documents.
+        let run = tasks.explain_run(page.select(["tries"])).unwrap();
+        assert_eq!(
+            (run.stats.from_entries, run.stats.documents_examined),
+            (0, 20),
+            "{run:?}"
+        );
+        // Every id, from the primary index alone.
+        let ids = Filter::new().select([] as [&str; 0]);
+        let run = tasks.explain_run(ids.clone()).unwrap();
+        assert_eq!(
+            (run.stats.from_entries, run.stats.documents_examined),
+            (500, 0),
+            "{run:?}"
+        );
+        assert_eq!(tasks.find(ids).unwrap().len(), 500);
+    }
+
+    /// SPEC §106.3: writes work on whole documents, whatever is selected,
+    /// and `count` counts what it counts without a selection.
+    #[test]
+    fn writes_ignore_the_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("a").unwrap();
+        for n in 0..10i64 {
+            docs.insert(object(vec![
+                ("a", Document::Int(n % 2)),
+                ("b", Document::Int(n)),
+            ]))
+            .unwrap();
+        }
+        let odd = || Filter::new().eq("a", 1).select(["a"]);
+        assert_eq!(docs.count(odd()).unwrap(), 5);
+        // `update_many` is given the whole document, and keeps it.
+        let changed = docs
+            .update_many(odd(), |doc| {
+                let Document::Object(map) = doc else { panic!() };
+                assert!(map.contains_key("b"), "given the whole document");
+                map.insert("c".into(), Document::Bool(true));
+            })
+            .unwrap();
+        assert_eq!(changed, 5);
+        let whole = docs.find(Filter::new().eq("a", 1)).unwrap();
+        assert!(
+            whole.iter().all(|doc| doc.to_string().contains(r#""b":"#)),
+            "{whole:?}"
+        );
+        let update = crate::update::Update::new().inc("b", 100);
+        assert_eq!(docs.update_fields(odd(), &update).unwrap(), 5);
+        assert_eq!(docs.count(Filter::new().gt("b", 100)).unwrap(), 5);
+        assert!(matches!(
+            docs.upsert(
+                Filter::new().eq("b", 0).select(["a"]),
+                object(vec![("b", Document::Int(0))])
+            ),
+            Ok(Upserted::Updated(_))
+        ));
+        assert_eq!(docs.delete_many(odd().sort_asc("b").limit(2)).unwrap(), 2);
+        assert_eq!(docs.count(Filter::new()).unwrap(), 8);
     }
 }

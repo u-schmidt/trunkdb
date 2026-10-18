@@ -190,9 +190,36 @@ held up or refused for it. `db.snapshot_info()` shows how much is kept.
 
 ### Reading only some fields
 
-A collection can be opened with a smaller type: serde ignores the
-fields it doesn't declare, so this hands back only names and teams, as
-LINQ's `Select` or a SQL column list would:
+`select` hands out only the fields it names, and each document's `_id`,
+as a SQL column list does (SPEC §106):
+
+```rust
+let rows = db
+    .collection::<Document>("users")
+    .find(Filter::new().eq("team", "core").select(["name", "address.city"]))?;
+// [{"_id": ..., "name": "Ada", "address": {"city": "London"}}, ...]
+```
+
+- `_id` comes first, then the paths in the order selected, nested as
+  stored.
+- A missing field is left out; a stored `null` is kept.
+- A path doesn't walk into arrays: `items[*].sku` selects `items` whole.
+- The filter and the sort see the whole document.
+- Writes ignore it: `update_many` is given the whole document, since
+  what it returns is written back.
+
+The fields not selected are skipped, not decoded. Where an index holds
+the filter's fields and every selected one, a match comes from its index
+entry and the document isn't read at all: `(status, created)` answers
+"the queued, newest first, their status and creation" from the index
+alone, if `created` is a date-time. Booleans, strings, ids and
+date-times can come from an entry. Numbers and nulls are read from the
+document, because the key keeps neither a number's type nor whether a
+null field is there.
+
+A typed collection can also be opened with a smaller type: serde
+ignores the fields it doesn't declare, so this hands back only names
+and teams:
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -292,6 +319,7 @@ yours ran.
 cd bench && cargo run --release
 cd bench && cargo run --release --bin reader_wait   # readers while a writer commits
 cd bench && cargo run --release --bin long_read     # one long snapshot beside single writes
+cd bench && cargo run --release --bin select        # reads with a selection (§106)
 ```
 
 ## Roadmap (short version)
@@ -674,7 +702,19 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     (`check` reported it, `compact` reclaims it); now it is. And the
     other fuzz targets' starting database hadn't built since §95.
 
-    Item 75: not released yet; nothing changes in the API or the file.
+76. **Projection, a select of fields** (§106): `Filter::select(["name",
+    "address.city"])` hands out only those fields and `_id`, in the
+    order selected, nested as stored; the rest is skipped, not decoded.
+    Where an index's entries decide the filter and hold every selected
+    field, a match comes from its entry without its document being read:
+    booleans, strings, ids and date-times; numbers and nulls are read
+    from the document. `explain_run` counts those (`from_entries`) and
+    names the selection. Writes ignore it, `update_many` too. Aggregates
+    are no longer "not planned": §106.7 takes them up again.
+
+    Items 75–76: not released yet. `Filter::select`, and the new fields
+    of `Explained` and `ExecutionStats`, which are `#[non_exhaustive]`,
+    are additions; nothing changes in the file.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

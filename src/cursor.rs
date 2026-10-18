@@ -1,7 +1,9 @@
 use crate::collection::Collection;
 use crate::collection::Found;
 use crate::document::Document;
+use crate::index::key;
 use crate::query::Filter;
+use crate::select::{Answer, Selection};
 use crate::storage::RecordLocation;
 
 /// A streaming `find`: an iterator over a filter's matches, reading one
@@ -36,22 +38,36 @@ pub struct Cursor<T> {
     source: Source<T>,
 }
 
+/// A match decoded (SPEC §99.3): into a `Document` for the untyped path,
+/// a `T` for the typed one, cut down to the selection if there is one
+/// (SPEC §106).
+pub(crate) type Convert<T> = fn(Found, Option<&Selection>) -> crate::Result<T>;
+
+/// A candidate a streaming cursor still has to hand out or pass over.
+pub(crate) enum Pending {
+    /// To be read and checked.
+    Unchecked(RecordLocation),
+    /// Its index entry decided it matches (SPEC §100): it isn't checked,
+    /// and a skip passes over it unread. With its key where the
+    /// selection may be answered from it (§106.5).
+    Matched(RecordLocation, Option<Vec<u8>>),
+}
+
 enum Source<T> {
     Streaming {
         /// The collection, as of the cursor's creation.
         documents: Collection<Document>,
         /// Where each candidate is, in that same commit: a location
         /// means nothing in another one, where its slot may hold a
-        /// different document (SPEC §20.2). With it, whether its index
-        /// entry decided it matches (SPEC §100): then it isn't checked.
-        candidates: std::vec::IntoIter<(RecordLocation, bool)>,
+        /// different document (SPEC §20.2).
+        candidates: std::vec::IntoIter<Pending>,
         filter: Filter,
+        /// The selection, and how the entries answer it (SPEC §106).
+        selected: Option<Box<(Selection, Option<Answer>)>>,
         /// Matches still to pass over (`Filter::skip`, SPEC §72).
         skipping: usize,
         remaining: Option<usize>,
-        /// A match decoded (SPEC §99.3): into a `Document` for the
-        /// untyped path, a `T` for the typed one.
-        convert: fn(Found) -> crate::Result<T>,
+        convert: Convert<T>,
     },
     Collected(std::vec::IntoIter<T>),
 }
@@ -59,16 +75,20 @@ enum Source<T> {
 impl<T> Cursor<T> {
     pub(crate) fn streaming(
         documents: Collection<Document>,
-        candidates: Vec<(RecordLocation, bool)>,
+        candidates: Vec<Pending>,
         filter: Filter,
-        convert: fn(Found) -> crate::Result<T>,
+        select: Option<Selection>,
+        answer: Option<Answer>,
+        convert: Convert<T>,
     ) -> Self {
         let (skipping, remaining) = (filter.skip, filter.limit);
+        let selected = select.map(|select| Box::new((select, answer)));
         Cursor {
             source: Source::Streaming {
                 documents,
                 candidates: candidates.into_iter(),
                 filter,
+                selected,
                 skipping,
                 remaining,
                 convert,
@@ -96,20 +116,37 @@ impl<T> Iterator for Cursor<T> {
                 documents,
                 candidates,
                 filter,
+                selected,
                 skipping,
                 remaining,
                 convert,
             } => {
+                let select = selected.as_ref().map(|selected| &selected.0);
+                let answer = selected.as_ref().and_then(|selected| selected.1.as_ref());
                 if *remaining == Some(0) {
                     return None;
                 }
                 // Checked on the fields the filter names (SPEC §99.2).
                 let names = filter.fields();
                 let matcher = filter.matcher();
-                for (loc, decided) in candidates.by_ref() {
+                for pending in candidates.by_ref() {
+                    let (loc, decided, key) = match pending {
+                        Pending::Unchecked(loc) => (loc, false, None),
+                        Pending::Matched(loc, key) => (loc, true, key),
+                    };
                     if decided && *skipping > 0 {
                         *skipping -= 1;
                         continue; // a match passed over unread
+                    }
+                    // Answered from its entry, unread (SPEC §106.5).
+                    let answered = key
+                        .zip(answer)
+                        .and_then(|(key, answer)| Some((key::doc_id(&key), answer.entry(&key)?)));
+                    if let Some((id, selected)) = answered {
+                        if let Some(n) = remaining {
+                            *n -= 1;
+                        }
+                        return Some(convert(Found::answered(id, selected), select));
                     }
                     let candidate = documents.stored_at(loc).and_then(|stored| {
                         if decided {
@@ -128,7 +165,7 @@ impl<T> Iterator for Cursor<T> {
                             if let Some(n) = remaining {
                                 *n -= 1;
                             }
-                            return Some(convert(Found::from(stored)));
+                            return Some(convert(Found::from(stored), select));
                         }
                         Ok(_) => continue, // a candidate that doesn't match
                     }

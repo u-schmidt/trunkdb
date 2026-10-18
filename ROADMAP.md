@@ -38,7 +38,7 @@ All of it is done:
 | 0.18.0 | A WAL size limit, `OpenOptions::checkpoint_wal_bytes`, so a large `checkpoint_pages` cannot grow the WAL without bound; a failed log taken back alone, so it no longer empties the WAL along with the batches committed before it (a fix to §51); snapshot reads: a batch is staged, logged, flushed and checkpointed beside the readers, which wait only for its publish, and a page's older versions stay in memory for the snapshots open, so a read keeps its commit to its end and commits wait for no read; `Database::snapshot` and `View<T>`, a snapshot a caller keeps, and a `cursor` that shows the moment it was made (breaking for code that relied on seeing later changes); `OpenOptions::snapshot_memory`, a limit on what snapshots keep, past which the oldest is ended with `Error::SnapshotTooOld`; `compact` takes the database alone and is refused with `Error::SnapshotOpen` while a snapshot is kept | §76–§83 |
 | 0.19.0 | Damaged and hostile input: `trunkdb export` through a temporary file, never over the database or its WAL; damaged header fields recovered from the WAL; a limit on the line an import reads, 256 MiB unless `ImportOptions::max_line_bytes` says otherwise; a WAL header that can't grow the file past its pages; `drop_index` on `_id` refused. A read-only open, `OpenOptions::read_only`: a shared file lock, nothing written, the WAL's batches and the open's own changes kept in memory, every write refused with `Error::ReadOnly`; the `trunkdb` command's `info`, `check` and `export` open read-only; a `checkpoint_pages` past 2^50 no longer overflows the default WAL limit (a fix to §76) | §84–§89 |
 | 0.20.0 | **Memory that doesn't grow with the file**, steps 1 and 2: the WAL record written from the pages, compaction in 1.2× the new file's size instead of 3.3×; a batch over 32 MiB logged in several records, crash recovery a record at a time, 37 MB where it took 2.5 GB; no batch size limit, where a batch over 4 GiB was logged with its length cut to 32 bits; WAL version 3, version 2 still recovered. **Diagnostics:** `Error::Format` for a file this build can't read at all (not a trunkdb file, a format or WAL version it doesn't read), `InvalidData` at an open meaning damage only; `Database::stats`, in `trunkdb info` too: pages by kind, sizes per collection and index, the WAL, recovery at open, and the pages a `compact` would leave; `explain_run`: the plan, each index read and its bounds, how the sort was done, entries and documents examined, matched and returned, the time. **Only objects** (breaking for `Collection<i64>` and the like): a document that isn't one refused with `Error::NotAnObject`, file format 12, an older file checked once at open. **Reads** — same results, same file: a sort by `_id` walks the primary index and stops at the limit, or the range an `Eq` fixes, `_id` comparisons narrowing either (`explain` says `IndexOrder` for the second, where it said `Index`); only what a read needs decoded, typed reads straight into `T`; index entries decide the filter without their documents, on their bytes, and a leaf inside the range counted or skipped whole; walks lend their entries instead of copying them; paths parsed once per query. On 100,000 documents: the first 50 by id 33 µs instead of 189 ms, a scan 64 ms instead of 168, a count by index 0.01 ms instead of 0.9, page 50 of 20 27 µs instead of 1.2 ms, a tenant's first 20 by id 23 µs instead of 0.6 ms. **Documented:** on Unix a database dropped while a process starts stays locked until that child's exec. | §90–§104 |
-| next | A differential fuzz target for queries, `queries`: any bytes as a program of index changes, writes, compactions, reopens, snapshots and reads on a valid database, every read through every way of reading held against the filter applied in memory to a model of what is stored; a smoke run of it on stable, in CI on 400 random programs; it catches 33 of the 36 hand-made mutations of §100–§104 that change answers. A leak it found fixed: a current data page emptied by deletes and given up for a new one, when a large document didn't fit beside its slot directory, was left in the free-space map instead of freed. The other fuzz targets' starting database built again: a scratch collection of plain numbers, refused since §95, had left them panicking at their start, and CI now builds it. `compact` beside a snapshot documented as `Ok` where nothing would be rewritten | §105 |
+| next | A differential fuzz target for queries, `queries`: any bytes as a program of index changes, writes, compactions, reopens, snapshots and reads on a valid database, every read through every way of reading held against the filter applied in memory to a model of what is stored; a smoke run of it on stable, in CI on 400 random programs; it catches 33 of the 36 hand-made mutations of §100–§104 that change answers. A leak it found fixed: a current data page emptied by deletes and given up for a new one, when a large document didn't fit beside its slot directory, was left in the free-space map instead of freed. The other fuzz targets' starting database built again: a scratch collection of plain numbers, refused since §95, had left them panicking at their start, and CI now builds it. `compact` beside a snapshot documented as `Ok` where nothing would be rewritten. **Projection:** `Filter::select`, the fields a read hands out, `_id` always, in the order selected, nested as stored, a missing field left out; the rest skipped, not decoded; a match handed out from its index entry, its document never read, where the entries decide the filter and hold every selected field and its values are booleans, strings that fit the key, ids or date-times; `explain_run`'s `from_entries` and `select`; writes on whole documents, `update_many` too. Aggregates taken off "not planned" | §105–§106 |
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
@@ -150,16 +150,19 @@ limit is described.
 - A document as `serde_json::Value`, beside its text form (§71), if a
   tool needs it: behind a feature named `serde_json-1`, so `serde_json`
   stays out of the default public API (§71.4).
-- Projection, a `select` of fields (`Filter::new().select(["name",
-  "team"])`), for `Collection<Document>` and the `trunkdb` command,
-  which have no smaller struct to read into (a typed collection already
-  can: the README's "Reading only some fields"). It saves decoding
-  and memory, not reads: a document is stored in one piece, overflow
-  pages included (§26), and its encoding records no byte sizes, so
-  reaching a field still walks those before it (§11.1), though without
-  allocating them. With projection, a `find` whose index covers the
-  filter and the fields selected could return without reading a
-  document, as `count` does since §100. When a workload asks for it.
+- Aggregates, reconsidered (§106.7): `count`, `sum`, `min`, `max` and
+  `avg`, grouped by one or more fields, behind the same `Filter`, without
+  joins. They were left to application code in v0 (§6), when `count`
+  read every document; since §100–§104 the engine counts from index
+  entries, which application code can't. §106's selection is what they
+  build on: paths walked in one pass over a stored document, and
+  results from index entries, where the entries of one group lie side
+  by side. Numbers and nulls handed out from keys would want an
+  `Int`/`Float` bit and a missing mark in every key, file format 13
+  (§106.8): weighed again here, where a `sum` over an index needs it.
+- Projection beyond paths, when asked (§106.8): arrays trimmed to a
+  field of their elements (`items[*].sku`, which now selects `items`
+  whole), and fields excluded instead of selected.
 - Operators in a `Batch` and in `upsert` (§68.3).
 - More update operators, when asked for: `pull` by a condition on the
   element, `push` of several values at once, `mul`, `pop` (§73.3).
@@ -185,7 +188,11 @@ limit is described.
   on nightly (§55.6).
 - Unique indexes in the `queries` target, the model asking the
   database's own filters whether two values collide (§105.7).
+- A query on the command line, `trunkdb find`: the command has none yet
+  (§39), and one needs a filter syntax in text, a decision of its own
+  (§106.8).
 - PyO3 bindings, for Python apps.
 
-Not planned: a cost-based query planner, joins, aggregates, multiple
-writers, encryption, schema validation (§6).
+Not planned: a cost-based query planner, joins, multiple writers,
+encryption, schema validation (§6). Aggregates were on this list until
+§106.7.

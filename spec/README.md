@@ -116,3 +116,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 103. [An `Eq`-fixed index walked in id order (`query.rs`, `collection.rs`)](103-an-eq-fixed-index-walked-in-id-order.md)
 104. [Index entries matched on their bytes (`query.rs`, `index/key.rs`)](104-index-entries-matched-on-their-bytes.md)
 105. [A differential fuzz target for queries (`fuzz/`)](105-a-differential-fuzz-target-for-queries.md)
+106. [Projection: a select of fields (`select.rs`, `query.rs`, `collection.rs`, `cursor.rs`, `explain.rs`)](106-projection-a-select-of-fields.md)

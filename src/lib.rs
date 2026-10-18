@@ -26,6 +26,7 @@ mod index;
 mod json;
 mod path;
 pub mod query;
+mod select;
 mod serde_bridge;
 mod serde_stored;
 mod snapshot;
