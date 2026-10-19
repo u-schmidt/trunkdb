@@ -64,8 +64,8 @@ Ada
   don't have.
 - **Exit code 1 when nothing is found**, as `grep` does: a script that
   counts matches would have to tell it from an error.
-- **`--explain`**, the plan instead of the documents: useful, and easy
-  to add (`explain_run`); left until someone wants it.
+- **`--explain`**, the plan instead of the documents: left for a step
+  of its own, which §113 is.
 
 ## 112.5 Tests
 `tests/cli.rs`, the command run as a process:

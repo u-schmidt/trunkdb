@@ -290,6 +290,8 @@ trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
 trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
 trunkdb find app.trunkdb users 'age >= 30 order by name limit 10'
                                          # one JSON document per line
+trunkdb find app.trunkdb users 'age >= 30' --explain
+                                         # the plan, index reads, counts
 ```
 
 `info`, `check`, `export` and `find` open the file read-only: they change
@@ -802,6 +804,12 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     Items 78–82 → 0.22.0: nothing breaking; `FromStr` and `Display`
     for `Filter` and `Condition`, and `ParseFilterError`, are additions.
     Files and exports as in 0.21.0.
+
+83. **`trunkdb find --explain`** (§113): how a query ran instead of
+    what it found: the plan, each index read with its bounds in the
+    filter language, the sort, and `explain_run`'s counts and time.
+
+    Item 83: not released yet. Nothing changes in the library.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

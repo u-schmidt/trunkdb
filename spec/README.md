@@ -123,3 +123,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 110. [A group's first document found late (`aggregate.rs`)](110-a-groups-first-document-found-late.md)
 111. [Filters as text (`query_text.rs`)](111-filters-as-text.md)
 112. [`trunkdb find` (`src/bin/trunkdb.rs`)](112-trunkdb-find.md)
+113. [`trunkdb find --explain` (`src/bin/trunkdb.rs`)](113-trunkdb-find-explain.md)

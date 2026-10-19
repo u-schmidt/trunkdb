@@ -514,6 +514,127 @@ fn find_names_a_mistake_and_where_it_is() {
     assert_eq!(trunkdb(&["find", &db]).status.code(), Some(2));
 }
 
+/// `find … --explain` (SPEC §113): how the query ran, a line each, in
+/// place of the documents.
+#[test]
+fn find_explain_says_how_it_found_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+
+    // All but the time, which differs from run to run.
+    let explained = |args: &[&str]| -> String {
+        let output = trunkdb(args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(stderr(&output), "");
+        let text = stdout(&output);
+        let (rest, time) = text.trim_end().rsplit_once('\n').unwrap();
+        assert!(
+            time.starts_with("time: ") && time.ends_with(" ms"),
+            "{text}"
+        );
+        format!("{rest}\n")
+    };
+    assert_eq!(
+        explained(&["find", &db, "users", "age > 40", "--explain"]),
+        "plan: index on age\n\
+         read: age, where age > 40, 1 entry, its entries decide the filter\n\
+         keys examined: 1\n\
+         documents examined: 1\n\
+         documents matched: 1\n\
+         documents returned: 1\n\
+         answered from index entries: 0\n"
+    );
+    assert_eq!(
+        explained(&["find", &db, "users", "--explain"]),
+        "plan: scan of every document\n\
+         read: _id, the whole index, 2 entries, its entries decide the filter\n\
+         keys examined: 2\n\
+         documents examined: 2\n\
+         documents matched: 2\n\
+         documents returned: 2\n\
+         answered from index entries: 0\n"
+    );
+    let text = explained(&[
+        "find",
+        &db,
+        "users",
+        "select",
+        "email",
+        "where",
+        "email",
+        "=",
+        "\"b@x\"",
+        "or",
+        "age",
+        "<",
+        "40",
+        "order",
+        "by",
+        "age",
+        "desc",
+        "limit",
+        "1",
+        "--explain",
+    ]);
+    assert_eq!(
+        text,
+        "plan: indexes on email, age, together\n\
+         read: email, where email = \"b@x\", 1 entry\n\
+         read: age, where age < 40, 1 entry\n\
+         sort: 0 keys from the index order, 1 in memory\n\
+         keys examined: 2\n\
+         documents examined: 2\n\
+         documents matched: 2\n\
+         documents returned: 1\n\
+         answered from index entries: 0\n"
+    );
+    let text = explained(&[
+        "find",
+        &db,
+        "users",
+        "order by age desc limit 1",
+        "--explain",
+    ]);
+    assert!(
+        text.starts_with("plan: index on age, in its order\n"),
+        "{text}"
+    );
+    assert!(text.contains(", backward"), "{text}");
+    assert!(
+        text.contains("sort: 1 key from the index order, 0 in memory\n"),
+        "{text}"
+    );
+
+    let text = explained(&[
+        "find",
+        &db,
+        "users",
+        r#"select email where email = "a@x""#,
+        "--explain",
+    ]);
+    assert_eq!(
+        text,
+        "plan: index on email\n\
+         read: email, where email = \"a@x\", 1 entry, its entries decide the filter\n\
+         keys examined: 1\n\
+         documents examined: 0\n\
+         documents matched: 1\n\
+         documents returned: 1\n\
+         answered from index entries: 1\n"
+    );
+
+    // Its mistakes are `find`'s.
+    let output = trunkdb(&["find", &db, "users", "age >", "--explain"]);
+    assert_eq!(
+        (output.status.code(), stdout(&output)),
+        (Some(2), String::new())
+    );
+    let output = trunkdb(&["find", &db, "user", "--explain"]);
+    assert_eq!(stderr(&output), "trunkdb: user: no such collection\n");
+}
+
 /// `find … | head`: the reader gone, `find` stops, and that's no error.
 #[test]
 fn find_stops_quietly_when_its_reader_goes() {

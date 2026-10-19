@@ -29,12 +29,14 @@ commands:
                               it doesn't exist; `-` reads standard input.
                               A line over 256 MiB (or the given size) stops
                               the import; `none` turns the limit off
-  find   <file> <collection> [filter]
+  find   <file> <collection> [filter] [--explain]
                               print the documents the filter finds, one
                               JSON document per line; every document
                               without a filter. A filter is text like
                               'age >= 30 order by name limit 10'; words
-                              after the collection are joined into one
+                              after the collection are joined into one.
+                              --explain runs it and prints how instead:
+                              the plan, the index reads, the counts
 
 info, check, export and find only read: they change nothing in the file or its
 log, not even what a crash of the program that had it open left there.
@@ -43,27 +45,29 @@ log, not even what a crash of the program that had it open left there.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = match args[..] {
-        ["info", file] => read_only(file).and_then(|db| info(file, &db)),
-        ["check", file] => read_only(file).and_then(|db| check(&db)),
-        ["compact", file] => existing(file).and_then(|db| compact(&db)),
-        ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
-        ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
-        ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
-        ["find", file, collection, ref filter @ ..] => {
-            read_only(file).and_then(|db| find(&db, collection, &filter.join(" ")))
-        }
-        ["import", file, input, "--max-line", limit] => max_line(limit)
-            .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
-        ["help" | "-h" | "--help"] => {
-            print!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        _ => {
-            eprint!("{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
+    let result =
+        match args[..] {
+            ["info", file] => read_only(file).and_then(|db| info(file, &db)),
+            ["check", file] => read_only(file).and_then(|db| check(&db)),
+            ["compact", file] => existing(file).and_then(|db| compact(&db)),
+            ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
+            ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
+            ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
+            ["find", file, collection, ref filter @ .., "--explain"] => read_only(file)
+                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained)),
+            ["find", file, collection, ref filter @ ..] => read_only(file)
+                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents)),
+            ["import", file, input, "--max-line", limit] => max_line(limit)
+                .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
+            ["help" | "-h" | "--help"] => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            _ => {
+                eprint!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        };
     match result {
         Ok(code) => code,
         Err(message) => {
@@ -382,9 +386,19 @@ fn import(db: &Database, input: &str, max_line: Option<usize>) -> Outcome {
     Ok(ExitCode::SUCCESS)
 }
 
+/// What `find` prints.
+#[derive(Clone, Copy)]
+enum Show {
+    /// The documents found, one JSON line each (SPEC §112).
+    Documents,
+    /// How the query ran, `--explain` (SPEC §113).
+    Explained,
+}
+
 /// The documents `filter` finds in `collection`, one JSON line each
-/// (SPEC §112), streamed from a cursor; how many, to stderr.
-fn find(db: &Database, collection: &str, filter: &str) -> Outcome {
+/// (SPEC §112), streamed from a cursor; how many, to stderr. Or how it
+/// found them (§113).
+fn find(db: &Database, collection: &str, filter: &str, show: Show) -> Outcome {
     let failed = |e: trunkdb::Error| e.to_string();
     let filter: Filter = match filter.parse() {
         Ok(filter) => filter,
@@ -403,6 +417,16 @@ fn find(db: &Database, collection: &str, filter: &str) -> Outcome {
         return Err(format!("{collection}: no such collection"));
     }
     let docs = db.collection::<Document>(collection);
+    if let Show::Explained = show {
+        let explained = docs.explain_run(filter).map_err(failed)?;
+        return match io::stdout()
+            .lock()
+            .write_all(explanation(&explained).as_bytes())
+        {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => stopped_writing(e),
+        };
+    }
     let mut out = io::BufWriter::new(io::stdout().lock());
     let mut found = 0;
     for doc in docs.cursor(filter).map_err(failed)? {
@@ -440,4 +464,61 @@ fn filter_error(filter: &str, e: &ParseFilterError) -> String {
         &filter[start..end],
         " ".repeat(column)
     )
+}
+
+/// How a query ran (SPEC §113), a line for each thing `explain_run` says.
+fn explanation(explained: &trunkdb::query::Explained) -> String {
+    use std::fmt::Write;
+    use trunkdb::query::QueryPlan;
+    let mut text = String::new();
+    let plan = match &explained.plan {
+        QueryPlan::Scan => "scan of every document".to_string(),
+        QueryPlan::Index { field } => format!("index on {field}"),
+        QueryPlan::IndexOrder { field } => format!("index on {field}, in its order"),
+        QueryPlan::IndexUnion { fields } => format!("indexes on {}, together", fields.join(", ")),
+        QueryPlan::ById => "by id".to_string(),
+        other => format!("{other:?}"),
+    };
+    let _ = writeln!(text, "plan: {plan}");
+    for read in &explained.reads {
+        let bounds = match read.bounds.as_slice() {
+            [] => "the whole index".to_string(),
+            bounds => {
+                let bounds: Vec<String> = bounds.iter().map(|b| b.to_string()).collect();
+                format!("where {}", bounds.join(" and "))
+            }
+        };
+        let _ = write!(
+            text,
+            "read: {}, {bounds}, {}",
+            read.index,
+            match read.entries {
+                1 => "1 entry".to_string(),
+                n => format!("{n} entries"),
+            }
+        );
+        if read.backward {
+            text.push_str(", backward");
+        }
+        if read.covering {
+            text.push_str(", its entries decide the filter");
+        }
+        text.push('\n');
+    }
+    if let Some(sort) = explained.sort {
+        let _ = writeln!(
+            text,
+            "sort: {} from the index order, {} in memory",
+            count(sort.from_index, "key"),
+            sort.in_memory
+        );
+    }
+    let stats = &explained.stats;
+    let _ = writeln!(text, "keys examined: {}", stats.keys_examined);
+    let _ = writeln!(text, "documents examined: {}", stats.documents_examined);
+    let _ = writeln!(text, "documents matched: {}", stats.documents_matched);
+    let _ = writeln!(text, "documents returned: {}", stats.documents_returned);
+    let _ = writeln!(text, "answered from index entries: {}", stats.from_entries);
+    let _ = writeln!(text, "time: {:.2} ms", stats.elapsed.as_secs_f64() * 1000.0);
+    text
 }
