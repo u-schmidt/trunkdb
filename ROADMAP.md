@@ -154,14 +154,19 @@ limit is described.
   `Int`/`Float` bit and a missing mark in every key, file format 13
   (§106.8); `min` and `max` that seek a group's ends instead of walking
   its entries; rows handed out as they are made rather than collected.
-- A count with a condition, `Aggregate::count_if(condition, name)`:
-  how many of a group's documents meet it, several such counts in one
-  pass (`count_if(hours >= 1)`, `count_if(status = "open")`), where a
-  filter in front gives one count per query. Named `count_if`, as in
-  Spark SQL and DuckDB (BigQuery's `COUNTIF`): in SQL, `COUNT(x)`
-  counts where `x` isn't null, so `COUNT(hours >= 1)` counts every
-  document with `hours`, true and false alike, and a reader from SQL
-  shouldn't have to wonder which meaning applies here.
+- A condition on a column: a `count`, `sum`, `avg`, `min` or `max`
+  over only those of a group's documents that meet it, where a filter
+  in front would leave the others out of every column. So per team all
+  tasks counted, and the mean only of those with `hours >= 4`; or
+  several counts in one pass, `hours >= 1` and `status = "open"`, where
+  a filter gives one count per query. One condition any column can
+  take, as standard SQL's `FILTER (WHERE …)` (PostgreSQL, DuckDB,
+  SQLite) has it, rather than a function per kind (ClickHouse's
+  `countIf`, `avgIf`; BigQuery's `COUNTIF`, Spark's `count_if`):
+  one rule instead of five names. MongoDB has none; a `$cond` turning
+  the others into null, which `$avg` skips, does it. Not `count(hours
+  >= 1)`: in SQL `COUNT(x)` counts where `x` isn't null, so that counts
+  every document with `hours`, true and false alike.
 - Projection beyond paths, when asked (§106.8): arrays trimmed to a
   field of their elements (`items[*].sku`, which now selects `items`
   whole), and fields excluded instead of selected.
@@ -195,8 +200,8 @@ limit is described.
   aggregates and updates as text (§111.11). Aggregates in SQL's
   order, `group by team select count() as tasks, avg(hours) as
   mean_hours having tasks > 1`, the form most who'd want it know,
-  documented with what goes in and what comes out; `count_if` in it
-  if it's there by then.
+  documented with what goes in and what comes out; a column's
+  condition in it if it's there by then.
 - PyO3 bindings, for Python apps.
 
 Not planned: a cost-based query planner, joins, multiple writers,
