@@ -799,9 +799,9 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     when its reader goes (`| head`). A filter's mistake is shown under
     its line with a `^`.
 
-    Items 78–82: not released yet. Nothing breaking: `FromStr` and
-    `Display` for `Filter` and `Condition`, and `ParseFilterError`, are
-    additions. Files and exports as in 0.21.0.
+    Items 78–82 → 0.22.0: nothing breaking; `FromStr` and `Display`
+    for `Filter` and `Condition`, and `ParseFilterError`, are additions.
+    Files and exports as in 0.21.0.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
