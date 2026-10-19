@@ -504,7 +504,10 @@ more than four.
   [§39](spec/39-the-trunkdb-command-and-database-check.md); `info`, `check` and `export` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
-  without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md).
+  without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md). It reads
+  documents one at a time and checks an index entry by entry against
+  the documents its entries name, so its memory doesn't grow with the
+  file: four bytes a page, for its owner [§109](spec/109-check-in-memory-that-does-not-grow-with-the-file.md).
 - **Compaction** rebuilds the collections into a fresh image with full
   pages, logs it through the WAL like any batch, copies it in and
   truncates the file [§41](spec/41-compaction.md). The image is built in a file beside the

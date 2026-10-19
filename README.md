@@ -769,7 +769,15 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     The disk needs room for the new file twice more until it's done.
     No file is left behind, after a crash either.
 
-    Item 78: not released yet. Nothing changes in the API or the file.
+79. **`check` in memory that doesn't grow with the file** (§109): it
+    reads documents one at a time and checks each index entry against
+    the document it names, where it held every document and every key.
+    On a file of 1.1 GB: 0.3 GB instead of 1.75 with the default cache,
+    in the same 2.5 s; 3 MB instead of 1.3 GB without one, in 5 s
+    instead of 2.6. The same problems found.
+
+    Items 78–79: not released yet. Nothing changes in the API or the
+    file.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

@@ -8,9 +8,9 @@ use crate::collection::{index_keys, same_values, unique_tuples};
 use crate::data;
 use crate::database::{Database, ReadGuard};
 use crate::document::{DocId, Document};
-use crate::index::{BTreeIndex, Index, key};
+use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::storage::{PAGE_SIZE, PageId, RecordLocation, SnapshotStore};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// What the file is, from its header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,12 +77,19 @@ impl Database {
     }
 
     /// `check`, of the commit `state` reads.
+    ///
+    /// In memory that doesn't grow with the file (SPEC §109): documents
+    /// are read and checked one at a time, and an index is checked entry
+    /// by entry against the documents its entries name. Only a page's
+    /// owner is kept for every page, four bytes of it.
     pub(crate) fn check_of(state: &ReadGuard<'_>) -> crate::Result<CheckReport> {
         let at = state.snapshot();
         let (catalog, store) = (at.catalog, &at.store);
+        let page_count = store.page_count();
         let mut check = Check {
-            owners: BTreeMap::new(),
-            page_count: store.page_count(),
+            owners: vec![NOBODY; page_count as usize],
+            names: Vec::new(),
+            page_count,
             problems: Vec::new(),
             incomplete: false,
         };
@@ -100,17 +107,18 @@ impl Database {
                 "page {page} is damaged: its checksum doesn't match"
             ));
         }
-        check.claim(0, "the header");
+        let header = check.owner("the header".to_string());
+        check.claim(0, header);
+        let catalog_pages = check.owner("the catalog".to_string());
         match Catalog::pages(store) {
             Ok(pages) => pages
                 .into_iter()
-                .for_each(|p| check.claim(p, "the catalog")),
+                .for_each(|p| check.claim(p, catalog_pages)),
             Err(e) => check.unreadable(format!("the catalog: {e}")),
         }
+        let free_list = check.owner("the free list".to_string());
         match store.free_pages() {
-            Ok(pages) => pages
-                .into_iter()
-                .for_each(|p| check.claim(p, "the free list")),
+            Ok(pages) => pages.into_iter().for_each(|p| check.claim(p, free_list)),
             Err(e) => check.unreadable(e.to_string()),
         }
 
@@ -130,7 +138,7 @@ impl Database {
             check.problem("leaks not checked: not everything could be read".to_string());
         } else {
             for page in 0..check.page_count {
-                if !check.owners.contains_key(&page) {
+                if check.owners[page as usize] == NOBODY {
                     check.problem(format!("page {page} belongs to nothing (leaked)"));
                 }
             }
@@ -144,8 +152,18 @@ impl Database {
     }
 }
 
+/// Who owns a page, as `Check::owner` numbered them.
+type Owner = u32;
+
+/// A page nobody has claimed yet.
+const NOBODY: Owner = Owner::MAX;
+
 struct Check {
-    owners: BTreeMap<PageId, String>,
+    /// Every page's owner, by page id (SPEC §109): four bytes a page,
+    /// where a name each took tens.
+    owners: Vec<Owner>,
+    /// The owners' names, by number.
+    names: Vec<String>,
     page_count: u64,
     problems: Vec<String>,
     /// Something couldn't be read, so the pages it owns are unknown.
@@ -163,14 +181,42 @@ impl Check {
         self.problem(problem);
     }
 
-    fn claim(&mut self, page: PageId, owner: &str) {
+    /// A new owner of pages, by its name in problems.
+    fn owner(&mut self, name: String) -> Owner {
+        self.names.push(name);
+        (self.names.len() - 1) as Owner
+    }
+
+    /// `page` is `owner`'s alone: a second claim is a problem, even by
+    /// the same owner.
+    fn claim(&mut self, page: PageId, owner: Owner) {
+        self.claim_as(page, owner, false);
+    }
+
+    /// `page` is `owner`'s, which may claim it again: a data page holds
+    /// many documents.
+    fn claim_shared(&mut self, page: PageId, owner: Owner) {
+        self.claim_as(page, owner, true);
+    }
+
+    fn claim_as(&mut self, page: PageId, owner: Owner, shared: bool) {
         if page >= self.page_count {
-            self.problem(format!("{owner} uses page {page}, past the file's end"));
-        } else if let Some(other) = self.owners.get(&page) {
-            let problem = format!("page {page} belongs to both {other} and {owner}");
+            let problem = format!(
+                "{} uses page {page}, past the file's end",
+                self.names[owner as usize]
+            );
             self.problem(problem);
-        } else {
-            self.owners.insert(page, owner.to_string());
+            return;
+        }
+        let other = self.owners[page as usize];
+        if other == NOBODY {
+            self.owners[page as usize] = owner;
+        } else if !(shared && other == owner) {
+            let problem = format!(
+                "page {page} belongs to both {} and {}",
+                self.names[other as usize], self.names[owner as usize]
+            );
+            self.problem(problem);
         }
     }
 }
@@ -179,6 +225,9 @@ impl Check {
 /// it has. An `Err` is a problem that stopped the check of this
 /// collection partway. Documents on `damaged` pages aren't read: one
 /// problem names them all, and their index entries are left alone.
+///
+/// The documents are read one at a time, in id order, and let go: what
+/// each index should hold is counted, not kept (SPEC §109).
 fn check_collection(
     check: &mut Check,
     catalog: &Catalog,
@@ -188,26 +237,34 @@ fn check_collection(
 ) -> std::io::Result<usize> {
     let meta = *catalog.get(name).expect("a listed collection");
     let primary = BTreeIndex::new(meta.index_root);
+    let primary_pages = check.owner(format!("{name:?}'s primary index"));
     for page in primary.pages(store)? {
-        check.claim(page, &format!("{name:?}'s primary index"));
+        check.claim(page, primary_pages);
     }
-    let entries = primary.scan(store)?;
-    check_order(check, name, "primary index", &entries);
+    let data_pages = check.owner(format!("{name:?}'s documents"));
+    let chain_pages = check.owner(format!("{name:?}'s large documents"));
+    let indexes = catalog.indexes(name);
+    // How many entries the documents call for, index by index.
+    let mut expected = vec![0usize; indexes.len()];
 
-    let mut documents: Vec<(DocId, Document, RecordLocation)> = Vec::new();
+    let mut documents = 0;
     let mut unreadable = BTreeSet::new();
     let (mut on_damaged, mut on_damaged_count) = (BTreeSet::new(), 0);
     let mut records = data::Records::new(store);
-    for (key, loc) in &entries {
-        let expected = key::doc_id(key);
+    let mut order = Order::new(format!("{name:?}'s primary index"));
+    let mut walk = primary.walk(store, KeyRange::everything(), false);
+    while let Some(entry) = walk.step() {
+        let (key, loc) = entry?;
+        order.see(check, key);
+        let expected_id = key::doc_id(key);
         if damaged.contains(&loc.page) {
-            unreadable.insert(expected);
+            unreadable.insert(expected_id);
             on_damaged.insert(loc.page);
             on_damaged_count += 1;
             continue;
         }
-        match records.get(*loc) {
-            Ok((id, doc)) if id == expected => {
+        match records.get(loc) {
+            Ok((id, doc)) if id == expected_id => {
                 // A file says format 12 once it is open, and so that
                 // every document is an object (SPEC §95).
                 if !matches!(doc, Document::Object(_)) {
@@ -215,16 +272,26 @@ fn check_collection(
                         "{name:?}: document {id} isn't an object, which the file's format promises"
                     ));
                 }
-                documents.push((id, doc, *loc));
+                documents += 1;
+                let (pages, chain) = data::collection_pages(store, 0, [loc])?;
+                pages
+                    .into_iter()
+                    .for_each(|p| check.claim_shared(p, data_pages));
+                chain.into_iter().for_each(|p| check.claim(p, chain_pages));
+                for (expected, index) in expected.iter_mut().zip(indexes) {
+                    *expected += index_keys(&doc, index, id).len();
+                }
             }
             Ok((id, _)) => check.problem(format!(
-                "{name:?}: the primary index files document {expected} at page {} slot {}, \
+                "{name:?}: the primary index files document {expected_id} at page {} slot {}, \
                  which holds document {id}",
                 loc.page, loc.slot
             )),
             Err(e) => {
-                unreadable.insert(expected);
-                check.unreadable(format!("{name:?}: document {expected} can't be read: {e}"));
+                unreadable.insert(expected_id);
+                check.unreadable(format!(
+                    "{name:?}: document {expected_id} can't be read: {e}"
+                ));
             }
         }
     }
@@ -240,97 +307,234 @@ fn check_collection(
 
     // A damaged current page is already reported, and holds nothing
     // else to find.
-    let current = match damaged.contains(&meta.current_data_page) {
-        true => 0,
-        false => meta.current_data_page,
-    };
-    let locs = documents.iter().map(|(_, _, loc)| *loc);
-    let (data_pages, chain_pages) = data::collection_pages(store, current, locs)?;
-    for page in data_pages {
-        check.claim(page, &format!("{name:?}'s documents"));
-    }
-    for page in chain_pages {
-        check.claim(page, &format!("{name:?}'s large documents"));
+    if meta.current_data_page != 0 && !damaged.contains(&meta.current_data_page) {
+        let (pages, _) = data::collection_pages(store, meta.current_data_page, [])?;
+        pages
+            .into_iter()
+            .for_each(|p| check.claim_shared(p, data_pages));
     }
 
-    for index in catalog.indexes(name) {
-        if let Err(e) = check_index(check, store, name, index, &documents, &unreadable) {
+    for (index, expected) in indexes.iter().zip(expected) {
+        let checked = check_index(check, store, name, &primary, index, expected, &unreadable);
+        if let Err(e) = checked {
             check.unreadable(format!("{name:?}'s index on {:?}: {e}", index.name()));
         }
     }
-    Ok(documents.len())
+    Ok(documents)
 }
 
 /// A secondary index against the documents: its pages, its order, one
 /// entry per document with an indexed value and nothing else, and for a
 /// unique one no two equal non-null values. Entries for `unreadable`
 /// documents are skipped: there's nothing to compare them with.
+///
+/// Entry by entry (SPEC §109): an entry is right if its document is where
+/// the primary index has it, and the document gives the entry's key.
+/// Right entries are distinct, as the index is in order, so as many of
+/// them as the documents call for (`expected`) is all of them. Only if
+/// there are fewer, or the order is broken, does a second pass go
+/// through the documents to name what's missing (`name_missing`).
+///
+/// A unique index's equal values have equal value parts (SPEC §28.1), so
+/// their entries are neighbors: each run of them is compared by value.
 fn check_index(
     check: &mut Check,
     store: &SnapshotStore,
     name: &str,
+    primary: &BTreeIndex,
     index: &IndexMeta,
-    documents: &[(DocId, Document, RecordLocation)],
+    expected: usize,
     unreadable: &BTreeSet<DocId>,
 ) -> std::io::Result<()> {
     let what = format!("{name:?}'s index on {:?}", index.name());
     let tree = BTreeIndex::new(index.root);
+    let owner = check.owner(what.clone());
     for page in tree.pages(store)? {
-        check.claim(page, &what);
-    }
-    let entries = tree.scan(store)?;
-    check_order(
-        check,
-        name,
-        &format!("index on {:?}", index.name()),
-        &entries,
-    );
-
-    let found: BTreeSet<(Vec<u8>, PageId, u16)> = entries
-        .into_iter()
-        .filter(|(key, _)| !unreadable.contains(&key::doc_id(key)))
-        .map(|(key, loc)| (key, loc.page, loc.slot))
-        .collect();
-    let expected: BTreeSet<(Vec<u8>, PageId, u16)> = documents
-        .iter()
-        .flat_map(|(id, doc, loc)| {
-            index_keys(doc, index, *id)
-                .into_iter()
-                .map(|key| (key, loc.page, loc.slot))
-        })
-        .collect();
-    for (key, _, _) in expected.difference(&found) {
-        check.problem(format!("{what} lacks document {}", key::doc_id(key)));
-    }
-    for (key, _, _) in found.difference(&expected) {
-        check.problem(format!(
-            "{what} has an entry for document {} that doesn't match it",
-            key::doc_id(key)
-        ));
+        check.claim(page, owner);
     }
 
-    if index.unique {
-        // Equal values share a key's value part (SPEC §28.1): compare
-        // within each group — values of two documents, not two elements
-        // of one (SPEC §42.2).
-        type Group<'a> = Vec<(DocId, Vec<&'a Document>)>;
-        let mut groups: BTreeMap<Vec<u8>, Group> = BTreeMap::new();
-        for (id, doc, _) in documents {
-            for (value_part, values) in unique_tuples(doc, index) {
-                groups.entry(value_part).or_default().push((*id, values));
+    let mut order = Order::new(format!("{name:?}'s index on {:?}", index.name()));
+    let mut records = data::Records::new(store);
+    let mut right = 0;
+    let mut reported = BTreeSet::new();
+    // The run of right entries with one value part, of a unique index.
+    let mut run: Vec<(DocId, RecordLocation)> = Vec::new();
+    let mut run_part: Vec<u8> = Vec::new();
+    let mut walk = tree.walk(store, KeyRange::everything(), false);
+    while let Some(entry) = walk.step() {
+        let (key, loc) = entry?;
+        order.see(check, key);
+        let id = key::doc_id(key);
+        if unreadable.contains(&id) {
+            continue;
+        }
+        if !entry_is_right(store, &mut records, primary, index, key, loc)? {
+            check.problem(format!(
+                "{what} has an entry for document {id} that doesn't match it"
+            ));
+            continue;
+        }
+        right += 1;
+        if index.unique {
+            if key::value_part(key) != run_part.as_slice() {
+                same_in_run(check, store, &what, index, &run_part, &run, &mut reported)?;
+                run.clear();
+                run_part.clear();
+                run_part.extend_from_slice(key::value_part(key));
+            }
+            run.push((id, loc));
+        }
+    }
+    same_in_run(check, store, &what, index, &run_part, &run, &mut reported)?;
+
+    if right < expected || order.broken {
+        name_missing(
+            check,
+            store,
+            primary,
+            &tree,
+            index,
+            &what,
+            unreadable,
+            &mut reported,
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether an index entry is right: its document where the primary index
+/// has it, under its own id, and giving the entry's key.
+fn entry_is_right(
+    store: &SnapshotStore,
+    records: &mut data::Records,
+    primary: &BTreeIndex,
+    index: &IndexMeta,
+    key: &[u8],
+    loc: RecordLocation,
+) -> std::io::Result<bool> {
+    let id = key::doc_id(key);
+    if primary.lookup(store, &key::primary(id))? != Some(loc) {
+        return Ok(false);
+    }
+    Ok(match records.get(loc) {
+        Ok((at, doc)) => at == id && index_keys(&doc, index, id).iter().any(|k| k == key),
+        Err(_) => false,
+    })
+}
+
+/// A run of a unique index's entries with one value part, compared by
+/// value: two documents with equal values are a problem, reported once
+/// for each pair (`reported`).
+fn same_in_run(
+    check: &mut Check,
+    store: &SnapshotStore,
+    what: &str,
+    index: &IndexMeta,
+    value_part: &[u8],
+    run: &[(DocId, RecordLocation)],
+    reported: &mut BTreeSet<(DocId, DocId)>,
+) -> std::io::Result<()> {
+    if run.len() < 2 {
+        return Ok(());
+    }
+    let mut records = data::Records::new(store);
+    let mut seen: Vec<(DocId, Vec<Document>)> = Vec::new();
+    for (id, loc) in run {
+        let (_, doc) = records.get(*loc)?;
+        for (part, values) in unique_tuples(&doc, index) {
+            if part == value_part {
+                seen.push((*id, values.into_iter().cloned().collect()));
             }
         }
-        for group in groups.values() {
-            for (i, (a, a_values)) in group.iter().enumerate() {
-                if let Some((b, _)) = group[i + 1..]
-                    .iter()
-                    .find(|(b, b_values)| b != a && same_values(a_values, b_values))
+    }
+    report_equal_values(check, what, &seen, reported);
+    Ok(())
+}
+
+/// Of documents' values under one value part, in id order, each pair of
+/// two documents with equal values, reported once (SPEC §42.2: values of
+/// two documents, not two elements of one).
+fn report_equal_values(
+    check: &mut Check,
+    what: &str,
+    seen: &[(DocId, Vec<Document>)],
+    reported: &mut BTreeSet<(DocId, DocId)>,
+) {
+    for (i, (a, a_values)) in seen.iter().enumerate() {
+        let a_values: Vec<&Document> = a_values.iter().collect();
+        let equal = seen[i + 1..].iter().find(|(b, b_values)| {
+            let b_values: Vec<&Document> = b_values.iter().collect();
+            b != a && same_values(&a_values, &b_values)
+        });
+        if let Some((b, _)) = equal
+            && reported.insert((*a.min(b), *a.max(b)))
+        {
+            check.problem(format!(
+                "{what} is unique, but documents {a} and {b} share a value"
+            ));
+        }
+    }
+}
+
+/// The second pass, for an index that isn't all it should be: every
+/// document's keys looked up, each one missing named; and for a unique
+/// index, each document's values compared with those of the entries
+/// under the same value part, which the run of entries alone can't see
+/// when an entry is wrong or missing.
+#[allow(clippy::too_many_arguments)]
+fn name_missing(
+    check: &mut Check,
+    store: &SnapshotStore,
+    primary: &BTreeIndex,
+    tree: &BTreeIndex,
+    index: &IndexMeta,
+    what: &str,
+    unreadable: &BTreeSet<DocId>,
+    reported: &mut BTreeSet<(DocId, DocId)>,
+) -> std::io::Result<()> {
+    let mut records = data::Records::new(store);
+    let mut others = data::Records::new(store);
+    let mut walk = primary.walk(store, KeyRange::everything(), false);
+    while let Some(entry) = walk.step() {
+        let (key, loc) = entry?;
+        let id = key::doc_id(key);
+        if unreadable.contains(&id) {
+            continue;
+        }
+        let doc = match records.get(loc) {
+            Ok((at, doc)) if at == id => doc,
+            // Already reported, as the primary index was walked.
+            _ => continue,
+        };
+        for key in index_keys(&doc, index, id) {
+            if tree.lookup(store, &key)? != Some(loc) {
+                check.problem(format!("{what} lacks document {}", key::doc_id(&key)));
+            }
+        }
+        if !index.unique {
+            continue;
+        }
+        for (part, values) in unique_tuples(&doc, index) {
+            let mut seen = vec![(id, values.into_iter().cloned().collect::<Vec<_>>())];
+            let mut under = tree.walk(store, KeyRange::prefixed(&part), false);
+            while let Some(entry) = under.step() {
+                let (key, at) = entry?;
+                let other = key::doc_id(key);
+                if key::value_part(key) != part.as_slice() || other == id {
+                    continue;
+                }
+                if let Ok((found, doc)) = others.get(at)
+                    && found == other
                 {
-                    check.problem(format!(
-                        "{what} is unique, but documents {a} and {b} share a value"
-                    ));
+                    for (other_part, values) in unique_tuples(&doc, index) {
+                        if other_part == part {
+                            seen.push((other, values.into_iter().cloned().collect()));
+                        }
+                    }
                 }
             }
+            seen.sort_by_key(|(id, _)| *id);
+            report_equal_values(check, what, &seen, reported);
         }
     }
     Ok(())
@@ -344,13 +548,38 @@ fn count(n: usize, noun: &str) -> String {
     }
 }
 
-/// An index scan must come back in strictly ascending key order.
-fn check_order(check: &mut Check, name: &str, what: &str, entries: &[(Vec<u8>, RecordLocation)]) {
-    if let Some(pair) = entries.windows(2).find(|pair| pair[0].0 >= pair[1].0) {
-        check.problem(format!(
-            "{name:?}'s {what} is out of order at document {}",
-            key::doc_id(&pair[1].0)
-        ));
+/// An index walk must come in strictly ascending key order: the first
+/// key that doesn't is a problem, the rest of the walk goes on.
+struct Order {
+    what: String,
+    last: Option<Vec<u8>>,
+    broken: bool,
+}
+
+impl Order {
+    fn new(what: String) -> Self {
+        Order {
+            what,
+            last: None,
+            broken: false,
+        }
+    }
+
+    fn see(&mut self, check: &mut Check, key: &[u8]) {
+        if let Some(last) = &mut self.last {
+            if !self.broken && last.as_slice() >= key {
+                self.broken = true;
+                check.problem(format!(
+                    "{} is out of order at document {}",
+                    self.what,
+                    key::doc_id(key)
+                ));
+            }
+            last.clear();
+            last.extend_from_slice(key);
+        } else {
+            self.last = Some(key.to_vec());
+        }
     }
 }
 
@@ -480,6 +709,209 @@ mod tests {
         assert!(db.check().unwrap().is_ok());
         db.drop_collection("notes").unwrap();
         assert!(db.check().unwrap().is_ok());
+    }
+
+    /// A consistent file is checked in one pass over the documents and
+    /// one over each index, which reads each entry's document (SPEC
+    /// §109): each document read once, and once more per index. The
+    /// second pass, which names what's missing, doesn't run.
+    #[test]
+    fn a_consistent_file_reads_each_document_once_and_once_per_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = sample(&dir);
+        crate::data::RECORDS_READ.with(|n| n.set(0));
+        let report = db.check().unwrap();
+        let read = crate::data::RECORDS_READ.with(|n| n.get());
+        assert!(report.is_ok(), "{report:#?}");
+        assert_eq!(report.documents, 200);
+        assert_eq!(read, 200 * (1 + 2));
+    }
+
+    /// An entry with the right key, but at another document's place: it
+    /// doesn't match, and the document it should point to lacks one.
+    #[test]
+    fn an_entry_at_another_documents_place_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = sample(&dir);
+        let people = db.collection::<Document>("people");
+        let (id, doc) = people
+            .find_one_with_id(Filter::new().eq("age", 7))
+            .unwrap()
+            .unwrap();
+        let (other, _) = people
+            .find_one_with_id(Filter::new().eq("age", 8))
+            .unwrap()
+            .unwrap();
+        db.transact(|catalog, store| {
+            let index = &catalog.indexes("people")[0];
+            let mut tree = BTreeIndex::new(index.root);
+            let key = key::secondary(crate::query::value_or_null(&doc, "age"), id).unwrap();
+            tree.remove(store, &key)?;
+            let elsewhere = BTreeIndex::new(catalog.get("people").unwrap().index_root)
+                .lookup(store, &key::primary(other))?
+                .unwrap();
+            tree.insert(store, &key, elsewhere)?;
+            Ok(())
+        })
+        .unwrap();
+        let problems = problems(&db);
+        assert_eq!(problems.len(), 2, "{problems:#?}");
+        assert_found(&db, &format!("entry for document {id} that doesn't match"));
+        assert_found(&db, &format!("index on \"age\" lacks document {id}"));
+    }
+
+    /// An entry with its document's key, at a copy of the document that
+    /// the primary index doesn't have: it doesn't match, and the
+    /// document lacks its entry — though the copy has the same id and the
+    /// same values.
+    #[test]
+    fn an_entry_at_a_stale_copy_of_its_document_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = sample(&dir);
+        let people = db.collection::<Document>("people");
+        let (id, doc) = people
+            .find_one_with_id(Filter::new().eq("age", 7))
+            .unwrap()
+            .unwrap();
+        db.transact(|catalog, store| {
+            let meta = *catalog.get("people").unwrap();
+            let mut current = meta.current_data_page;
+            let free = catalog.free_space_mut("people");
+            let copy = data::insert_record(store, &mut current, free, id, &doc)?;
+            let index = &catalog.indexes("people")[0];
+            let mut tree = BTreeIndex::new(index.root);
+            let key = key::secondary(crate::query::value_or_null(&doc, "age"), id).unwrap();
+            tree.remove(store, &key)?;
+            tree.insert(store, &key, copy)?;
+            Ok(())
+        })
+        .unwrap();
+        let problems = problems(&db);
+        assert_eq!(problems.len(), 2, "{problems:#?}");
+        assert_found(&db, &format!("entry for document {id} that doesn't match"));
+        assert_found(&db, &format!("index on \"age\" lacks document {id}"));
+    }
+
+    /// An index entry changed on its leaf to a value that sorts after the
+    /// next one: the index is out of order there, and the second pass
+    /// names the document as missing.
+    #[test]
+    fn an_index_out_of_order_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = sample(&dir);
+        let people = db.collection::<Document>("people");
+        let (id, _) = people
+            .find_one_with_id(Filter::new().eq("age", 7))
+            .unwrap()
+            .unwrap();
+        let (was, now) = (
+            key::secondary(&Document::Int(7), id).unwrap(),
+            key::secondary(&Document::Int(1_000), id).unwrap(),
+        );
+        assert_eq!(was.len(), now.len());
+        db.transact(|catalog, store| {
+            let root = catalog.indexes("people")[0].root;
+            for page_id in BTreeIndex::new(root).pages(store)? {
+                let mut page = store.read_page(page_id)?;
+                let bytes = page.make_mut();
+                if let Some(at) = bytes.windows(was.len()).position(|w| w == was) {
+                    bytes[at..at + now.len()].copy_from_slice(&now);
+                    store.write_page(page_id, page)?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_found(&db, "index on \"age\" is out of order at document");
+        assert_found(&db, &format!("entry for document {id} that doesn't match"));
+        assert_found(&db, &format!("index on \"age\" lacks document {id}"));
+    }
+
+    /// Two large documents of one collection on one chain of overflow
+    /// pages: each of its pages is claimed twice by the same owner, which
+    /// a data page may be and an overflow page may not.
+    #[test]
+    fn an_overflow_chain_under_two_documents_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let big = |c: &str| object(&[("pad", Document::String(c.repeat(20_000)))]);
+        let a = docs.insert(big("a")).unwrap();
+        let b = docs.insert(big("b")).unwrap();
+        db.transact(|catalog, store| {
+            let meta = *catalog.get("docs").unwrap();
+            let primary = BTreeIndex::new(meta.index_root);
+            let cell = |store: &dyn PageStore, id: DocId| -> std::io::Result<Vec<u8>> {
+                let loc = primary.lookup(store, &key::primary(id))?.unwrap();
+                let page = crate::storage::SlottedPage::from_bytes(store.read_page(loc.page)?)?;
+                Ok(page.get_cell(loc.slot).unwrap().to_vec())
+            };
+            let (cell_a, cell_b) = (cell(store, a)?, cell(store, b)?);
+            assert_eq!(cell_a.len(), cell_b.len(), "two overflow cells");
+            // A's cell, B's id: B's cell, pointing to A's chain.
+            let mut shared = cell_a.clone();
+            let at = shared.windows(16).position(|w| w == a.0).unwrap();
+            shared[at..at + 16].copy_from_slice(&b.0);
+            let loc = primary.lookup(store, &key::primary(b))?.unwrap();
+            let mut page = store.read_page(loc.page)?;
+            let bytes = page.make_mut();
+            let at = bytes
+                .windows(cell_b.len())
+                .position(|w| w == cell_b)
+                .unwrap();
+            bytes[at..at + shared.len()].copy_from_slice(&shared);
+            Ok(store.write_page(loc.page, page)?)
+        })
+        .unwrap();
+        assert_found(
+            &db,
+            "belongs to both \"docs\"'s large documents and \"docs\"'s large documents",
+        );
+    }
+
+    /// A duplicate in a unique index that holds both documents rightly is
+    /// seen by the walk of the index, and again by the second pass, which
+    /// another document's missing entry sets off: it's reported once.
+    #[test]
+    fn a_duplicate_seen_by_both_passes_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<Document>("users");
+        let long = |end: &str| Document::String("x".repeat(1200) + end);
+        let aliases = |names: Vec<Document>| object(&[("aliases", Document::Array(names))]);
+        users
+            .ensure_index_with("aliases[*]", crate::IndexOptions::new().unique())
+            .unwrap();
+        users.insert(aliases(vec![long("b")])).unwrap();
+        let id = users.insert(aliases(vec![long("a"), long("c")])).unwrap();
+        let other = users
+            .insert(aliases(vec![Document::String("z".into())]))
+            .unwrap();
+        let copy = object(&[
+            ("_id", Document::Id(id)),
+            ("aliases", Document::Array(vec![long("a"), long("b")])),
+        ]);
+        db.transact(|catalog, store| {
+            let meta = *catalog.get("users").unwrap();
+            let loc = BTreeIndex::new(meta.index_root)
+                .lookup(store, &key::primary(id))?
+                .unwrap();
+            let mut current = meta.current_data_page;
+            let free = catalog.free_space_mut("users");
+            assert_eq!(
+                data::update_record(store, &mut current, free, loc, id, &copy)?,
+                loc
+            );
+            let index = &catalog.indexes("users")[0];
+            let key = key::secondary(&Document::String("z".into()), other).unwrap();
+            BTreeIndex::new(index.root).remove(store, &key)?;
+            Ok(())
+        })
+        .unwrap();
+        let problems = problems(&db);
+        assert_eq!(problems.len(), 2, "{problems:#?}");
+        assert_found(&db, "is unique, but documents");
+        assert_found(&db, &format!("lacks document {other}"));
     }
 
     #[test]
