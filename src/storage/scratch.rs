@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 /// Where a compaction builds its image: `<database>.compact`, beside the
 /// WAL. Only ever there while a compaction runs, and gone as soon as
-/// it's opened (`ScratchStore::create`).
+/// it's opened (`ScratchStore::create`); on Windows, while it's open,
+/// and maybe under a number after it.
 pub(crate) fn scratch_path(db_path: &Path) -> PathBuf {
     let mut os_string = db_path.as_os_str().to_os_string();
     os_string.push(".compact");
@@ -49,20 +50,22 @@ pub(crate) struct ScratchStore {
 impl ScratchStore {
     /// Creates the file at `path`, emptied if one is there, and removes
     /// its name at once: it lives as long as its handle does, and a crash
-    /// leaves nothing behind. On Windows, where an open file can't lose
-    /// its name, it is removed when it's closed, or the process ends.
+    /// leaves nothing behind.
+    ///
+    /// On Windows an open file can't lose its name, so it is removed when
+    /// it's closed, or the process ends. Until then the name is taken:
+    /// the image of an earlier compaction keeps it until its checkpoint,
+    /// and opening it again would empty that image under its readers. So
+    /// a name nobody holds is taken, `path`, or `path` with `.1`, `.2`
+    /// and so on after it.
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-            options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+        #[cfg(test)]
+        if FAIL_CREATE.with(|fail| fail.replace(false)) {
+            return Err(io::Error::other(
+                "injected failure to make the image's file",
+            ));
         }
-        let file = options.open(path)?;
-        #[cfg(not(windows))]
-        std::fs::remove_file(path)?;
+        let file = open_new(path)?;
         Ok(ScratchStore {
             file,
             page_count: 1,
@@ -126,6 +129,52 @@ impl ScratchStore {
             _ => Ok(()),
         }
     }
+}
+
+#[cfg(not(windows))]
+fn open_new(path: &Path) -> io::Result<File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    std::fs::remove_file(path)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_new(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    /// More images than this open at once is something else going on.
+    const NAMES: u32 = 1000;
+    let mut taken = None;
+    for n in 0..NAMES {
+        let mut name = path.as_os_str().to_os_string();
+        if n > 0 {
+            name.push(format!(".{n}"));
+        }
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(&name);
+        match opened {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => taken = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(taken.expect("at least one name tried"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next `ScratchStore::create` on this thread fails,
+    /// as on a full disk or in a directory without write access.
+    pub(crate) static FAIL_CREATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl PageStore for ScratchStore {
@@ -312,7 +361,6 @@ mod tests {
     fn the_file_is_gone_with_its_last_handle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("image");
-        std::fs::write(&path, b"left by a crash").unwrap();
         let mut store = ScratchStore::create(&path).unwrap();
         assert_eq!(path.exists(), cfg!(windows));
         store.allocate_page().unwrap();
@@ -320,6 +368,36 @@ mod tests {
         assert_eq!(image.read(1).unwrap(), page(0));
         drop(image);
         assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Two images of one database open at once, as when a compaction
+    /// follows one whose image no checkpoint has copied in yet: the
+    /// second doesn't touch the first, on Windows too, where the first
+    /// still has the name. And a file another program left under the
+    /// name is emptied, or passed by.
+    #[test]
+    fn two_images_live_at_once_keep_their_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        std::fs::write(&path, b"left by another program").unwrap();
+        let mut images = Vec::new();
+        for fill in 1..=3u8 {
+            let mut store = ScratchStore::create(&path).unwrap();
+            for _ in 0..fill {
+                store.allocate_page().unwrap();
+            }
+            store.write_page(1, page(fill)).unwrap();
+            images.push(store.finish().unwrap());
+        }
+        for (image, fill) in images.iter().zip(1..=3u8) {
+            assert_eq!(image.page_count(), 1 + fill as u64);
+            assert_eq!(image.read(1).unwrap(), page(fill));
+        }
+        drop(images);
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        // On Windows, the other program's file is its own.
+        assert_eq!(left.len(), usize::from(cfg!(windows)));
     }
 
     /// Pages 1 and up land at their places with their checksums, a

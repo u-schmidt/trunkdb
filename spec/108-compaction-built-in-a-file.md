@@ -34,6 +34,17 @@ so there the file is opened to be deleted when it's closed
 (`FILE_FLAG_DELETE_ON_CLOSE`), which a crash does too. A file left
 under that name some other way is emptied and reused.
 
+**On Windows, a name nobody holds.** An image is read from until its
+checkpoint, and in a small database that can be many commits after
+its compaction (§108.3). A compaction in between makes its image under
+the same name. Where the first image's name is gone, that is a new
+file. On Windows it isn't gone: the second open was the first image,
+emptied (`truncate`), and reads of the first image's pages failed at
+the end of the file. CI's Windows tests found it, in the first build
+of this section. So on Windows the file is made new (`create_new`)
+under the first name nobody holds: `<database>.compact`, then
+`.compact.1`, `.compact.2` and so on.
+
 ## 108.2 Logged from the file
 `FileStore::replace_all` takes the `Scratch` and stages it: the header
 with the image's page count and no free list in the dirty pages, the
@@ -145,7 +156,10 @@ Every document was there each time, `check` passed, and no
   time long after it left memory: at most 2,047 are held at any time,
   and every page reads back as last written, before `finish` and after.
 - The name is gone at once (on Windows, once the image is dropped),
-  and a file left under it is emptied.
+  and nothing is left in the directory.
+- Three images made under one name and kept open at once each keep
+  their pages, on Windows too; a file another program left under the
+  name is emptied, or, on Windows, passed by and left as it was.
 - `copy_into` puts pages 1 and up at their places with their
   checksums, more than a megabyte of them, and leaves page 0 and what's
   past the image alone. Stopped after 0, 1, 128 and all but one pages,
@@ -171,10 +185,10 @@ byte, in one record and in several; more or fewer pages than counted,
 or a page that fails to come, fail it, and `undo_failed_log` leaves the
 WAL as it was, the batch before it recovered.
 
-`compact.rs`: no `.compact` file after a compaction, nor after one
-refused for a duplicate; a compaction where the file can't be made
-(a directory has its name) fails with `Error::Io` and changes nothing,
-on disk or after the next open. The other tests of §41 pass unchanged,
+`compact.rs`: no `.compact` file after a compaction and its checkpoint,
+nor after one refused for a duplicate; a compaction whose file can't
+be made (a failure the test injects) fails with `Error::Io` and
+changes nothing, on disk or after the next open. The other tests of §41 pass unchanged,
 among them the compaction whose write-back fails twice, now read from
 its image meanwhile, and completed by the next open.
 

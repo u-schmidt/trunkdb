@@ -279,6 +279,8 @@ mod tests {
         let pages_before = db.file_info().unwrap().pages;
 
         let compacted = db.compact().unwrap();
+        // Read from until the checkpoint; on Windows, under its name.
+        db.checkpoint().unwrap();
         assert!(!db.scratch_path().exists(), "the image's file is gone");
         assert_eq!(compacted.pages_before, pages_before);
         assert!(
@@ -480,16 +482,16 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
-    /// Where the image's file can't be made — here a directory has its
-    /// name — the compaction fails before anything is staged, and the
-    /// file stays as it was (SPEC §108).
+    /// Where the image's file can't be made — a full disk, a directory
+    /// without write access — the compaction fails before anything is
+    /// staged, and the file stays as it was (SPEC §108).
     #[test]
     fn a_compaction_without_room_for_its_image_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let db = churned(&path);
         let before = contents(&db);
-        std::fs::create_dir(db.scratch_path()).unwrap();
+        crate::storage::FAIL_CREATE.with(|fail| fail.set(true));
         assert!(matches!(db.compact(), Err(crate::Error::Io(_))));
         assert_eq!(contents(&db), before);
         drop(db);

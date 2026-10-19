@@ -15,6 +15,8 @@ pub use page::Page;
 pub(crate) use pages::checksum;
 pub(crate) use pages::{DEFAULT_VERSION_LIMIT, Pages, TooOld};
 pub use pages::{PAGE_SIZE, USABLE_PAGE_SIZE};
+#[cfg(test)]
+pub(crate) use scratch::FAIL_CREATE;
 pub(crate) use scratch::{Scratch, ScratchStore, scratch_path};
 pub use slotted::SlottedPage;
 pub(crate) use snapshot::{Commit, SnapshotStore};
