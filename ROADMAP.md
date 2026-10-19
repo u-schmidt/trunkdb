@@ -182,8 +182,9 @@ limit is described.
   on nightly (§55.6).
 - Unique indexes in the `queries` target, the model asking the
   database's own filters whether two values collide (§105.7).
-- Parameters in a filter's text, `status = $1`, values passed apart
-  (§111.8); aggregates and updates as text (§111.11).
+- Parameters in a filter's text, named, `status = :status`, values
+  passed apart (§111.8), with the PyO3 bindings at the latest;
+  aggregates and updates as text (§111.11).
 - PyO3 bindings, for Python apps.
 
 Not planned: a cost-based query planner, joins, multiple writers,

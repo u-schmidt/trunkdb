@@ -155,10 +155,16 @@ for it alone.
 - **Single-quoted strings:** §111.4.
 - **A leading `where` required:** noise in a text box that takes a
   condition only.
-- **Parameters, `status = $1`,** with values passed apart: open. Until
-  then, a value spliced into a query should be printed by its
-  `Document`'s `Display`, or the filter built in code. `$` isn't a bare
-  name's character, so it stays free for them.
+- **Parameters,** values passed apart from the text: open, for when
+  code holds queries as text with gaps (a query in a config file,
+  bindings for other languages). Until then, a value spliced into a
+  query should be printed by its `Document`'s `Display`, or the filter
+  built in code. They would be named, `status = :status`, as SQLite
+  and Oracle have them: a `:` never starts a value, and names read
+  better than counting `?`s. Not `$1`: `$` already marks JSON's type
+  tags (§71), and is kept for references and operators, as in
+  `{"_id": {"$eq": 17}}`. Not `@0`, LiteDB's: `@` is the element inside
+  `has`.
 - **Expressions** (`a + b > 3`, field compared with field): a filter
   can't say them (§107.8).
 
