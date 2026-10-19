@@ -756,9 +756,10 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     whole leaves of a group. `explain_aggregate` says how it ran, with
     the groups it made.
 
-    Items 75–77: not released yet. `Filter::select`, and the new fields
-    of `Explained` and `ExecutionStats`, which are `#[non_exhaustive]`,
-    are additions; nothing changes in the file.
+    Items 75–77 → 0.21.0: nothing breaking; `Filter::select`,
+    `aggregate`, and the new fields of `Explained` and `ExecutionStats`,
+    which are `#[non_exhaustive]`, are additions. Files and exports as
+    in 0.20.0.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 
