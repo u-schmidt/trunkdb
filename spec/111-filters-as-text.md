@@ -217,5 +217,4 @@ condition inside `has` in parentheses of its own.
 - Aggregates have no text yet: `group by … count() as n` would extend
   this one.
 - Updates neither.
-- No `trunkdb find` on the command line yet: it needs only this, and
-  is the next step (ROADMAP.md).
+- On the command line through `trunkdb find` since §112.

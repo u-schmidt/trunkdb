@@ -1,15 +1,16 @@
 //! The `trunkdb` command (SPEC §39): look into a database file, check it,
-//! compact it, export it, import into it. Looking, checking and exporting
-//! open it read-only (SPEC §88).
+//! compact it, export it, import into it, find documents in it (§112).
+//! Looking, checking, exporting and finding open it read-only (SPEC §88).
 //!
-//! Arguments are parsed by hand: five subcommands don't need a parser
+//! Arguments are parsed by hand: six subcommands don't need a parser
 //! crate, and a library's dependencies are compiled for everyone who uses
 //! the library.
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use trunkdb::{Database, OpenOptions};
+use trunkdb::query::{Filter, ParseFilterError};
+use trunkdb::{Database, Document, OpenOptions};
 
 const USAGE: &str = "\
 usage: trunkdb <command> <file> [argument]
@@ -28,8 +29,14 @@ commands:
                               it doesn't exist; `-` reads standard input.
                               A line over 256 MiB (or the given size) stops
                               the import; `none` turns the limit off
+  find   <file> <collection> [filter]
+                              print the documents the filter finds, one
+                              JSON document per line; every document
+                              without a filter. A filter is text like
+                              'age >= 30 order by name limit 10'; words
+                              after the collection are joined into one
 
-info, check and export only read: they change nothing in the file or its
+info, check, export and find only read: they change nothing in the file or its
 log, not even what a crash of the program that had it open left there.
 ";
 
@@ -43,6 +50,9 @@ fn main() -> ExitCode {
         ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
         ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
         ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
+        ["find", file, collection, ref filter @ ..] => {
+            read_only(file).and_then(|db| find(&db, collection, &filter.join(" ")))
+        }
         ["import", file, input, "--max-line", limit] => max_line(limit)
             .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
         ["help" | "-h" | "--help"] => {
@@ -370,4 +380,64 @@ fn import(db: &Database, input: &str, max_line: Option<usize>) -> Outcome {
         count(summary.documents, "document")
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// The documents `filter` finds in `collection`, one JSON line each
+/// (SPEC §112), streamed from a cursor; how many, to stderr.
+fn find(db: &Database, collection: &str, filter: &str) -> Outcome {
+    let failed = |e: trunkdb::Error| e.to_string();
+    let filter: Filter = match filter.parse() {
+        Ok(filter) => filter,
+        Err(e) => {
+            eprintln!("trunkdb: {}", filter_error(filter, &e));
+            return Ok(ExitCode::from(2));
+        }
+    };
+    // A typo in the name would find nothing, as if nothing matched.
+    if !db
+        .collections()
+        .map_err(failed)?
+        .iter()
+        .any(|c| c == collection)
+    {
+        return Err(format!("{collection}: no such collection"));
+    }
+    let docs = db.collection::<Document>(collection);
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    let mut found = 0;
+    for doc in docs.cursor(filter).map_err(failed)? {
+        let doc = doc.map_err(failed)?;
+        if let Err(e) = writeln!(out, "{doc}") {
+            return stopped_writing(e);
+        }
+        found += 1;
+    }
+    if let Err(e) = out.flush() {
+        return stopped_writing(e);
+    }
+    eprintln!("found {}", count(found, "document"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A write to standard output that failed: the reader gone, as `| head`
+/// goes once it has its lines, is the end of what anyone wants.
+fn stopped_writing(e: io::Error) -> Outcome {
+    match e.kind() {
+        io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+        _ => Err(format!("standard output: {e}")),
+    }
+}
+
+/// The filter's mistake, with its line of the filter and a `^` under
+/// where it is.
+fn filter_error(filter: &str, e: &ParseFilterError) -> String {
+    let at = e.offset();
+    let start = filter[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = filter[at..].find('\n').map_or(filter.len(), |i| at + i);
+    let column = filter[start..at].chars().count();
+    format!(
+        "filter: {e}\n  {}\n  {}^",
+        &filter[start..end],
+        " ".repeat(column)
+    )
 }

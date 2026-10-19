@@ -288,9 +288,11 @@ trunkdb check app.trunkdb                # consistency check; exit code 1 on pro
 trunkdb compact app.trunkdb              # rebuild into as few pages as needed
 trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
 trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
+trunkdb find app.trunkdb users 'age >= 30 order by name limit 10'
+                                         # one JSON document per line
 ```
 
-`info`, `check` and `export` open the file read-only: they change
+`info`, `check`, `export` and `find` open the file read-only: they change
 nothing in it or in its WAL, even after a crash of the program that had
 it open.
 
@@ -791,7 +793,13 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     and compiles to the same `Filter`. `Condition` has both too;
     mistakes come back as `ParseFilterError`, with line and column.
 
-    Items 78–81: not released yet. Nothing breaking: `FromStr` and
+82. **`trunkdb find`** (§112): `trunkdb find <file> <collection>
+    [filter]` prints what a filter in text (§111) finds, one JSON
+    document per line, the count to stderr; read-only, streamed, quiet
+    when its reader goes (`| head`). A filter's mistake is shown under
+    its line with a `^`.
+
+    Items 78–82: not released yet. Nothing breaking: `FromStr` and
     `Display` for `Filter` and `Condition`, and `ParseFilterError`, are
     additions. Files and exports as in 0.21.0.
 

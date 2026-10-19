@@ -309,6 +309,8 @@ fn looking_into_a_file_opens_it_read_only() {
     assert!(trunkdb(&["check", &db_path]).status.success());
     assert!(trunkdb(&["export", &db_path, &out]).status.success());
     assert!(std::fs::read_to_string(&out).unwrap().contains("users"));
+    let output = trunkdb(&["find", &db_path, "users", "n = 1"]);
+    assert_eq!(stderr(&output), "found 1 document\n");
     let output = trunkdb(&["compact", &db_path]);
     assert!(stderr(&output).contains("in use by another program"));
     close(db);
@@ -417,6 +419,132 @@ fn import_stops_at_a_line_over_the_limit_unless_it_is_turned_off() {
         std::fs::remove_file(&big).unwrap();
         let _ = std::fs::remove_file(format!("{big}.wal"));
     }
+}
+
+/// `find` (SPEC §112): what a filter finds, one JSON line each, which
+/// reads back as the stored document; the count to stderr.
+#[test]
+fn find_prints_what_a_filter_finds_as_json_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+
+    let lines = |output: &Output| -> Vec<trunkdb::Document> {
+        assert!(output.status.success(), "{}", stderr(output));
+        stdout(output)
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect()
+    };
+    let output = trunkdb(&["find", &db, "users"]);
+    let all = lines(&output);
+    assert_eq!(stderr(&output), "found 2 documents\n");
+    let opened = trunkdb::Database::open_with(&db, trunkdb::OpenOptions::default().read_only(true));
+    let users = opened
+        .as_ref()
+        .unwrap()
+        .collection::<trunkdb::Document>("users");
+    for doc in &all {
+        let trunkdb::Document::Object(fields) = doc else {
+            panic!("{doc}")
+        };
+        let Some(trunkdb::Document::Id(id)) = fields.get("_id") else {
+            panic!("{doc}")
+        };
+        assert_eq!(users.get(id).unwrap().as_ref(), Some(doc));
+    }
+    close(opened.unwrap());
+
+    let output = trunkdb(&["find", &db, "users", "age > 40"]);
+    assert_eq!(lines(&output).len(), 1);
+    assert!(
+        stdout(&output).contains(r#""name":"Bob""#),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(stderr(&output), "found 1 document\n");
+
+    // Words after the collection are one filter.
+    let output = trunkdb(&[
+        "find", &db, "users", "select", "name", "order", "by", "age", "desc",
+    ]);
+    let names: Vec<String> = lines(&output).iter().map(|doc| doc.to_string()).collect();
+    assert_eq!(names.len(), 2);
+    assert!(names[0].ends_with(r#","name":"Bob"}"#), "{names:?}");
+    assert!(names[1].ends_with(r#","name":"Ada"}"#), "{names:?}");
+
+    let output = trunkdb(&["find", &db, "empty"]);
+    assert_eq!(
+        (stdout(&output), stderr(&output)),
+        (String::new(), "found 0 documents\n".to_string())
+    );
+}
+
+#[test]
+fn find_names_a_mistake_and_where_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+
+    let output = trunkdb(&[
+        "find",
+        &db,
+        "users",
+        "age >= 30 and\n  name = Ada\n  order by name",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "trunkdb: filter: expected a value, found `Ada` at line 2 column 10\n    name = Ada\n           ^\n"
+    );
+
+    let output = trunkdb(&["find", &db, "user"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "trunkdb: user: no such collection\n");
+
+    let missing = path(dir.path(), "typo.trunkdb");
+    let output = trunkdb(&["find", &missing, "users"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("no such file"));
+    assert!(!Path::new(&missing).exists());
+
+    assert_eq!(trunkdb(&["find", &db]).status.code(), Some(2));
+}
+
+/// `find … | head`: the reader gone, `find` stops, and that's no error.
+#[test]
+fn find_stops_quietly_when_its_reader_goes() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = path(dir.path(), "db.trunkdb");
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    let docs = db.collection::<trunkdb::Document>("docs");
+    let mut batch = db.batch();
+    for n in 0..20_000 {
+        batch
+            .insert(&docs, object("n", trunkdb::Document::Int(n)))
+            .unwrap();
+    }
+    batch.commit().unwrap();
+    drop(docs); // it holds the database open too
+    close(db);
+
+    let mut child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_trunkdb"))
+            .args(["find", &db_path, "docs"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let mut first = [0u8; 100];
+    let read = child.stdout.take().unwrap().read_exact(&mut first);
+    let output = child.wait_with_output().unwrap();
+    assert!(read.is_ok(), "{read:?}: {}", stderr(&output));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "");
 }
 
 /// `{field: value}`: every document is an object (SPEC §95).
