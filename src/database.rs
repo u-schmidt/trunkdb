@@ -69,6 +69,8 @@ struct Shared {
     txn: GlobalLockTxnManager,
     /// Where the WAL is, for `stats` to measure (SPEC §93).
     wal_path: PathBuf,
+    /// Where a compaction builds its image (SPEC §108).
+    scratch_path: PathBuf,
     /// What the open restored from the WAL, for `stats`.
     recovered: Option<crate::Recovered>,
 }
@@ -511,6 +513,7 @@ impl Database {
                 id_gen: UuidV7Generator,
                 txn: GlobalLockTxnManager::default(),
                 wal_path: durability::wal_path(path),
+                scratch_path: crate::storage::scratch_path(path),
                 recovered,
             }),
         }
@@ -518,6 +521,10 @@ impl Database {
 
     pub(crate) fn wal_path(&self) -> &Path {
         &self.inner.wal_path
+    }
+
+    pub(crate) fn scratch_path(&self) -> &Path {
+        &self.inner.scratch_path
     }
 
     pub(crate) fn recovered(&self) -> Option<crate::Recovered> {
@@ -726,15 +733,12 @@ impl Database {
             }
         };
 
-        let pages: Vec<(PageId, &[u8])> = writer.store.dirty_pages().collect();
-        if pages.is_empty() {
+        if writer.store.staged_count() == 0 {
             // Nothing changed (e.g. an index that already existed):
             // nothing to log or write, just end staging.
-            drop(pages);
             writer.store.rollback();
             return Ok(result);
         }
-        drop(pages);
 
         // Alone, for a batch that replaces the whole file: the reads
         // under way are waited for, and none begins before the commit.
@@ -757,9 +761,10 @@ impl Database {
             None
         };
 
-        let pages: Vec<(PageId, &[u8])> = writer.store.dirty_pages().collect();
-        let logged = wal(&mut writer.durability).log(&pages);
-        drop(pages);
+        // A record's pages at a time: a compaction's image is in a file
+        // (SPEC §108).
+        let logged = wal(&mut writer.durability)
+            .log_each(writer.store.staged_count(), writer.store.staged_pages());
         if let Err(e) = logged {
             writer.store.rollback();
             // A failed `log` may still have left a complete record behind
@@ -2986,9 +2991,18 @@ mod tests {
                 .collect();
             batch.commit().unwrap();
             let done = std::sync::atomic::AtomicBool::new(false);
+            // Set when the writer ends, a panic included: the readers
+            // stop, and the test fails instead of waiting for ever.
+            struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for Done<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
 
             std::thread::scope(|scope| {
                 let writer = scope.spawn(|| {
+                    let _done = Done(&done);
                     let mut rng = crate::testing::XorShift(7 + cache_pages as u64);
                     let extras = db.collection::<Document>("extras");
                     let mut extra_ids = Vec::new();
@@ -3025,7 +3039,6 @@ mod tests {
                             _ => {}
                         }
                     }
-                    done.store(true, std::sync::atomic::Ordering::Release);
                 });
 
                 let mut readers = Vec::new();

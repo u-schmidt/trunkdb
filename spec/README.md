@@ -118,3 +118,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 105. [A differential fuzz target for queries (`fuzz/`)](105-a-differential-fuzz-target-for-queries.md)
 106. [Projection: a select of fields (`select.rs`, `query.rs`, `collection.rs`, `cursor.rs`, `explain.rs`)](106-projection-a-select-of-fields.md)
 107. [Aggregates: count, sum, min, max and avg by group (`aggregate.rs`, `collection.rs`, `snapshot.rs`, `explain.rs`)](107-aggregates.md)
+108. [Compaction built in a file (`compact.rs`, `storage/scratch.rs`, `storage/pages.rs`, `storage/file.rs`, `durability/wal.rs`)](108-compaction-built-in-a-file.md)

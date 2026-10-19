@@ -1,8 +1,8 @@
 mod cache;
 mod file;
-mod memory;
 mod page;
 mod pages;
+mod scratch;
 mod slotted;
 mod snapshot;
 
@@ -10,12 +10,12 @@ pub(crate) use file::HEADER_PAGE;
 #[cfg(test)]
 pub(crate) use file::rewrite_format_version;
 pub use file::{DEFAULT_CACHE_SIZE, FileStore};
-pub(crate) use memory::MemoryStore;
 pub use page::Page;
 #[cfg(feature = "fuzzing")]
 pub(crate) use pages::checksum;
 pub(crate) use pages::{DEFAULT_VERSION_LIMIT, Pages, TooOld};
 pub use pages::{PAGE_SIZE, USABLE_PAGE_SIZE};
+pub(crate) use scratch::{Scratch, ScratchStore, scratch_path};
 pub use slotted::SlottedPage;
 pub(crate) use snapshot::{Commit, SnapshotStore};
 

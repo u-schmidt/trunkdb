@@ -505,11 +505,14 @@ more than four.
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
   without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md).
-- **Compaction** rebuilds the collections into a fresh image in memory,
-  with full pages, logs it through the WAL like any batch and truncates
-  the file [§41](spec/41-compaction.md). The whole new image is held in memory while it runs, once:
-  the WAL's records are written from its pages, 32 MiB at a time, not
-  built beside them [§90](spec/90-a-wal-record-written-from-the-pages.md) [§91](spec/91-a-batch-in-several-records.md).
+- **Compaction** rebuilds the collections into a fresh image with full
+  pages, logs it through the WAL like any batch, copies it in and
+  truncates the file [§41](spec/41-compaction.md). The image is built in a file beside the
+  database, `<database>.compact`, whose name is gone as soon as it's
+  open; the WAL's records are written from it, 32 MiB at a time, and
+  reads find the new pages there until the checkpoint has copied them
+  in. Memory stays at about 100 MB whatever the file's size, besides
+  each index's keys while they are sorted [§90](spec/90-a-wal-record-written-from-the-pages.md) [§91](spec/91-a-batch-in-several-records.md) [§108](spec/108-compaction-built-in-a-file.md).
 - **Export and import** write and read JSON Lines, with the types JSON
   lacks kept by tags (`{"$id": ...}`, `{"$binary": ...}`, `{"$date":
   "<RFC 3339>"}`), so an export is a readable backup and the path

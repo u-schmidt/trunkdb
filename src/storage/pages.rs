@@ -1,4 +1,5 @@
 use super::cache::PageCache;
+use super::scratch::Scratch;
 use super::{Page, PageId};
 use crate::crc32::Crc32;
 use std::collections::BTreeMap;
@@ -6,7 +7,7 @@ use std::fs::File;
 use std::io;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A page's size in the file. Matches LiteDB's page size, partly so
 /// numbers stay comparable to it later, and because a document DB's
@@ -74,7 +75,13 @@ pub(super) struct Memory {
     /// reader reads that. So a page keeps its entry as long as the file
     /// holds anything but what every open snapshot should see.
     versions: BTreeMap<PageId, Vec<Version>>,
-    /// How many pages' newest version waits for `checkpoint`.
+    /// A compaction's image, committed in place of every page but the
+    /// header (SPEC §108): from its commit until a checkpoint has copied
+    /// it into the file, where every page past the header is read. No
+    /// snapshot is open beside it, and no version but the header's.
+    replacement: Option<Arc<Scratch>>,
+    /// How many pages' newest version waits for `checkpoint`, a
+    /// replacement's pages included.
     unwritten: usize,
     /// The number of the last commit, counted from 0 at open: in memory
     /// only, the file knows nothing of it (SPEC §77).
@@ -204,6 +211,7 @@ impl Pages {
             memory: RwLock::new(Memory {
                 cache: PageCache::new(cache_pages),
                 versions: BTreeMap::new(),
+                replacement: None,
                 unwritten: 0,
                 seq: 0,
                 file_epoch: 0,
@@ -279,6 +287,13 @@ impl Pages {
                     let version = chain.iter().rev().find(|version| version.seq <= seq);
                     return version.map(|v| v.page.clone()).ok_or_else(too_old);
                 }
+                if let Some(scratch) = &memory.replacement {
+                    // Read outside the lock: the image doesn't change,
+                    // and the handle keeps it, checkpoint or not.
+                    let scratch = Arc::clone(scratch);
+                    drop(memory);
+                    return scratch.read(id);
+                }
                 if let Some(page) = memory.cache.get(id) {
                     return Ok(page);
                 }
@@ -329,11 +344,12 @@ impl Pages {
             loop {
                 let epoch = {
                     let memory = self.memory();
-                    let waiting = memory
-                        .versions
-                        .get(&id)
-                        .and_then(|chain| chain.last())
-                        .is_some_and(|newest| !newest.written);
+                    let waiting = memory.replacement.is_some()
+                        || memory
+                            .versions
+                            .get(&id)
+                            .and_then(|chain| chain.last())
+                            .is_some_and(|newest| !newest.written);
                     if waiting {
                         break;
                     }
@@ -425,6 +441,34 @@ impl Pages {
         memory.keep_within_limit(live);
     }
 
+    /// `commit` for a compaction (SPEC §108): `scratch` becomes every
+    /// page past the header, `dirty` (the header) the newest version of
+    /// its own. Everything else in memory is of the file being replaced,
+    /// and goes: the versions, waiting or not — the WAL holds the
+    /// batches they're from before this one, and their pages are all
+    /// replaced — and the cache. No snapshot is open (`transact` made
+    /// sure of it), and no read is under way.
+    pub(super) fn commit_replacing(&self, dirty: BTreeMap<PageId, Page>, scratch: Arc<Scratch>) {
+        let mut memory = self.memory_mut();
+        let memory = &mut *memory;
+        memory.seq += 1;
+        let seq = memory.seq;
+        memory.file_epoch += 1;
+        memory.versions.clear();
+        memory.older = 0;
+        memory.cache.clear();
+        memory.unwritten = dirty.len() + (scratch.page_count() - 1) as usize;
+        for (id, page) in dirty {
+            let version = Version {
+                seq,
+                page: page.checked(),
+                written: false,
+            };
+            memory.versions.insert(id, vec![version]);
+        }
+        memory.replacement = Some(scratch);
+    }
+
     /// Drops the versions no open snapshot would read (`prune`), in every
     /// page: for when snapshots have closed. A page left with one
     /// version, which the file holds, has none in memory any more.
@@ -506,7 +550,7 @@ impl Pages {
     /// The rest go (`forget`).
     pub(super) fn checkpoint(&self, page_count: u64, live: &[u64]) -> io::Result<()> {
         // No commit comes between this and the end: the writer is here.
-        let waiting: Vec<(PageId, Page)> = {
+        let (waiting, replacement): (Vec<(PageId, Page)>, _) = {
             let mut memory = self.memory_mut();
             // Before the first write, and with the list: a reader that
             // found no version for a page reads the file safely unless
@@ -516,11 +560,16 @@ impl Pages {
                 let newest = chain.last().unwrap();
                 (!newest.written).then(|| (id, newest.page.clone()))
             });
-            unwritten.collect()
+            (unwritten.collect(), memory.replacement.clone())
         };
-        if waiting.is_empty() {
+        if waiting.is_empty() && replacement.is_none() {
             self.forget(live);
             return Ok(());
+        }
+        // A replacement's pages first, then the header: readers read
+        // neither from the file until the end, and the WAL has both.
+        if let Some(scratch) = &replacement {
+            self.copy_back(scratch)?;
         }
         self.write_back(&waiting)?;
         self.truncate(page_count)?;
@@ -539,9 +588,30 @@ impl Pages {
                 }
             }
             memory.unwritten = 0;
+            // Read from the file from here on, as the cache fills.
+            memory.replacement = None;
         }
         self.forget(live);
         Ok(())
+    }
+
+    /// `checkpoint`'s copy of a replacement into the file (SPEC §108).
+    /// Fails as `write_back` does in tests, after so many pages.
+    fn copy_back(&self, scratch: &Scratch) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let failing = self.failing_write_backs.load(Ordering::Relaxed);
+            if failing > 0 {
+                let after = self.write_back_fails_after.load(Ordering::Relaxed);
+                let copied = scratch.copy_into(&self.file, Some(after as u64));
+                if copied.is_err() {
+                    self.failing_write_backs
+                        .store(failing - 1, Ordering::Relaxed);
+                }
+                return copied;
+            }
+        }
+        scratch.copy_into(&self.file, None)
     }
 
     /// `checkpoint`'s writes: every waiting page, in ascending id order.
@@ -584,7 +654,7 @@ impl Pages {
         {
             let mut memory = self.memory_mut();
             assert!(
-                memory.versions.is_empty(),
+                memory.versions.is_empty() && memory.replacement.is_none(),
                 "Pages::restore with pages to write back"
             );
             memory.file_epoch += 1;

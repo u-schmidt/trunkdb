@@ -94,7 +94,7 @@ src/
 │   ├── snapshot.rs    SnapshotStore: the pages as of one commit
 │   ├── slotted.rs     SlottedPage: slot directory + cells
 │   ├── cache.rs       PageCache: CLOCK eviction
-│   └── memory.rs      MemoryStore: pages in memory (compaction, tests)
+│   └── scratch.rs     ScratchStore: a compaction's image, in a file
 ├── index/
 │   ├── mod.rs         Index trait
 │   ├── btree.rs       BTreeIndex: every index, primary and secondary
@@ -760,6 +760,16 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     `aggregate`, and the new fields of `Explained` and `ExecutionStats`,
     which are `#[non_exhaustive]`, are additions. Files and exports as
     in 0.20.0.
+78. **Compaction in memory that doesn't grow with the file** (§108):
+    the new image is built in a file beside the database,
+    `<database>.compact`, logged to the WAL from there and copied into
+    the database at the checkpoint, where it was held in memory. A
+    compaction from 2.1 GB to 1.1 GB takes 0.1 GB of memory instead of
+    1.25, in the same 11 s; with a 256 MiB cache, 0.4 GB instead of 1.5.
+    The disk needs room for the new file twice more until it's done.
+    No file is left behind, after a crash either.
+
+    Item 78: not released yet. Nothing changes in the API or the file.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

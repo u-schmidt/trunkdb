@@ -445,6 +445,69 @@ impl WalDurability {
         self.record_pages = pages;
     }
 
+    /// `log`, for `count` pages handed out one at a time: only one
+    /// record's pages are in memory at once, so a batch whose pages are
+    /// in a file — a compaction's image (SPEC §108) — is logged without
+    /// reading it all in. Fails if `pages` hands out more or fewer than
+    /// `count`, or fails itself; `undo_failed_log` takes back what was
+    /// written of it.
+    pub(crate) fn log_each<P: std::ops::Deref<Target = [u8]>>(
+        &mut self,
+        count: usize,
+        mut pages: impl Iterator<Item = io::Result<(PageId, P)>>,
+    ) -> io::Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let end = self.file.seek(SeekFrom::End(0))?;
+        if end != 0 && !self.appendable {
+            return Err(io::Error::other(
+                "the WAL holds records of an older version, or a torn header: checkpoint it before logging",
+            ));
+        }
+        let records = count.div_ceil(self.record_pages);
+        let largest = count.min(self.record_pages);
+        let mut record = Vec::with_capacity(WAL_HEADER_LEN + 16 + largest * PAGE_ENTRY_LEN);
+        if end == 0 {
+            record.extend_from_slice(&encode_header());
+        }
+        let mut chunk: Vec<(PageId, P)> = Vec::with_capacity(largest);
+        let mut len = 0;
+        for i in 0..records {
+            let take = (count - i * self.record_pages).min(self.record_pages);
+            chunk.clear();
+            for _ in 0..take {
+                let page = pages.next().ok_or_else(|| {
+                    io::Error::other(format!("a batch of {count} pages handed out fewer"))
+                })??;
+                chunk.push(page);
+            }
+            let borrowed: Vec<(PageId, &[u8])> =
+                chunk.iter().map(|(id, page)| (*id, &**page)).collect();
+            encode_record_into(&mut record, &borrowed, i < records - 1);
+            self.file.write_all(&record)?;
+            len += record.len() as u64;
+            record.clear();
+            if i < records - 1 {
+                self.sync()?;
+            }
+        }
+        if pages.next().is_some() {
+            return Err(io::Error::other(format!(
+                "a batch of {count} pages handed out more"
+            )));
+        }
+        #[cfg(test)]
+        if self.failing_logs > 0 {
+            self.failing_logs -= 1;
+            return Err(io::Error::other("injected log failure"));
+        }
+        self.sync()?;
+        self.len = end + len;
+        self.appendable = true;
+        Ok(())
+    }
+
     /// Flushes the file, and counts it for the tests.
     fn sync(&mut self) -> io::Result<()> {
         #[cfg(test)]
@@ -474,41 +537,7 @@ impl Durability for WalDurability {
     /// makes the batch whole, is only ever on disk behind all the
     /// others, and a crash tears the WAL's tail and nothing before it.
     fn log(&mut self, pages: &[(PageId, &[u8])]) -> io::Result<()> {
-        if pages.is_empty() {
-            return Ok(());
-        }
-        let end = self.file.seek(SeekFrom::End(0))?;
-        if end != 0 && !self.appendable {
-            return Err(io::Error::other(
-                "the WAL holds records of an older version, or a torn header: checkpoint it before logging",
-            ));
-        }
-        let records = pages.chunks(self.record_pages);
-        let last = records.len() - 1;
-        let largest = pages.len().min(self.record_pages);
-        let mut record = Vec::with_capacity(WAL_HEADER_LEN + 16 + largest * PAGE_ENTRY_LEN);
-        if end == 0 {
-            record.extend_from_slice(&encode_header());
-        }
-        let mut len = 0;
-        for (i, chunk) in records.enumerate() {
-            encode_record_into(&mut record, chunk, i < last);
-            self.file.write_all(&record)?;
-            len += record.len() as u64;
-            record.clear();
-            if i < last {
-                self.sync()?;
-            }
-        }
-        #[cfg(test)]
-        if self.failing_logs > 0 {
-            self.failing_logs -= 1;
-            return Err(io::Error::other("injected log failure"));
-        }
-        self.sync()?;
-        self.len = end + len;
-        self.appendable = true;
-        Ok(())
+        self.log_each(pages.len(), pages.iter().map(|&page| Ok(page)))
     }
 
     fn undo_failed_log(&mut self) -> io::Result<()> {
@@ -592,6 +621,59 @@ mod tests {
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
         let recovered = recovered.images();
         assert_eq!(recovered, vec![(3, page(1)), (3, page(9)), (4, page(4))]);
+    }
+
+    /// `log_each` writes what `log` writes, byte for byte, in one record
+    /// or in several (SPEC §108).
+    #[test]
+    fn log_each_writes_what_log_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch: Vec<PageImage> = (1..=7).map(|id| (id, page(id as u8))).collect();
+        for record_pages in [2, 7, 100] {
+            let (one, each) = (dir.path().join("one"), dir.path().join("each"));
+            let (mut wal, _) = WalDurability::open(&one).unwrap();
+            wal.set_record_pages(record_pages);
+            log(&mut wal, &batch);
+            let (mut wal, _) = WalDurability::open(&each).unwrap();
+            wal.set_record_pages(record_pages);
+            let pages = batch.iter().map(|(id, page)| Ok((*id, page.as_slice())));
+            wal.log_each(batch.len(), pages).unwrap();
+            assert_eq!(wal.len(), wal_bytes(&each).len() as u64);
+            assert_eq!(wal_bytes(&one), wal_bytes(&each), "{record_pages}");
+            std::fs::remove_file(wal_path(&one)).unwrap();
+            std::fs::remove_file(wal_path(&each)).unwrap();
+        }
+    }
+
+    /// Pages that don't come as counted, or fail to come, fail the log;
+    /// what it wrote is taken back, and the batch before it stays.
+    #[test]
+    fn log_each_fails_on_pages_that_dont_come_as_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        wal.set_record_pages(2);
+        log(&mut wal, &two_page_batch());
+        let before = wal_bytes(&db_path);
+        let batch: Vec<PageImage> = (1..=5).map(|id| (id, page(id as u8))).collect();
+        let pages = || batch.iter().map(|(id, page)| Ok((*id, page.as_slice())));
+        let failing = batch.iter().enumerate().map(|(i, (id, page))| match i {
+            3 => Err(io::Error::other("a page that can't be read")),
+            _ => Ok((*id, page.as_slice())),
+        });
+        let attempts: [io::Result<()>; 3] = [
+            wal.log_each(6, pages()),
+            wal.log_each(4, pages()),
+            wal.log_each(5, failing),
+        ];
+        for attempt in attempts {
+            assert!(attempt.is_err());
+        }
+        wal.undo_failed_log().unwrap();
+        assert_eq!(wal_bytes(&db_path), before);
+        drop(wal);
+        let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(recovered.images(), two_page_batch());
     }
 
     #[test]

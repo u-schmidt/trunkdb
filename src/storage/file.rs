@@ -6,7 +6,7 @@ use super::pages::{
 use super::snapshot::Commit;
 #[cfg(test)]
 use super::snapshot::SnapshotStore;
-use super::{Page, PageId, PageStore, PageType, PendingPages};
+use super::{Page, PageId, PageStore, PageType, PendingPages, Scratch};
 use crate::FormatError;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -225,6 +225,10 @@ struct Staging {
     /// nothing is kept in `before`, and the batch may only commit with
     /// no snapshot open (`FileStore::replaces_all`).
     replaces_all: bool,
+    /// The image that replaces every page past the header, built in a
+    /// file (SPEC §108): read from there, logged from there, and copied
+    /// from there into the database at the checkpoint.
+    replacement: Option<Arc<Scratch>>,
 }
 
 impl FileStore {
@@ -436,10 +440,13 @@ impl FileStore {
     /// Shared wherever it comes from, never copied (SPEC §64). No bounds
     /// check — callers do that.
     fn read_current(&self, id: PageId) -> io::Result<Page> {
-        if let Some(staging) = &self.staging
-            && let Some(page) = staging.dirty.get(&id)
-        {
-            return Ok(page.clone());
+        if let Some(staging) = &self.staging {
+            if let Some(page) = staging.dirty.get(&id) {
+                return Ok(page.clone());
+            }
+            if let Some(scratch) = &staging.replacement {
+                return scratch.read(id);
+            }
         }
         self.pages.read(id)
     }
@@ -535,6 +542,7 @@ impl FileStore {
             dirty: BTreeMap::new(),
             before: BTreeMap::new(),
             replaces_all: false,
+            replacement: None,
         });
     }
 
@@ -549,8 +557,8 @@ impl FileStore {
     }
 
     /// Every page changed since `begin`, in ascending id order, header
-    /// (page 0) included if it changed. Empty when not staging. This is
-    /// what the WAL logs before `write_back` touches the file.
+    /// (page 0) included if it changed. Empty when not staging. Not a
+    /// replacement's pages: `staged_pages` has those too.
     pub fn dirty_pages(&self) -> impl Iterator<Item = (PageId, &[u8])> {
         self.staging
             .iter()
@@ -558,15 +566,41 @@ impl FileStore {
             .map(|(&id, page)| (id, &**page))
     }
 
-    /// Makes `pages` — ids 1 and up, as a `MemoryStore` built them — the
-    /// file's whole content, staged like any other change: the page count
-    /// becomes `page_count`, the free list empty, and `write_back` cuts
-    /// the file to that length (SPEC §41).
-    pub(crate) fn replace_all(
-        &mut self,
-        pages: impl IntoIterator<Item = (PageId, impl Into<Page>)>,
-        page_count: u64,
-    ) -> io::Result<()> {
+    /// How many pages `staged_pages` hands out.
+    pub(crate) fn staged_count(&self) -> usize {
+        self.staging.as_ref().map_or(0, |staging| {
+            let replaced = staging
+                .replacement
+                .as_ref()
+                .map_or(0, |scratch| scratch.page_count() - 1);
+            staging.dirty.len() + replaced as usize
+        })
+    }
+
+    /// What the WAL logs before the batch commits: every page changed
+    /// since `begin`, then, for a compaction, its image's pages, read
+    /// from its file one at a time (SPEC §108). In ascending id order:
+    /// the header is the only page changed beside an image.
+    pub(crate) fn staged_pages(&self) -> impl Iterator<Item = io::Result<(PageId, Page)>> + '_ {
+        let staging = self.staging.as_ref();
+        let dirty = staging
+            .into_iter()
+            .flat_map(|staging| staging.dirty.iter())
+            .map(|(&id, page)| Ok((id, page.clone())));
+        let replaced = staging
+            .and_then(|staging| staging.replacement.as_deref())
+            .into_iter()
+            .flat_map(Scratch::pages);
+        dirty.chain(replaced)
+    }
+
+    /// Makes `image`, as a compaction built it, the file's whole content
+    /// past the header, staged like any other change: the page count
+    /// becomes the image's, the free list empty, and the checkpoint
+    /// copies the image in and cuts the file to that length (SPEC §41,
+    /// §108). Whatever else the batch changed goes: the image replaces
+    /// it.
+    pub(crate) fn replace_all(&mut self, image: Scratch) -> io::Result<()> {
         let staging = self
             .staging
             .as_mut()
@@ -577,23 +611,30 @@ impl FileStore {
         // §80.5), and nothing needs keeping.
         staging.replaces_all = true;
         staging.before.clear();
-        for (id, page) in pages {
-            let page = page.into();
-            assert!(
-                id != HEADER_PAGE && id < page_count,
-                "page {id} out of range"
-            );
-            if page.len() != USABLE_PAGE_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("page {id} is {} bytes, not {USABLE_PAGE_SIZE}", page.len()),
-                ));
-            }
-            self.write_raw(id, page)?;
-        }
-        self.header.page_count = page_count;
+        staging.dirty.clear();
+        self.header.page_count = image.page_count();
         self.header.free_list_head = NO_FREE_PAGE;
+        staging.replacement = Some(Arc::new(image));
         self.write_header()
+    }
+
+    /// `replace_all` with an image of `pages`, ids 1 to `page_count - 1`:
+    /// for tests.
+    #[cfg(test)]
+    pub(crate) fn replace_with(
+        &mut self,
+        pages: impl IntoIterator<Item = (PageId, Vec<u8>)>,
+        page_count: u64,
+    ) -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut image = super::ScratchStore::create(&dir.path().join("image"))?;
+        while image.page_count() < page_count {
+            image.allocate_page()?;
+        }
+        for (id, page) in pages {
+            image.write_page(id, Page::from(page))?;
+        }
+        self.replace_all(image.finish()?)
     }
 
     /// Checks the staged pages' layout (SPEC §66), ahead of `commit`,
@@ -625,7 +666,10 @@ impl FileStore {
             live.is_empty() || !staging.replaces_all,
             "a batch that replaces the whole file committed beside a snapshot"
         );
-        self.pages.commit(staging.dirty, staging.before, live);
+        match staging.replacement {
+            Some(image) => self.pages.commit_replacing(staging.dirty, image),
+            None => self.pages.commit(staging.dirty, staging.before, live),
+        }
     }
 
     /// Whether the staged batch replaces the whole file (`replace_all`),
@@ -1550,7 +1594,7 @@ mod tests {
             (1, vec![8u8; USABLE_PAGE_SIZE]),
             (2, vec![9u8; USABLE_PAGE_SIZE]),
         ];
-        store.replace_all(pages, 3).unwrap();
+        store.replace_with(pages, 3).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             6 * PAGE_SIZE as u64
@@ -1575,12 +1619,154 @@ mod tests {
         let mut store = five_page_file(&path);
         store.begin();
         store
-            .replace_all([(1, vec![8u8; USABLE_PAGE_SIZE])], 2)
+            .replace_with([(1, vec![8u8; USABLE_PAGE_SIZE])], 2)
             .unwrap();
         store.rollback();
         assert_eq!(store.page_count(), 6);
         assert_eq!(store.free_pages().unwrap(), vec![4]);
         assert_eq!(store.read_page(1).unwrap(), vec![1u8; USABLE_PAGE_SIZE]);
+    }
+
+    /// A committed replacement is read from its image until a checkpoint
+    /// copies it in (SPEC §108): the file keeps the old pages until then,
+    /// and `check`'s scan of the file skips them as pages that wait.
+    #[test]
+    fn a_replacement_is_read_from_its_image_until_the_checkpoint() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store
+            .replace_with([(1, filled(8)), (2, filled(9))], 3)
+            .unwrap();
+        assert_eq!(store.read_page(2).unwrap(), filled(9), "while staged");
+        store.commit();
+        assert_eq!(store.unwritten_pages(), 3);
+        assert_eq!(store.read_page(1).unwrap(), filled(8));
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        assert_eq!(on_disk(&store).read_page(2).unwrap(), filled(2));
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+
+        store.checkpoint().unwrap();
+        assert_eq!(store.unwritten_pages(), 0);
+        // Not the old pages the cache held before (`five_page_file`
+        // wrote them through it).
+        assert_eq!(store.read_page(1).unwrap(), filled(8));
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        let disk = on_disk(&store);
+        assert_eq!(disk.page_count(), 3);
+        assert_eq!(disk.read_page(1).unwrap(), filled(8));
+        assert_eq!(disk.read_page(2).unwrap(), filled(9));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * PAGE_SIZE as u64
+        );
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+    }
+
+    /// A copy that fails part of the way leaves the file half written,
+    /// and the replacement read from its image; the next checkpoint
+    /// copies it all again.
+    #[test]
+    fn a_failed_copy_leaves_the_replacement_to_the_next_checkpoint() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store
+            .replace_with([(1, filled(8)), (2, filled(9)), (3, filled(7))], 4)
+            .unwrap();
+        store.commit();
+        store.pages.fail_write_backs(1, 1);
+        assert!(store.checkpoint().is_err());
+        assert_eq!(on_disk(&store).read_page(1).unwrap(), filled(8));
+        assert_eq!(on_disk(&store).read_page(2).unwrap(), filled(2));
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        assert_eq!(store.unwritten_pages(), 4);
+
+        store.checkpoint().unwrap();
+        let disk = on_disk(&store);
+        assert_eq!(disk.page_count(), 4);
+        for (id, fill) in [(1, 8), (2, 9), (3, 7)] {
+            assert_eq!(disk.read_page(id).unwrap(), filled(fill));
+        }
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+    }
+
+    /// A batch committed after a replacement, before the checkpoint, is
+    /// read over it, and written over it.
+    #[test]
+    fn a_batch_after_a_replacement_is_read_and_written_over_it() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store
+            .replace_with([(1, filled(8)), (2, filled(9))], 3)
+            .unwrap();
+        store.commit();
+        store.begin();
+        store.write_page(1, filled(3).into()).unwrap();
+        let grown = store.allocate_page().unwrap();
+        store.write_page(grown, filled(4).into()).unwrap();
+        store.commit();
+        assert_eq!(store.read_page(1).unwrap(), filled(3));
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        assert_eq!(store.read_page(grown).unwrap(), filled(4));
+
+        store.checkpoint().unwrap();
+        let disk = on_disk(&store);
+        assert_eq!(disk.page_count(), 4);
+        for (id, fill) in [(1, 3), (2, 9), (grown, 4)] {
+            assert_eq!(disk.read_page(id).unwrap(), filled(fill));
+        }
+
+        // Copied once: a later checkpoint writes its own pages only,
+        // not the image again over what came after it.
+        store.begin();
+        store.write_page(2, filled(5).into()).unwrap();
+        store.commit();
+        store.checkpoint().unwrap();
+        let disk = on_disk(&store);
+        for (id, fill) in [(1, 3), (2, 5), (grown, 4)] {
+            assert_eq!(disk.read_page(id).unwrap(), filled(fill));
+            assert_eq!(store.read_page(id).unwrap(), filled(fill));
+        }
+    }
+
+    /// A batch committed before a replacement and not written back yet
+    /// is replaced along with the rest: neither read nor written after
+    /// it, though the WAL holds it until the checkpoint.
+    #[test]
+    fn a_replacement_replaces_the_batches_waiting_before_it() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        store.write_page(2, filled(6).into()).unwrap();
+        store.commit();
+        store.begin();
+        store
+            .replace_with([(1, filled(8)), (2, filled(9))], 3)
+            .unwrap();
+        store.commit();
+        assert_eq!(store.unwritten_pages(), 3);
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+        store.checkpoint().unwrap();
+        assert_eq!(on_disk(&store).read_page(2).unwrap(), filled(9));
+        assert_eq!(store.read_page(2).unwrap(), filled(9));
+    }
+
+    /// While a replacement waits, `check`'s scan of the file skips every
+    /// page past the header, even ones past the file's end.
+    #[test]
+    fn a_waiting_replacement_is_not_scanned_for_damage() {
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        store.begin();
+        let pages = (1..9).map(|id| (id, filled(id as u8)));
+        store.replace_with(pages, 9).unwrap();
+        store.commit();
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+        store.checkpoint().unwrap();
+        assert_eq!(store.damaged_pages().unwrap(), Vec::<PageId>::new());
+        assert_eq!(on_disk(&store).read_page(8).unwrap(), filled(8));
     }
 
     /// A crash between a shrinking batch's write-back and its cut leaves
@@ -1592,11 +1778,13 @@ mod tests {
         let mut store = five_page_file(&path);
         store.begin();
         let pages = (1..5).map(|id| (id, vec![8u8; USABLE_PAGE_SIZE]));
-        store.replace_all(pages, 5).unwrap();
+        store.replace_with(pages, 5).unwrap();
         let pages: Vec<PageImage> = store
-            .dirty_pages()
-            .map(|(id, page)| (id, page.to_vec()))
-            .collect();
+            .staged_pages()
+            .map(|page| page.map(|(id, page)| (id, page.to_vec())))
+            .collect::<io::Result<_>>()
+            .unwrap();
+        assert_eq!(pages.len(), 5);
         store.rollback();
         store.restore_pages(&pages).unwrap();
         drop(store);
@@ -2005,24 +2193,28 @@ mod tests {
         store.read_page(5).unwrap();
         assert!(store.cached(5).is_some());
         store.begin();
-        store.replace_all([(1, filled(8))], 2).unwrap();
+        store.replace_with([(1, filled(8))], 2).unwrap();
         store.write_back().unwrap();
+        // A replacement's pages are copied in, not cached (SPEC §108):
+        // read from the file, then cached.
         assert!(store.cached(5).is_none());
+        assert!(store.cached(1).is_none());
+        assert_eq!(store.read_page(1).unwrap(), filled(8));
         assert_eq!(store.cached(1).unwrap(), filled(8));
 
         // Committed by one batch, cut off by the next, before either is
         // written back: the checkpoint doesn't cache it either.
         store.begin();
         store
-            .replace_all([(1, filled(1)), (4, filled(4))], 5)
+            .replace_with([(1, filled(1)), (4, filled(4))], 5)
             .unwrap();
         store.commit();
         store.begin();
-        store.replace_all([(1, filled(7))], 2).unwrap();
+        store.replace_with([(1, filled(7))], 2).unwrap();
         store.commit();
         store.checkpoint().unwrap();
         assert!(store.cached(4).is_none());
-        assert_eq!(store.cached(1).unwrap(), filled(7));
+        assert_eq!(store.read_page(1).unwrap(), filled(7));
     }
 
     /// The cache answers for a page that was damaged on disk after it was
@@ -2433,7 +2625,7 @@ mod tests {
         let (_dir, path) = open_temp();
         let mut store = five_page_file(&path);
         store.begin();
-        store.replace_all([(1, filled(8))], 2).unwrap();
+        store.replace_with([(1, filled(8))], 2).unwrap();
         assert!(store.replaces_all());
         store.commit_beside(&[0]);
     }

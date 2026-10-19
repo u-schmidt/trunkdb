@@ -7,7 +7,8 @@ use crate::collection::{index_keys, same_values, unique_tuples};
 use crate::data;
 use crate::database::Database;
 use crate::index::{BTreeIndex, Index, key};
-use crate::storage::{FileStore, MemoryStore, RecordLocation};
+use crate::storage::{FileStore, PageStore, RecordLocation, ScratchStore};
+use std::path::Path;
 
 /// What `Database::compact` did: the file's pages before and after, the
 /// header included. Equal when it was already as small as a rebuild
@@ -26,12 +27,17 @@ impl Database {
     /// leaves, no free pages. Documents keep their ids; what `find`
     /// returns doesn't change.
     ///
-    /// The new file is built in memory, then written like any batch —
-    /// through the WAL, so a crash leaves the old file or the new one,
-    /// never a mix. That needs memory for the whole new file, twice (the
-    /// pages, and the WAL record of them). Other writes wait for
-    /// all of it. Reads go on while the new file is built; then it waits
-    /// for the reads under way, and new ones wait until it is committed.
+    /// The new file is built in a file beside the database,
+    /// `<database>.compact`, which is gone once the compaction is (SPEC
+    /// §108). Then it is written like any batch — through the WAL, so a
+    /// crash leaves the old file or the new one, never a mix — and
+    /// copied into the database. Memory stays a few megabytes whatever
+    /// the file's size, besides the keys of each index while it is
+    /// sorted; the disk needs room for the new file twice more until the
+    /// end, once beside the database and once in the WAL. Other writes
+    /// wait for all of it. Reads go on while the new file is built; then
+    /// it waits for the reads under way, and new ones wait until it is
+    /// committed.
     ///
     /// `Error::SnapshotOpen` if a snapshot is kept open: every page
     /// changes, and none can be kept as it was (SPEC §80.5). A file
@@ -40,7 +46,7 @@ impl Database {
     pub fn compact(&self) -> crate::Result<Compacted> {
         self.transact(|catalog, store| {
             let pages_before = store.page_count();
-            let (rebuilt, image) = rebuild(catalog, store)?;
+            let (rebuilt, image) = rebuild(catalog, store, self.scratch_path())?;
             let pages_after = image.page_count();
             if pages_after >= pages_before {
                 // Already this small: rewriting it would gain nothing.
@@ -49,7 +55,7 @@ impl Database {
                     pages_after: pages_before,
                 });
             }
-            store.replace_all(image.into_pages(), pages_after)?;
+            store.replace_all(image.finish()?)?;
             *catalog = rebuilt;
             Ok(Compacted {
                 pages_before,
@@ -63,8 +69,12 @@ impl Database {
 /// documents in id order (so data pages fill one after another and the
 /// primary index grows at its end), then each index from its keys,
 /// sorted. Returns the image's catalog along with it.
-fn rebuild(catalog: &Catalog, store: &FileStore) -> crate::Result<(Catalog, MemoryStore)> {
-    let mut image = MemoryStore::new();
+fn rebuild(
+    catalog: &Catalog,
+    store: &FileStore,
+    scratch: &Path,
+) -> crate::Result<(Catalog, ScratchStore)> {
+    let mut image = ScratchStore::create(scratch)?;
     let mut rebuilt = Catalog::load(&mut image)?;
     let mut names: Vec<&str> = catalog.names().collect();
     names.sort();
@@ -117,7 +127,7 @@ fn rebuild(catalog: &Catalog, store: &FileStore) -> crate::Result<(Catalog, Memo
 /// are compared by value. A file whose unique index holds a duplicate
 /// isn't compacted into another one.
 fn refuse_duplicates(
-    image: &MemoryStore,
+    image: &dyn PageStore,
     collection: &str,
     index: &IndexMeta,
     entries: &[(Vec<u8>, RecordLocation)],
@@ -269,6 +279,7 @@ mod tests {
         let pages_before = db.file_info().unwrap().pages;
 
         let compacted = db.compact().unwrap();
+        assert!(!db.scratch_path().exists(), "the image's file is gone");
         assert_eq!(compacted.pages_before, pages_before);
         assert!(
             compacted.pages_after * 10 < pages_before * 7,
@@ -464,6 +475,27 @@ mod tests {
             Err(crate::Error::DuplicateValue { field, .. }) => assert_eq!(field, "email"),
             other => panic!("expected DuplicateValue, got {other:?}"),
         }
+        assert!(!db.scratch_path().exists());
+        drop(db);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// Where the image's file can't be made — here a directory has its
+    /// name — the compaction fails before anything is staged, and the
+    /// file stays as it was (SPEC §108).
+    #[test]
+    fn a_compaction_without_room_for_its_image_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = churned(&path);
+        let before = contents(&db);
+        std::fs::create_dir(db.scratch_path()).unwrap();
+        assert!(matches!(db.compact(), Err(crate::Error::Io(_))));
+        assert_eq!(contents(&db), before);
+        drop(db);
+        let bytes = std::fs::read(&path).unwrap();
+        let db = Database::open(&path).unwrap();
+        assert_eq!(contents(&db), before);
         drop(db);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
