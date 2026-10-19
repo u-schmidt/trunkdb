@@ -581,9 +581,15 @@ impl<'a> Groups<'a> {
         let i = self.last.expect("a group added before");
         let group = &mut self.list[i];
         if group.first.first().is_some_and(|f| order < f.order) {
+            // The value held is a later match's: equal, and the same but
+            // for a number (`5` for `5.0`), which the row reads from this
+            // one's document.
             for seen in &mut group.first {
                 seen.order = order;
                 seen.at = Some(at);
+                if matches!(seen.value, Document::Int(_) | Document::Float(_)) {
+                    seen.stored = false;
+                }
             }
         }
         self.add_values(i, values, order, at);

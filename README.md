@@ -776,7 +776,12 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     in the same 2.5 s; 3 MB instead of 1.3 GB without one, in 5 s
     instead of 2.6. The same problems found.
 
-    Items 78–79: not released yet. Nothing changes in the API or the
+80. **A fix to aggregates** (§110): grouped through an index whose
+    group fields aren't its last, a row could show its group's number
+    as an earlier match had it, `3` where the first document by id has
+    `3.0`. Found by the `queries` fuzz target in CI.
+
+    Items 78–80: not released yet. Nothing changes in the API or the
     file.
 
 What's still open: [ROADMAP.md](ROADMAP.md).

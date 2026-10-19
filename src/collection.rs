@@ -9771,6 +9771,43 @@ mod tests {
     /// index, a single-field one and a sparse one, with values of every
     /// kind: `Int` and `Float`, cut strings, null and missing, arrays,
     /// NaN. Most matches come from their entries.
+    /// A group's first document by id found late in the walk, as an
+    /// entry of the group the last match went to, after a match read
+    /// from its document: the row gives the first document's value, not
+    /// the one read before (`5` and `5.0` are one group, SPEC §107.5).
+    /// The index's second field orders the group's entries otherwise
+    /// than by id: the cut string first, its entry unable to answer.
+    #[test]
+    fn a_groups_first_document_found_late_gives_its_value() {
+        use crate::query::Aggregate;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index(["a", "b"]).unwrap();
+        let cut = "a".repeat(600);
+        for (a, b) in [
+            (Document::Float(3.0), "z".to_string()),
+            (Document::Int(3), cut),
+            (Document::Int(3), "m".to_string()),
+        ] {
+            docs.insert(object(vec![("a", a), ("b", Document::String(b))]))
+                .unwrap();
+        }
+        let aggregate = Aggregate::new().group_by("a").min("b", "first_b");
+        let rows = docs.aggregate(Filter::new(), &aggregate).unwrap();
+        let run = docs.explain_aggregate(Filter::new(), &aggregate).unwrap();
+        // The cut string's document, and the first document's, for its
+        // number.
+        assert_eq!(
+            (run.stats.from_entries, run.stats.documents_examined),
+            (2, 2),
+            "{run:#?}"
+        );
+        let all = docs.find(Filter::new()).unwrap();
+        assert_eq!(rows, aggregate.apply(all).unwrap());
+        assert!(matches!(&rows[0], Document::Object(f) if f["a"] == Document::Float(3.0)));
+    }
+
     #[test]
     fn aggregates_from_entries_agree_with_the_documents() {
         use crate::query::Aggregate;
