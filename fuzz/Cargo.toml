@@ -56,3 +56,10 @@ path = "fuzz_targets/queries.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "filter_text"
+path = "fuzz_targets/filter_text.rs"
+test = false
+doc = false
+bench = false

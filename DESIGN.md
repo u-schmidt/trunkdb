@@ -290,6 +290,12 @@ limit and a selection, applied in that order [§72](spec/72-skip-for-paging.md)
 - **conditions on array elements:** any element with `[*]` [§42](spec/42-array-conditions-and-multikey-indexes.md), or
   one element meeting several conditions with `elem_match` [§46](spec/46-conditions-on-one-element-elem-match.md).
 
+**As text**, a filter reads and prints in a language like SQL's
+`WHERE`, `status = "Complete" and seen >= 10 order by started_at desc
+limit 1`, which says what the methods say and compiles to the same
+`Filter`; values are JSON as a `Document` reads it, so their types
+survive the round trip [§111](spec/111-filters-as-text.md).
+
 Values of different types never compare equal or ordered, except
 numbers: an `Int` and a `Float` compare by exact value [§34](spec/34-sorting-through-an-index.md).
 
@@ -477,8 +483,9 @@ more than four.
   was made [§82](spec/82-a-snapshot-to-keep.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
-- **Filters** only through `Filter`'s methods; `limit` takes an `Option`
-  too [§60](spec/60-a-smaller-public-api.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md);
+- **Filters** through `Filter`'s methods; `limit` takes an `Option`
+  too [§60](spec/60-a-smaller-public-api.md); or from text, `text.parse::<Filter>()`, and back with
+  `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md);
   `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
@@ -560,7 +567,7 @@ changed page is copied once, not twice: `write_page` takes the `Page` [§67](spe
   open has the state before or after the batch, and nothing in between
   [§19](spec/19-durability-take-two-a-page-image-wal.md) [§51](spec/51-one-flush-per-commit.md).
 - **Fuzzing** (`fuzz/`): damaged databases, WALs and exports, millions
-  of them, where anything but a panic or a hang is a correct answer. Each
+  of them, and filters as text [§111](spec/111-filters-as-text.md), where anything but a panic or a hang is a correct answer. Each
   crash it found became a test in the library [§55](spec/55-fuzzing.md).
 - **Differential fuzzing** (`fuzz/`, the `queries` target): any bytes as
   a program of index changes, writes, compactions, reopens, snapshots

@@ -71,6 +71,7 @@ src/
 │                        moment, to keep reading
 ├── query.rs           Filter, Condition, Sort; the planner; index
 │                        entries deciding a filter
+├── query_text.rs      a filter as text, read and printed
 ├── path.rs            field paths, parsed once per query
 ├── explain.rs         explain and explain_run: how a query ran
 ├── stats.rs           Database::stats: where a file's space goes
@@ -119,8 +120,8 @@ src/
 tests/                 the command line, and a time-series-shaped
                          workload through the public API
 bench/                 against SQLite, redb and sled (its own crate)
-fuzz/                  fuzz targets: damaged files, WALs and exports,
-                         and queries against a model (its own crate,
+fuzz/                  fuzz targets: damaged files, WALs, exports and
+                         filter texts, and queries against a model (its own crate,
                          nightly; a smoke run on stable)
 ```
 
@@ -781,8 +782,18 @@ Done so far (see [ROADMAP.md](ROADMAP.md) for the full list, and
     as an earlier match had it, `3` where the first document by id has
     `3.0`. Found by the `queries` fuzz target in CI.
 
-    Items 78–80: not released yet. Nothing changes in the API or the
-    file.
+81. **Filters as text** (§111): `text.parse::<Filter>()` and
+    `filter.to_string()`, in a language like SQL's `WHERE`: `status =
+    "Complete" and seen >= 10 order by started_at desc limit 1`, with
+    `select`, `is null`, `exists(…)`, `size(…)`, `has (…)` for one
+    element, `not`/`and`/`or`, values as JSON with `id("…")` and
+    `date("…")`, and names in backticks. It says what the builders say
+    and compiles to the same `Filter`. `Condition` has both too;
+    mistakes come back as `ParseFilterError`, with line and column.
+
+    Items 78–81: not released yet. Nothing breaking: `FromStr` and
+    `Display` for `Filter` and `Condition`, and `ParseFilterError`, are
+    additions. Files and exports as in 0.21.0.
 
 What's still open: [ROADMAP.md](ROADMAP.md).
 

@@ -121,3 +121,4 @@ is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 108. [Compaction built in a file (`compact.rs`, `storage/scratch.rs`, `storage/pages.rs`, `storage/file.rs`, `durability/wal.rs`)](108-compaction-built-in-a-file.md)
 109. [`check` in memory that doesn't grow with the file (`check.rs`)](109-check-in-memory-that-does-not-grow-with-the-file.md)
 110. [A group's first document found late (`aggregate.rs`)](110-a-groups-first-document-found-late.md)
+111. [Filters as text (`query_text.rs`)](111-filters-as-text.md)

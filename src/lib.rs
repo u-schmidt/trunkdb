@@ -27,6 +27,7 @@ mod index;
 mod json;
 mod path;
 pub mod query;
+mod query_text;
 mod select;
 mod serde_bridge;
 mod serde_stored;

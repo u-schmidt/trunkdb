@@ -4,6 +4,7 @@ use crate::document::{DocId, Document, ID_FIELD};
 pub use crate::explain::{ExecutionStats, Explained, IndexRead, SortWork};
 use crate::index::{KeyRange, key};
 use crate::path::Path;
+pub use crate::query_text::ParseFilterError;
 use crate::select::Selection;
 pub use crate::update::Update;
 

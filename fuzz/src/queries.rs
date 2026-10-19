@@ -1167,10 +1167,17 @@ impl Run<'_> {
                 self.at()
             );
         }
+        // The typed read takes the query as its text reads it back
+        // (SPEC §111): the same text, and the same answers.
+        let text = filter.to_string();
+        let from_text: Filter = text
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: {text}: {e}", self.at()));
+        assert_eq!(from_text.to_string(), text, "{}", self.at());
         let answers = Answers {
             find: docs.find(filter.clone()).unwrap(),
             typed: typed
-                .find(filter.clone())
+                .find(from_text)
                 .unwrap()
                 .into_iter()
                 .map(|d| d.id)
