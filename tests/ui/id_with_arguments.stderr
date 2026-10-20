@@ -1,0 +1,5 @@
+error: unexpected token in attribute
+ --> tests/ui/id_with_arguments.rs:4:9
+  |
+4 |     #[id(x)]
+  |         ^

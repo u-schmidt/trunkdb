@@ -1,0 +1,16 @@
+[package]
+name = "trunkdb-derive"
+version = "0.22.0"
+edition = "2024"
+rust-version = "1.89"
+description = "The #[trunkdb::document] attribute for trunkdb."
+license = "MIT"
+repository = "https://github.com/u-schmidt/trunkdb"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "3", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

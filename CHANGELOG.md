@@ -451,4 +451,11 @@ limit, batches and a write-ahead log. Since then:
     what it found: the plan, each index read with its bounds in the
     filter language, the sort, and `explain_run`'s counts and time.
 
-    Item 83: not released yet. Nothing changes in the library.
+84. **`#[trunkdb::document]`** (§114): with the `derive` feature,
+    `#[id]` on a struct's id field instead of `#[serde(rename =
+    "_id")]`, refused at compile time on a field that isn't a `DocId`
+    or an `Option<DocId>`, or on a second field; a macro crate of its
+    own, `trunkdb-derive`, as serde has `serde_derive`.
+
+    Items 83–84: not released yet. Nothing breaking: the feature is
+    off unless asked for.

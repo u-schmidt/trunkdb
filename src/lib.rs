@@ -99,6 +99,30 @@ pub use json::ParseDocumentError;
 pub use serde_bridge::DocumentError;
 pub use snapshot::{Snapshot, SnapshotInfo, View};
 pub use stats::{CollectionStats, IndexStats, PageUse, Recovered, Stats};
+/// Marks a struct as a document and one of its fields as its id (SPEC
+/// §114), with the `derive` feature: `#[id]` on the field becomes
+/// `#[serde(rename = "_id")]` before serde's derive, written below it,
+/// sees the struct.
+///
+/// ```
+/// use serde::{Deserialize, Serialize};
+/// use trunkdb::DocId;
+///
+/// #[trunkdb::document]
+/// #[derive(Serialize, Deserialize)]
+/// struct Task {
+///     #[id]
+///     id: Option<DocId>, // None on insert: one is made; filled in on every read
+///     title: String,
+/// }
+/// ```
+///
+/// The id is a `DocId` or an `Option<DocId>`, at most one field has
+/// `#[id]`, and neither attribute takes arguments; anything else is a
+/// compile error. The type is checked as written, so an alias of
+/// `DocId` is refused.
+#[cfg(feature = "derive")]
+pub use trunkdb_derive::document;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

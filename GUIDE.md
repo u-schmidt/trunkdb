@@ -51,6 +51,27 @@ let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new
 let tagged = users.update_fields(Filter::new().id(id), &Update::new().add_to_set("tags", "admin").pull("tags", "guest"))?;
 ```
 
+## The id without serde's rename
+
+With the `derive` feature (`trunkdb = { version = "0.22", features =
+["derive"] }`), a struct says which field is its id, and the rename is
+written for it:
+
+```rust
+#[trunkdb::document]
+#[derive(Serialize, Deserialize)]
+struct Task {
+    #[id]
+    id: Option<DocId>,
+    title: String,
+}
+```
+
+`#[trunkdb::document]` goes above the derive, which then sees
+`#[serde(rename = "_id")]` where `#[id]` was. The id must be a `DocId`
+or an `Option<DocId>`, on one field at most, or it doesn't compile.
+Filters still name the field `_id`, or use `Filter::id`.
+
 ## Filters as text
 
 A filter can also be written as text, in a language like SQL's `WHERE`,

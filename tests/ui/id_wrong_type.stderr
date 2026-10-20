@@ -1,0 +1,5 @@
+error: the id must be a `DocId` or an `Option<DocId>`
+ --> tests/ui/id_wrong_type.rs:5:9
+  |
+5 |     id: String,
+  |         ^^^^^^

@@ -13,11 +13,22 @@ categories = ["database-implementations", "database"]
 # own dependencies (SPEC §48, §55).
 exclude = ["bench/", "fuzz/"]
 
+# The `derive` feature's macro crate (SPEC §114). `bench/` and `fuzz/`
+# are workspaces of their own.
+[workspace]
+members = ["trunkdb-derive"]
+
 [features]
 # Hooks for the fuzz targets in `fuzz/` (SPEC §55); not for applications.
 # It switches nothing off: skipping the flush is `--cfg fuzzing`, which
 # `cargo fuzz` sets and a feature can't (SPEC §55.1).
 fuzzing = []
+# `#[trunkdb::document]` and `#[id]`, from the trunkdb-derive crate
+# (SPEC §114).
+derive = ["dep:trunkdb-derive"]
+
+[package.metadata.docs.rs]
+features = ["derive"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
@@ -28,6 +39,8 @@ uuid = { version = "1", features = ["v7"] }
 indexmap = "2"
 thiserror = "2"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+trunkdb-derive = { path = "trunkdb-derive", version = "0.22.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+trybuild = "1"

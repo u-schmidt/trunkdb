@@ -21,6 +21,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      # `#[trunkdb::document]` and its compile-fail tests (SPEC §114).
+      - run: cargo test --features derive
 
   lint:
     name: Clippy and rustfmt
@@ -33,8 +35,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # The `fuzzing` feature's hooks too (SPEC §55).
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # The `fuzzing` feature's hooks (SPEC §55) and the macro crate
+      # (SPEC §114) too.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   msrv:
     name: Minimum Rust version (rust-version in Cargo.toml)
@@ -44,6 +47,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      # `#[trunkdb::document]` and its compile-fail tests (SPEC §114).
+      - run: cargo test --features derive
 
   bench:
     name: Benchmark (builds, lints, runs small)

@@ -196,7 +196,9 @@ from it through serde, and delegates to `Collection<Document>`: one
 code path, not two [§13](spec/13-the-serde-bridge.md). Each stored object gets its id as an `_id`
 field [§18](spec/18-merging-id-into-the-untyped-path.md), and a struct takes it with `#[serde(rename = "_id")] id:
 Option<DocId>`: filled in on every read, used on insert if `Some`, made
-if `None` [§59](spec/59-a-struct-carries-its-own-id.md). The id is stored once, in the cell: an object is
+if `None` [§59](spec/59-a-struct-carries-its-own-id.md); with the `derive` feature, `#[id]` under
+`#[trunkdb::document]` writes that rename, and refuses another type at
+compile time [§114](spec/114-the-document-attribute.md). The id is stored once, in the cell: an object is
 encoded without its `_id`, and every read puts the cell's id there,
 first, so there's no second copy that could say something else. `DocId`
 serializes as a marked newtype the bridge stores as `Document::Id`, and
@@ -711,7 +713,10 @@ src/
 └── bin/trunkdb.rs     the `trunkdb` command (info, check, compact,
                          export, import, find)
 tests/                 the command line, and a time-series-shaped
-                         workload through the public API
+                         workload through the public API; ui/: what
+                         #[trunkdb::document] refuses, compiled
+trunkdb-derive/        #[trunkdb::document], the `derive` feature's
+                         macro (its own crate)
 bench/                 against SQLite, redb and sled (its own crate)
 fuzz/                  fuzz targets: damaged files, WALs, exports and
                          filter texts, and queries against a model (its own crate,
