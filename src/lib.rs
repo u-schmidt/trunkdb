@@ -1,6 +1,54 @@
 //! trunkdb — an embedded, single-file, schema-less document database.
-//! A from-scratch, learning-first take on the LiteDB idea in Rust: no
-//! tables, no joins, no schema migrations.
+//!
+//! Open a file, get collections of documents: no server, no tables, no
+//! joins, no schema migrations. Any `T: Serialize + Deserialize` is a
+//! document, and [`Document`] is the untyped one.
+//!
+//! ```
+//! use serde::{Deserialize, Serialize};
+//! use trunkdb::{Database, DocId, query::Filter};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Task {
+//!     #[serde(rename = "_id")]
+//!     id: Option<DocId>, // None on insert: one is made; filled in on every read
+//!     title: String,
+//!     priority: i64,
+//! }
+//!
+//! # fn main() -> trunkdb::Result<()> {
+//! # let dir = tempfile::tempdir().unwrap();
+//! # let path = dir.path().join("app.trunkdb");
+//! let db = Database::open(&path)?;
+//! let tasks = db.collection::<Task>("tasks");
+//! tasks.ensure_index("priority")?;
+//!
+//! tasks.insert(Task { id: None, title: "write the docs".into(), priority: 2 })?;
+//! tasks.insert(Task { id: None, title: "ship it".into(), priority: 1 })?;
+//!
+//! let urgent = tasks.find(Filter::new().lte("priority", 1))?;
+//! assert_eq!(urgent[0].title, "ship it");
+//!
+//! // The same filter, as text.
+//! let urgent = tasks.find("priority <= 1 order by title".parse().unwrap())?;
+//! assert_eq!(urgent.len(), 1);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Where to start:
+//! - [`Database`]: open a file, get a [`Collection`], start a [`Batch`]
+//!   (atomic across collections) or a [`Snapshot`] (reads of one moment).
+//! - [`Collection`]: insert, get, update, delete, `find`, `count`,
+//!   `aggregate`, indexes.
+//! - [`query`]: [`Filter`](query::Filter), [`Condition`](query::Condition),
+//!   [`Update`](query::Update) and [`Aggregate`](query::Aggregate), built
+//!   with methods or parsed from text.
+//!
+//! Every commit goes through a write-ahead log, so a crash leaves a batch
+//! either entirely there or not at all. Readers run in parallel beside one
+//! writer, and neither waits for the other. How it all works is in the
+//! repository's `DESIGN.md`, and why in its `spec/`.
 
 mod aggregate;
 mod batch;

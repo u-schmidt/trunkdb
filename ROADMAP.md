@@ -7,7 +7,7 @@ with a migration path — export/import (§30) is that path.
 Section numbers (§) refer to the spec, one file per section in
 [spec/](spec/README.md), which records why each step was taken. New
 work gets a new spec section with the next number; this file only
-lists it.
+lists it. [CHANGELOG.md](CHANGELOG.md) has each step on its own.
 
 ## Done
 The first roadmap (2026-09-23) was ordered by priority: correctness and

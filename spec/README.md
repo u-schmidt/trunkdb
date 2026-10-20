@@ -11,6 +11,10 @@ them as `SPEC §N` or `§N`, and a new section gets the next number.
 How the parts fit together today is in [DESIGN.md](../DESIGN.md); what
 is done and what is open is in [ROADMAP.md](../ROADMAP.md).
 
+The first sections (§1–§6) are where it started: why it exists, and a
+deliberately small v0. They stay as they were written; later sections
+say what changed, and DESIGN.md says what is true now.
+
 1. [Motivation](01-motivation.md)
 2. [Feasibility read](02-feasibility-read.md)
 3. [Architecture: layers and what's real vs. fakeable](03-architecture-layers-and-whats-real-vs-fakeable.md)

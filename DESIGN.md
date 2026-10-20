@@ -4,7 +4,8 @@ How trunkdb works today, one subsystem at a time. This file describes
 the current state; the reasons, the rejected alternatives and the
 measurements are in [the spec](spec/README.md), one numbered section per
 step, linked from each part below. What's done and what's open is in
-[ROADMAP.md](ROADMAP.md).
+[ROADMAP.md](ROADMAP.md), and every step by release in
+[CHANGELOG.md](CHANGELOG.md).
 
 When this file and a spec section disagree, the newer spec section
 describes the code. This file should be updated with every change that
@@ -17,15 +18,23 @@ get collections of documents, no tables, joins or schema migrations. It
 takes the idea of [LiteDB](https://www.litedb.org/) outside .NET, as an
 independent design rather than a port [§1](spec/01-motivation.md).
 
-It's a learning project first and a personal tool second [§2](spec/02-feasibility-read.md). Two
-real workloads shaped what it needs: a time-series workload of many
-small documents queried by time, and a large-document desktop workload;
-a small sync app replaced MongoDB with it [§5](spec/05-reference-workloads.md).
+It began as a learning project first and a personal tool second [§2](spec/02-feasibility-read.md),
+with a deliberately small v0 [§6](spec/06-v0-feature-set.md). Every layer has since been
+replaced by a real implementation, and the engine has grown well past
+that v0: secondary indexes of every common kind, snapshot reads beside
+a writer, projection and aggregates, a text query language, explain
+with execution statistics, and reads level with SQLite, redb and sled
+in its benchmark. Learning is still how it grows: each step is a spec
+section with its reasons and its measurements.
 
-Deliberately not there: a cost-based planner, joins, several writers
-at once, several processes on one file, encryption and schema
-validation [§6](spec/06-v0-feature-set.md). Aggregates were on that list; they came
-back in [§107](spec/107-aggregates.md).
+Three real workloads shaped what it needs: a time-series workload of
+many small documents queried by time, a large-document desktop
+workload, and a small sync app that replaced MongoDB with it [§5](spec/05-reference-workloads.md).
+
+Deliberately not there: a cost-based planner (the planner follows
+fixed rules, and `explain` says which), joins, several writers at once,
+several processes on one file, encryption and schema validation [§6](spec/06-v0-feature-set.md).
+Aggregates were on that list; they came back in [§107](spec/107-aggregates.md).
 
 ## 2. Layers
 
@@ -533,8 +542,58 @@ more than four.
 
 `bench/` runs one workload against trunkdb, SQLite, redb and sled, with
 the same documents and indexes and a durable commit everywhere, and
-checks that all four give the same answers [§48](spec/48-benchmarks-against-sqlite-redb-and-sled.md). The README has the
-current table. Each gap had a measured cause, fixed one at a time:
+checks that all four give the same answers [§48](spec/48-benchmarks-against-sqlite-redb-and-sled.md).
+
+Reads are level with SQLite, redb and sled or ahead of them; writes and
+compaction are still behind. On an M1 Pro with 100,000 documents, the median of
+three runs (0.20.0):
+
+| | trunkdb | SQLite | redb | sled |
+|---|---:|---:|---:|---:|
+| insert, 1000 per commit | 22k/s | 42k/s | 37k/s | 28k/s |
+| one commit | 4.7 ms | 4.9 ms | 5.0 ms | 10.2 ms |
+| get by id | 2.5 µs | 17 µs | 2.1 µs | 3.1 µs |
+| 1000 documents by index | 0.98 ms | 2.1 ms | 1.2 ms | 2.1 ms |
+| count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.28 ms |
+| count of a range of 1000 | 0.01 ms | 0.02 ms | 0.03 ms | 0.37 ms |
+| count of all 100,000 | 0.09 ms | 0.02 ms | 0.00 ms | 25 ms |
+| oldest 20 of a status | 19 µs | 25 µs | 16 µs | 22 µs |
+| page 50 of 20 of a status | 27 µs | 58 µs | 47 µs | 277 µs |
+| first 50 by id | 33 µs | 40 µs | 25 µs | 33 µs |
+| 50 by id after skipping 5000 | 40 µs | 133 µs | 160 µs | 1.1 ms |
+| a tenant's first 20 by id | 23 µs | 1.3 ms | 21 µs | 23 µs |
+| scan, 100,000 for a fifth | 64 ms | 49 ms | 52 ms | 70 ms |
+| update, 1000 per commit | 9.1k/s | 12k/s | 17k/s | 21k/s |
+| delete, 1000 per commit | 15k/s | 17k/s | 21k/s | 33k/s |
+| compact | 1.1 s | 0.19 s | 0.44 s | — |
+| file size after compact | 31 MB | 22 MB | 30 MB | — |
+
+Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
+- **Through an index, reads are fast:** a count reads no document, and
+  counts a leaf at a time where its ends decide it (§100, §101, §104).
+  A page by index reads only the page, and a deep one skips leaves
+  whole. A sort by `_id` walks the primary index, or the range an `Eq`
+  fixes (§96, §103).
+- **Still behind:**
+  - the count of all documents, which trunkdb counts leaf by leaf where
+    the others keep a total;
+  - a scan, 1.3× SQLite: each document's filtered fields are decoded
+    into a small object to be checked;
+  - "first 50 by id", 1.3× redb.
+- **Writes are about half as fast:** nearly every batch of 1,000 crosses
+  the default checkpoint threshold once the indexes are large (§53).
+  Compaction inserts its entries one by one (§48.4), and its file is
+  1.4× SQLite's.
+
+```
+cd bench && cargo run --release
+cd bench && cargo run --release --bin reader_wait   # readers while a writer commits
+cd bench && cargo run --release --bin long_read     # one long snapshot beside single writes
+cd bench && cargo run --release --bin select        # reads with a selection (§106)
+cd bench && cargo run --release --bin aggregate     # aggregates by group (§107)
+```
+
+Each gap had a measured cause, fixed one at a time:
 
 | What | Before | Fix |
 |---|---|---|
@@ -582,3 +641,79 @@ changed page is copied once, not twice: `write_page` takes the `Page` [§67](spe
   benchmark run, and the fuzz crate: compiling, building the targets'
   database, and the `queries` target on 400 random programs from a new
   seed each run (guided fuzzing runs by hand).
+
+## 14. Where the code is
+
+```
+DESIGN.md              how it works today, one subsystem at a time
+spec/                  why: one numbered section per step (SPEC §N)
+ROADMAP.md             what's done, what's open
+GUIDE.md               how to use it, by example
+CHANGELOG.md           every step so far, by release
+src/
+├── lib.rs             public re-exports, the crate's Error type
+├── database.rs        Database: open, recovery, the commit protocol,
+│                        checkpoints, OpenOptions
+├── collection.rs      Collection<T>: CRUD, find, indexes, update_many,
+│                        update_fields
+├── batch.rs           Batch: typed atomic multi-op writes
+├── cursor.rs          Cursor: streaming find, of one moment
+├── snapshot.rs        Snapshot and View<T>: the database at one
+│                        moment, to keep reading
+├── query.rs           Filter, Condition, Sort; the planner; index
+│                        entries deciding a filter
+├── query_text.rs      a filter as text, read and printed
+├── path.rs            field paths, parsed once per query
+├── select.rs          projection: the fields a read hands out
+├── aggregate.rs       Aggregate: count, sum, min, max, avg by group
+├── explain.rs         explain and explain_run: how a query ran
+├── stats.rs           Database::stats: where a file's space goes
+├── update.rs          Update: operators on dotted paths
+├── document.rs        Document and DocId: the schema-less value type
+├── datetime.rs        DateTime, what Document::DateTime holds
+├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document
+├── serde_stored.rs    a stored document straight into T, for typed reads
+├── json.rs            tagged JSON <-> Document, lossless
+├── id.rs              IdGenerator + UuidV7Generator
+├── catalog.rs         collections and their indexes (page 1)
+├── data.rs            documents on data pages, overflow chains
+├── free_space.rs      FreeSpace: data pages with room, by free bytes
+├── storage/
+│   ├── mod.rs         PageStore, page types
+│   ├── file.rs        FileStore: the writer's staged pages, the
+│   │                    header, the file lock
+│   ├── pages.rs       Pages: the file, checksums, the committed
+│   │                    pages, shared by readers and the writer
+│   ├── page.rs        Page: a page's bytes, shared, copied on change
+│   ├── snapshot.rs    SnapshotStore: the pages as of one commit
+│   ├── slotted.rs     SlottedPage: slot directory + cells
+│   ├── cache.rs       PageCache: CLOCK eviction
+│   └── scratch.rs     ScratchStore: a compaction's image, in a file
+├── index/
+│   ├── mod.rs         Index trait
+│   ├── btree.rs       BTreeIndex: every index, primary and secondary
+│   ├── key.rs         index key encoding, KeyRange
+│   ├── leaf.rs        leaf entry encoding
+│   ├── branch.rs      branch entry encoding
+│   └── in_memory.rs   InMemoryIndex: a fake, for tests
+├── durability/
+│   ├── mod.rs         Durability trait
+│   └── wal.rs         WalDurability: the page-image write-ahead log
+├── txn/
+│   ├── mod.rs         TransactionManager trait, WriteOp
+│   └── global_lock.rs GlobalLockTxnManager: one batch at a time
+├── decode.rs          reading bytes from disk: running out is an error
+├── crc32.rs           CRC-32C, in hardware where the CPU has it
+├── export.rs          Database::export/import (JSON Lines)
+├── check.rs           Database::check: consistency check
+├── compact.rs         Database::compact: rebuild, file shrinks
+├── fuzzing.rs         hooks for fuzz/, behind a feature, hidden
+└── bin/trunkdb.rs     the `trunkdb` command (info, check, compact,
+                         export, import, find)
+tests/                 the command line, and a time-series-shaped
+                         workload through the public API
+bench/                 against SQLite, redb and sled (its own crate)
+fuzz/                  fuzz targets: damaged files, WALs, exports and
+                         filter texts, and queries against a model (its own crate,
+                         nightly; a smoke run on stable)
+```

@@ -3,9 +3,12 @@ name = "trunkdb"
 version = "0.22.0"
 edition = "2024"
 rust-version = "1.89"
-description = "An embedded, single-file, schema-less document database — a learning-first, from-scratch reimplementation of the LiteDB idea in Rust."
+description = "An embedded, single-file, schema-less document database: crash-safe batches, secondary indexes, snapshot reads and a text query language, built from the page layer up."
 license = "MIT"
 repository = "https://github.com/u-schmidt/trunkdb"
+readme = "README.md"
+keywords = ["database", "embedded", "document", "nosql", "storage"]
+categories = ["database-implementations", "database"]
 # The benchmark and the fuzz targets are crates of their own, with their
 # own dependencies (SPEC §48, §55).
 exclude = ["bench/", "fuzz/"]
