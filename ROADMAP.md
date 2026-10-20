@@ -94,6 +94,23 @@ limit is described.
 
 **Queries**
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
+- Where the planner's rules (§28.4, §36.3) are blind to the data: an
+  `Eq` on a skewed value (`status == "done"`, 99% of documents) beats
+  a range that holds a few (`created > yesterday`); and a walk in sort
+  order with a `limit` (§34.2) beside a range filter reads the whole
+  index when matches are rare, where reading the range and sorting in
+  memory costs the range, always. Both cost at most about a scan: waste,
+  not disaster. If it shows: count the candidate ranges before choosing,
+  with `BTreeIndex::count` (§101.4), each up to a cap (about 1,000
+  entries), or all together a leaf at a time until the smallest ends:
+  planning then costs at most a small multiple of the smallest range,
+  which the query reads anyway. Counted only where the rules see a tie,
+  or an `Eq` against a range, so other plans stay as they are. Still no
+  statistics kept, nothing to go stale (MySQL's index dives do the
+  same); `explain` would show the counts. Rules are enough while every
+  plan is bounded by one pass over one collection: with joins, or
+  lookups into another collection, that bound is gone and the choice
+  of a rule-based planner wants a second look.
 - A sort by `_id` after an OR of `Eq`s, or after a compound index fixed
   only in part: a merge of id-ordered ranges, where §103 walks one
   (§103.7).
