@@ -44,38 +44,91 @@ All of it is done:
 
 ## Before 1.0
 No date: 1.0 comes after months of real use in more than one
-application, not after a list. This is what it would have to settle, so
-nothing lands in the meantime that makes it harder.
+application, not after a list. What the list settles is everything that
+can't change after 1.0 without breaking a file, a program or a query,
+so nothing lands in the meantime that makes it harder.
 
 **What 1.0 promises**
 - Every 1.x build opens every file a 1.x build wrote; a file using
   something an older 1.x build lacks is refused by it, clearly, as now
   (§21.2, §33.4). Files from before 1.0 move up by export and import
   (§30).
-- No breaking API change within 1.x.
+- No breaking API change within 1.x: what compiles against 1.0
+  compiles against every 1.x, and means the same.
+- **The text language counts as API** (§111): a filter that reads in
+  one 1.x reads in every later one, and finds the same. So a new
+  operator comes in 1.x only where a field can't be (`in`, `has`,
+  `contains` are such), and no word becomes reserved: the eleven of
+  §111.3 are all there will be in 1.x, or a field of that name would
+  stop reading bare.
+- Public dependencies are named: a type from another crate in
+  trunkdb's API ties trunkdb's major version to that crate's. `serde`
+  is one, as for nearly every crate; any other is a decision, not an
+  accident.
 
-**Format questions.** Index changes are cheap, since indexes are derived
-data and can be rebuilt from the documents at open. Changes to
-documents, data pages and the header are the expensive ones.
-- Done in §75: a free-space map, in memory only, no format change. A
-  persisted form can come in 1.x if real use asks for it: a file using
-  it is refused by an older 1.x build, as 1.0 promises, so it needn't
-  be decided before.
-- Done in §69: a date-time type, `Document::DateTime`, file format 11.
-- Done in §95: every document an object, file format 12.
-- The WAL's format matters less: it's empty after a clean close, so a
-  change needs only a checkpoint before upgrading.
-- Settled in §77: snapshot reads live in memory only, and freed pages
-  need no tag, so they don't touch the file format.
+**Settled already.** The free-space map lives in memory, so a
+persisted one can come in 1.x (§75); a date-time type, file format 11
+(§69); every document an object, format 12 (§95); snapshot reads in
+memory only, with nothing in the file (§77); `find_with_ids` removed and
+`cursor` handing out `T` (§74); the internals private, and `Error`,
+`Document` and the reports `#[non_exhaustive]` (§60). The WAL's format
+matters less: it's empty after a clean close, so a change needs only a
+checkpoint before upgrading.
 
-**API questions: cheap now, breaking after 1.0**
-- Done in §74: `find_with_ids` and `find_one_with_id` removed, and
-  `cursor` handing out `T`, like `find`; a type without an id field
-  wrapped.
-- Done in §95: documents that aren't objects refused, so every
-  document has its `_id` and `Collection<T>` takes a struct or a map.
-- Done in §60: the internals private, `Error`, `Document` and the
-  reports `#[non_exhaustive]`, `IndexOptions` with builder methods.
+**Must: breaking, or impossible, after 1.0**
+- **`indexmap` out of the API.** `Document::Object` holds an
+  `IndexMap<String, Document>`, kept for its order: fields come back
+  as written, `_id` first. But the type is `indexmap` 2's, so an
+  `indexmap` 3 in trunkdb would break every program that builds or
+  reads an object — two major versions are two types to the compiler,
+  "expected `IndexMap`, found `IndexMap`". §60.4 saw it and left it,
+  rightly for 0.x. Either trunkdb's own map type, `IndexMap` inside it
+  and out of sight (`get`, `insert`, `remove`, `iter`, `len`, built
+  from pairs, …), or `indexmap` named a public dependency as `serde`
+  is; the own type is the one that leaves trunkdb free. The reason
+  `serde_json::Value` stayed out (§71.4).
+- **Variants with public fields `#[non_exhaustive]`.** `Condition`
+  is, but its variants aren't: anyone can build `Condition::Compare {
+  field, op, value }` or match all its fields, so a field added later,
+  a path parsed ahead say, breaks them. Marked, a match still works
+  with `..`, and building goes through the methods, which exist for
+  all of them. The same for `QueryPlan`'s variants; `Error`'s with
+  fields are marked already (§60).
+- **One pass over the whole public API**, listed (`cargo public-api`):
+  everything public is a promise at 1.0, so what nobody needs is made
+  private before. The two above are what a first look found.
+- **On crates.io as 0.x first**, with its docs on docs.rs: 1.0 asks
+  for use in more than one application, and that starts with `cargo add
+  trunkdb`. Nothing is published yet.
+
+**Should: cheap, and the promises are checked instead of kept by care**
+- **Old files as fixtures:** a small database written by each release
+  from here on, kept in the repository, and a test that opens every
+  one and reads it as written. Older formats are tested now by
+  rewriting the version in the header, which shows that a build
+  accepts them, not that it reads what an older build really wrote.
+- **`cargo-semver-checks` in CI**, so a breaking change shows in the
+  commit that makes it, not in someone's build.
+- **An index rebuilt at open** where its key format changed, as a
+  mechanism with a test, not a sentence: then an index format can move
+  in 1.x without an export and import, the `Int`/`Float` bit and the
+  missing mark that `sum` from index entries wants among the first
+  (§106.8). Documents and data pages stay the expensive ones.
+- **Every public item documented** (the `missing_docs` lint), and the
+  MSRV policy written down: how far behind stable `rust-version` may
+  lag, and that raising it isn't breaking.
+- **Unique indexes in the `queries` target** (§105.7): only testing,
+  but a bug found before real users is cheaper than one after.
+
+**After 1.0: additive, so any 1.x**
+- New types — a date without a time, a time without a date, a decimal:
+  `Document` is `#[non_exhaustive]`, and a file holding one is refused
+  by an older 1.x build, which the promise allows.
+- Everything under **Open** below: new operators, aggregate columns
+  with conditions, parameters (`:` reads nowhere now), `serde_json`
+  behind a feature, repairing what `check` finds, the planner,
+  performance, the PyO3 bindings. None changes a file a 1.0 build
+  writes or what a 1.0 program or query means.
 
 **What only use can tell:** whether the API holds up in two or three
 applications, and whether the format has anything that hurts over
@@ -198,8 +251,6 @@ limit is described.
 - `check` finding overlapping cells on a page (§54.2).
 - Longer fuzzing runs, with AddressSanitizer too, and short ones in CI
   on nightly (§55.6).
-- Unique indexes in the `queries` target, the model asking the
-  database's own filters whether two values collide (§105.7).
 - Parameters in a filter's text, named, `status = :status`, values
   passed apart (§111.8), with the PyO3 bindings at the latest;
   aggregates and updates as text (§111.11). Aggregates in SQL's
