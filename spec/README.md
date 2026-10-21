@@ -133,3 +133,4 @@ say what changed, and DESIGN.md says what is true now.
 116. [A map of its own (`map.rs`)](116-a-map-of-its-own.md)
 117. [Variants that can grow (`query.rs`)](117-variants-that-can-grow.md)
 118. [The public API, gone through (`database.rs`, `export.rs`, `catalog.rs`, `explain.rs`, `stats.rs`, `check.rs`, `compact.rs`, `snapshot.rs`, `query.rs`, `document.rs`, `serde_bridge.rs`, `fuzzing.rs`)](118-the-public-api-gone-through.md)
+119. [Unique indexes in the `queries` target (`fuzz/src/queries.rs`, `collection.rs`)](119-unique-indexes-in-the-queries-target.md)

@@ -479,7 +479,15 @@ limit, batches and a write-ahead log. Since then:
     `Document` no longer a serde `Deserializer`, `into_value` the one
     way to a `T`; the `fuzzing` feature declared outside semver.
 
-    Items 83–88: not released yet. **Breaking:** `IndexMap<String,
+89. **Unique indexes in the `queries` fuzz target** (§119), checked
+    with the database's own filters. **Fixed**, found by it: an update
+    that changed a long string only past where its key is cut (about
+    1000 bytes in one field, less in a compound index) wasn't checked,
+    and could store a duplicate in a unique index. `check` reports such
+    a duplicate in an older file; changing or deleting one of the two
+    documents fixes it.
+
+    Items 83–89: not released yet. **Breaking:** `IndexMap<String,
     Document>` becomes `trunkdb::Map`, `IndexMap::new()` `Map::new()`,
     `shift_remove` `remove`; `IndexMap`-only methods (`entry`, `first`,
     `get_index`, …) are done with `get`, `get_mut`, `insert` and

@@ -643,7 +643,9 @@ changed page is copied once, not twice: `write_page` takes the `Page` [§67](spe
   and reads on a valid database, every read through every way of reading
   held against the filter applied in memory to a model of what is
   stored. It catches 33 of the 36 hand-made mutations of §100–§104 that
-  change answers [§105](spec/105-a-differential-fuzz-target-for-queries.md).
+  change answers [§105](spec/105-a-differential-fuzz-target-for-queries.md). Its writes meet unique indexes too, each
+  refusal held against the database's own `Eq` over the model; that
+  found an update that could store a duplicate [§119](spec/119-unique-indexes-in-the-queries-target.md).
 - **Mutation checks:** each section breaks its own code on purpose in a
   handful of ways and lists them; every one has to fail a test.
 - **CI** runs the tests on Linux, macOS and Windows, clippy with

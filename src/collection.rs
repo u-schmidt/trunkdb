@@ -2597,8 +2597,11 @@ pub(crate) fn same_values(a: &[&Document], b: &[&Document]) -> bool {
 /// `new` one — each `(document, location)`, `None` for "not there":
 /// insert is `(None, new)`, delete `(old, None)`. Only keys that went
 /// away are removed and only new ones inserted — all of them, if the
-/// document moved. A unique index checks each new key's values before
-/// anything goes in, not one that stayed (only the document moved).
+/// document moved. A unique index checks each of the new document's
+/// values before anything goes in, but those the old one held already,
+/// equal as `Eq` sees them: they can't be a new duplicate. Values, not
+/// keys: a key that stays may hold another value, past where a long
+/// string is cut (SPEC §119.1).
 fn update_secondary_indexes(
     collection: &str,
     indexes: &[IndexMeta],
@@ -2619,9 +2622,11 @@ fn update_secondary_indexes(
         }
         let Some((doc, loc)) = new else { continue };
         if index.unique {
+            let held = old.map_or(Vec::new(), |(doc, _)| unique_tuples(doc, index));
             for (value_part, values) in unique_tuples(doc, index) {
-                let key = [value_part.as_slice(), &id.0].concat();
-                if !before.contains(&key) {
+                let kept = (held.iter())
+                    .any(|(part, was)| *part == value_part && same_values(was, &values));
+                if !kept {
                     check_unique(store, collection, index, id, &value_part, &values)?;
                 }
             }
@@ -7966,6 +7971,109 @@ mod tests {
 
         let none = Filter::new().is_in("status", [] as [&str; 0]);
         assert_eq!(runs.count(none).unwrap(), 0);
+    }
+
+    /// An update to a value past where its key is cut keeps its key,
+    /// but not its value, and is checked (SPEC §119.1): in a one-field
+    /// unique index, past about 1000 bytes; in a compound one, sooner. A
+    /// value kept as it was isn't a new duplicate, `5` for `5.0` neither.
+    #[test]
+    fn an_update_past_the_key_cut_is_checked_for_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index_with("a", crate::IndexOptions::new().unique())
+            .unwrap();
+        docs.ensure_index_with(["b", "c"], crate::IndexOptions::new().unique())
+            .unwrap();
+        let doc = |a: &str, b: &str, c: &str| -> Document {
+            format!(r#"{{"a": {a}, "b": "{b}", "c": "{c}"}}"#)
+                .parse()
+                .unwrap()
+        };
+        let (long, mid) = ("y".repeat(1100), "y".repeat(990));
+        let a = |end: u8| format!(r#""{long}{end}""#);
+        docs.insert(doc(&a(0), &format!("{mid}0"), "x")).unwrap();
+        let id = docs.insert(doc(&a(1), &format!("{mid}1"), "x")).unwrap();
+
+        // `a` past its cut, into the first document's.
+        let result = docs.update(&id, doc(&a(0), &format!("{mid}1"), "x"));
+        assert!(
+            matches!(&result, Err(crate::Error::DuplicateValue { field, .. }) if field == "a"),
+            "{result:?}"
+        );
+        // `b` past its cut in a key of two fields, into the first one's.
+        let result = docs.update(&id, doc(&a(1), &format!("{mid}0"), "x"));
+        assert!(
+            matches!(&result, Err(crate::Error::DuplicateValue { field, .. }) if field == "(b, c)"),
+            "{result:?}"
+        );
+        assert!(db.check().unwrap().is_ok());
+
+        // What it holds already passes, as does a number as its equal;
+        // and a value past the cut that no other document holds, under
+        // the key the document's own entry has — which the check passes
+        // over, as it now holds the new value itself (SPEC §119.6).
+        assert!(
+            docs.update(&id, doc(&a(1), &format!("{mid}1"), "x"))
+                .unwrap()
+        );
+        assert!(
+            docs.update(&id, doc(&a(2), &format!("{mid}2"), "x"))
+                .unwrap()
+        );
+        let n = docs.insert(doc("5", "n", "x")).unwrap();
+        assert!(docs.update(&n, doc("5.0", "n", "x")).unwrap());
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// Found by the `queries` target, not by the tests before it (SPEC
+    /// §119.6): a compound index's values compared in every field, also
+    /// where the key can't tell them apart. And a stored id inserted
+    /// again is `DuplicateId`, alone or in a batch, though its values are
+    /// those of the document stored.
+    #[test]
+    fn a_unique_check_compares_every_field_of_a_compound_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index_with(["b", "c"], crate::IndexOptions::new().unique())
+            .unwrap();
+        let mid = "y".repeat(990);
+        let doc =
+            |c: u8| -> Document { format!(r#"{{"b": "x", "c": "{mid}{c}"}}"#).parse().unwrap() };
+        // The same `b`, and a `c` that differs past its cut: one key, two
+        // values, no duplicate.
+        let id = docs.insert(doc(0)).unwrap();
+        docs.insert(doc(1)).unwrap();
+        assert!(db.check().unwrap().is_ok());
+
+        let mut again = doc(0);
+        if let Document::Object(map) = &mut again {
+            map.insert("_id".into(), Document::Id(id));
+        }
+        let result = docs.insert(again.clone());
+        assert!(
+            matches!(result, Err(crate::Error::DuplicateId { .. })),
+            "{result:?}"
+        );
+        // In a batch too, of a stored id, and of one an op before stored.
+        let mut batch = db.batch();
+        batch.insert(&docs, again.clone()).unwrap();
+        let result = batch.commit();
+        assert!(
+            matches!(result, Err(crate::Error::DuplicateId { .. })),
+            "{result:?}"
+        );
+        docs.delete(&id).unwrap();
+        let mut batch = db.batch();
+        batch.insert(&docs, again.clone()).unwrap();
+        batch.insert(&docs, again).unwrap();
+        let result = batch.commit();
+        assert!(
+            matches!(result, Err(crate::Error::DuplicateId { .. })),
+            "{result:?}"
+        );
     }
 
     // --- delete_many (SPEC §37) ---

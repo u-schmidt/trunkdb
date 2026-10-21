@@ -3,7 +3,9 @@
 //! same filter applied in memory to a model of what is stored.
 //!
 //! Unlike the other targets, an `Err` isn't a correct answer here: a
-//! read never fails, and a write fails only where the model says it must.
+//! read never fails, and a write fails only where the model says it must
+//! — a duplicate id, a missing one, or a duplicate in a unique index,
+//! found with the database's own filters (SPEC §119).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +19,8 @@ const MAX_DOCS: usize = 400;
 const MAX_SNAPSHOTS: usize = 2;
 const COLLECTION: &str = "docs";
 
-/// The indexes a program can make, each plain or sparse (SPEC §105.2).
+/// The indexes a program can make, each plain or sparse, unique or not
+/// (SPEC §105.2, §119).
 const INDEXES: [&[&str]; 9] = [
     &["a"],
     &["b"],
@@ -127,6 +130,11 @@ pub struct Ran {
     /// Matches `explain_aggregate` counted as aggregated from their
     /// index entries (SPEC §107.5).
     pub aggregated: u64,
+    /// Unique indexes made (SPEC §119).
+    pub unique_indexes: u64,
+    /// Writes refused as duplicates in a unique index, where the model
+    /// said they must be, and unique indexes refused over duplicates.
+    pub refused_duplicates: u64,
 }
 
 pub const STEP_NAMES: [&str; 15] = [
@@ -146,6 +154,25 @@ pub const STEP_NAMES: [&str; 15] = [
     "read",
     "aggregate",
 ];
+
+/// Why the model says a batch fails: its first op that does.
+#[derive(Debug)]
+enum Refusal {
+    DuplicateId,
+    NotFound,
+    /// `id` written as a duplicate of the documents in `colliding`
+    /// (SPEC §119).
+    Duplicate {
+        id: DocId,
+        colliding: Vec<DocId>,
+    },
+}
+
+impl Refusal {
+    fn duplicate(id: DocId, colliding: Vec<DocId>) -> Option<Self> {
+        (!colliding.is_empty()).then_some(Refusal::Duplicate { id, colliding })
+    }
+}
 
 /// A document read through a typed collection: only its id (SPEC §99).
 #[derive(Serialize, Deserialize)]
@@ -280,8 +307,8 @@ struct Run<'p> {
     model: BTreeMap<DocId, Document>,
     /// Kept snapshots, each with the model as it was.
     snapshots: Vec<(trunkdb::Snapshot, BTreeMap<DocId, Document>)>,
-    /// The menu's indexes made, and whether sparse.
-    indexes: BTreeMap<usize, bool>,
+    /// The menu's indexes made, with their options.
+    indexes: BTreeMap<usize, IndexOptions>,
     pool: Vec<Document>,
     next_id: u16,
     /// In eighths, how often a value is a long string: the program
@@ -361,9 +388,12 @@ impl Run<'_> {
         for _ in 0..100 + self.program.below(201) {
             let id = self.new_id();
             let doc = Self::with_id(self.document(), id);
-            if self.model.insert(id, doc.clone()).is_none() {
-                batch.insert(&docs, doc).unwrap();
+            // One a unique index made above would refuse is left out.
+            if self.model.contains_key(&id) || !self.collisions(&self.model, id, &doc).is_empty() {
+                continue;
             }
+            self.model.insert(id, doc.clone());
+            batch.insert(&docs, doc).unwrap();
         }
         batch.commit().unwrap();
         self.stored_is_model();
@@ -837,19 +867,57 @@ impl Run<'_> {
         if self.indexes.contains_key(&at) {
             return;
         }
-        let sparse = self.program.one_in(3);
-        let options = match sparse {
-            true => IndexOptions::new().sparse(),
-            false => IndexOptions::new(),
-        };
-        let made = self.docs().ensure_index_with(INDEXES[at], options);
+        let mut options = IndexOptions::new();
+        if self.program.one_in(3) {
+            options = options.sparse();
+        }
+        if self.program.one_in(3) {
+            options = options.unique();
+        }
+        let made = self.docs().ensure_index_with(INDEXES[at], options.clone());
+        // Over documents that hold a duplicate, a unique index is refused
+        // and nothing is made (SPEC §33.2).
+        let duplicates = options.is_unique()
+            && self
+                .model
+                .iter()
+                .any(|(id, doc)| !Self::collisions_in(at, &self.model, *id, doc).is_empty());
+        if duplicates {
+            let named = match &made {
+                Err(Error::DuplicateValue { id, existing, .. }) => Some((*id, *existing)),
+                _ => None,
+            };
+            assert!(
+                named.is_some_and(|(id, existing)| self.model.get(&id).is_some_and(|doc| {
+                    Self::collisions_in(at, &self.model, id, doc).contains(&existing)
+                })),
+                "{}: unique {:?} over duplicates: {made:?}",
+                self.at(),
+                INDEXES[at]
+            );
+            let fields = |info: &trunkdb::IndexInfo| {
+                info.fields()
+                    .iter()
+                    .map(String::as_str)
+                    .eq(INDEXES[at].iter().copied())
+            };
+            assert!(
+                !self.docs().indexes().unwrap().iter().any(fields),
+                "{}: a refused unique {:?} was made",
+                self.at(),
+                INDEXES[at]
+            );
+            self.ran.refused_duplicates += 1;
+            return;
+        }
         assert!(
             made.unwrap(),
             "{}: ensure_index {:?}",
             self.at(),
             INDEXES[at]
         );
-        self.indexes.insert(at, sparse);
+        self.ran.unique_indexes += u64::from(options.is_unique());
+        self.indexes.insert(at, options);
     }
 
     fn drop_index(&mut self) {
@@ -877,67 +945,103 @@ impl Run<'_> {
             return;
         }
         let result = self.docs().insert(doc.clone());
-        match self.model.contains_key(&id) {
-            true => assert!(
+        if self.model.contains_key(&id) {
+            assert!(
                 matches!(result, Err(Error::DuplicateId { .. })),
                 "{}: insert of a stored id: {result:?}",
                 self.at()
-            ),
-            false => {
-                assert_eq!(result.unwrap(), id, "{}", self.at());
-                self.model.insert(id, doc);
-            }
+            );
+            return;
         }
+        let colliding = self.collisions(&self.model, id, &doc);
+        if self.refused(&result, id, &doc, &colliding, "insert") {
+            return;
+        }
+        assert_eq!(result.unwrap(), id, "{}", self.at());
+        self.model.insert(id, doc);
     }
 
     fn batch(&mut self) {
         let docs = self.docs();
         let mut batch = self.db().batch();
         let mut after = self.model.clone();
-        let mut fails = false;
+        // The first op that fails, which fails the batch (SPEC §17.3):
+        // each is checked against the state the ops before it left
+        // (§33.2), so the model goes op by op as well.
+        let mut fails: Option<Refusal> = None;
         for _ in 0..1 + self.program.below(32) {
             let id = self.some_id();
             // Half inserts, so that collections grow as much as they
             // shrink, with deletes and the rest of the steps.
-            match self.program.below(4) {
+            let refusal = match self.program.below(4) {
                 0 | 1 if after.len() < MAX_DOCS => {
                     let doc = Self::with_id(self.document(), id);
-                    fails |= after.insert(id, doc.clone()).is_some();
+                    let refusal = match after.contains_key(&id) {
+                        true => Some(Refusal::DuplicateId),
+                        false => Refusal::duplicate(id, self.collisions(&after, id, &doc)),
+                    };
+                    after.insert(id, doc.clone());
                     batch.insert(&docs, doc).unwrap();
+                    refusal
                 }
                 2 => {
                     let doc = Self::with_id(self.document(), id);
-                    fails |= after.insert(id, doc.clone()).is_none();
+                    let refusal = match after.contains_key(&id) {
+                        false => Some(Refusal::NotFound),
+                        true => Refusal::duplicate(id, self.collisions(&after, id, &doc)),
+                    };
+                    after.insert(id, doc.clone());
                     batch.update(&docs, &id, doc).unwrap();
+                    refusal
                 }
                 _ => {
-                    fails |= after.remove(&id).is_none();
                     batch.delete(&docs, &id);
+                    after.remove(&id).is_none().then_some(Refusal::NotFound)
                 }
+            };
+            if self.trace {
+                eprintln!("  batch op on {id}: the model says {refusal:?}");
             }
+            fails = fails.or(refusal);
         }
         let result = batch.commit();
-        match fails {
-            true => assert!(
-                matches!(
-                    result,
-                    Err(Error::DuplicateId { .. } | Error::NotFound { .. })
-                ),
-                "{}: a batch the model refuses: {result:?}",
-                self.at()
-            ),
-            false => {
-                result.unwrap();
+        let as_said = match (&fails, &result) {
+            (None, Ok(())) => {
                 self.model = after;
+                return;
             }
-        }
+            (Some(Refusal::DuplicateId), Err(Error::DuplicateId { .. })) => true,
+            (Some(Refusal::NotFound), Err(Error::NotFound { .. })) => true,
+            (
+                Some(Refusal::Duplicate { id, colliding }),
+                Err(Error::DuplicateValue {
+                    id: i, existing, ..
+                }),
+            ) => {
+                self.ran.refused_duplicates += 1;
+                i == id && colliding.contains(existing)
+            }
+            _ => false,
+        };
+        assert!(
+            as_said,
+            "{}: a batch the model says {fails:?} of: {result:?}",
+            self.at()
+        );
     }
 
     fn replace(&mut self) {
         let id = self.some_id();
         let fields = self.document();
         let doc = Self::with_id(fields, id);
-        let replaced = self.docs().update(&id, doc.clone()).unwrap();
+        let result = self.docs().update(&id, doc.clone());
+        if self.model.contains_key(&id) {
+            let colliding = self.collisions(&self.model, id, &doc);
+            if self.refused(&result, id, &doc, &colliding, "update") {
+                return;
+            }
+        }
+        let replaced = result.unwrap();
         assert_eq!(replaced, self.model.contains_key(&id), "{}", self.at());
         if replaced {
             self.model.insert(id, doc);
@@ -1006,6 +1110,26 @@ impl Run<'_> {
                     self.model
                         .insert(id, doc.expect("an updated document stays"));
                 }
+                // Nor does it know which update would make a duplicate,
+                // so whatever was let through mustn't hold one (SPEC
+                // §119).
+                for (id, doc) in &self.model {
+                    let colliding = self.collisions(&self.model, *id, doc);
+                    assert!(
+                        colliding.is_empty(),
+                        "{}: update_fields {filter:?} {update:?} left {id} a duplicate of {colliding:?}",
+                        self.at()
+                    );
+                }
+            }
+            // Refused: a document it changes, colliding with one stored.
+            Err(Error::DuplicateValue { id, existing, .. }) => {
+                assert!(
+                    touched.contains(&id) && self.model.contains_key(&existing),
+                    "{}: update_fields {filter:?} {update:?} refused {id} for {existing}",
+                    self.at()
+                );
+                self.ran.refused_duplicates += 1;
             }
             Err(Error::Update { .. }) => {}
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
@@ -1027,6 +1151,18 @@ impl Run<'_> {
             .map(id_of)
             .collect();
         let result = self.docs().upsert(filter.clone(), doc.clone());
+        // An upsert replaces its one match, keeping its id, or inserts.
+        let into = match matches[..] {
+            [one] => Some(one),
+            [] => Some(id),
+            _ => None,
+        };
+        if let Some(into) = into {
+            let colliding = self.collisions(&self.model, into, &doc);
+            if self.refused(&result, into, &doc, &colliding, "upsert") {
+                return;
+            }
+        }
         match matches[..] {
             [] => {
                 assert!(
@@ -1049,6 +1185,119 @@ impl Run<'_> {
                 matches!(result, Err(Error::MultipleMatches { .. })),
                 "{}: upsert {filter:?}: {result:?}",
                 self.at()
+            ),
+        }
+    }
+
+    // --- Unique indexes (SPEC §119) ---
+
+    /// The documents of `model`, other than `id`, that `doc` would be a
+    /// duplicate of in the unique index `at`. No rule of its own: §33.1
+    /// says a unique index holds exactly what `find(field == v)` never
+    /// finds twice, so each value `doc` holds there (each element, for
+    /// `[*]`) is looked for with the database's own `Eq`, the AND of
+    /// them for a compound index. A null — or a field missing, which a
+    /// filter can't tell from null — collides with nothing; arrays,
+    /// objects and `NaN` equal nothing under `Eq` anyway.
+    fn collisions_in(
+        at: usize,
+        model: &BTreeMap<DocId, Document>,
+        id: DocId,
+        doc: &Document,
+    ) -> Vec<DocId> {
+        let fields = INDEXES[at];
+        let tuples: Vec<Vec<Document>> = match fields {
+            [one] => values_at(doc, one).into_iter().map(|v| vec![v]).collect(),
+            many => vec![
+                many.iter()
+                    .map(|field| {
+                        values_at(doc, field)
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Document::Null)
+                    })
+                    .collect(),
+            ],
+        };
+        let mut colliding = Vec::new();
+        for tuple in tuples {
+            if tuple.iter().any(|value| matches!(value, Document::Null)) {
+                continue;
+            }
+            let filter = (fields.iter().zip(tuple))
+                .fold(Filter::new(), |f, (field, value)| f.eq(*field, value));
+            let others = model.values().filter(|other| id_of(other) != id).cloned();
+            colliding.extend(filter.apply(others).iter().map(id_of));
+        }
+        colliding
+    }
+
+    /// Where `doc` and the stored `other` collide, for a failure's
+    /// message: each unique index, its fields' values in both.
+    fn collision_shown(&self, doc: &Document, other: DocId) -> String {
+        let other = self.model.get(&other).cloned().unwrap_or(Document::Null);
+        (self.indexes.iter())
+            .filter(|(_, options)| options.is_unique())
+            .map(|(&at, options)| {
+                let values = |d: &Document| -> Vec<Vec<Document>> {
+                    INDEXES[at].iter().map(|f| values_at(d, f)).collect()
+                };
+                format!(
+                    "{:?} ({options:?}): {:?} against {:?}",
+                    INDEXES[at],
+                    values(doc),
+                    values(&other)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// `collisions_in` every unique index made.
+    fn collisions(
+        &self,
+        model: &BTreeMap<DocId, Document>,
+        id: DocId,
+        doc: &Document,
+    ) -> Vec<DocId> {
+        (self.indexes.iter())
+            .filter(|(_, options)| options.is_unique())
+            .flat_map(|(&at, _)| Self::collisions_in(at, model, id, doc))
+            .collect()
+    }
+
+    /// Whether a write of `id` the model says is a duplicate of
+    /// `colliding` was refused as one, naming one of them; it must be,
+    /// and one that isn't mustn't be.
+    fn refused<T: std::fmt::Debug>(
+        &mut self,
+        result: &Result<T, Error>,
+        id: DocId,
+        doc: &Document,
+        colliding: &[DocId],
+        what: &str,
+    ) -> bool {
+        match (colliding.is_empty(), result) {
+            (true, Err(Error::DuplicateValue { .. })) => {
+                panic!(
+                    "{}: {what} of {id} refused as a duplicate: {result:?}",
+                    self.at()
+                )
+            }
+            (true, _) => false,
+            (
+                false,
+                Err(Error::DuplicateValue {
+                    id: i, existing, ..
+                }),
+            ) if *i == id && colliding.contains(existing) => {
+                self.ran.refused_duplicates += 1;
+                true
+            }
+            (false, _) => panic!(
+                "{}: {what} of {id}, a duplicate of {colliding:?}: {result:?}; {}",
+                self.at(),
+                self.collision_shown(doc, colliding[0])
             ),
         }
     }

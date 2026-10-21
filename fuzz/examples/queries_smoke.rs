@@ -66,6 +66,8 @@ fn main() {
                 total.plans.extend(ran.plans);
                 total.answered += ran.answered;
                 total.aggregated += ran.aggregated;
+                total.unique_indexes += ran.unique_indexes;
+                total.refused_duplicates += ran.refused_duplicates;
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -85,6 +87,11 @@ fn main() {
     }
     println!("  answered from entries (§106.5): {}", total.answered);
     println!("  aggregated from entries (§107.5): {}", total.aggregated);
+    println!("  unique indexes made (§119): {}", total.unique_indexes);
+    println!(
+        "  refused as duplicates (§119): {}",
+        total.refused_duplicates
+    );
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

@@ -358,7 +358,7 @@ one.
   reasons that aren't bugs.
 - **Another database as the oracle:** SQLite's type order, null and
   missing differ.
-- **Unique indexes** (§33): which writes they refuse would need the
+- **Unique indexes** (§33), until §119: which writes they refuse would need the
   model to know when two values are equal across `Int` and `Float`,
   array elements and nulls.
 - **`arbitrary`:** `Document` and `Filter` aren't `Arbitrary`, and
@@ -371,7 +371,7 @@ one.
 ## 105.8 Limits
 - **The meaning itself isn't tested** by the target, only every route
   to it (105.1, 105.5).
-- **One collection, one thread, no unique indexes, no damage.**
+- **One collection, one thread, no damage;** no unique indexes until §119.
 - **Random programs in CI, guided ones by hand.**
 - **Rare shapes** of the interval rule are left to §104's own tests and
   to guided fuzzing (105.5).
