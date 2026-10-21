@@ -487,7 +487,16 @@ limit, batches and a write-ahead log. Since then:
     a duplicate in an older file; changing or deleting one of the two
     documents fixes it.
 
-    Items 83–89: not released yet. **Breaking:** `IndexMap<String,
+90. **Old files as fixtures** (§120): a database this release wrote,
+    every kind of value, overflow pages, an index of each kind, free
+    space and a dropped collection, kept in `tests/fixtures/0.23.0/`
+    with what it holds; every build opens it, reads it as written,
+    queries it through each index and writes to it. Each release adds
+    its own. The minimum Rust version's policy written down in the
+    README: it rises only when a dependency or a real need requires it,
+    and that isn't breaking.
+
+    Items 83–90: not released yet. **Breaking:** `IndexMap<String,
     Document>` becomes `trunkdb::Map`, `IndexMap::new()` `Map::new()`,
     `shift_remove` `remove`; `IndexMap`-only methods (`entry`, `first`,
     `get_index`, …) are done with `get`, `get_mut`, `insert` and

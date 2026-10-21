@@ -646,6 +646,11 @@ changed page is copied once, not twice: `write_page` takes the `Page` [§67](spe
   change answers [§105](spec/105-a-differential-fuzz-target-for-queries.md). Its writes meet unique indexes too, each
   refusal held against the database's own `Eq` over the model; that
   found an update that could store a duplicate [§119](spec/119-unique-indexes-in-the-queries-target.md).
+- **Old files** (`tests/old_files.rs`): a database each release from
+  0.23.0 wrote, kept in `tests/fixtures/` with what it holds, opened by
+  every build, read as written and written to. It's the one test that
+  sees a change to how a value is stored, made in the encoder and
+  decoder alike [§120](spec/120-old-files-as-fixtures.md).
 - **Mutation checks:** each section breaks its own code on purpose in a
   handful of ways and lists them; every one has to fail a test.
 - **CI** runs the tests on Linux, macOS and Windows, clippy with
