@@ -528,6 +528,7 @@ more than four.
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
   [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `info`, `check`, `export`, `find` and `fields` open the file read-only [§88](spec/88-a-read-only-open.md).
+- **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
   without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md). It reads
@@ -736,4 +737,5 @@ bench/                 against SQLite, redb and sled (its own crate)
 fuzz/                  fuzz targets: damaged files, WALs, exports and
                          filter texts, and queries against a model (its own crate,
                          nightly; a smoke run on stable)
+skills/trunkdb/        an Agent Skill: the command, for an AI agent
 ```

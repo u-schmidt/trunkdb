@@ -136,3 +136,4 @@ say what changed, and DESIGN.md says what is true now.
 119. [Unique indexes in the `queries` target (`fuzz/src/queries.rs`, `collection.rs`)](119-unique-indexes-in-the-queries-target.md)
 120. [Old files as fixtures (`tests/old_files.rs`, `tests/fixtures/`)](120-old-files-as-fixtures.md)
 121. [`trunkdb fields` (`src/bin/trunkdb.rs`)](121-trunkdb-fields.md)
+122. [A skill for AI agents (`skills/trunkdb/`)](122-a-skill-for-ai-agents.md)

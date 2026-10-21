@@ -11,7 +11,7 @@ keywords = ["database", "embedded", "document", "nosql", "storage"]
 categories = ["database-implementations", "database"]
 # The benchmark and the fuzz targets are crates of their own, with their
 # own dependencies (SPEC §48, §55).
-exclude = ["assets/", "bench/", "fuzz/", "tests/fixtures/"]
+exclude = ["assets/", "bench/", "fuzz/", "skills/", "tests/fixtures/"]
 
 # The `derive` feature's macro crate (SPEC §114). `bench/` and `fuzz/`
 # are workspaces of their own.

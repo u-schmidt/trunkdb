@@ -103,6 +103,15 @@ trunkdb fields app.trunkdb users         # every path, in how many documents,
 
 `info`, `check`, `export`, `find` and `fields` open the file read-only.
 
+### For an AI agent
+
+[skills/trunkdb/](skills/trunkdb/SKILL.md) is an
+[Agent Skill](https://agentskills.io) that teaches an AI agent with a
+shell (Claude Code, Codex, Gemini CLI and others) to look into a
+trunkdb file with this command: shape first, then narrow queries, and
+never the whole file into its context. Copy the folder to where your
+agent reads skills.
+
 ## Performance
 
 `bench/` runs one document workload against trunkdb, SQLite, redb and

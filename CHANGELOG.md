@@ -514,3 +514,11 @@ limit, batches and a write-ahead log. Since then:
     schema-less file looks like, for a person or an AI meeting it. A
     filter sums up only what it finds, so `limit 1000` is a sample.
     Read-only; at most 10,000 paths, and a notice past them.
+
+92. **A skill for AI agents** (§122): `skills/trunkdb/`, an Agent
+    Skill in the open format Claude Code, Codex and others read. It
+    teaches an agent with a shell to look into a trunkdb file through
+    the command: `info`, then `fields`, then `find` with `select` and
+    `limit`, counts without the documents, `export` only as a backup;
+    the filter language in a file of its own, read when needed. Not in
+    the crate.
