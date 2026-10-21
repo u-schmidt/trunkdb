@@ -27,7 +27,6 @@
 //! the object it was.
 
 use crate::document::{DocId, Document};
-use indexmap::IndexMap;
 use serde_json::{Map, Number, Value};
 
 const TAG_ID: &str = "$id";
@@ -282,14 +281,14 @@ fn non_finite_name(f: f64) -> &'static str {
     }
 }
 
-fn object_to_json(map: &IndexMap<String, Document>) -> Map<String, Value> {
+fn object_to_json(map: &crate::Map) -> Map<String, Value> {
     map.iter().map(|(k, v)| (k.clone(), to_json(v))).collect()
 }
 
 fn object_from_json(
     object: Map<String, Value>,
     tags: Tags,
-) -> Result<IndexMap<String, Document>, ParseDocumentError> {
+) -> Result<crate::Map, ParseDocumentError> {
     object
         .into_iter()
         .map(|(k, v)| Ok((k, read(v, tags)?)))

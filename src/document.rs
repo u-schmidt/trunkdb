@@ -1,6 +1,6 @@
 use crate::datetime::DateTime;
 use crate::decode::{corrupt, take, take_array, take_u8, take_u32};
-use indexmap::IndexMap;
+use crate::map::Map;
 use std::time::SystemTime;
 
 /// The schema-less value every document is made of — this DB's equivalent
@@ -20,7 +20,8 @@ pub enum Document {
     String(String),
     Binary(Vec<u8>),
     Array(Vec<Document>),
-    Object(IndexMap<String, Document>),
+    /// An object: names to values, in order (SPEC §116).
+    Object(Map),
     Id(DocId),
     /// A point in time, in UTC, to the nanosecond (SPEC §69, §70): what a
     /// `SystemTime` or `DateTime` field stores. Filters compare, sort and
@@ -293,7 +294,8 @@ pub(crate) const ID_FIELD: &str = "_id";
 pub(crate) fn with_id(doc: Document, id: DocId) -> Document {
     match doc {
         Document::Object(mut map) => {
-            map.shift_insert(0, ID_FIELD.to_string(), Document::Id(id));
+            map.0
+                .shift_insert(0, ID_FIELD.to_string(), Document::Id(id));
             Document::Object(map)
         }
         other => other,
@@ -409,7 +411,7 @@ pub(crate) fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<
             // At the top, room for the `_id` a read adds (SPEC §59):
             // without it, adding one reallocates the map on every read.
             let top = usize::from(levels == Document::MAX_NESTING);
-            let mut entries = IndexMap::with_capacity(count.min(bytes.len()) + top);
+            let mut entries = Map::with_capacity(count.min(bytes.len()) + top);
             for _ in 0..count {
                 let key = decode_string(bytes, "a key")?;
                 entries.insert(key, decode_value(bytes, levels - 1)?);
@@ -513,7 +515,7 @@ pub(crate) fn decode_fields(
     if !encodes_object(encoded) {
         return Ok(with_id(decode_document(encoded)?.0, id));
     }
-    let mut entries = IndexMap::new();
+    let mut entries = Map::new();
     if names.contains(&ID_FIELD) {
         entries.insert(ID_FIELD.to_string(), Document::Id(id));
     }
@@ -690,7 +692,7 @@ mod tests {
 
     #[test]
     fn nested_object_with_id_roundtrips() {
-        let mut entries = IndexMap::new();
+        let mut entries = Map::new();
         entries.insert("_id".to_string(), Document::Id(DocId([1; 16])));
         entries.insert("name".to_string(), Document::String("Ada".to_string()));
         entries.insert(
@@ -707,7 +709,7 @@ mod tests {
         roundtrip(Document::String("x".repeat(70_000)));
         roundtrip(Document::Binary(vec![9; 70_000]));
         roundtrip(Document::Array(vec![Document::Null; 70_000]));
-        let mut entries = IndexMap::new();
+        let mut entries = Map::new();
         entries.insert("k".repeat(70_000), Document::Int(1));
         roundtrip(Document::Object(entries));
     }

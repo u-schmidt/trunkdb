@@ -1077,7 +1077,7 @@ mod tests {
         let Document::Object(mut fields) = doc else {
             panic!("every document is an object");
         };
-        fields.shift_remove("v")
+        fields.remove("v")
     }
 
     /// Where `log_batch_then_crash` stops, mirroring `write_batch`'s steps.
@@ -3126,7 +3126,7 @@ mod tests {
                 // The stored document has its id in it (SPEC §59).
                 for (id, doc) in &mut docs {
                     if let Document::Object(fields) = doc {
-                        assert_eq!(fields.shift_remove("_id"), Some(Document::Id(*id)));
+                        assert_eq!(fields.remove("_id"), Some(Document::Id(*id)));
                     }
                 }
                 assert!(docs == expected[name], "{what}: {name}");

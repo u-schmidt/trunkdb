@@ -5,11 +5,10 @@
 //! Unlike the other targets, an `Err` isn't a correct answer here: a
 //! read never fails, and a write fails only where the model says it must.
 
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use trunkdb::query::{Aggregate, Condition, Filter, Op, SortOrder, Update};
-use trunkdb::{Database, DocId, Document, Error, IndexOptions, Upserted};
+use trunkdb::{Database, DocId, Document, Error, IndexOptions, Map, Upserted};
 
 /// Steps a program runs at most, and documents it keeps at most.
 const MAX_STEPS: usize = 64;
@@ -268,7 +267,7 @@ fn pool() -> Vec<Document> {
         time(0, 1),
         time(-5, 0),
         Document::Array(vec![Document::Int(1)]),
-        Document::Object(IndexMap::new()),
+        Document::Object(Map::new()),
         Document::Binary(vec![1]),
     ]
 }
@@ -494,8 +493,8 @@ impl Run<'_> {
         }
     }
 
-    fn document(&mut self) -> IndexMap<String, Document> {
-        let mut fields = IndexMap::new();
+    fn document(&mut self) -> Map {
+        let mut fields = Map::new();
         for name in ["a", "aa", "b", "c"] {
             if !self.program.one_in(6) {
                 let value = self.value();
@@ -539,8 +538,8 @@ impl Run<'_> {
     }
 
     /// A document with `id` as its `_id`, as an insert stores it.
-    fn with_id(fields: IndexMap<String, Document>, id: DocId) -> Document {
-        let mut doc = IndexMap::new();
+    fn with_id(fields: Map, id: DocId) -> Document {
+        let mut doc = Map::new();
         doc.insert("_id".to_string(), Document::Id(id));
         doc.extend(fields);
         Document::Object(doc)

@@ -342,7 +342,6 @@ dependencies = [
 name = "trunkdb-fuzz"
 version = "0.0.0"
 dependencies = [
- "indexmap",
  "libfuzzer-sys",
  "serde",
  "tempfile",

@@ -3,7 +3,7 @@
 //! each of its paths when a read starts, not on every document it checks.
 
 use crate::document::Document;
-use indexmap::IndexMap;
+use crate::map::Map;
 
 /// Up to this many fields an object is searched for a name in order,
 /// beyond it by hash (SPEC §102.3): comparing a handful of short names
@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 const SCAN_UP_TO: usize = 8;
 
 /// The field `name` of `map` (SPEC §102.3).
-pub(crate) fn get<'d>(map: &'d IndexMap<String, Document>, name: &str) -> Option<&'d Document> {
+pub(crate) fn get<'d>(map: &'d Map, name: &str) -> Option<&'d Document> {
     #[cfg(test)]
     LOOKUPS.with(|n| n.set(n.get() + 1));
     if map.len() <= SCAN_UP_TO {
@@ -23,16 +23,13 @@ pub(crate) fn get<'d>(map: &'d IndexMap<String, Document>, name: &str) -> Option
 }
 
 /// The field `name` of `map`, to change; made a `Null` first if missing.
-pub(crate) fn get_or_insert<'d>(
-    map: &'d mut IndexMap<String, Document>,
-    name: &str,
-) -> &'d mut Document {
+pub(crate) fn get_or_insert<'d>(map: &'d mut Map, name: &str) -> &'d mut Document {
     let at = match map.len() <= SCAN_UP_TO {
         true => map.keys().position(|key| key == name),
-        false => map.get_index_of(name),
+        false => map.0.get_index_of(name),
     };
-    let at = at.unwrap_or_else(|| map.insert_full(name.to_string(), Document::Null).0);
-    map.get_index_mut(at).expect("just found or made").1
+    let at = at.unwrap_or_else(|| map.0.insert_full(name.to_string(), Document::Null).0);
+    map.0.get_index_mut(at).expect("just found or made").1
 }
 
 /// A path, parsed (SPEC §102.1). The common one, a single field name, is
@@ -166,7 +163,7 @@ impl<'p> Path<'p> {
     /// the way, for an index entry's document (SPEC §100.2, §102.4).
     /// Whatever is on the way and isn't an object is replaced by one: a
     /// path inside another named one is ruled out (`Covering::new`).
-    pub fn slot<'d>(&self, map: &'d mut IndexMap<String, Document>) -> &'d mut Document {
+    pub fn slot<'d>(&self, map: &'d mut Map) -> &'d mut Document {
         let steps = match self {
             Path::Field(name) => return get_or_insert(map, name),
             Path::Steps { steps, .. } => steps,
@@ -176,7 +173,7 @@ impl<'p> Path<'p> {
         for step in before {
             let value = get_or_insert(map, step.raw);
             if !matches!(value, Document::Object(_)) {
-                *value = Document::Object(IndexMap::new());
+                *value = Document::Object(Map::new());
             }
             map = match value {
                 Document::Object(inner) => inner,

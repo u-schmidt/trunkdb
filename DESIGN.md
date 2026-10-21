@@ -503,9 +503,12 @@ more than four.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.
 - **What's public** is only this: `Database`, `Collection`, `Batch`,
-  `Cursor`, `Snapshot`, `View`, `Document`, `DocId`, the options, reports and errors, and
+  `Cursor`, `Snapshot`, `View`, `Document`, `DocId`, `Map`, the options, reports and errors, and
   `query`. Types a caller passes in are built with methods; types it
   gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md).
+  No other crate's type is in it but `serde`'s traits and `std`'s: an
+  object's fields are a `Map` of trunkdb's own, the `IndexMap` inside it
+  out of sight [§116](spec/116-a-map-of-its-own.md).
 - **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),
   `compact` [§41](spec/41-compaction.md), `checkpoint` [§51](spec/51-one-flush-per-commit.md), `drop_collection` [§37](spec/37-delete-many-and-dropping-a-collection.md),
   `stats`: pages by kind, each collection's and index's size, the WAL's,

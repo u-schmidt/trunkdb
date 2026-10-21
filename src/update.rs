@@ -1,5 +1,5 @@
 use crate::document::{Document, ID_FIELD};
-use indexmap::IndexMap;
+use crate::map::Map;
 use std::cmp::Ordering;
 
 /// Changes to make to every document a filter finds, named by field
@@ -335,21 +335,18 @@ fn slot<'a>(doc: &'a mut Document, path: &str) -> Result<(&'a mut Document, bool
     let mut object = object_at(doc, "", "the document")?;
     for step in parents.into_iter().flat_map(|p| p.split('.')) {
         let child = object
+            .0
             .entry(step.to_string())
-            .or_insert_with(|| Document::Object(IndexMap::new()));
+            .or_insert_with(|| Document::Object(Map::new()));
         object = object_at(child, path, step)?;
     }
-    match object.entry(name.to_string()) {
+    match object.0.entry(name.to_string()) {
         indexmap::map::Entry::Occupied(entry) => Ok((entry.into_mut(), false)),
         indexmap::map::Entry::Vacant(entry) => Ok((entry.insert(Document::Null), true)),
     }
 }
 
-fn object_at<'a>(
-    value: &'a mut Document,
-    path: &str,
-    what: &str,
-) -> Result<&'a mut IndexMap<String, Document>, String> {
+fn object_at<'a>(value: &'a mut Document, path: &str, what: &str) -> Result<&'a mut Map, String> {
     match value {
         Document::Object(map) => Ok(map),
         other => {
@@ -383,7 +380,7 @@ fn take(doc: &mut Document, path: &str) -> Option<Document> {
         None => (doc, path),
     };
     match parent {
-        Document::Object(map) => map.shift_remove(name),
+        Document::Object(map) => map.remove(name),
         _ => None,
     }
 }
@@ -468,7 +465,7 @@ mod tests {
         let unset = |path: &str, to: &str| applied(Update::new().unset(path), to).unwrap();
         // `==` on objects ignores the order, so the keys are compared.
         let keys = |d: Document| match d {
-            Document::Object(map) => map.into_keys().collect::<Vec<_>>(),
+            Document::Object(map) => map.0.into_keys().collect::<Vec<_>>(),
             _ => unreachable!(),
         };
         let after = unset("b", r#"{"a": 1, "b": 2, "c": 3, "d": 4}"#);
@@ -560,7 +557,7 @@ mod tests {
         let early: crate::DateTime = "2026-01-01T00:00:00Z".parse().unwrap();
         let late: crate::DateTime = "2026-09-27T00:00:00Z".parse().unwrap();
         let seen = |at: crate::DateTime| {
-            let mut map = IndexMap::new();
+            let mut map = Map::new();
             map.insert("n".to_string(), Document::DateTime(at));
             Document::Object(map)
         };
@@ -726,7 +723,7 @@ mod tests {
         let update = Update::new()
             .set("n", 1)
             .inc("n", 1)
-            .set("a", Document::Object(IndexMap::new()))
+            .set("a", Document::Object(Map::new()))
             .set("a.b", "x")
             .unset("gone")
             .inc("n", 10);

@@ -6,6 +6,7 @@
 //! (§107.5), and turns them into rows.
 
 use crate::document::{DocId, Document, ID_FIELD, encode_document};
+use crate::map::Map;
 use crate::path::Path;
 use crate::query::{Condition, Filter, SortOrder, is_unordered, sort_order};
 use crate::storage::RecordLocation;
@@ -729,7 +730,7 @@ impl<'a> Groups<'a> {
         };
         let mut rows = Vec::with_capacity(groups.len());
         for group in groups {
-            let mut row = Document::Object(indexmap::IndexMap::new());
+            let mut row = Document::Object(Map::new());
             for ((seen, path), name) in (group.first.into_iter())
                 .zip(&self.group_paths)
                 .zip(&self.aggregate.group_by)
@@ -816,8 +817,9 @@ fn put(row: &mut Document, path: &str, value: Document) {
         }
         Some((first, rest)) => {
             let inner = map
+                .0
                 .entry(first.to_string())
-                .or_insert_with(|| Document::Object(indexmap::IndexMap::new()));
+                .or_insert_with(|| Document::Object(Map::new()));
             put(inner, rest, value);
         }
     }
@@ -832,7 +834,8 @@ mod tests {
             .map(|(i, json)| {
                 let mut doc: Document = json.parse().unwrap();
                 if let Document::Object(map) = &mut doc {
-                    map.shift_insert(0, ID_FIELD.into(), Document::Id(DocId([i as u8 + 1; 16])));
+                    map.0
+                        .shift_insert(0, ID_FIELD.into(), Document::Id(DocId([i as u8 + 1; 16])));
                 }
                 doc
             })

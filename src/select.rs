@@ -18,7 +18,7 @@ use crate::document::{
     skip_value, take_str, with_id,
 };
 use crate::index::key;
-use indexmap::IndexMap;
+use crate::map::Map;
 
 /// What is selected at one place in a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,8 +61,8 @@ impl Selection {
         let Document::Object(mut map) = doc else {
             return doc;
         };
-        let mut out = IndexMap::with_capacity(fields.len() + 1);
-        if let Some(id) = map.swap_remove(ID_FIELD) {
+        let mut out = Map::with_capacity(fields.len() + 1);
+        if let Some(id) = map.0.swap_remove(ID_FIELD) {
             out.insert(ID_FIELD.to_string(), id);
         }
         take(&mut map, fields, &mut out);
@@ -82,7 +82,7 @@ impl Selection {
         if !encodes_object(encoded) {
             return Ok(with_id(decode_document(encoded)?.0, id));
         }
-        let mut out = IndexMap::with_capacity(fields.len() + 1);
+        let mut out = Map::with_capacity(fields.len() + 1);
         out.insert(ID_FIELD.to_string(), Document::Id(id));
         // `_id` alone still walks the document: damage reads as damage.
         let mut bytes = &encoded[1..];
@@ -158,13 +158,9 @@ fn add(node: &mut Node, path: &str) {
 }
 
 /// `fields` of `map`, moved into `out` in the selection's order.
-fn take(
-    map: &mut IndexMap<String, Document>,
-    fields: &[(String, Node)],
-    out: &mut IndexMap<String, Document>,
-) {
+fn take(map: &mut Map, fields: &[(String, Node)], out: &mut Map) {
     for (name, node) in fields {
-        let Some(value) = map.swap_remove(name) else {
+        let Some(value) = map.0.swap_remove(name) else {
             continue;
         };
         match (node, value) {
@@ -172,7 +168,7 @@ fn take(
                 out.insert(name.clone(), value);
             }
             (Node::Fields(inner), Document::Object(mut map)) => {
-                let mut selected = IndexMap::with_capacity(inner.len());
+                let mut selected = Map::with_capacity(inner.len());
                 take(&mut map, inner, &mut selected);
                 if !selected.is_empty() {
                     out.insert(name.clone(), Document::Object(selected));
@@ -192,7 +188,7 @@ fn decode_object(
     fields: &[(String, Node)],
     levels: usize,
     top: bool,
-    out: &mut IndexMap<String, Document>,
+    out: &mut Map,
 ) -> std::io::Result<()> {
     let mut slots: Vec<Option<Document>> = vec![None; fields.len()];
     let count = take_u32(bytes, "an object's length")?;
@@ -232,7 +228,7 @@ fn decode_inner(
         return Ok(None);
     }
     take_u8(bytes, "a document's type tag")?;
-    let mut inner = IndexMap::with_capacity(fields.len());
+    let mut inner = Map::with_capacity(fields.len());
     decode_object(bytes, fields, levels - 1, false, &mut inner)?;
     Ok((!inner.is_empty()).then_some(Document::Object(inner)))
 }
@@ -309,7 +305,7 @@ impl Answer {
         let Node::Fields(fields) = &self.selection.root else {
             unreachable!("an answer selects fields");
         };
-        let mut out = IndexMap::with_capacity(fields.len() + 1);
+        let mut out = Map::with_capacity(fields.len() + 1);
         out.insert(ID_FIELD.to_string(), Document::Id(key::doc_id(key)));
         let mut leaves = values.iter_mut();
         build(fields, &mut leaves, &mut out);
@@ -322,13 +318,13 @@ impl Answer {
 fn build(
     fields: &[(String, Node)],
     leaves: &mut std::slice::IterMut<Option<Document>>,
-    out: &mut IndexMap<String, Document>,
+    out: &mut Map,
 ) {
     for (name, node) in fields {
         let value = match node {
             Node::Whole => (leaves.next().and_then(Option::take)).expect("each leaf decoded"),
             Node::Fields(inner) => {
-                let mut map = IndexMap::with_capacity(inner.len());
+                let mut map = Map::with_capacity(inner.len());
                 build(inner, leaves, &mut map);
                 Document::Object(map)
             }

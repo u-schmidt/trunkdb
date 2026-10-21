@@ -819,7 +819,7 @@ mod tests {
             let Document::Object(mut fields) = doc else {
                 panic!()
             };
-            Ok::<_, crate::Error>(fields.shift_remove("at").unwrap())
+            Ok::<_, crate::Error>(fields.remove("at").unwrap())
         };
         let time = crate::DateTime::from_unix(1_790_000_000, 0).unwrap();
         let date = r#""2026-09-21T14:13:20Z""#;

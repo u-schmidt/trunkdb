@@ -407,7 +407,6 @@ mod tests {
     use crate::document::{decode_document, encode_stored, with_id};
     use crate::serde_bridge::from_document;
     use crate::testing::XorShift;
-    use indexmap::IndexMap;
     use serde::Deserialize;
     use std::collections::{BTreeMap, HashMap};
     use std::time::SystemTime;
@@ -584,7 +583,7 @@ mod tests {
     }
 
     fn random_object(rng: &mut XorShift, depth: usize) -> Document {
-        let mut map = IndexMap::new();
+        let mut map = crate::Map::new();
         for _ in 0..rng.below(5) {
             let key = FIELDS[rng.below(FIELDS.len())].to_string();
             map.insert(key, random_value(rng, depth));
@@ -711,7 +710,7 @@ mod tests {
         for _ in 0..Document::MAX_NESTING {
             deep = Document::Array(vec![deep]);
         }
-        let mut map = IndexMap::new();
+        let mut map = crate::Map::new();
         map.insert("any".to_string(), deep);
         let encoded = encode_stored(&Document::Object(map));
         let id = DocId([2; 16]);

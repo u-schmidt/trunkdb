@@ -176,7 +176,7 @@ mod tests {
         let notes = db.collection::<Document>("notes");
         let given = DocId([5; 16]);
         let note = |text: &str, id: Option<DocId>| {
-            let mut fields = indexmap::IndexMap::new();
+            let mut fields = crate::Map::new();
             if let Some(id) = id {
                 fields.insert("_id".to_string(), Document::Id(id));
             }

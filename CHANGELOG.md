@@ -462,5 +462,15 @@ limit, batches and a write-ahead log. Since then:
     read as one point of an index per value, by id on `_id`; `status
     in ("open", "blocked")` and `not in` in the text.
 
-    Items 83–85: not released yet. Nothing breaking: the feature is
-    off unless asked for, and `is_in` is an addition.
+86. **A map of its own** (§116): `Document::Object` holds a
+    `trunkdb::Map` instead of an `IndexMap<String, Document>`, so
+    `indexmap` is no longer part of trunkdb's API and can change
+    without breaking a program. The same methods and order: a field
+    set again keeps its place, `remove` keeps the others' order.
+
+    Items 83–86: not released yet. **Breaking:** `IndexMap<String,
+    Document>` becomes `trunkdb::Map`, `IndexMap::new()` `Map::new()`,
+    `shift_remove` `remove`; `IndexMap`-only methods (`entry`, `first`,
+    `get_index`, …) are done with `get`, `get_mut`, `insert` and
+    `iter`. The `derive` feature is off unless asked for; `is_in` is an
+    addition. Files and exports as in 0.22.0.

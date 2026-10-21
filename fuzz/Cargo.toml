@@ -8,7 +8,6 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-indexmap = "2"
 libfuzzer-sys = "0.4"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"

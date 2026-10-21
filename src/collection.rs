@@ -3043,9 +3043,9 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        let mut young = indexmap::IndexMap::new();
+        let mut young = crate::Map::new();
         young.insert("age".to_string(), Document::Int(10));
-        let mut old = indexmap::IndexMap::new();
+        let mut old = crate::Map::new();
         old.insert("age".to_string(), Document::Int(30));
 
         users.insert(Document::Object(young)).unwrap();
@@ -3070,7 +3070,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        let mut fields = indexmap::IndexMap::new();
+        let mut fields = crate::Map::new();
         fields.insert("name".to_string(), Document::String("Ada".to_string()));
         let id = users.insert(Document::Object(fields)).unwrap();
 
@@ -3090,7 +3090,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        let mut fields = indexmap::IndexMap::new();
+        let mut fields = crate::Map::new();
         fields.insert("name".to_string(), Document::String("Ada".to_string()));
         let id = users.insert(Document::Object(fields)).unwrap();
 
@@ -3111,7 +3111,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
         let with_id = |id: Document| {
-            let mut fields = indexmap::IndexMap::new();
+            let mut fields = crate::Map::new();
             fields.insert("_id".to_string(), id);
             fields.insert("name".to_string(), Document::String("Ada".to_string()));
             Document::Object(fields)
@@ -3145,11 +3145,11 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let users = db.collection::<Document>("users");
 
-        let mut fields = indexmap::IndexMap::new();
+        let mut fields = crate::Map::new();
         fields.insert("name".to_string(), Document::String("Ada".to_string()));
         let id = users.insert(Document::Object(fields)).unwrap();
 
-        let mut updated = indexmap::IndexMap::new();
+        let mut updated = crate::Map::new();
         updated.insert("name".to_string(), Document::String("Grace".to_string()));
         assert!(users.update(&id, Document::Object(updated)).unwrap());
 
@@ -9522,7 +9522,9 @@ mod tests {
                     let Document::Object(mut map) = doc else {
                         panic!("{doc}")
                     };
-                    assert!(matches!(map.first(), Some((key, Document::Id(_))) if key == "_id"));
+                    assert!(
+                        matches!(map.iter().next(), Some((key, Document::Id(_))) if key == "_id")
+                    );
                     map["_id"] = Document::String("ID".into());
                     Document::Object(map).to_string()
                 })

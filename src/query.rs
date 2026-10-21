@@ -3,6 +3,7 @@ use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
 pub use crate::explain::{ExecutionStats, Explained, IndexRead, SortWork};
 use crate::index::{KeyRange, key};
+use crate::map::Map;
 use crate::path::Path;
 pub use crate::query_text::ParseFilterError;
 use crate::select::Selection;
@@ -1381,7 +1382,7 @@ impl<'a> Covering<'a> {
     /// (`key::decode_part`) — the document must be read — or the key is
     /// damaged.
     pub fn entry(&self, key: &[u8]) -> Option<Document> {
-        let mut doc = Document::Object(indexmap::IndexMap::new());
+        let mut doc = Document::Object(Map::new());
         self.fill(key, &mut doc)?;
         Some(doc)
     }
@@ -1398,7 +1399,7 @@ impl<'a> Covering<'a> {
     /// `entry` into `doc`, an object, its slots reused.
     fn fill(&self, key: &[u8], doc: &mut Document) -> Option<()> {
         let Document::Object(map) = doc else {
-            *doc = Document::Object(indexmap::IndexMap::new());
+            *doc = Document::Object(Map::new());
             return self.fill(key, doc);
         };
         if self.id {
@@ -2033,7 +2034,6 @@ pub(crate) fn sort_order(a: &Document, b: &Document, order: SortOrder) -> std::c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexmap::IndexMap;
 
     /// Paths, matching and sorting as they were before SPEC §102: each
     /// path taken apart on every call, every step hashed, every sort key
@@ -2273,7 +2273,7 @@ mod tests {
     #[test]
     fn a_field_is_found_by_scan_or_by_hash_alike() {
         for len in 0..=20 {
-            let map: IndexMap<String, Document> = (0..len)
+            let map: Map = (0..len)
                 .map(|i| (format!("f{i}"), Document::Int(i as i64)))
                 .collect();
             for name in (0..=21)
@@ -2291,7 +2291,7 @@ mod tests {
         // another, as `IndexMap`'s own entries would be.
         for len in 0..=12 {
             let names: Vec<String> = (1..=len).map(|n| "k".repeat(n)).collect();
-            let map: IndexMap<String, Document> = (names.iter().rev())
+            let map: Map = (names.iter().rev())
                 .map(|name| (name.clone(), Document::Int(name.len() as i64)))
                 .collect();
             let (mut changed, mut expected) = (map.clone(), map);
@@ -2300,9 +2300,9 @@ mod tests {
                 .enumerate()
             {
                 *crate::path::get_or_insert(&mut changed, name) = Document::Int(100 + i as i64);
-                *expected.entry(name.to_string()).or_insert(Document::Null) =
+                *expected.0.entry(name.to_string()).or_insert(Document::Null) =
                     Document::Int(100 + i as i64);
-                let order = |m: &IndexMap<String, Document>| m.keys().cloned().collect::<Vec<_>>();
+                let order = |m: &Map| m.keys().cloned().collect::<Vec<_>>();
                 assert_eq!(order(&changed), order(&expected), "{len} fields, {name:?}");
                 assert_eq!(changed, expected, "{len} fields, {name:?}");
             }
@@ -2532,7 +2532,7 @@ mod tests {
     }
 
     fn doc(pairs: &[(&str, Document)]) -> Document {
-        let mut map = IndexMap::new();
+        let mut map = Map::new();
         for (k, v) in pairs {
             map.insert(k.to_string(), v.clone());
         }
@@ -3031,7 +3031,7 @@ mod tests {
             time(0, 1),
             time(-5, 0),
             Document::Array(vec![Document::Int(1)]),
-            Document::Object(IndexMap::new()),
+            Document::Object(Map::new()),
             Document::Binary(vec![1]),
         ]
     }
@@ -3078,7 +3078,7 @@ mod tests {
         values: &[Option<Document>],
         id: crate::DocId,
     ) -> (Document, Option<Vec<u8>>) {
-        let mut doc = IndexMap::new();
+        let mut doc = Map::new();
         doc.insert(ID_FIELD.to_string(), Document::Id(id));
         let mut doc = Document::Object(doc);
         for (field, value) in fields.iter().zip(values) {
@@ -3454,7 +3454,7 @@ mod tests {
         let Some(Document::Object(mut got)) = doc(&both) else {
             panic!("no document");
         };
-        assert_eq!(got.shift_remove("_id"), Some(Document::Id(id)));
+        assert_eq!(got.remove("_id"), Some(Document::Id(id)));
         assert_eq!(got.len(), 2);
         assert_eq!(
             value_or_null(&Document::Object(got.clone()), "o.p"),
@@ -3489,11 +3489,11 @@ mod tests {
         assert!(Covering::new(&Filter::new().eq("ab", 1).eq("a", 1), Some(&ab), false).is_some());
         // The primary index: the id alone, and only if named.
         let primary = Covering::new(&Filter::new().gt("_id", id), None, false).unwrap();
-        let mut only_id = indexmap::IndexMap::new();
+        let mut only_id = Map::new();
         only_id.insert("_id".to_string(), Document::Id(id));
         assert_eq!(primary.entry(&id.0), Some(Document::Object(only_id)));
         let nothing = Covering::new(&Filter::new(), None, false).unwrap();
-        let empty = Document::Object(indexmap::IndexMap::new());
+        let empty = Document::Object(Map::new());
         assert_eq!(nothing.entry(&id.0), Some(empty));
         // Deciding entry after entry in one scratch document: each
         // entry's own values, whatever the one before left.

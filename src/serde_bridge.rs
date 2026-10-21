@@ -7,7 +7,7 @@
 //! crates.
 
 use crate::document::{DocId, Document};
-use indexmap::IndexMap;
+use crate::map::Map;
 use serde::de::{
     self, Deserialize, DeserializeOwned, DeserializeSeed, Deserializer, EnumAccess,
     IntoDeserializer, VariantAccess, Visitor,
@@ -224,7 +224,7 @@ impl Serializer for DocumentSerializer {
     ) -> Result<Document, DocumentError> {
         // {"Variant": value} — one-entry object, same shape deserialize_enum
         // expects back.
-        let mut map = IndexMap::new();
+        let mut map = Map::new();
         map.insert(variant.to_string(), value.serialize(DocumentSerializer)?);
         Ok(Document::Object(map))
     }
@@ -260,7 +260,7 @@ impl Serializer for DocumentSerializer {
     fn serialize_map(self, _len: Option<usize>) -> Result<SerializeMapImpl, DocumentError> {
         Ok(SerializeMapImpl {
             name: None,
-            map: IndexMap::new(),
+            map: Map::new(),
             next_key: None,
         })
     }
@@ -271,7 +271,7 @@ impl Serializer for DocumentSerializer {
     ) -> Result<SerializeMapImpl, DocumentError> {
         Ok(SerializeMapImpl {
             name: Some(name),
-            map: IndexMap::with_capacity(len),
+            map: Map::with_capacity(len),
             next_key: None,
         })
     }
@@ -284,7 +284,7 @@ impl Serializer for DocumentSerializer {
     ) -> Result<SerializeStructVariant, DocumentError> {
         Ok(SerializeStructVariant {
             variant: variant.to_string(),
-            map: IndexMap::with_capacity(len),
+            map: Map::with_capacity(len),
         })
     }
 }
@@ -343,7 +343,7 @@ impl ser::SerializeTupleVariant for SerializeTupleVariant {
         Ok(())
     }
     fn end(self) -> Result<Document, DocumentError> {
-        let mut map = IndexMap::new();
+        let mut map = Map::new();
         map.insert(self.variant, Document::Array(self.items));
         Ok(Document::Object(map))
     }
@@ -357,7 +357,7 @@ struct SerializeMapImpl {
     /// The struct's name, for `SerializeStruct`: how a `SystemTime` is
     /// told apart (SPEC §69).
     name: Option<&'static str>,
-    map: IndexMap<String, Document>,
+    map: Map,
     next_key: Option<String>,
 }
 
@@ -411,7 +411,7 @@ const SYSTEM_TIME: &str = "SystemTime";
 const SYSTEM_TIME_FIELDS: [&str; 2] = ["secs_since_epoch", "nanos_since_epoch"];
 
 /// The time a serialized `SystemTime` holds, if `fields` are its two.
-fn system_time(fields: &IndexMap<String, Document>) -> Option<crate::DateTime> {
+fn system_time(fields: &Map) -> Option<crate::DateTime> {
     let mut fields = fields.iter();
     let (Some((secs_key, Document::Int(secs))), Some((nanos_key, Document::Int(nanos))), None) =
         (fields.next(), fields.next(), fields.next())
@@ -445,7 +445,7 @@ fn document_to_key(doc: Document) -> Result<String, DocumentError> {
 
 struct SerializeStructVariant {
     variant: String,
-    map: IndexMap<String, Document>,
+    map: Map,
 }
 
 impl ser::SerializeStructVariant for SerializeStructVariant {
@@ -461,7 +461,7 @@ impl ser::SerializeStructVariant for SerializeStructVariant {
         Ok(())
     }
     fn end(self) -> Result<Document, DocumentError> {
-        let mut outer = IndexMap::new();
+        let mut outer = Map::new();
         outer.insert(self.variant, Document::Object(self.map));
         Ok(Document::Object(outer))
     }
