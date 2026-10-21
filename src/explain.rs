@@ -45,7 +45,7 @@ pub struct IndexRead {
 }
 
 /// How a sort was done.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct SortWork {
     /// How many sort keys, from the first, the index order gives (§47).
@@ -55,7 +55,7 @@ pub struct SortWork {
 }
 
 /// What a query cost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ExecutionStats {
     /// Index entries read, every read together, the primary index's too.
@@ -222,7 +222,7 @@ mod tests {
 
     /// examined, matched, returned.
     fn counts(run: &Explained) -> (u64, u64, u64) {
-        let stats = run.stats;
+        let stats = run.stats.clone();
         (
             stats.documents_examined,
             stats.documents_matched,

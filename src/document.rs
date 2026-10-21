@@ -45,7 +45,7 @@ impl Document {
     /// §30.1): every export then stays well inside what an import reads.
     /// Stops at the limit, so even a document too deep for the stack
     /// can't overflow it here.
-    pub fn nests_too_deep(&self) -> bool {
+    pub(crate) fn nests_too_deep(&self) -> bool {
         fn within(doc: &Document, levels: usize) -> bool {
             match doc {
                 Document::Array(items) => {

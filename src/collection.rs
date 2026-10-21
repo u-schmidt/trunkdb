@@ -4180,7 +4180,7 @@ mod tests {
             };
             insert(&mut rng, 150);
             for path in paths {
-                assert!(docs.ensure_index_with(path, options).unwrap());
+                assert!(docs.ensure_index_with(path, options.clone()).unwrap());
             }
             insert(&mut rng, 150);
             for _ in 0..6 {
@@ -5228,7 +5228,7 @@ mod tests {
     fn compound_finds_match_full_scans_through_every_kind_of_write() {
         let plain = IndexOptions::default();
         compound_finds_match_full_scans(
-            &[(&["a", "b"], plain), (&["a", "b", "c"], plain)],
+            &[(&["a", "b"], plain.clone()), (&["a", "b", "c"], plain)],
             &[
                 r#"Index { field: "(a, b)" }"#,
                 r#"IndexOrder { field: "(a, b)" }"#,
@@ -5325,7 +5325,7 @@ mod tests {
             };
             insert(&mut rng, 150);
             for (fields, options) in indexes {
-                assert!(docs.ensure_index_with(*fields, *options).unwrap());
+                assert!(docs.ensure_index_with(*fields, options.clone()).unwrap());
             }
             insert(&mut rng, 150);
             for _ in 0..6 {
@@ -5374,7 +5374,7 @@ mod tests {
         assert_eq!(run.plan, plan, "{f:?}");
         let mut found = Vec::new();
         let read = records_read(|| found = docs.find_with_ids(f.clone()).unwrap());
-        let stats = run.stats;
+        let stats = run.stats.clone();
         assert_eq!(stats.documents_returned, found.len() as u64, "{f:?}");
         assert_eq!(stats.documents_examined, read as u64, "{f:?} via {plan:?}");
         let entries: u64 = run.reads.iter().map(|read| read.entries).sum();
@@ -7131,8 +7131,8 @@ mod tests {
                 true => IndexOptions::new().sparse(),
                 false => IndexOptions::new(),
             };
-            docs.ensure_index_with("b", options).unwrap();
-            docs.ensure_index_with(["a", "b"], options).unwrap();
+            docs.ensure_index_with("b", options.clone()).unwrap();
+            docs.ensure_index_with(["a", "b"], options.clone()).unwrap();
             docs.ensure_index_with("o.p", options).unwrap();
             let mut rng = XorShift(0x0100_C0DE_0100_C0DE ^ sparse as u64);
             let ops = (0..300)
@@ -7482,7 +7482,7 @@ mod tests {
         for _ in 0..2 {
             let mut opened = None;
             let reads = records_read(|| {
-                opened = Some(Database::open_with(&path, read_only).unwrap());
+                opened = Some(Database::open_with(&path, read_only.clone()).unwrap());
             });
             assert!(reads >= 300, "keyed at every read-only open");
             let db = opened.unwrap();
@@ -9112,7 +9112,7 @@ mod tests {
         };
         assert!(members.ensure_index_with("nick", SPARSE).unwrap());
         assert!(!members.ensure_index_with("nick", SPARSE).unwrap());
-        assert!(members.ensure_index_with("name", both).unwrap());
+        assert!(members.ensure_index_with("name", both.clone()).unwrap());
         for result in [
             members.ensure_index("nick"),
             members.ensure_index_with("nick", crate::IndexOptions::new().unique()),

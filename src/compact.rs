@@ -13,7 +13,7 @@ use std::path::Path;
 /// What `Database::compact` did: the file's pages before and after, the
 /// header included. Equal when it was already as small as a rebuild
 /// makes it — then nothing was written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Compacted {
     pub pages_before: u64,

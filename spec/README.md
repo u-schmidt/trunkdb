@@ -132,3 +132,4 @@ say what changed, and DESIGN.md says what is true now.
 115. [A list of values: `in` (`query.rs`, `query_text.rs`)](115-a-list-of-values-in.md)
 116. [A map of its own (`map.rs`)](116-a-map-of-its-own.md)
 117. [Variants that can grow (`query.rs`)](117-variants-that-can-grow.md)
+118. [The public API, gone through (`database.rs`, `export.rs`, `catalog.rs`, `explain.rs`, `stats.rs`, `check.rs`, `compact.rs`, `snapshot.rs`, `query.rs`, `document.rs`, `serde_bridge.rs`, `fuzzing.rs`)](118-the-public-api-gone-through.md)

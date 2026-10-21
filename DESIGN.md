@@ -506,7 +506,10 @@ more than four.
   `Cursor`, `Snapshot`, `View`, `Document`, `DocId`, `Map`, the options, reports and errors, and
   `query`. Types a caller passes in are built with methods; types it
   gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md), and so is every
-  variant with named fields, matched with `..` [§117](spec/117-variants-that-can-grow.md).
+  variant with named fields, matched with `..` [§117](spec/117-variants-that-can-grow.md). Options and reports
+  are `Clone` and `PartialEq` but not `Copy` or `Eq`, so a field of any
+  kind can join them; a document becomes a `T` only through `into_value`
+  [§118](spec/118-the-public-api-gone-through.md).
   No other crate's type is in it but `serde`'s traits and `std`'s: an
   object's fields are a `Map` of trunkdb's own, the `IndexMap` inside it
   out of sight [§116](spec/116-a-map-of-its-own.md).

@@ -79,7 +79,7 @@ impl std::fmt::Debug for Snapshot {
 
 /// What open snapshots cost right now — see
 /// [`Database::snapshot_info`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct SnapshotInfo {
     /// How many pages are kept in memory as they were, for the snapshots

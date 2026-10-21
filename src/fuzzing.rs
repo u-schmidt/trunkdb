@@ -1,5 +1,7 @@
 //! Hooks for the fuzz targets in `fuzz/` (SPEC §55), behind the `fuzzing`
-//! feature and hidden from the docs: not for applications.
+//! feature and hidden from the docs: not for applications, and not
+//! covered by trunkdb's semver promise (SPEC §118). They change with the
+//! fuzz targets, in any release, 1.x ones too.
 //!
 //! Every page ends with a checksum and every WAL record carries one, so
 //! bytes a fuzzer makes up would almost never get past them, and the

@@ -10,7 +10,7 @@ use crate::storage::{PageId, PageStore, PendingPages, RecordLocation, SlottedPag
 use std::collections::HashSet;
 
 /// What `Database::stats` found, on one snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Stats {
     /// As `Database::file_info`: format, page size, pages, free pages.
@@ -28,7 +28,7 @@ pub struct Stats {
 
 /// The file's pages by what they hold. The fields add up to the file's
 /// pages.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct PageUse {
     /// The header: always 1.
@@ -48,7 +48,7 @@ pub struct PageUse {
 }
 
 /// One collection's documents and indexes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct CollectionStats {
     pub name: String,
@@ -68,7 +68,7 @@ pub struct CollectionStats {
 }
 
 /// One index's size.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct IndexStats {
     /// `["_id"]` for the primary index.
@@ -86,7 +86,7 @@ pub struct IndexStats {
 }
 
 /// What an open restored from the WAL after an unclean shutdown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Recovered {
     /// Page images written back — or, read-only, kept in memory.
@@ -717,13 +717,13 @@ mod tests {
         assert_eq!(
             (
                 &seen.file,
-                seen.pages,
+                seen.pages.clone(),
                 &seen.collections,
                 seen.compacted_pages_estimate()
             ),
             (
                 &stats.file,
-                stats.pages,
+                stats.pages.clone(),
                 &stats.collections,
                 stats.compacted_pages_estimate()
             )

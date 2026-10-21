@@ -23,6 +23,7 @@ use crate::document::{
     TAG_ID, TAG_INT, TAG_NULL, TAG_OBJECT, TAG_STRING,
 };
 use crate::serde_bridge::DocumentError;
+use crate::serde_bridge::Reader;
 use serde::de::{
     self, DeserializeOwned, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, SeqAccess,
     Visitor,
@@ -143,8 +144,7 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
         if tag == TAG_DATETIME || self.not_an_object()? {
             // A date-time is a two-field map to `deserialize_any`; a
             // document that isn't an object is only damage since §95.
-            return self
-                .decoded()?
+            return Reader(self.decoded()?)
                 .deserialize_any(visitor)
                 .map_err(StoredError::Message);
         }
@@ -215,8 +215,7 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, StoredError> {
         if self.not_an_object()? {
-            return self
-                .decoded()?
+            return Reader(self.decoded()?)
                 .deserialize_option(visitor)
                 .map_err(StoredError::Message);
         }
@@ -233,7 +232,7 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
         variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, StoredError> {
-        self.decoded()?
+        Reader(self.decoded()?)
             .deserialize_enum(name, variants, visitor)
             .map_err(StoredError::Message)
     }
@@ -241,8 +240,7 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
     /// A date-time as its text (SPEC §69), as the bridge reads it.
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, StoredError> {
         if self.tag()? == TAG_DATETIME || self.not_an_object()? {
-            return self
-                .decoded()?
+            return Reader(self.decoded()?)
                 .deserialize_str(visitor)
                 .map_err(StoredError::Message);
         }
@@ -383,7 +381,7 @@ impl<'de> MapAccess<'de> for Entries<'_, '_> {
     ) -> Result<S::Value, StoredError> {
         if let Some(id) = self.id_value.take() {
             return seed
-                .deserialize(Document::Id(id))
+                .deserialize(Reader(Document::Id(id)))
                 .map_err(StoredError::Message);
         }
         self.value_pending = false;

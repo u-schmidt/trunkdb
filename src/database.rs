@@ -168,7 +168,7 @@ impl ReadGuard<'_> {
 /// How `Database::open_with` opens a database. Made with
 /// `OpenOptions::default()` and its setters; the fields are private and the
 /// type `#[non_exhaustive]`, so a new option breaks nobody.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct OpenOptions {
     cache_size: usize,
@@ -528,7 +528,7 @@ impl Database {
     }
 
     pub(crate) fn recovered(&self) -> Option<crate::Recovered> {
-        self.inner.recovered
+        self.inner.recovered.clone()
     }
 
     pub fn collection<T>(&self, name: &str) -> Collection<T> {
@@ -1987,17 +1987,17 @@ mod tests {
     fn checkpoint_pages_sets_when_a_commit_writes_back() {
         let options = OpenOptions::default();
         assert_eq!(
-            pages_waiting_after_one_commit(options.checkpoint_pages(0)),
+            pages_waiting_after_one_commit(options.clone().checkpoint_pages(0)),
             0
         );
         assert_eq!(
-            pages_waiting_after_one_commit(options.checkpoint_pages(1)),
+            pages_waiting_after_one_commit(options.clone().checkpoint_pages(1)),
             0
         );
-        let waiting = pages_waiting_after_one_commit(options);
+        let waiting = pages_waiting_after_one_commit(options.clone());
         assert!(waiting > 1);
 
-        let just_enough = options.checkpoint_pages(waiting);
+        let just_enough = options.clone().checkpoint_pages(waiting);
         assert_eq!(pages_waiting_after_one_commit(just_enough), 0);
         let one_short = options.checkpoint_pages(waiting + 1);
         assert_eq!(pages_waiting_after_one_commit(one_short), waiting);
@@ -2031,7 +2031,8 @@ mod tests {
     fn checkpoint_wal_bytes_bounds_the_wal_when_few_pages_change() {
         let many_pages = OpenOptions::default().checkpoint_pages(1_000_000);
         // Without the guard, 200 commits of the same page: 200 images.
-        let (unbounded, waiting) = hot_page_wal_peak(many_pages.checkpoint_wal_bytes(u64::MAX));
+        let (unbounded, waiting) =
+            hot_page_wal_peak(many_pages.clone().checkpoint_wal_bytes(u64::MAX));
         assert!(unbounded > 200 * PAGE_SIZE as u64, "{unbounded}");
         assert!(waiting > 0);
 
@@ -2048,7 +2049,7 @@ mod tests {
     #[test]
     fn checkpoint_wal_bytes_defaults_to_twice_the_page_threshold() {
         let options = OpenOptions::default().checkpoint_pages(5);
-        let (peak, _) = hot_page_wal_peak(options);
+        let (peak, _) = hot_page_wal_peak(options.clone());
         assert!(peak < 40 * PAGE_SIZE as u64, "{peak}");
         let explicit = options.checkpoint_wal_bytes(u64::MAX);
         assert!(hot_page_wal_peak(explicit).0 > 200 * PAGE_SIZE as u64);

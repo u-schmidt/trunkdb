@@ -473,11 +473,19 @@ limit, batches and a write-ahead log. Since then:
     `IndexOrder` and `IndexUnion` are `#[non_exhaustive]`, so a field
     can be added to one without breaking a program.
 
-    Items 83–87: not released yet. **Breaking:** `IndexMap<String,
+88. **The public API, gone through** (§118): options and reports no
+    longer `Copy` or `Eq`, so they can get any field in 1.x;
+    `Document::nests_too_deep` and `Filter::apply_to` private; a
+    `Document` no longer a serde `Deserializer`, `into_value` the one
+    way to a `T`; the `fuzzing` feature declared outside semver.
+
+    Items 83–88: not released yet. **Breaking:** `IndexMap<String,
     Document>` becomes `trunkdb::Map`, `IndexMap::new()` `Map::new()`,
     `shift_remove` `remove`; `IndexMap`-only methods (`entry`, `first`,
     `get_index`, …) are done with `get`, `get_mut`, `insert` and
     `iter`. Those seven variants are matched with `..` and built with
     `Condition`'s methods; a plan is checked with `matches!` instead of
-    `==` against one built by hand. The `derive` feature is off unless asked for; `is_in` is an
+    `==` against one built by hand. Options and reports are `.clone()`d
+    where they were copied; `T::deserialize(document)` is
+    `document.into_value::<T>()`. The `derive` feature is off unless asked for; `is_in` is an
     addition. Files and exports as in 0.22.0.

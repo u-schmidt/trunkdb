@@ -1,0 +1,203 @@
+error[E0277]: the trait bound `trunkdb::OpenOptions: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:12:10
+   |
+12 |     eq::<OpenOptions>(); eq::<ImportOptions>(); eq::<IndexOptions>(); eq::<IndexInfo>();
+   |          ^^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `trunkdb::OpenOptions`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `ImportOptions: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:12:31
+   |
+12 |     eq::<OpenOptions>(); eq::<ImportOptions>(); eq::<IndexOptions>(); eq::<IndexInfo>();
+   |                               ^^^^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `ImportOptions`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `IndexOptions: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:12:54
+   |
+12 |     eq::<OpenOptions>(); eq::<ImportOptions>(); eq::<IndexOptions>(); eq::<IndexInfo>();
+   |                                                      ^^^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `IndexOptions`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `IndexInfo: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:12:76
+   |
+12 |     eq::<OpenOptions>(); eq::<ImportOptions>(); eq::<IndexOptions>(); eq::<IndexInfo>();
+   |                                                                            ^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `IndexInfo`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `ExecutionStats: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:13:10
+   |
+13 |     eq::<ExecutionStats>(); eq::<SortWork>(); eq::<QueryPlan>(); eq::<Compacted>();
+   |          ^^^^^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `ExecutionStats`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `SortWork: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:13:34
+   |
+13 |     eq::<ExecutionStats>(); eq::<SortWork>(); eq::<QueryPlan>(); eq::<Compacted>();
+   |                                  ^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `SortWork`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `QueryPlan: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:13:52
+   |
+13 |     eq::<ExecutionStats>(); eq::<SortWork>(); eq::<QueryPlan>(); eq::<Compacted>();
+   |                                                    ^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `QueryPlan`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `Compacted: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:13:71
+   |
+13 |     eq::<ExecutionStats>(); eq::<SortWork>(); eq::<QueryPlan>(); eq::<Compacted>();
+   |                                                                       ^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `Compacted`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `SnapshotInfo: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:14:10
+   |
+14 |     eq::<SnapshotInfo>(); eq::<PageUse>(); eq::<Recovered>(); eq::<Summary>();
+   |          ^^^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `SnapshotInfo`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `PageUse: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:14:32
+   |
+14 |     eq::<SnapshotInfo>(); eq::<PageUse>(); eq::<Recovered>(); eq::<Summary>();
+   |                                ^^^^^^^ the trait `std::cmp::Eq` is not implemented for `PageUse`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `Recovered: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:14:49
+   |
+14 |     eq::<SnapshotInfo>(); eq::<PageUse>(); eq::<Recovered>(); eq::<Summary>();
+   |                                                 ^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `Recovered`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `Summary: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:14:68
+   |
+14 |     eq::<SnapshotInfo>(); eq::<PageUse>(); eq::<Recovered>(); eq::<Summary>();
+   |                                                                    ^^^^^^^ the trait `std::cmp::Eq` is not implemented for `Summary`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `CheckReport: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:15:10
+   |
+15 |     eq::<CheckReport>(); eq::<FileInfo>(); eq::<Stats>(); eq::<CollectionStats>();
+   |          ^^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `CheckReport`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `FileInfo: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:15:31
+   |
+15 |     eq::<CheckReport>(); eq::<FileInfo>(); eq::<Stats>(); eq::<CollectionStats>();
+   |                               ^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `FileInfo`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `Stats: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:15:49
+   |
+15 |     eq::<CheckReport>(); eq::<FileInfo>(); eq::<Stats>(); eq::<CollectionStats>();
+   |                                                 ^^^^^ the trait `std::cmp::Eq` is not implemented for `Stats`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `CollectionStats: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:15:64
+   |
+15 |     eq::<CheckReport>(); eq::<FileInfo>(); eq::<Stats>(); eq::<CollectionStats>();
+   |                                                                ^^^^^^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `CollectionStats`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`
+
+error[E0277]: the trait bound `IndexStats: std::cmp::Eq` is not satisfied
+  --> tests/ui/options_and_reports_are_not_eq.rs:16:10
+   |
+16 |     eq::<IndexStats>();
+   |          ^^^^^^^^^^ the trait `std::cmp::Eq` is not implemented for `IndexStats`
+   |
+note: required by a bound in `eq`
+  --> tests/ui/options_and_reports_are_not_eq.rs:19:10
+   |
+19 | fn eq<T: Eq>() {}
+   |          ^^ required by this bound in `eq`

@@ -1,0 +1,25 @@
+error[E0624]: method `nests_too_deep` is private
+ --> tests/ui/internal_helpers_are_private.rs:7:28
+  |
+7 |     let _ = Document::Null.nests_too_deep();
+  |                            ^^^^^^^^^^^^^^ private method
+  |
+ ::: src/document.rs
+  |
+  |     pub(crate) fn nests_too_deep(&self) -> bool {
+  |     ------------------------------------------- private method defined here
+
+error[E0624]: method `apply_to` is private
+ --> tests/ui/internal_helpers_are_private.rs:8:27
+  |
+8 |       let _ = Filter::new().apply_to(Vec::<Document>::new(), |doc| doc);
+  |                             ^^^^^^^^ private method
+  |
+ ::: src/query.rs
+  |
+  | /     pub(crate) fn apply_to<T>(
+  | |         &self,
+  | |         items: impl IntoIterator<Item = T>,
+  | |         doc_of: impl Fn(&T) -> &Document,
+  | |     ) -> Vec<T> {
+  | |_______________- private method defined here

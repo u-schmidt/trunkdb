@@ -203,7 +203,7 @@ fn print_page_use(stats: &trunkdb::Stats) {
     if let Some(wal) = stats.wal_bytes {
         println!("  WAL: {}", bytes(wal));
     }
-    if let Some(recovered) = stats.recovered {
+    if let Some(ref recovered) = stats.recovered {
         println!(
             "  recovered {} from the WAL{}",
             count(recovered.pages as usize, "page"),
@@ -507,7 +507,7 @@ fn explanation(explained: &trunkdb::query::Explained) -> String {
         }
         text.push('\n');
     }
-    if let Some(sort) = explained.sort {
+    if let Some(ref sort) = explained.sort {
         let _ = writeln!(
             text,
             "sort: {} from the index order, {} in memory",

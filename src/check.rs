@@ -13,7 +13,7 @@ use crate::storage::{PAGE_SIZE, PageId, RecordLocation, SnapshotStore};
 use std::collections::BTreeSet;
 
 /// What the file is, from its header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct FileInfo {
     /// The format version in the header (SPEC §21.2, §33.4).
@@ -27,7 +27,7 @@ pub struct FileInfo {
 
 /// What `Database::check` found. `problems` is empty for a consistent
 /// file; each entry says what's wrong and where.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct CheckReport {
     pub collections: usize,

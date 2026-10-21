@@ -646,7 +646,7 @@ impl Filter {
     /// e.g. `(DocId, Document)` pairs, so `delete_many` keeps each id
     /// with its document through filtering, sorting and limiting. The
     /// items come back as they were: a selection isn't applied.
-    pub fn apply_to<T>(
+    pub(crate) fn apply_to<T>(
         &self,
         items: impl IntoIterator<Item = T>,
         doc_of: impl Fn(&T) -> &Document,
@@ -743,7 +743,7 @@ impl std::ops::Not for Condition {
 /// The variants with named fields are `#[non_exhaustive]` (SPEC §117):
 /// matched with `..`, `QueryPlan::Index { field, .. }`, so a field can be
 /// added to one without breaking a program.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum QueryPlan {
     /// Every document of the collection is read and checked.

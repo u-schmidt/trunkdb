@@ -45,7 +45,7 @@ const CHUNK_DOCUMENTS: usize = 1000;
 const CHUNK_BYTES: usize = 8 << 20;
 
 /// What an export wrote or an import read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct Summary {
     pub collections: usize,
@@ -231,7 +231,7 @@ impl Database {
 /// How `Database::import_with` reads. Made with `ImportOptions::default()`
 /// and its setters; the type is `#[non_exhaustive]`, so a new option
 /// breaks nobody.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ImportOptions {
     max_line_bytes: usize,
@@ -368,7 +368,7 @@ impl CollectionHeader {
     fn build_indexes(self, db: &Database) -> crate::Result<()> {
         let collection = db.collection::<crate::Document>(&self.name);
         for (fields, options) in &self.indexes {
-            collection.ensure_index_with(fields.as_slice(), *options)?;
+            collection.ensure_index_with(fields.as_slice(), options.clone())?;
         }
         Ok(())
     }

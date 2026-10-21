@@ -41,6 +41,15 @@ impl Document {
     /// This document as a `T`, taking it over: its content moves into the
     /// value, uncopied. Fields the `T` doesn't have are ignored, as serde
     /// does; a field it needs and the document lacks is an error.
+    ///
+    /// It's the one way from a document to a `T`: a `Document` isn't a
+    /// serde `Deserializer` itself (SPEC §118), so how it deserializes
+    /// can change behind this method.
+    ///
+    /// ```compile_fail,E0277
+    /// use serde::Deserialize;
+    /// let _ = String::deserialize(trunkdb::Document::String("a".into()));
+    /// ```
     pub fn into_value<T: DeserializeOwned>(self) -> crate::Result<T> {
         Ok(from_document(self)?)
     }
@@ -53,13 +62,13 @@ pub fn to_document<T: Serialize>(value: &T) -> Result<Document, DocumentError> {
     value.serialize(DocumentSerializer)
 }
 
-/// Converts a `Document` back into any `T: Deserialize`, by letting
-/// `Document` itself act as the `Deserializer`.
+/// Converts a `Document` back into any `T: Deserialize`, through
+/// `Reader`, the `Deserializer` that reads it.
 pub fn from_document<T>(doc: Document) -> Result<T, DocumentError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    T::deserialize(doc)
+    T::deserialize(Reader(doc))
 }
 
 /// The bridge's error type. Serde only requires `Error: serde::ser::Error
@@ -469,20 +478,37 @@ impl ser::SerializeStructVariant for SerializeStructVariant {
 
 // ---------- Deserialize: Document -> T ----------
 
+/// A document as serde's `Deserializer` reads it (SPEC §118): a type of
+/// the crate's own, so how a document deserializes isn't part of
+/// `Document`'s API — `into_value` is the way in, and the one promise.
+pub(crate) struct Reader(pub(crate) Document);
+
 /// A one-line, otherwise-unremarkable impl that `SeqDeserializer`/
 /// `MapDeserializer` below need: they require their elements to be
 /// "turnable into a deserializer," which for a type that's already a
 /// `Deserializer` itself is just returning `self`. Serde doesn't provide
 /// this generically for every `Deserializer` — every "value" type
 /// (`serde_json::Value` included) writes this exact one-liner itself.
-impl<'de> IntoDeserializer<'de, DocumentError> for Document {
-    type Deserializer = Document;
-    fn into_deserializer(self) -> Document {
+impl<'de> IntoDeserializer<'de, DocumentError> for Reader {
+    type Deserializer = Reader;
+    fn into_deserializer(self) -> Reader {
         self
     }
 }
 
-impl<'de> Deserializer<'de> for Document {
+/// `items` read one at a time, each by a `Reader`.
+fn read_each(items: Vec<Document>) -> SeqDeserializer<impl Iterator<Item = Reader>, DocumentError> {
+    SeqDeserializer::new(items.into_iter().map(Reader))
+}
+
+/// `map`'s fields read one at a time, each value by a `Reader`.
+fn read_fields(
+    map: Map,
+) -> MapDeserializer<'static, impl Iterator<Item = (String, Reader)>, DocumentError> {
+    MapDeserializer::new(map.into_iter().map(|(name, value)| (name, Reader(value))))
+}
+
+impl<'de> Deserializer<'de> for Reader {
     type Error = DocumentError;
 
     /// The one method that actually inspects `self`'s shape. Everything
@@ -491,7 +517,7 @@ impl<'de> Deserializer<'de> for Document {
     /// nothing format-specific like "peek the next byte" to do) or gets
     /// its own real implementation (`option`, `enum` — see below).
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DocumentError> {
-        match self {
+        match self.0 {
             Document::Null => visitor.visit_unit(),
             Document::Bool(v) => visitor.visit_bool(v),
             Document::Int(v) => visitor.visit_i64(v),
@@ -513,17 +539,21 @@ impl<'de> Deserializer<'de> for Document {
                         Document::Int(time.subsec_nanos().into()),
                     ),
                 ];
-                visitor.visit_map(MapDeserializer::new(fields.into_iter()))
+                visitor.visit_map(MapDeserializer::new(
+                    fields
+                        .into_iter()
+                        .map(|(name, value)| (name, Reader(value))),
+                ))
             }
-            Document::Array(items) => visitor.visit_seq(SeqDeserializer::new(items.into_iter())),
-            Document::Object(map) => visitor.visit_map(MapDeserializer::new(map.into_iter())),
+            Document::Array(items) => visitor.visit_seq(read_each(items)),
+            Document::Object(map) => visitor.visit_map(read_fields(map)),
         }
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DocumentError> {
-        match self {
+        match self.0 {
             Document::Null => visitor.visit_none(),
-            other => visitor.visit_some(other),
+            other => visitor.visit_some(Reader(other)),
         }
     }
 
@@ -533,7 +563,7 @@ impl<'de> Deserializer<'de> for Document {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, DocumentError> {
-        let (variant, value) = match self {
+        let (variant, value) = match self.0 {
             Document::String(variant) => (variant, None),
             Document::Object(map) => {
                 let mut iter = map.into_iter();
@@ -559,9 +589,9 @@ impl<'de> Deserializer<'de> for Document {
     /// A `DateTime` read as text is RFC 3339 in UTC (SPEC §69), so a
     /// `String` field, or a type that parses one, can hold it.
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DocumentError> {
-        match self {
+        match self.0 {
             Document::DateTime(time) => visitor.visit_string(time.to_string()),
-            other => other.deserialize_any(visitor),
+            other => Reader(other).deserialize_any(visitor),
         }
     }
 
@@ -629,7 +659,7 @@ impl<'de> VariantAccess<'de> for VariantDeserializer {
         seed: S,
     ) -> Result<S::Value, DocumentError> {
         match self.value {
-            Some(value) => seed.deserialize(value),
+            Some(value) => seed.deserialize(Reader(value)),
             None => Err(DocumentError::custom(
                 "expected a newtype variant, found a unit variant",
             )),
@@ -642,9 +672,7 @@ impl<'de> VariantAccess<'de> for VariantDeserializer {
         visitor: V,
     ) -> Result<V::Value, DocumentError> {
         match self.value {
-            Some(Document::Array(items)) => {
-                visitor.visit_seq(SeqDeserializer::new(items.into_iter()))
-            }
+            Some(Document::Array(items)) => visitor.visit_seq(read_each(items)),
             Some(other) => Err(DocumentError::custom(format!(
                 "expected an array for a tuple variant, got {other:?}"
             ))),
@@ -660,7 +688,7 @@ impl<'de> VariantAccess<'de> for VariantDeserializer {
         visitor: V,
     ) -> Result<V::Value, DocumentError> {
         match self.value {
-            Some(Document::Object(map)) => visitor.visit_map(MapDeserializer::new(map.into_iter())),
+            Some(Document::Object(map)) => visitor.visit_map(read_fields(map)),
             Some(other) => Err(DocumentError::custom(format!(
                 "expected an object for a struct variant, got {other:?}"
             ))),

@@ -57,7 +57,7 @@ pub struct IndexMeta {
 /// let options = IndexOptions::new().unique().sparse();
 /// assert!(options.is_unique() && options.is_sparse());
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct IndexOptions {
     pub(crate) unique: bool,
     pub(crate) sparse: bool,
@@ -65,7 +65,7 @@ pub struct IndexOptions {
 
 /// One secondary index, as `Collection::indexes` lists it (SPEC §60): its
 /// fields, and the options it was built with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IndexInfo {
     fields: Vec<String>,
     options: IndexOptions,
@@ -87,7 +87,7 @@ impl IndexInfo {
     }
 
     pub fn options(&self) -> IndexOptions {
-        self.options
+        self.options.clone()
     }
 
     pub fn is_unique(&self) -> bool {
