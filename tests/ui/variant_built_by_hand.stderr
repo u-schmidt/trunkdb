@@ -1,0 +1,5 @@
+error[E0639]: cannot create non-exhaustive variant using struct expression
+ --> tests/ui/variant_built_by_hand.rs:7:13
+  |
+7 |     let _ = Condition::Compare { field: "a".to_string(), op: Op::Eq, value: Document::Int(1) };
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

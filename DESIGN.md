@@ -505,7 +505,8 @@ more than four.
 - **What's public** is only this: `Database`, `Collection`, `Batch`,
   `Cursor`, `Snapshot`, `View`, `Document`, `DocId`, `Map`, the options, reports and errors, and
   `query`. Types a caller passes in are built with methods; types it
-  gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md).
+  gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md), and so is every
+  variant with named fields, matched with `..` [§117](spec/117-variants-that-can-grow.md).
   No other crate's type is in it but `serde`'s traits and `std`'s: an
   object's fields are a `Map` of trunkdb's own, the `IndexMap` inside it
   out of sight [§116](spec/116-a-map-of-its-own.md).

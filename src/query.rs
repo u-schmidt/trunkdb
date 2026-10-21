@@ -32,11 +32,16 @@ pub enum Op {
 /// What a document must satisfy (SPEC §36): a comparison of one field,
 /// a test of its shape — there at all, an array of some size (§45) — or
 /// several conditions combined, nested as deep as needed.
-/// `#[non_exhaustive]`, like `Op`.
+/// `#[non_exhaustive]`, like `Op`, and so is each variant with named
+/// fields (SPEC §117): outside trunkdb they're built with `Condition`'s
+/// methods, and matched with `..`, so a field can be added to one
+/// without breaking a program —
+/// `Condition::Compare { field, op, value, .. }`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Condition {
     /// `field op value`.
+    #[non_exhaustive]
     Compare {
         field: String,
         op: Op,
@@ -44,16 +49,19 @@ pub enum Condition {
     },
     /// The field is there — even if it holds null, unlike `is_not_null`
     /// (SPEC §45.1). On a path with `[*]`: some element has it.
+    #[non_exhaustive]
     Exists { field: String },
     /// The field is an array whose length `op`-compares true against
     /// `size` (SPEC §45.2) — `Op::Eq` and 0 for an empty one. `Ne` is
     /// `Eq` negated, so it also holds where there's no array at all.
+    #[non_exhaustive]
     Size { field: String, op: Op, size: usize },
     /// Some element of the array at `field` meets `condition` on its own
     /// (SPEC §46): `items` has an item with `sku == "A1"` *and* `qty >
     /// 2`, where `items[*].sku == "A1" AND items[*].qty > 2` may be met
     /// by two different items. Paths in `condition` start at the
     /// element; `""` is the element itself.
+    #[non_exhaustive]
     ElemMatch {
         field: String,
         condition: Box<Condition>,
@@ -732,6 +740,9 @@ impl std::ops::Not for Condition {
 }
 
 /// How `Collection::find` runs a filter — see `Collection::explain`.
+/// The variants with named fields are `#[non_exhaustive]` (SPEC §117):
+/// matched with `..`, `QueryPlan::Index { field, .. }`, so a field can be
+/// added to one without breaking a program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryPlan {
@@ -739,15 +750,18 @@ pub enum QueryPlan {
     Scan,
     /// Only the documents in a range of the index on `field` are read,
     /// then checked against the whole filter.
+    #[non_exhaustive]
     Index { field: String },
     /// The index on the sort field `field` is read in sort order, and
     /// documents are checked one by one until `limit` of them match; the
     /// rest are never read (SPEC §34.2). For `_id`, the primary index
     /// (SPEC §96).
+    #[non_exhaustive]
     IndexOrder { field: String },
     /// Several index ranges are read — one per branch of an OR, on the
     /// indexes on `fields` — each document once, then checked against
     /// the whole filter (SPEC §36.3).
+    #[non_exhaustive]
     IndexUnion { fields: Vec<String> },
     /// The filter names its documents by id — `eq("_id", id)`, or an OR
     /// of such — and they are looked up in the primary index, as `get`

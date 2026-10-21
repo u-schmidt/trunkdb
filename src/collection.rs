@@ -404,7 +404,7 @@ impl<T> Collection<T> {
     ///     people.insert(Person { age })?;
     /// }
     /// let adults = people.explain_run(Filter::new().gte("age", 18).lt("age", 65))?;
-    /// assert_eq!(adults.plan, QueryPlan::Index { field: "age".into() });
+    /// assert!(matches!(&adults.plan, QueryPlan::Index { field, .. } if field == "age"));
     /// assert_eq!(adults.reads[0].bounds.len(), 2); // age >= 18, age < 65
     /// // The range holds age 65 too, which the check against the
     /// // filter leaves out (SPEC §28.3) — on the index entry, which

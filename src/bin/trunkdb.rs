@@ -473,9 +473,11 @@ fn explanation(explained: &trunkdb::query::Explained) -> String {
     let mut text = String::new();
     let plan = match &explained.plan {
         QueryPlan::Scan => "scan of every document".to_string(),
-        QueryPlan::Index { field } => format!("index on {field}"),
-        QueryPlan::IndexOrder { field } => format!("index on {field}, in its order"),
-        QueryPlan::IndexUnion { fields } => format!("indexes on {}, together", fields.join(", ")),
+        QueryPlan::Index { field, .. } => format!("index on {field}"),
+        QueryPlan::IndexOrder { field, .. } => format!("index on {field}, in its order"),
+        QueryPlan::IndexUnion { fields, .. } => {
+            format!("indexes on {}, together", fields.join(", "))
+        }
         QueryPlan::ById => "by id".to_string(),
         other => format!("{other:?}"),
     };

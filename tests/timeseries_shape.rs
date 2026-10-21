@@ -72,11 +72,10 @@ fn time_range_filter_combined_with_sort_and_limit() {
     // The same query over a secondary index on `tst` (SPEC §28): only
     // the range 200..=400 is read, and the result is the same.
     assert!(pings.ensure_index("tst").unwrap());
-    assert_eq!(
-        pings.explain(&filter).unwrap(),
-        QueryPlan::Index {
-            field: "tst".to_string()
-        }
+    let plan = pings.explain(&filter).unwrap();
+    assert!(
+        matches!(&plan, QueryPlan::Index { field, .. } if field == "tst"),
+        "{plan:?}"
     );
     assert_eq!(pings.find(filter).unwrap(), found);
 }

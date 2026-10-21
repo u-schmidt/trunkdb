@@ -468,9 +468,16 @@ limit, batches and a write-ahead log. Since then:
     without breaking a program. The same methods and order: a field
     set again keeps its place, `remove` keeps the others' order.
 
-    Items 83–86: not released yet. **Breaking:** `IndexMap<String,
+87. **Variants that can grow** (§117): `Condition`'s `Compare`,
+    `Exists`, `Size` and `ElemMatch` and `QueryPlan`'s `Index`,
+    `IndexOrder` and `IndexUnion` are `#[non_exhaustive]`, so a field
+    can be added to one without breaking a program.
+
+    Items 83–87: not released yet. **Breaking:** `IndexMap<String,
     Document>` becomes `trunkdb::Map`, `IndexMap::new()` `Map::new()`,
     `shift_remove` `remove`; `IndexMap`-only methods (`entry`, `first`,
     `get_index`, …) are done with `get`, `get_mut`, `insert` and
-    `iter`. The `derive` feature is off unless asked for; `is_in` is an
+    `iter`. Those seven variants are matched with `..` and built with
+    `Condition`'s methods; a plan is checked with `matches!` instead of
+    `==` against one built by hand. The `derive` feature is off unless asked for; `is_in` is an
     addition. Files and exports as in 0.22.0.

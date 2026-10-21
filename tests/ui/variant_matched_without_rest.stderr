@@ -1,0 +1,76 @@
+error[E0638]: `..` required with variant marked as non-exhaustive
+ --> tests/ui/variant_matched_without_rest.rs:8:12
+  |
+8 |     if let Condition::Compare { field, op, value } = &condition { let _ = (field, op, value); }
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+help: add `..` at the end of the field list to ignore all other fields
+  |
+8 |     if let Condition::Compare { field, op, value , .. } = &condition { let _ = (field, op, value); }
+  |                                                  ++++
+
+error[E0638]: `..` required with variant marked as non-exhaustive
+ --> tests/ui/variant_matched_without_rest.rs:9:12
+  |
+9 |     if let Condition::Exists { field } = &condition { let _ = field; }
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+help: add `..` at the end of the field list to ignore all other fields
+  |
+9 |     if let Condition::Exists { field , .. } = &condition { let _ = field; }
+  |                                      ++++
+
+error[E0638]: `..` required with variant marked as non-exhaustive
+  --> tests/ui/variant_matched_without_rest.rs:10:12
+   |
+10 |     if let Condition::Size { field, op, size } = &condition { let _ = (field, op, size); }
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: add `..` at the end of the field list to ignore all other fields
+   |
+10 |     if let Condition::Size { field, op, size , .. } = &condition { let _ = (field, op, size); }
+   |                                              ++++
+
+error[E0638]: `..` required with variant marked as non-exhaustive
+  --> tests/ui/variant_matched_without_rest.rs:11:12
+   |
+11 |     if let Condition::ElemMatch { field, condition } = &condition { let _ = (field, condition); }
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: add `..` at the end of the field list to ignore all other fields
+   |
+11 |     if let Condition::ElemMatch { field, condition , .. } = &condition { let _ = (field, condition); }
+   |                                                    ++++
+
+error[E0638]: `..` required with variant marked as non-exhaustive
+  --> tests/ui/variant_matched_without_rest.rs:13:12
+   |
+13 |     if let QueryPlan::Index { field } = &plan { let _ = field; }
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: add `..` at the end of the field list to ignore all other fields
+   |
+13 |     if let QueryPlan::Index { field , .. } = &plan { let _ = field; }
+   |                                     ++++
+
+error[E0638]: `..` required with variant marked as non-exhaustive
+  --> tests/ui/variant_matched_without_rest.rs:14:12
+   |
+14 |     if let QueryPlan::IndexOrder { field } = &plan { let _ = field; }
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: add `..` at the end of the field list to ignore all other fields
+   |
+14 |     if let QueryPlan::IndexOrder { field , .. } = &plan { let _ = field; }
+   |                                          ++++
+
+error[E0638]: `..` required with variant marked as non-exhaustive
+  --> tests/ui/variant_matched_without_rest.rs:15:12
+   |
+15 |     if let QueryPlan::IndexUnion { fields } = &plan { let _ = fields; }
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: add `..` at the end of the field list to ignore all other fields
+   |
+15 |     if let QueryPlan::IndexUnion { fields , .. } = &plan { let _ = fields; }
+   |                                           ++++
