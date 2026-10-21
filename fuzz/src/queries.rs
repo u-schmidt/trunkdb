@@ -565,6 +565,19 @@ impl Run<'_> {
                     let (x, y) = (self.value_for(paths[a]), self.value_for(paths[b]));
                     Condition::eq(paths[a], x) | Condition::eq(paths[b], y)
                 }
+                // `in` (SPEC §115): an OR of `eq`s on one path, a point
+                // of its index per value; none, nothing.
+                5 => {
+                    let paths = ["a", "b", "o.p", "tags[*]", "_id"];
+                    let path = paths[self.program.below(paths.len())];
+                    let values: Vec<Document> = (0..self.program.below(4))
+                        .map(|_| match path {
+                            "_id" => Document::Id(self.some_id()),
+                            _ => self.value_for(path),
+                        })
+                        .collect();
+                    Condition::is_in(path, values)
+                }
                 3 => {
                     let inner = match self.program.one_in(2) {
                         true => "",

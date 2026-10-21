@@ -457,5 +457,10 @@ limit, batches and a write-ahead log. Since then:
     or an `Option<DocId>`, or on a second field; a macro crate of its
     own, `trunkdb-derive`, as serde has `serde_derive`.
 
-    Items 83–84: not released yet. Nothing breaking: the feature is
-    off unless asked for.
+85. **`in`** (§115): `Filter::is_in("status", ["open", "blocked"])`
+    and `Condition::is_in`, SQL's `IN`: the OR of an `eq` per value,
+    read as one point of an index per value, by id on `_id`; `status
+    in ("open", "blocked")` and `not in` in the text.
+
+    Items 83–85: not released yet. Nothing breaking: the feature is
+    off unless asked for, and `is_in` is an addition.

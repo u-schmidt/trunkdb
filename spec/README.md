@@ -129,3 +129,4 @@ say what changed, and DESIGN.md says what is true now.
 112. [`trunkdb find` (`src/bin/trunkdb.rs`)](112-trunkdb-find.md)
 113. [`trunkdb find --explain` (`src/bin/trunkdb.rs`)](113-trunkdb-find-explain.md)
 114. [`#[trunkdb::document]` (`trunkdb-derive/`, `src/lib.rs`)](114-the-document-attribute.md)
+115. [A list of values: `in` (`query.rs`, `query_text.rs`)](115-a-list-of-values-in.md)

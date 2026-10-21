@@ -86,8 +86,9 @@ let page = Filter::new().eq("team", "core").sort_asc("name").skip(40).limit(20);
 assert_eq!(page.to_string(), r#"team = "core" order by name limit 20 offset 40"#);
 ```
 
-`is null`, `exists(…)`, `size(…)`, `has (…)` for one element of an
-array, `not`/`and`/`or` and `select` are there too; a mistake comes
+`is null`, `in (…)` for one of a list of values, `exists(…)`,
+`size(…)`, `has (…)` for one element of an array, `not`/`and`/`or` and
+`select` are there too; a mistake comes
 back as `ParseFilterError`, with its line and column.
 
 ## Atomic batches

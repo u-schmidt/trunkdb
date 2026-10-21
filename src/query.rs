@@ -117,6 +117,30 @@ impl Condition {
         Self::compare(field, Op::Eq, Document::Null)
     }
 
+    /// The field holds one of `values`, SQL's `IN` (SPEC §115): an OR of
+    /// an `eq` per value, so an index on the field reads one point per
+    /// value (§36.3), and on `_id` each is a lookup by id (§61). No
+    /// values: nothing matches. `!Condition::is_in(..)` is `NOT IN`.
+    ///
+    /// ```
+    /// use trunkdb::query::Condition;
+    ///
+    /// let waiting = Condition::is_in("status", ["open", "blocked"]);
+    /// # let _ = waiting;
+    /// ```
+    pub fn is_in<V: Into<Document>>(
+        field: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let field = field.into();
+        Condition::Any(
+            values
+                .into_iter()
+                .map(|value| Self::eq(field.clone(), value))
+                .collect(),
+        )
+    }
+
     pub fn is_not_null(field: impl Into<String>) -> Self {
         Self::compare(field, Op::Ne, Document::Null)
     }
@@ -292,7 +316,7 @@ impl Filter {
     /// in the primary index (SPEC §61). Filters see a field by its stored
     /// name, so on a struct's `#[serde(rename = "_id")] id` field,
     /// `eq("id", ...)` would find nothing; this can't be misspelled.
-    /// Several ids: `any_of(ids.into_iter().map(Condition::id))`.
+    /// Several ids: `is_in("_id", ids)` (SPEC §115).
     pub fn id(self, id: DocId) -> Self {
         self.and(Condition::id(id))
     }
@@ -334,6 +358,15 @@ impl Filter {
     /// The field is null or missing (SPEC §32).
     pub fn is_null(self, field: impl Into<String>) -> Self {
         self.condition(field, Op::Eq, Document::Null)
+    }
+
+    /// The field holds one of `values` (SPEC §115): `Condition::is_in`.
+    pub fn is_in<V: Into<Document>>(
+        self,
+        field: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        self.and(Condition::is_in(field, values))
     }
 
     /// The field is there and not null.

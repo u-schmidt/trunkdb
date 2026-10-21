@@ -7901,6 +7901,73 @@ mod tests {
         assert_eq!(runs.count(active).unwrap(), 180);
     }
 
+    /// `is_in` (SPEC §115): one point of the index per value, the
+    /// documents by id on `_id`, nothing for no values; `NOT IN` its
+    /// negation, a scan.
+    #[test]
+    fn a_list_of_values_reads_one_point_each() {
+        let field = |run: &Document, name: &str| match run {
+            Document::Object(fields) => fields.get(name).cloned(),
+            _ => None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let runs = db.collection::<Document>("runs");
+        let mut batch = db.batch();
+        let mut ids = Vec::new();
+        for seen in 0..300 {
+            let status = ["Queued", "Running", "Complete"][seen % 3];
+            let run: Document = format!(r#"{{"status": "{status}", "seen": {seen}}}"#)
+                .parse()
+                .unwrap();
+            ids.push(batch.insert(&runs, run).unwrap());
+        }
+        batch.commit().unwrap();
+        runs.ensure_index("status").unwrap();
+
+        let active = Filter::new().is_in("status", ["Queued", "Running", "Paused"]);
+        assert_eq!(
+            runs.explain(&active).unwrap(),
+            QueryPlan::IndexUnion {
+                fields: vec!["status".to_string(); 3]
+            }
+        );
+        let mut found = Vec::new();
+        let reads = records_read(|| found = runs.find(active.clone()).unwrap());
+        assert_eq!(
+            (reads, found.len()),
+            (200, 200),
+            "the Queued and Running entries only"
+        );
+        let stats = runs.explain_run(active).unwrap().stats;
+        assert_eq!(stats.keys_examined, 200);
+
+        let others = Filter::new().and(!Condition::is_in("status", ["Queued", "Running"]));
+        assert_eq!(runs.explain(&others).unwrap(), QueryPlan::Scan);
+        let others = runs.find(others).unwrap();
+        assert_eq!(others.len(), 100);
+        assert!(
+            others
+                .iter()
+                .all(|r| field(r, "status") == Some(Document::from("Complete")))
+        );
+
+        let two = Filter::new()
+            .is_in("_id", [ids[7], ids[3]])
+            .sort_asc("seen");
+        assert_eq!(runs.explain(&two).unwrap(), QueryPlan::ById);
+        let seen: Vec<_> = runs
+            .find(two)
+            .unwrap()
+            .iter()
+            .map(|r| field(r, "seen"))
+            .collect();
+        assert_eq!(seen, [Some(Document::Int(3)), Some(Document::Int(7))]);
+
+        let none = Filter::new().is_in("status", [] as [&str; 0]);
+        assert_eq!(runs.count(none).unwrap(), 0);
+    }
+
     // --- delete_many (SPEC §37) ---
 
     #[test]

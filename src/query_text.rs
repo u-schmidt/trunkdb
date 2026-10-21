@@ -308,6 +308,13 @@ impl<'t> Parser<'t> {
             let value = Document::Null;
             return Ok(Condition::Compare { field, op, value });
         }
+        if self.keyword("in") {
+            return self.list(field);
+        }
+        if self.keyword("not") {
+            self.expect_keyword("in")?;
+            return Ok(Condition::Not(Box::new(self.list(field)?)));
+        }
         if self.keyword("has") {
             self.expect("(")?;
             let condition = Box::new(self.condition()?);
@@ -315,10 +322,27 @@ impl<'t> Parser<'t> {
             return Ok(Condition::ElemMatch { field, condition });
         }
         let Some(op) = self.op() else {
-            return self.expected("a comparison (=, !=, <, <=, >, >=, contains, is null, has)");
+            return self.expected("a comparison (=, !=, <, <=, >, >=, contains, is null, in, has)");
         };
         let value = self.value()?;
         Ok(Condition::Compare { field, op, value })
+    }
+
+    /// `(value, …)` after `in` (SPEC §115): an `eq` of `field` per value,
+    /// as `Condition::is_in` makes them.
+    fn list(&mut self, field: String) -> Parsed<Condition> {
+        self.expect("(")?;
+        let mut values = Vec::new();
+        if !self.eat(")") {
+            loop {
+                values.push(self.value()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(")")?;
+        }
+        Ok(Condition::is_in(field, values))
     }
 
     fn op(&mut self) -> Option<Op> {
@@ -640,6 +664,16 @@ fn write_list<T>(
 
 /// `condition`, in parentheses if it binds less tightly than `least`.
 fn write_condition(f: &mut Formatter<'_>, condition: &Condition, least: u8) -> fmt::Result {
+    // An OR of `eq`s of one field is `in`, and its NOT `not in` (SPEC
+    // §115): one comparison each, needing no parentheses.
+    if let Some((field, values)) = in_list(condition) {
+        return write_in(f, field, " in (", &values);
+    }
+    if let Condition::Not(inner) = condition
+        && let Some((field, values)) = in_list(only(inner))
+    {
+        return write_in(f, field, " not in (", &values);
+    }
     let binds = match condition {
         Condition::Any(any) if any.len() >= 2 => OR,
         Condition::All(all) if all.len() >= 2 => AND,
@@ -693,6 +727,53 @@ fn write_condition(f: &mut Formatter<'_>, condition: &Condition, least: u8) -> f
         f.write_char(')')?;
     }
     Ok(())
+}
+
+/// `condition`, past any AND or OR of it alone, which print as it does.
+fn only(mut condition: &Condition) -> &Condition {
+    while let Condition::All(one) | Condition::Any(one) = condition
+        && let [inner] = one.as_slice()
+    {
+        condition = inner;
+    }
+    condition
+}
+
+/// The field and values of an OR of two or more `eq`s of one field.
+fn in_list(condition: &Condition) -> Option<(&str, Vec<&Document>)> {
+    let Condition::Any(any) = condition else {
+        return None;
+    };
+    let mut field = None;
+    let mut values = Vec::new();
+    for branch in any {
+        let Condition::Compare {
+            field: this,
+            op: Op::Eq,
+            value,
+        } = branch
+        else {
+            return None;
+        };
+        if field.is_some_and(|field| field != this) {
+            return None;
+        }
+        field = Some(this.as_str());
+        values.push(value);
+    }
+    (values.len() >= 2).then_some((field?, values))
+}
+
+fn write_in(
+    f: &mut Formatter<'_>,
+    field: &str,
+    keyword: &str,
+    values: &[&Document],
+) -> fmt::Result {
+    write_path(f, field)?;
+    f.write_str(keyword)?;
+    write_list(f, values, |f, value| write_value(f, value))?;
+    f.write_char(')')
 }
 
 fn write_joined(
@@ -922,6 +1003,57 @@ mod tests {
         );
     }
 
+    /// `in` and `not in` (SPEC §115): an OR of `eq`s of one field, read
+    /// and printed as a list.
+    #[test]
+    fn a_list_of_values_reads_as_an_or_of_eqs_and_prints_as_in() {
+        same(
+            r#"status in ("open", "blocked") and n not in (1, 2.0, null)"#,
+            Filter::new()
+                .is_in("status", ["open", "blocked"])
+                .and(!Condition::is_in(
+                    "n",
+                    [Document::Int(1), Document::Float(2.0), Document::Null],
+                )),
+        );
+        let read = |text: &str| text.parse::<Condition>().unwrap();
+        assert_eq!(
+            read(r#"status in ("open", "blocked")"#),
+            Condition::eq("status", "open") | Condition::eq("status", "blocked")
+        );
+        assert_eq!(read("a IN ()"), Condition::any([]));
+        assert_eq!(
+            read("`in` in (1)"),
+            Condition::Any(vec![Condition::eq("in", 1)])
+        );
+        let print = |text: &str| read(text).to_string();
+        // Printed as `in` however it was written; anything else as it is.
+        assert_eq!(print("a = 1 or a = 2 or a = 3"), "a in (1, 2, 3)");
+        assert_eq!(print("not (a = 1 or a = 2)"), "a not in (1, 2)");
+        assert_eq!(print("x = 0 and (a = 1 or a = 2)"), "x = 0 and a in (1, 2)");
+        assert_eq!(print("a in (1, 2) or b = 3"), "a in (1, 2) or b = 3");
+        assert_eq!(print("a = 1 or b = 2"), "a = 1 or b = 2");
+        assert_eq!(print("a = 1 or a > 2"), "a = 1 or a > 2");
+        assert_eq!(print("a in (1)"), "a = 1");
+        assert_eq!(print("a in ()"), "false");
+        assert_eq!(
+            print(r#"tags[*] in ([1], {"b": null}, id("00000000-0000-0000-0000-000000000000"))"#),
+            r#"tags[*] in ([1], {"b":null}, id("00000000-0000-0000-0000-000000000000"))"#
+        );
+        assert_eq!(
+            error("a in 1"),
+            "expected `(`, found `1` at line 1 column 6"
+        );
+        assert_eq!(
+            error("a in (1,)"),
+            "expected a value, found `)` at line 1 column 9"
+        );
+        assert_eq!(
+            error("a not = 1"),
+            "expected `in`, found `=` at line 1 column 7"
+        );
+    }
+
     #[test]
     fn mistakes_are_named_where_they_are() {
         assert_eq!(
@@ -942,7 +1074,7 @@ mod tests {
         );
         assert_eq!(
             error("a"),
-            "expected a comparison (=, !=, <, <=, >, >=, contains, is null, has), found the end at line 1 column 2"
+            "expected a comparison (=, !=, <, <=, >, >=, contains, is null, in, has), found the end at line 1 column 2"
         );
         assert_eq!(
             error("select a b = 1"),
@@ -1140,7 +1272,7 @@ mod tests {
     }
 
     fn random_condition(rng: &mut XorShift, depth: usize) -> Condition {
-        let kinds = if depth == 0 { 4 } else { 8 };
+        let kinds = if depth == 0 { 5 } else { 9 };
         let few = |rng: &mut XorShift| {
             (0..rng.below(4))
                 .map(|_| random_condition(rng, depth - 1))
@@ -1150,9 +1282,14 @@ mod tests {
             0 | 1 => Condition::compare(random_path(rng), random_op(rng), random_value(rng, 1)),
             2 => Condition::exists(random_path(rng)),
             3 => Condition::size(random_path(rng), random_op(rng), rng.below(3)),
-            4 => Condition::elem_match(random_path(rng), random_condition(rng, depth - 1)),
-            5 => Condition::All(few(rng)),
-            6 => Condition::Any(few(rng)),
+            4 => {
+                let values: Vec<Document> =
+                    (0..rng.below(4)).map(|_| random_value(rng, 1)).collect();
+                Condition::is_in(random_path(rng), values)
+            }
+            5 => Condition::elem_match(random_path(rng), random_condition(rng, depth - 1)),
+            6 => Condition::All(few(rng)),
+            7 => Condition::Any(few(rng)),
             _ => !random_condition(rng, depth - 1),
         }
     }

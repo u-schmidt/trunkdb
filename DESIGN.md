@@ -294,7 +294,8 @@ limit and a selection, applied in that order [§72](spec/72-skip-for-paging.md)
 [§35](spec/35-a-filter-builder.md) [§36](spec/36-or-not-and-nesting.md) [§47](spec/47-sorting-by-several-fields.md):
 
 - **comparisons** (`eq`, `ne`, `lt`, `lte`, `gt`, `gte`) and a
-  case-insensitive `contains` [§25](spec/25-op-contains-case-insensitive-substring-match.md);
+  case-insensitive `contains` [§25](spec/25-op-contains-case-insensitive-substring-match.md); `is_in`, one of a list of
+  values, an OR of `eq`s read as a point of an index per value [§115](spec/115-a-list-of-values-in.md);
 - **`all`, `any_of` and `not`**, also as `&`, `|` and `!` [§36](spec/36-or-not-and-nesting.md);
 - **`exists` and `missing`**, telling a stored null from an absent field;
   `size` for array lengths [§45](spec/45-exists-and-array-size.md);
