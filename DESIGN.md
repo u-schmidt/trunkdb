@@ -527,7 +527,7 @@ more than four.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md); `info`, `check`, `export` and `find` open the file read-only [§88](spec/88-a-read-only-open.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `info`, `check`, `export`, `find` and `fields` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
   without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md). It reads
@@ -726,7 +726,7 @@ src/
 ├── compact.rs         Database::compact: rebuild, file shrinks
 ├── fuzzing.rs         hooks for fuzz/, behind a feature, hidden
 └── bin/trunkdb.rs     the `trunkdb` command (info, check, compact,
-                         export, import, find)
+                         export, import, find, fields)
 tests/                 the command line, and a time-series-shaped
                          workload through the public API; ui/: what
                          #[trunkdb::document] refuses, compiled

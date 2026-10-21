@@ -311,6 +311,8 @@ fn looking_into_a_file_opens_it_read_only() {
     assert!(std::fs::read_to_string(&out).unwrap().contains("users"));
     let output = trunkdb(&["find", &db_path, "users", "n = 1"]);
     assert_eq!(stderr(&output), "found 1 document\n");
+    let output = trunkdb(&["fields", &db_path, "users"]);
+    assert_eq!(stderr(&output), "2 paths in 1 document\n");
     let output = trunkdb(&["compact", &db_path]);
     assert!(stderr(&output).contains("in use by another program"));
     close(db);
@@ -666,6 +668,153 @@ fn find_stops_quietly_when_its_reader_goes() {
     assert!(read.is_ok(), "{read:?}: {}", stderr(&output));
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stderr(&output), "");
+}
+
+/// Documents of every shape `fields` sums up (SPEC §121): kinds that
+/// differ from one document to the next, objects and arrays at any depth,
+/// names a filter writes in backticks, and one no path can name; a name
+/// that sorts before `_id`, and one of more bytes than letters.
+const SHAPES: &str = r#"{"$trunkdb_export":2}
+{"$collection":"users","$indexes":["age"]}
+{"name":"Ada","age":36,"address":{"city":"Berlin"},"tags":["a","b"],"first name":"A","grid":[[1,2],[3]],"Zone":1,"größe":2}
+{"name":"Bob","age":41.5,"address":"unknown","tags":[],"order":1,"a`b":true,"grid":{"n":1}}
+{"name":"Cy","age":null,"address":{"city":"Paris"},"tags":["x",{"k":1}],"a.b":{"c":2},"seen":{"$date":"2026-01-01T00:00:00Z"},"bin":{"$binary":"AAE="}}
+{"$collection":"empty"}
+"#;
+
+#[test]
+fn fields_sums_up_every_path_the_documents_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, SHAPES).unwrap();
+    let imported = trunkdb(&["import", &db, &input]);
+    assert!(imported.status.success(), "{}", stderr(&imported));
+
+    let output = trunkdb(&["fields", &db, "users"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    // `_id` first, then names in order, a field before what's below it.
+    // Every count is of documents: Ada's two string tags count once.
+    assert_eq!(
+        stdout(&output),
+        "\
+_id                            3  id 3
+Zone                           1  int 1
+`a.b` (no path can name it)    1  object 1
+`a.b`.c (no path can name it)  1  int 1
+`a``b`                         1  bool 1
+address                        3  object 2, string 1
+address.city                   2  string 2
+age                            3  null 1, int 1, float 1
+bin                            1  binary 1
+`first name`                   1  string 1
+grid                           2  array 1, object 1
+grid.n                         1  int 1
+grid[*]                        1  array 1
+grid[*][*]                     1  int 1
+größe                          1  int 1
+name                           3  string 3
+`order`                        1  int 1
+seen                           1  date 1
+tags                           3  array 3
+tags[*]                        2  string 2, object 1
+tags[*].k                      1  int 1
+"
+    );
+    assert_eq!(stderr(&output), "21 paths in 3 documents\n");
+
+    // The words after the collection are one filter, and only what it
+    // finds is summed up.
+    let output = trunkdb(&[
+        "fields", &db, "users", "select", "name", "where", "age", ">", "40",
+    ]);
+    assert_eq!(stdout(&output), "_id   1  id 1\nname  1  string 1\n");
+    assert_eq!(stderr(&output), "2 paths in 1 document\n");
+
+    // Every path that can be named, pasted into a filter, finds the
+    // documents it was counted in.
+    let read_only = trunkdb::OpenOptions::default().read_only(true);
+    let opened = trunkdb::Database::open_with(&db, read_only).unwrap();
+    let users = opened.collection::<trunkdb::Document>("users");
+    let all = stdout(&trunkdb(&["fields", &db, "users"]));
+    for line in all.lines().filter(|line| !line.contains("no path")) {
+        let mut words = line.split("  ").filter(|word| !word.is_empty());
+        let (path, documents) = (words.next().unwrap(), words.next().unwrap());
+        let filter: trunkdb::query::Filter = format!("exists({path})").parse().unwrap();
+        assert_eq!(
+            users.count(filter).unwrap().to_string(),
+            documents.trim(),
+            "{line}"
+        );
+    }
+    drop(users);
+    close(opened);
+
+    let output = trunkdb(&["fields", &db, "empty"]);
+    assert_eq!(
+        (stdout(&output), stderr(&output)),
+        (String::new(), "0 paths in 0 documents\n".to_string())
+    );
+}
+
+#[test]
+fn fields_names_a_mistake_as_find_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, SHAPES).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+
+    let output = trunkdb(&["fields", &db, "users", "name = Ada"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "trunkdb: filter: expected a value, found `Ada` at line 1 column 8\n  name = Ada\n         ^\n"
+    );
+    let output = trunkdb(&["fields", &db, "user"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "trunkdb: user: no such collection\n");
+    let missing = path(dir.path(), "typo.trunkdb");
+    assert_eq!(
+        trunkdb(&["fields", &missing, "users"]).status.code(),
+        Some(1)
+    );
+    assert!(!Path::new(&missing).exists());
+    assert_eq!(trunkdb(&["fields", &db]).status.code(), Some(2));
+}
+
+/// Names that are data, a field per id or per day, would grow the
+/// summary without end: it keeps the first 10,000 paths, and says so.
+#[test]
+fn fields_keeps_at_most_ten_thousand_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = path(dir.path(), "db.trunkdb");
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    let docs = db.collection::<trunkdb::Document>("docs");
+    let wide: trunkdb::Map = (0..10_000)
+        .map(|n| (format!("f{n:05}"), trunkdb::Document::Int(n)))
+        .collect();
+    // With `_id`, 10,001 paths; the last one left out is in the second
+    // document, which `_id` and `f00000` still count.
+    docs.insert(trunkdb::Document::Object(wide)).unwrap();
+    docs.insert(object("f00000", trunkdb::Document::Int(1)))
+        .unwrap();
+    drop(docs);
+    close(db);
+
+    let output = trunkdb(&["fields", &db_path, "docs"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert_eq!(out.lines().count(), 10_000);
+    assert!(
+        out.starts_with("_id     2  id 2\nf00000  2  int 2\n"),
+        "{}",
+        &out[..80]
+    );
+    assert_eq!(
+        stderr(&output),
+        "10000 paths in 2 documents\n\
+         only the first 10000 paths found are counted; a filter can narrow it\n"
+    );
 }
 
 /// `{field: value}`: every document is an object (SPEC §95).

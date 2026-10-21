@@ -97,9 +97,11 @@ trunkdb find app.trunkdb users 'age >= 30 order by name limit 10'
                                          # one JSON document per line
 trunkdb find app.trunkdb users 'age >= 30' --explain
                                          # the plan, index reads, counts
+trunkdb fields app.trunkdb users         # every path, in how many documents,
+                                         # as which types
 ```
 
-`info`, `check`, `export` and `find` open the file read-only.
+`info`, `check`, `export`, `find` and `fields` open the file read-only.
 
 ## Performance
 

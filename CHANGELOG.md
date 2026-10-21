@@ -506,3 +506,11 @@ limit, batches and a write-ahead log. Since then:
     where they were copied; `T::deserialize(document)` is
     `document.into_value::<T>()`. The `derive` feature is off unless asked for; `is_in` is an
     addition. Files and exports as in 0.22.0.
+
+91. **`trunkdb fields <file> <collection> [filter]`** (§121): every
+    path a collection's documents have, as a filter writes it
+    (`address.city`, `tags[*].k`, `` `first name` ``), in how many
+    documents, and as which kinds of value, most first: what a
+    schema-less file looks like, for a person or an AI meeting it. A
+    filter sums up only what it finds, so `limit 1000` is a sample.
+    Read-only; at most 10,000 paths, and a notice past them.

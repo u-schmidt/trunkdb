@@ -1,8 +1,9 @@
 //! The `trunkdb` command (SPEC §39): look into a database file, check it,
-//! compact it, export it, import into it, find documents in it (§112).
-//! Looking, checking, exporting and finding open it read-only (SPEC §88).
+//! compact it, export it, import into it, find documents in it (§112),
+//! sum up the fields its documents have (§121). Looking, checking,
+//! exporting, finding and summing up open it read-only (SPEC §88).
 //!
-//! Arguments are parsed by hand: six subcommands don't need a parser
+//! Arguments are parsed by hand: seven subcommands don't need a parser
 //! crate, and a library's dependencies are compiled for everyone who uses
 //! the library.
 
@@ -37,8 +38,13 @@ commands:
                               after the collection are joined into one.
                               --explain runs it and prints how instead:
                               the plan, the index reads, the counts
+  fields <file> <collection> [filter]
+                              every path the documents have, in how many
+                              of them, and as which types: one line each,
+                              to paste into a filter. A filter sums up
+                              only what it finds; `limit 1000` a sample
 
-info, check, export and find only read: they change nothing in the file or its
+info, check, export, find and fields only read: they change nothing in the file or its
 log, not even what a crash of the program that had it open left there.
 ";
 
@@ -57,6 +63,9 @@ fn main() -> ExitCode {
                 .and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained)),
             ["find", file, collection, ref filter @ ..] => read_only(file)
                 .and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents)),
+            ["fields", file, collection, ref filter @ ..] => {
+                read_only(file).and_then(|db| fields(&db, collection, &filter.join(" ")))
+            }
             ["import", file, input, "--max-line", limit] => max_line(limit)
                 .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
             ["help" | "-h" | "--help"] => {
@@ -400,23 +409,10 @@ enum Show {
 /// found them (§113).
 fn find(db: &Database, collection: &str, filter: &str, show: Show) -> Outcome {
     let failed = |e: trunkdb::Error| e.to_string();
-    let filter: Filter = match filter.parse() {
-        Ok(filter) => filter,
-        Err(e) => {
-            eprintln!("trunkdb: {}", filter_error(filter, &e));
-            return Ok(ExitCode::from(2));
-        }
+    let (docs, filter) = match query(db, collection, filter)? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
     };
-    // A typo in the name would find nothing, as if nothing matched.
-    if !db
-        .collections()
-        .map_err(failed)?
-        .iter()
-        .any(|c| c == collection)
-    {
-        return Err(format!("{collection}: no such collection"));
-    }
-    let docs = db.collection::<Document>(collection);
     if let Show::Explained = show {
         let explained = docs.explain_run(filter).map_err(failed)?;
         return match io::stdout()
@@ -441,6 +437,32 @@ fn find(db: &Database, collection: &str, filter: &str, show: Show) -> Outcome {
     }
     eprintln!("found {}", count(found, "document"));
     Ok(ExitCode::SUCCESS)
+}
+
+/// A collection, and the filter to read it with.
+type Query = (trunkdb::Collection<Document>, Filter);
+
+/// `filter` read, and `collection` checked to be there: what `find` and
+/// `fields` start with. A filter that doesn't read is printed with its
+/// mistake, and comes back as exit code 2 in the inner `Err`.
+fn query(db: &Database, collection: &str, filter: &str) -> Result<Result<Query, ExitCode>, String> {
+    let parsed: Filter = match filter.parse() {
+        Ok(filter) => filter,
+        Err(e) => {
+            eprintln!("trunkdb: {}", filter_error(filter, &e));
+            return Ok(Err(ExitCode::from(2)));
+        }
+    };
+    // A typo in the name would find nothing, as if nothing matched.
+    if !db
+        .collections()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|c| c == collection)
+    {
+        return Err(format!("{collection}: no such collection"));
+    }
+    Ok(Ok((db.collection::<Document>(collection), parsed)))
 }
 
 /// A write to standard output that failed: the reader gone, as `| head`
@@ -523,4 +545,257 @@ fn explanation(explained: &trunkdb::query::Explained) -> String {
     let _ = writeln!(text, "answered from index entries: {}", stats.from_entries);
     let _ = writeln!(text, "time: {:.2} ms", stats.elapsed.as_secs_f64() * 1000.0);
     text
+}
+
+/// At most this many paths are kept (SPEC §121.4): documents whose keys
+/// are data, ids or dates as names, would otherwise grow the summary with
+/// every document.
+const MAX_PATHS: usize = 10_000;
+
+/// The kinds of value a path can hold, in the order a tie between two
+/// counts is printed; the names are the ones the filter language and
+/// `Display` use for them.
+const KINDS: [&str; 10] = [
+    "null", "bool", "int", "float", "string", "binary", "array", "object", "id", "date",
+];
+
+fn kind(value: &Document) -> usize {
+    match value {
+        Document::Null => 0,
+        Document::Bool(_) => 1,
+        Document::Int(_) => 2,
+        Document::Float(_) => 3,
+        Document::String(_) => 4,
+        Document::Binary(_) => 5,
+        Document::Array(_) => 6,
+        Document::Object(_) => 7,
+        Document::Id(_) => 8,
+        Document::DateTime(_) => 9,
+        _ => 0,
+    }
+}
+
+/// One path of the summary (SPEC §121.2), and the paths below it: the
+/// fields of the objects found there, and the elements of its arrays.
+/// Every count is of documents, so a document counts once per path and
+/// once per kind however many values it has there.
+#[derive(Default)]
+struct Shape {
+    /// Documents with a value here.
+    documents: u64,
+    /// Documents with a value of each kind here.
+    kinds: [u64; KINDS.len()],
+    /// The number, from 1, of the last document counted, for `documents`
+    /// and for each kind: a document reaches a path under an array once
+    /// per element.
+    last: u64,
+    last_kind: [u64; KINDS.len()],
+    fields: std::collections::BTreeMap<String, Shape>,
+    elements: Option<Box<Shape>>,
+}
+
+/// The whole summary: the documents' fields, and how many paths it keeps.
+struct Fields {
+    root: Shape,
+    paths: usize,
+    /// Whether a path was left out at `MAX_PATHS`.
+    full: bool,
+}
+
+impl Fields {
+    fn add(&mut self, doc: &Document, number: u64) {
+        if let Document::Object(map) = doc {
+            for (name, value) in map.iter() {
+                Self::field(
+                    &mut self.root,
+                    name,
+                    value,
+                    number,
+                    &mut self.paths,
+                    &mut self.full,
+                );
+            }
+        }
+    }
+
+    /// `value`, the field `name` of an object at `parent`.
+    fn field(
+        parent: &mut Shape,
+        name: &str,
+        value: &Document,
+        number: u64,
+        paths: &mut usize,
+        full: &mut bool,
+    ) {
+        if !parent.fields.contains_key(name) {
+            if *paths == MAX_PATHS {
+                *full = true;
+                return;
+            }
+            *paths += 1;
+            parent.fields.insert(name.to_string(), Shape::default());
+        }
+        let shape = parent.fields.get_mut(name).expect("just found or made");
+        Self::value(shape, value, number, paths, full);
+    }
+
+    /// `value`, counted at `shape`, and what's inside it below.
+    fn value(shape: &mut Shape, value: &Document, number: u64, paths: &mut usize, full: &mut bool) {
+        if shape.last != number {
+            shape.last = number;
+            shape.documents += 1;
+        }
+        let kind = kind(value);
+        if shape.last_kind[kind] != number {
+            shape.last_kind[kind] = number;
+            shape.kinds[kind] += 1;
+        }
+        match value {
+            Document::Object(map) => {
+                for (name, value) in map.iter() {
+                    Self::field(shape, name, value, number, paths, full);
+                }
+            }
+            Document::Array(items) => {
+                for item in items {
+                    if shape.elements.is_none() {
+                        if *paths == MAX_PATHS {
+                            *full = true;
+                            return;
+                        }
+                        *paths += 1;
+                        shape.elements = Some(Box::default());
+                    }
+                    let elements = shape.elements.as_mut().expect("just made");
+                    Self::value(elements, item, number, paths, full);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Each path with its counts, `_id` first, then a field before what's
+    /// below it, names in order, an object's fields before its elements.
+    fn lines(&self) -> Vec<Line<'_>> {
+        let mut lines = Vec::new();
+        let mut names: Vec<&String> = self.root.fields.keys().collect();
+        names.sort_by_key(|name| name.as_str() != "_id");
+        for name in names {
+            walk(
+                name_text(name),
+                named(name),
+                &self.root.fields[name],
+                &mut lines,
+            );
+        }
+        lines
+    }
+}
+
+/// A path of the summary, as a filter writes it.
+struct Line<'s> {
+    text: String,
+    /// Whether a filter can name it: no name on the way has a `.` or a
+    /// `[*]` in it (SPEC §31.2).
+    nameable: bool,
+    shape: &'s Shape,
+}
+
+fn named(name: &str) -> bool {
+    !name.contains('.') && !name.contains("[*]")
+}
+
+/// `name` as a filter writes it (SPEC §111.3), in backticks unless it's a
+/// bare word: written by the filter language itself, so the two can't
+/// disagree. One no path can name in backticks too, which the language
+/// would take apart at its `.`.
+fn name_text(name: &str) -> String {
+    match named(name) {
+        true => {
+            let text = trunkdb::query::Condition::exists(name).to_string();
+            text["exists(".len()..text.len() - 1].to_string()
+        }
+        false => format!("`{}`", name.replace('`', "``")),
+    }
+}
+
+fn walk<'s>(text: String, nameable: bool, shape: &'s Shape, lines: &mut Vec<Line<'s>>) {
+    lines.push(Line {
+        text: text.clone(),
+        nameable,
+        shape,
+    });
+    for (name, field) in &shape.fields {
+        let below = format!("{text}.{}", name_text(name));
+        walk(below, nameable && named(name), field, lines);
+    }
+    if let Some(ref elements) = shape.elements {
+        walk(format!("{text}[*]"), nameable, elements, lines);
+    }
+}
+
+/// Every path the documents `filter` finds have (SPEC §121): in how many
+/// documents, and as which kinds of value. How many documents, to stderr.
+fn fields(db: &Database, collection: &str, filter: &str) -> Outcome {
+    let failed = |e: trunkdb::Error| e.to_string();
+    let (docs, filter) = match query(db, collection, filter)? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
+    };
+    let mut summary = Fields {
+        root: Shape::default(),
+        paths: 0,
+        full: false,
+    };
+    let mut read = 0;
+    for doc in docs.cursor(filter).map_err(failed)? {
+        read += 1;
+        summary.add(&doc.map_err(failed)?, read);
+    }
+    let lines: Vec<(String, &Shape)> = summary
+        .lines()
+        .iter()
+        .map(|line| match line.nameable {
+            true => (line.text.clone(), line.shape),
+            false => (format!("{} (no path can name it)", line.text), line.shape),
+        })
+        .collect();
+    let width = lines
+        .iter()
+        .map(|(path, _)| path.chars().count())
+        .max()
+        .unwrap_or(0);
+    let digits = read.to_string().len();
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    for (path, shape) in &lines {
+        let mut kinds: Vec<usize> = (0..KINDS.len()).filter(|&k| shape.kinds[k] > 0).collect();
+        // Most first; a tie in `KINDS`' order.
+        kinds.sort_by_key(|&k| std::cmp::Reverse(shape.kinds[k]));
+        let kinds: Vec<String> = kinds
+            .iter()
+            .map(|&k| format!("{} {}", KINDS[k], shape.kinds[k]))
+            .collect();
+        let padding = width - path.chars().count();
+        if let Err(e) = writeln!(
+            out,
+            "{path}{:padding$}  {:>digits$}  {}",
+            "",
+            shape.documents,
+            kinds.join(", ")
+        ) {
+            return stopped_writing(e);
+        }
+    }
+    if let Err(e) = out.flush() {
+        return stopped_writing(e);
+    }
+    eprintln!(
+        "{} in {}",
+        count(lines.len(), "path"),
+        count(read as usize, "document")
+    );
+    if summary.full {
+        eprintln!("only the first {MAX_PATHS} paths found are counted; a filter can narrow it");
+    }
+    Ok(ExitCode::SUCCESS)
 }
