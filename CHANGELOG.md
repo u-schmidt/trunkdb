@@ -496,7 +496,7 @@ limit, batches and a write-ahead log. Since then:
     README: it rises only when a dependency or a real need requires it,
     and that isn't breaking.
 
-    Items 83–90: not released yet. **Breaking:** `IndexMap<String,
+    Items 83–90 → 0.23.0. **Breaking:** `IndexMap<String,
     Document>` becomes `trunkdb::Map`, `IndexMap::new()` `Map::new()`,
     `shift_remove` `remove`; `IndexMap`-only methods (`entry`, `first`,
     `get_index`, …) are done with `get`, `get_mut`, `insert` and

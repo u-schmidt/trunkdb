@@ -1,6 +1,6 @@
 [package]
 name = "trunkdb"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
 rust-version = "1.89"
 description = "An embedded, single-file, schema-less document database: crash-safe batches, secondary indexes, snapshot reads and a text query language, built from the page layer up."
