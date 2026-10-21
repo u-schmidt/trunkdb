@@ -1,4 +1,9 @@
-# trunkdb
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/trunkdb-logo-dark.svg">
+    <img src="assets/trunkdb-logo-light.svg" alt="trunkdb" width="260">
+  </picture>
+</h1>
 
 [![CI](https://github.com/u-schmidt/trunkdb/actions/workflows/ci.yml/badge.svg)](https://github.com/u-schmidt/trunkdb/actions/workflows/ci.yml)
 
