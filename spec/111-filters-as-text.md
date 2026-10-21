@@ -84,6 +84,22 @@ mean something only where a field can't be, so they stay free for
 fields: `size > 3`, `date = …` and `is = 1` compare fields of those
 names, and only `size(` and `exists(` are functions.
 
+**Kept free.** A word added later comes where a field can't be: after
+a field, where operators go (`in`, §115; `between`, `starts with`);
+before `(`, as a function (`count()`); after a function (`as`); or
+followed by what can't follow a field (`group by`, `having`). So none
+needs reserving now. What needs keeping are three places, each an
+error today, so that nothing claims them first:
+- **A bare word as a value.** `a = b` is refused, `expected a value`.
+  If a filter ever compares a field with a field (§111.8), that's how
+  it reads.
+- **`:` and `$` outside strings.** `:` is for parameters,
+  `status = :status` (§111.8); `$` for references.
+- **The start of another kind of text.** Updates and aggregates as text
+  (§111.11) get texts of their own, read by their own parsers, so a
+  word like `set` that starts an update never meets a field named
+  `set` in a filter.
+
 ## 111.4 Values
 A value is JSON as a `Document` reads it (§71): `5` is an `Int`, `5.0`
 a `Float`, strings in double quotes with JSON's escapes, `true`,
@@ -179,6 +195,8 @@ for it alone.
 - Keywords in any case; keywords that aren't reserved as field names;
   names in backticks, with a backtick, empty, a keyword, a dot, `@`.
 - Each kind of mistake, with its message and place.
+- The places kept free (§111.3) refused: a bare word as a value, `:`
+  and `$`, `group by`, `set`.
 - A filter read from text finds what its builder finds, sorted, paged
   and selected.
 - 3,000 random filters, every kind of condition nested three deep,
@@ -220,7 +238,9 @@ condition inside `has` in parentheses of its own.
 
 ## 111.11 Limits
 - No parameters (§111.8).
-- Aggregates have no text yet: `group by … count() as n` would extend
-  this one.
-- Updates neither.
+- Aggregates have no text yet: `group by … count() as n` would be a
+  text of its own, with this one's conditions inside (§111.3). Its
+  functions, `min(` and the like, are functions only before `(`.
+- Updates neither; theirs too would be its own, so `set`, `push` or
+  `pull` never mean anything in a filter.
 - On the command line through `trunkdb find` since §112.

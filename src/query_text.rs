@@ -1055,6 +1055,23 @@ mod tests {
     }
 
     #[test]
+    fn the_places_kept_free_are_errors() {
+        // SPEC §111.3: what a later version may give a meaning.
+        for text in [
+            "a = b",
+            "a in (1, b)",
+            "a = :b",
+            ":a = 1",
+            "a = $b",
+            "$a = 1",
+            "a = 1 group by b",
+            "set a = 1",
+        ] {
+            error(text);
+        }
+    }
+
+    #[test]
     fn mistakes_are_named_where_they_are() {
         assert_eq!(
             error("a = "),
