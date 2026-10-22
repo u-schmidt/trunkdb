@@ -739,9 +739,12 @@ fn only(mut condition: &Condition) -> &Condition {
     condition
 }
 
-/// The field and values of an OR of two or more `eq`s of one field.
+/// The field and values of an OR of two or more `eq`s of one field. A
+/// branch is looked at past an AND or OR of it alone, as it prints: else
+/// `Any([All([a = 1]), a = 2])` printed `a = 1 or a = 2`, which reads
+/// back as `in` and prints so, and the text didn't read back the same.
 fn in_list(condition: &Condition) -> Option<(&str, Vec<&Document>)> {
-    let Condition::Any(any) = condition else {
+    let Condition::Any(any) = only(condition) else {
         return None;
     };
     let mut field = None;
@@ -751,7 +754,7 @@ fn in_list(condition: &Condition) -> Option<(&str, Vec<&Document>)> {
             field: this,
             op: Op::Eq,
             value,
-        } = branch
+        } = only(branch)
         else {
             return None;
         };
@@ -1029,6 +1032,22 @@ mod tests {
         let print = |text: &str| read(text).to_string();
         // Printed as `in` however it was written; anything else as it is.
         assert_eq!(print("a = 1 or a = 2 or a = 3"), "a in (1, 2, 3)");
+        // Branches wrapped alone in an AND or OR print as they would
+        // bare: as `in`, so the text reads back the same (found by the
+        // `queries` target, seed 123123).
+        let wrapped = Condition::Any(vec![
+            Condition::All(vec![Condition::eq("a", "s0")]),
+            Condition::Any(vec![Condition::eq("a", 0)]),
+        ]);
+        assert_eq!(wrapped.to_string(), r#"a in ("s0", 0)"#);
+        assert_eq!((!wrapped.clone()).to_string(), r#"a not in ("s0", 0)"#);
+        let alone = Condition::All(vec![wrapped]);
+        assert_eq!(alone.to_string(), r#"a in ("s0", 0)"#);
+        for condition in [alone.clone(), !alone] {
+            let text = condition.to_string();
+            let back: Condition = text.parse().unwrap();
+            assert_eq!(back.to_string(), text);
+        }
         assert_eq!(print("not (a = 1 or a = 2)"), "a not in (1, 2)");
         assert_eq!(print("x = 0 and (a = 1 or a = 2)"), "x = 0 and a in (1, 2)");
         assert_eq!(print("a in (1, 2) or b = 3"), "a in (1, 2) or b = 3");

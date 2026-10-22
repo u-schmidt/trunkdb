@@ -535,3 +535,9 @@ limit, batches and a write-ahead log. Since then:
     once whatever its size, as §108 had it: under the new threshold a
     small image would have waited in the WAL. A caller who set either
     option sees no change; no file or WAL format moved.
+
+94. **A fix to `in` as text** (§115): an OR of `eq`s of one field whose
+    branches came wrapped alone in an AND or OR printed as
+    `a = "s0" or a = 0`, which reads back as `in` and prints so; the
+    text didn't read back the same. It prints as `in` now, as an OR of
+    bare `eq`s does. Found by the `queries` fuzz target.

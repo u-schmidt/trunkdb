@@ -80,6 +80,17 @@ The random filters found one thing: a NOT of an AND of one `in`
 printed as `not a in (…)`, and read back as `a not in (…)`. A NOT now
 looks through ANDs and ORs of one condition, which print as it does.
 
+**Fixed later**, found by the `queries` target (seed 123123, after
+0.23.0): an OR whose `eq` branches came wrapped alone in an AND or OR,
+`Any([All([a = "s0"]), a = 0])`, printed `a = "s0" or a = 0`, since the
+printer drops such wrappers, but wasn't recognized as a list. Its text
+read back as `in`, and printed so: the text didn't read back the same.
+The list now looks at its branches, and at itself, past such wrappers,
+as the NOT already did. The values' two types had nothing to do with
+it. Tested in `a_list_of_values_reads_as_an_or_of_eqs_and_prints_as_in`
+(the OR, its NOT, and both wrapped once more, each read back to the
+same text); the check removed, it fails.
+
 ## 115.5 Mutations
 Each caught: `is_in` as an AND (2 tests), of `ne`s (2); `Filter::is_in`
 negated (2); `not in` read as `in` (2); a list keeping its first value
