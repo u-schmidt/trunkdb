@@ -8,7 +8,7 @@
 use crate::document::{DocId, Document, ID_FIELD, encode_document};
 use crate::map::Map;
 use crate::path::Path;
-use crate::query::{Condition, Filter, SortOrder, is_unordered, sort_order};
+use crate::query::{Condition, Filter, SortOrder, canonical, is_unordered, sort_order};
 use crate::storage::RecordLocation;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -441,8 +441,9 @@ impl Wide {
 }
 
 /// A group's values, ordered as rows come (SPEC §107.2): by the order a
-/// sort uses, and values no comparison orders by their encoding, so that
-/// equal ones are one group and different ones two.
+/// sort uses, and values no comparison orders by the encoding of their
+/// canonical form (§124.4), so that values a filter finds equal are one
+/// group and different ones two.
 #[derive(Debug, Clone)]
 struct GroupKey(Vec<Document>);
 
@@ -677,7 +678,16 @@ impl<'a> Groups<'a> {
     }
 
     fn group_index(&mut self, first: Vec<Seen>) -> usize {
-        let key = GroupKey(first.iter().map(|seen| seen.value.clone()).collect());
+        // Arrays, objects and binary as a filter's `=` sees them: equal
+        // ones one group (SPEC §124.4).
+        let key = GroupKey(
+            (first.iter())
+                .map(|seen| match is_unordered(&seen.value) {
+                    true => canonical(&seen.value),
+                    false => seen.value.clone(),
+                })
+                .collect(),
+        );
         let columns = &self.aggregate.columns;
         let list = &mut self.list;
         let i = *self.groups.entry(key).or_insert_with(|| {

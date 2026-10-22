@@ -541,3 +541,18 @@ limit, batches and a write-ahead log. Since then:
     `a = "s0" or a = 0`, which reads back as `in` and prints so; the
     text didn't read back the same. It prints as `in` now, as an OR of
     bare `eq`s does. Found by the `queries` fuzz target.
+
+95. **`=` and `!=` on arrays, objects and binary** (§124): compared by
+    their contents, where before `=` never held for them and `!=`
+    always did, even against a document holding exactly that value.
+    Arrays element by element, objects field by field in any order,
+    binary byte by byte, single values inside as `=` sees them (`[1]`
+    equals `[1.0]`): the equality `add_to_set` and `pull` already used,
+    now one function for both. `in`, `not in` and `has (@ = …)` with
+    such values follow; `<`, `<=`, `>`, `>=` still never hold for them.
+    **Changed answers:** a filter with `!=` and such a value finds fewer
+    documents than before, and aggregates put equal ones into one group
+    (`{"a": 1, "b": 2}` with `{"b": 2, "a": 1}`). Reads through a
+    compound index now read the document where an entry holds such a
+    value, which it can't tell apart from its key. Unique indexes still
+    don't check these values. No file format or API change.

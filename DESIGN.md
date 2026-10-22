@@ -310,7 +310,9 @@ limit 1`, which says what the methods say and compiles to the same
 survive the round trip [§111](spec/111-filters-as-text.md).
 
 Values of different types never compare equal or ordered, except
-numbers: an `Int` and a `Float` compare by exact value [§34](spec/34-sorting-through-an-index.md).
+numbers: an `Int` and a `Float` compare by exact value [§34](spec/34-sorting-through-an-index.md). Arrays,
+objects and binary have no order; `=` and `!=` compare them by their
+contents, objects in any field order, `[1]` equal to `[1.0]` [§124](spec/124-equal-arrays-objects-and-binary.md).
 
 **The planner** follows fixed rules, not costs [§28.4](spec/28-secondary-indexes.md). `explain` shows
 what it picked (`QueryPlan`):

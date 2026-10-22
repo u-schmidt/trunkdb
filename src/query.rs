@@ -14,8 +14,16 @@ pub use crate::update::Update;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Op {
+    /// Equal: single values as `compare` has them (SPEC §32, §34.1) —
+    /// `5` equals `5.0`, a string never a number, NaN nothing — and
+    /// arrays, objects and binary by their contents (SPEC §124): arrays
+    /// element by element, objects field by field in any order.
     Eq,
+    /// Not `Eq`: also where the field is missing or null, or holds a
+    /// value of another kind.
     Ne,
+    /// `Lt` to `Gte` hold between values of one kind that have an order
+    /// (SPEC §34.1): never for arrays, objects, binary or NaN.
     Lt,
     Lte,
     Gt,
@@ -1653,6 +1661,12 @@ impl OnBytes<'_> {
                     return Some(!matches!(op, Op::Contains) && holds(op, ord));
                 };
                 let part = entry.parts[*at];
+                // An array, object or binary value in a compound key is
+                // its tag alone (SPEC §43): equal to one asked for or
+                // not, only the document tells (§124.3).
+                if matches!(op, Op::Eq | Op::Ne) && key::is_other(part) && is_whole(value) {
+                    return None;
+                }
                 if let Op::Contains = op {
                     // Case folding needs the text (SPEC §25).
                     return match (key::is_string(part), value) {
@@ -1908,7 +1922,68 @@ fn value_matches(op: &Op, field_value: &Document, value: &Document) -> bool {
             _ => false,
         };
     }
+    // Compared whole, by their contents, with `=` and `!=` only (SPEC
+    // §124.2): they have no order.
+    if is_whole(field_value) || is_whole(value) {
+        return match op {
+            Op::Eq => equal_values(field_value, value),
+            Op::Ne => !equal_values(field_value, value),
+            _ => false,
+        };
+    }
     holds(op, compare(field_value, value))
+}
+
+/// An array, an object or binary data: a value `=` and `!=` compare by
+/// its contents and nothing orders (SPEC §124).
+pub(crate) fn is_whole(value: &Document) -> bool {
+    matches!(
+        value,
+        Document::Array(_) | Document::Object(_) | Document::Binary(_)
+    )
+}
+
+/// Equal, as a filter's `Eq` sees it (SPEC §124.1), and `add_to_set`
+/// and `pull` (§73): single values as `compare` has them (`5` and `5.0`
+/// equal, NaN equal to nothing); arrays element by element, in order;
+/// objects field by field, in any order; binary byte by byte.
+pub(crate) fn equal_values(a: &Document, b: &Document) -> bool {
+    match (a, b) {
+        (Document::Array(x), Document::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| equal_values(x, y))
+        }
+        (Document::Object(x), Document::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(key, value)| y.get(key).is_some_and(|other| equal_values(value, other)))
+        }
+        (Document::Binary(x), Document::Binary(y)) => x == y,
+        _ => equal(a, b),
+    }
+}
+
+/// `value` in a form in which values `equal_values` finds equal are
+/// identical (SPEC §124.4), for grouping: an object's fields by name,
+/// and a `Float` with a whole value an `i64` holds as that `Int`, at
+/// every depth. NaN stays as it is, equal to nothing.
+pub(crate) fn canonical(value: &Document) -> Document {
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    match value {
+        Document::Float(f) if f.fract() == 0.0 && *f >= -TWO_POW_63 && *f < TWO_POW_63 => {
+            Document::Int(*f as i64)
+        }
+        Document::Array(items) => Document::Array(items.iter().map(canonical).collect()),
+        Document::Object(fields) => {
+            let mut sorted: Vec<(&String, &Document)> = fields.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            let mut map = Map::new();
+            for (name, value) in sorted {
+                map.insert(name.clone(), canonical(value));
+            }
+            Document::Object(map)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Whether `op` holds of two values that compare as `ord` (`compare`):
@@ -4391,5 +4466,57 @@ mod tests {
         ));
         assert!(!sorted(Filter::new().eq("name", "Ada")));
         assert!(sorted(Filter::new().any_of([ada(), unindexed()])));
+    }
+
+    /// SPEC §124.1: one equality for arrays, objects and binary, by
+    /// their contents, with single values inside as `eq` sees them.
+    #[test]
+    fn whole_values_are_equal_by_their_contents() {
+        let v = |text: &str| text.parse::<Document>().unwrap();
+        for (a, b) in [
+            ("[1, 2]", "[1, 2]"),
+            ("[1, 2]", "[1.0, 2]"),
+            (r#"{"a": 1, "b": 2}"#, r#"{"b": 2, "a": 1}"#),
+            (r#"{"a": {"x": [null]}}"#, r#"{"a": {"x": [null]}}"#),
+            (r#"{"a": null}"#, r#"{"a": null}"#),
+            ("[]", "[]"),
+            ("{}", "{}"),
+            (r#"{"$binary": "AAEC"}"#, r#"{"$binary": "AAEC"}"#),
+            (
+                r#"[{"$date": "2026-01-01T00:00:00Z"}]"#,
+                r#"[{"$date": "2026-01-01T00:00:00Z"}]"#,
+            ),
+        ] {
+            assert!(equal_values(&v(a), &v(b)), "{a} = {b}");
+            assert!(equal_values(&v(b), &v(a)), "{b} = {a}");
+            assert_eq!(canonical(&v(a)), canonical(&v(b)), "{a} and {b} one group");
+            for op in [Op::Eq, Op::Lte, Op::Gte, Op::Lt, Op::Gt, Op::Ne] {
+                let holds = value_matches(&op, &v(a), &v(b));
+                assert_eq!(holds, op == Op::Eq, "{a} {op:?} {b}");
+            }
+        }
+        for (a, b) in [
+            ("[1, 2]", "[2, 1]"),
+            ("[1, 2]", "[1, 2, 3]"),
+            ("[1]", r#"["1"]"#),
+            (r#"{"a": 1}"#, r#"{"a": 1, "b": 2}"#),
+            ("{}", r#"{"a": null}"#),
+            (r#"{"a": 1}"#, r#"{"b": 1}"#),
+            ("[]", "{}"),
+            ("[1]", "1"),
+            (r#"{"$binary": "AAEC"}"#, r#"{"$binary": "AQ=="}"#),
+            (r#"{"$binary": "AAEC"}"#, "[0, 1, 2]"),
+            (r#"[{"$float": "NaN"}]"#, r#"[{"$float": "NaN"}]"#),
+            ("[9007199254740993]", "[9007199254740992.0]"),
+        ] {
+            assert!(!equal_values(&v(a), &v(b)), "{a} != {b}");
+            assert!(value_matches(&Op::Ne, &v(a), &v(b)), "{a} != {b}");
+            assert!(!value_matches(&Op::Eq, &v(a), &v(b)), "not {a} = {b}");
+        }
+        // Not equal by `==`, which tells `1` from `1.0`.
+        assert_ne!(v("[1]"), v("[1.0]"));
+        // A missing field and a null one aren't arrays: `!=` holds.
+        assert!(value_matches(&Op::Ne, &Document::Null, &v("[1]")));
+        assert!(!value_matches(&Op::Eq, &Document::Null, &v("[]")));
     }
 }

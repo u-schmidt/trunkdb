@@ -26,7 +26,9 @@ SQLite; SQL Server allows one `NULL`). MongoDB counts missing as a
 duplicate null, so an optional field there needs a partial index as
 well. Here an optional field like `email` can be unique as it is.
 Values no condition can match as equal — arrays, objects, binary, ids,
-`NaN` — aren't in the index (§28.1) and aren't checked either.
+`NaN` — aren't in the index (§28.1) and aren't checked either. (Since
+§124, `=` compares arrays, objects and binary by content; a unique index
+still doesn't check them, §124.5.)
 
 Keys alone can't decide it. Different values can share a key's value
 part: `Int`s beyond 2^53 that round to one `f64`, strings cut to the

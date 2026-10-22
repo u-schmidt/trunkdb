@@ -155,7 +155,8 @@ everything else (§34.1).
 - **`eq("_id", id)` scans** too; `get` uses the primary index. The
   planner could send one to the other.
 - **`Binary` values still don't compare** with each other, the same gap
-  as ids had; nothing has asked for it.
+  as ids had; nothing has asked for it. (Closed for `=` and `!=` in
+  §124, with arrays and objects.)
 - **`DocId::NIL` is public**, new API: it's needed for the plain-field
   style, and a named constant reads better than `DocId([0; 16])`.
 

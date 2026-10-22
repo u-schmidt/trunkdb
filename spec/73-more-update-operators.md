@@ -71,7 +71,8 @@ would move a field into what it's being taken out of.
   equals nothing, not even NaN. Arrays, objects and binary, which no
   filter compares, are equal by their contents: arrays element by
   element in order, objects field by field in any order, as
-  `Document`'s `==` sees them.
+  `Document`'s `==` sees them. (Since §124 filters compare them too, by
+  this same equality, `query::equal_values`.)
 
 A multikey index on the array (`tags[*]`, §42) follows, as every index
 follows every update.

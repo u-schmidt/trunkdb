@@ -109,7 +109,9 @@ impl IndexOptions {
     }
 
     /// No two documents may have equal values in it (SPEC §33); nulls
-    /// and missing values never count.
+    /// and missing values never count, nor do values nothing orders —
+    /// arrays, objects, binary, NaN — which a filter's `=` may still
+    /// find equal (SPEC §124.5).
     pub const fn unique(mut self) -> Self {
         self.unique = true;
         self

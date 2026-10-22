@@ -22,7 +22,8 @@ measurements.
 
 - Typed documents through serde, or untyped ones (`Document`).
 - Filters in code or as text, with sort, skip and limit; projection and
-  aggregates by group.
+  aggregates by group. Arrays, objects and binary compare by their
+  contents with `=` and `!=`.
 - Secondary indexes: unique, compound, on nested paths and array
   elements, and sparse.
 - Atomic batches across collections; every commit crash-safe through a

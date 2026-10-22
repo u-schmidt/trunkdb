@@ -296,6 +296,22 @@ fn pool() -> Vec<Document> {
         Document::Array(vec![Document::Int(1)]),
         Document::Object(Map::new()),
         Document::Binary(vec![1]),
+        // Equal and unequal by their contents (SPEC §124): `[1]` and
+        // `[1.0]`, fields in either order, nested, other bytes.
+        Document::Array(vec![Document::Float(1.0)]),
+        Document::Array(vec![Document::Int(1), Document::Int(2)]),
+        Document::Array(vec![Document::Int(2), Document::Int(1)]),
+        object([("a", Document::Int(1)), ("b", Document::Int(2))]),
+        object([("b", Document::Int(2)), ("a", Document::Int(1))]),
+        object([(
+            "a",
+            object([("x", Document::Array(vec![Document::Int(1)]))]),
+        )]),
+        object([(
+            "a",
+            object([("x", Document::Array(vec![Document::Float(1.0)]))]),
+        )]),
+        Document::Binary(vec![1, 2]),
     ]
 }
 
@@ -1197,8 +1213,9 @@ impl Run<'_> {
     /// finds twice, so each value `doc` holds there (each element, for
     /// `[*]`) is looked for with the database's own `Eq`, the AND of
     /// them for a compound index. A null — or a field missing, which a
-    /// filter can't tell from null — collides with nothing; arrays,
-    /// objects and `NaN` equal nothing under `Eq` anyway.
+    /// filter can't tell from null — collides with nothing; nor do
+    /// arrays, objects and binary, which `Eq` compares by content but a
+    /// unique index doesn't check (SPEC §124.5); `NaN` equals nothing.
     fn collisions_in(
         at: usize,
         model: &BTreeMap<DocId, Document>,
@@ -1221,7 +1238,12 @@ impl Run<'_> {
         };
         let mut colliding = Vec::new();
         for tuple in tuples {
-            if tuple.iter().any(|value| matches!(value, Document::Null)) {
+            if tuple.iter().any(|value| {
+                matches!(
+                    value,
+                    Document::Null | Document::Array(_) | Document::Object(_) | Document::Binary(_)
+                )
+            }) {
                 continue;
             }
             let filter = (fields.iter().zip(tuple))

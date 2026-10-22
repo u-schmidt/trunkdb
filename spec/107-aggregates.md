@@ -72,7 +72,10 @@ let per_status = tasks.aggregate(
 - **Values a filter finds equal are one group:** `5` and `5.0` are one,
   `"a"` and `"A"` two. Values no comparison orders (arrays, objects,
   binary, NaN) are one group per equal encoding: `[1, 2]` is a group,
-  `[2, 1]` another, and every NaN of one bit pattern one.
+  `[2, 1]` another, and every NaN of one bit pattern one. (Since §124,
+  arrays, objects and binary group by their canonical form, so values
+  `=` finds equal are one group: `{"a": 1, "b": 2}` with
+  `{"b": 2, "a": 1}`, `[1]` with `[1.0]`.)
 - **The value a row shows** is its group's first document's, by id: of
   `5` (inserted first) and `5.0`, the row says `5`.
 - **An array is a value, not its elements:** `group_by("tags")` groups

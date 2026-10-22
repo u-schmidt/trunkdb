@@ -46,7 +46,9 @@ of different kinds never compare equal, and a string is never less or
 greater than a number: `age > 30` skips documents whose `age` is a
 string. `order by` sorts across kinds as null and missing, booleans,
 numbers, strings, ids (by when they were made), dates; arrays, objects
-and binary come last, whichever the direction.
+and binary come last, whichever the direction. Those three compare only
+with `=` and `!=`, by their contents: `meta = {"k": 1}` finds an equal
+object whatever its field order, and `<`, `>` never hold for them.
 
 ## Paths and names
 

@@ -106,7 +106,8 @@ a `Float`, strings in double quotes with JSON's escapes, `true`,
 `false`, `null`, arrays, objects, and the tags — `{"$binary": …}`,
 `{"$float": "NaN"}`. Since the value is a `Document`, its type is kept
 as exactly as a typed field in a form would keep it: a round trip never
-turns a date into a string or `5.0` into `5`.
+turns a date into a string or `5.0` into `5`. Arrays, objects and
+binary compare by their contents with `=` and `!=` since §124.
 
 Ids and date-times have short forms, `id("0192…")` and
 `date("2024-05-01T12:00:00Z")`, which is how they print; `{"$id": …}`

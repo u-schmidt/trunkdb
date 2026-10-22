@@ -1,5 +1,6 @@
 use crate::document::{Document, ID_FIELD};
 use crate::map::Map;
+use crate::query::equal_values;
 use std::cmp::Ordering;
 
 /// Changes to make to every document a filter finds, named by field
@@ -203,13 +204,13 @@ impl Update {
                 }
                 Change::AddToSet(path, value) => {
                     let items = array_at(doc, path, "add_to_set")?;
-                    if !items.iter().any(|item| same(item, value)) {
+                    if !items.iter().any(|item| equal_values(item, value)) {
                         items.push(value.clone());
                     }
                 }
                 Change::Pull(path, value) => match get_mut(doc, path) {
                     None => {}
-                    Some(Document::Array(items)) => items.retain(|item| !same(item, value)),
+                    Some(Document::Array(items)) => items.retain(|item| !equal_values(item, value)),
                     Some(other) => {
                         return Err(format!(
                             "{path:?}: `pull` needs an array there, not {}",
@@ -301,25 +302,6 @@ fn array_at<'a>(
             "{path:?}: `{op}` needs an array there, not {}",
             kind(other)
         )),
-    }
-}
-
-/// Equal, for `add_to_set` and `pull`: as a filter's `eq` sees scalars
-/// (`crate::query::equal`), and arrays, objects and binary by their
-/// contents, an object's fields in any order, as `Document`'s `==`
-/// sees them.
-fn same(a: &Document, b: &Document) -> bool {
-    match (a, b) {
-        (Document::Array(x), Document::Array(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y))
-        }
-        (Document::Object(x), Document::Object(y)) => {
-            x.len() == y.len()
-                && x.iter()
-                    .all(|(key, value)| y.get(key).is_some_and(|other| same(value, other)))
-        }
-        (Document::Binary(x), Document::Binary(y)) => x == y,
-        _ => crate::query::equal(a, b),
     }
 }
 
