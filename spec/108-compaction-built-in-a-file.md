@@ -85,7 +85,9 @@ time, checksums and all, then writes the header, cuts the file to its
 page count and flushes. Then it lets the replacement go, and with it
 the file. Until then the pages count as waiting (`unwritten`), so the
 checkpoint follows the commit at once, as it did when the pages were in
-memory. A batch committed after the compaction and before the
+memory. (That held while any image crossed the 1,000-page threshold;
+since §123 raised it, a commit checkpoints while a replacement waits,
+whatever its size.) A batch committed after the compaction and before the
 checkpoint is read over the replacement and written after it.
 
 **A failed copy** leaves the file half written and the replacement in

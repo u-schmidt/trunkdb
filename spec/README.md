@@ -137,3 +137,4 @@ say what changed, and DESIGN.md says what is true now.
 120. [Old files as fixtures (`tests/old_files.rs`, `tests/fixtures/`)](120-old-files-as-fixtures.md)
 121. [`trunkdb fields` (`src/bin/trunkdb.rs`)](121-trunkdb-fields.md)
 122. [A skill for AI agents (`skills/trunkdb/`)](122-a-skill-for-ai-agents.md)
+123. [Batched writes: a checkpoint less often (`database.rs`, `storage/file.rs`, `storage/pages.rs`)](123-batched-writes-checkpoint-less-often.md)

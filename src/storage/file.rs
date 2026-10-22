@@ -680,6 +680,12 @@ impl FileStore {
             .is_some_and(|staging| staging.replaces_all)
     }
 
+    /// Whether a committed compaction's image waits for `checkpoint`
+    /// (SPEC §108, §123).
+    pub fn replacement_waits(&self) -> bool {
+        self.pages.replacement_waits()
+    }
+
     /// How many committed pages wait for `checkpoint`.
     pub fn unwritten_pages(&self) -> usize {
         self.pages.unwritten()

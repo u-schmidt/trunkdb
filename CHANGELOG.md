@@ -522,3 +522,16 @@ limit, batches and a write-ahead log. Since then:
     `limit`, counts without the documents, `export` only as a backup;
     the filter language in a file of its own, read when needed. Not in
     the crate.
+
+93. **Batched writes, a checkpoint less often** (§123): the default
+    `checkpoint_pages` is 4,000 instead of 1,000, so the WAL limit that
+    follows it is 65.5 MB instead of 16.4. A commit of 1,000 documents
+    into large indexes leaves 800–1,250 pages waiting, and 59 commits
+    of 100 paid a checkpoint, now 10. On the benchmark's 100,000
+    documents: inserts about 1.35× faster, updates 1.35×, deletes 1.6×;
+    single commits and reads unchanged. It costs up to 33 MB of waiting
+    pages instead of 8, a WAL up to 65.5 MB, 79 ms of recovery after a
+    crash instead of 34. A compaction's commit now writes it back at
+    once whatever its size, as §108 had it: under the new threshold a
+    small image would have waited in the WAL. A caller who set either
+    option sees no change; no file or WAL format moved.

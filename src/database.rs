@@ -203,7 +203,7 @@ impl OpenOptions {
     /// the file (SPEC §51, §53); 0 or 1 writes them back after every
     /// commit. More: fewer writes, but more memory (8 KB a page) and a
     /// WAL that grows with every commit, not with this number (§53.3);
-    /// `checkpoint_wal_bytes` bounds that. Default: 1,000.
+    /// `checkpoint_wal_bytes` bounds that. Default: 4,000 (SPEC §123).
     pub fn checkpoint_pages(mut self, pages: usize) -> Self {
         self.checkpoint_pages = pages;
         self
@@ -215,7 +215,7 @@ impl OpenOptions {
     /// again add a page image to the WAL each time, and the next open
     /// after a crash reads all of it back. Checked after a commit, so one
     /// large commit can take the WAL past it. Default: twice the bytes of
-    /// `checkpoint_pages` pages, 16 MB at 1,000, and no limit for a
+    /// `checkpoint_pages` pages, 65.5 MB at the default 4,000, and no limit for a
     /// `checkpoint_pages` too large to count them; raise both together.
     pub fn checkpoint_wal_bytes(mut self, bytes: u64) -> Self {
         self.checkpoint_wal_bytes = Some(bytes);
@@ -265,9 +265,11 @@ impl OpenOptions {
 }
 
 /// How many committed pages may wait in memory, logged but not written
-/// back, before a commit writes them back (SPEC §51): 1,000 pages of 8 KB each —
-/// SQLite's default for its WAL mode too.
-const DEFAULT_CHECKPOINT_PAGES: usize = 1000;
+/// back, before a commit writes them back (SPEC §51): 4,000 pages of 8 KB
+/// each, 32.8 MB. A commit of 1,000 documents into large indexes leaves
+/// 800–1,250 pages waiting, so the 1,000 of SQLite's WAL mode, the
+/// default until SPEC §123, made most such commits checkpoint.
+const DEFAULT_CHECKPOINT_PAGES: usize = 4000;
 
 impl Writer {
     /// The WAL, for tests that look at it or make it fail.
@@ -807,8 +809,11 @@ impl Database {
         // The catalog before, if no read holds it, freed outside the lock.
         drop(before);
 
+        // A compaction's image is written back at once, however small:
+        // the file shrinks when `compact` returns (SPEC §108.3, §123.3).
         if writer.store.unwritten_pages() >= writer.checkpoint_pages
             || wal(&mut writer.durability).len() >= writer.checkpoint_wal_bytes
+            || writer.store.replacement_waits()
         {
             // Not an error for this batch if it fails: it's durable, and
             // reads find its pages in memory. The next one tries again.
@@ -1789,6 +1794,10 @@ mod tests {
         let pages_before = db.file_info().unwrap().pages;
 
         db.state().wal().set_record_pages(2);
+        // A compaction's commit writes it back at once (SPEC §123.3):
+        // that write-back fails before its first page, so the compaction
+        // is in the WAL alone.
+        db.state().store.pages.fail_write_backs(1, 0);
         let compacted = db.compact().unwrap();
         assert!(compacted.pages_after < pages_before);
         assert_eq!(db.state().store.file_bytes(), before.0, "not written back");
@@ -1980,7 +1989,7 @@ mod tests {
     }
 
     /// `OpenOptions::checkpoint_pages` decides when a commit writes its
-    /// pages back: at 0 or 1 right away, at the default only once 1,000
+    /// pages back: at 0 or 1 right away, at the default only once 4,000
     /// wait — which one small commit doesn't reach — and exactly when
     /// as many as it says are waiting.
     #[test]
@@ -2044,6 +2053,17 @@ mod tests {
         assert!(peak > limit / 2, "{peak}");
     }
 
+    /// The defaults: 4,000 pages, and a WAL of twice their bytes, 65.5 MB
+    /// (SPEC §123).
+    #[test]
+    fn the_defaults_are_4000_pages_and_a_wal_of_twice_their_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let state = db.state();
+        assert_eq!(state.checkpoint_pages, 4000);
+        assert_eq!(state.checkpoint_wal_bytes, 2 * 4000 * 8192);
+    }
+
     /// Unset, the limit is twice the bytes of `checkpoint_pages` pages: at
     /// 5 pages, 10 page images, so 200 commits of one page checkpoint.
     #[test]
@@ -2069,14 +2089,17 @@ mod tests {
         }
     }
 
-    /// Enough waiting pages, and the commit writes them back itself.
+    /// Enough waiting pages, and the commit writes them back itself: at
+    /// the default, the commit that brings 4,000 to wait, not one before
+    /// it (SPEC §123).
     #[test]
     fn a_commit_checkpoints_once_enough_pages_wait() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
         let db = Database::open(&path).unwrap();
         let big = obj(Document::String("x".repeat(6000)));
-        let checkpoint_pages = DEFAULT_CHECKPOINT_PAGES;
+        // The default, as a number: the test pins it (SPEC §123).
+        let checkpoint_pages = 4000;
         let mut waiting = 0;
         for commit in 0..100u8 {
             let ops = (0..50u8)
@@ -2088,9 +2111,11 @@ mod tests {
             db.write_batch(ops).unwrap();
             let now = db.state().store.unwritten_pages();
             if now < waiting {
-                // This commit's pages brought it over the line.
+                // This commit's pages brought it over the line: some 50
+                // pages of big documents, and the pages above them.
                 assert_eq!(now, 0);
                 assert!(waiting < checkpoint_pages, "{waiting}");
+                assert!(waiting + 60 >= checkpoint_pages, "{waiting}");
                 assert!(commit > 5, "{commit}");
                 assert_eq!(wal_len(&path), 0);
                 return;

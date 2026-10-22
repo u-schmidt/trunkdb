@@ -502,6 +502,28 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
+    /// A compaction far below the checkpoint threshold is in the file
+    /// when `compact` returns: its commit writes it back at once, the
+    /// file cut and the WAL empty (SPEC §108.3), as when the threshold
+    /// was small enough for any image to cross it (SPEC §123).
+    #[test]
+    fn a_small_compaction_is_in_the_file_when_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = churned(&path);
+        db.checkpoint().unwrap();
+        let before = contents(&db);
+        let compacted = db.compact().unwrap();
+        assert!(compacted.pages_after < compacted.pages_before);
+        assert!((compacted.pages_after as usize) < 4000, "{compacted:?}");
+        assert!(!db.scratch_path().exists(), "the image's file is gone");
+        assert_eq!(file_pages(&path), compacted.pages_after);
+        let wal = path.with_extension("trunkdb.wal");
+        assert_eq!(std::fs::metadata(&wal).map_or(0, |m| m.len()), 0);
+        assert_eq!(db.state().store.unwritten_pages(), 0);
+        assert_eq!(contents(&db), before);
+    }
+
     /// The compaction's write-back fails twice, after part of the file —
     /// its own checkpoint, and the one at drop: the compaction is still
     /// committed and readable (SPEC §51), and the next open completes it
@@ -522,7 +544,8 @@ mod tests {
         }
         let compacted = db.compact().unwrap();
         assert!(compacted.pages_after < compacted.pages_before);
-        assert!(db.checkpoint().is_err());
+        // Its own checkpoint, at its commit, failed: the image waits.
+        assert!(db.state().store.replacement_waits());
         assert_eq!(contents(&db), before);
         assert!(db.check().unwrap().is_ok());
         drop(db);

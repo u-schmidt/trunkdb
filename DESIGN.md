@@ -144,8 +144,9 @@ readers don't take (`Database::transact`) [§19.3](spec/19-durability-take-two-a
 4. **Commit.** The pages become the newest committed ones. Reads find
    them in memory; the main file isn't touched.
 5. **Checkpoint**, once `checkpoint_pages` or more committed pages
-   wait (default 1,000, an `OpenOptions` setting) [§53](spec/53-a-configurable-checkpoint-threshold.md), or the WAL
-   reaches `checkpoint_wal_bytes` (default twice that many pages' bytes) [§76](spec/76-a-wal-size-limit.md): write them to
+   wait (default 4,000, an `OpenOptions` setting) [§53](spec/53-a-configurable-checkpoint-threshold.md), [§123](spec/123-batched-writes-checkpoint-less-often.md), or the WAL
+   reaches `checkpoint_wal_bytes` (default twice that many pages' bytes) [§76](spec/76-a-wal-size-limit.md), or a
+   compaction's image waits [§108](spec/108-compaction-built-in-a-file.md): write them to
    the main file, `fsync`, truncate the WAL.
 
 A crash before step 3 finishes leaves the state before the batch; a
@@ -555,28 +556,28 @@ more than four.
 the same documents and indexes and a durable commit everywhere, and
 checks that all four give the same answers [§48](spec/48-benchmarks-against-sqlite-redb-and-sled.md).
 
-Reads are level with SQLite, redb and sled or ahead of them; writes and
-compaction are still behind. On an M1 Pro with 100,000 documents, the median of
-three runs (0.20.0):
+Reads are level with SQLite, redb and sled or ahead of them; inserts, a
+full scan and compaction are still behind. On an M1 Pro with 100,000
+documents, the median of three runs (0.23.0 with §123):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 22k/s | 42k/s | 37k/s | 28k/s |
-| one commit | 4.7 ms | 4.9 ms | 5.0 ms | 10.2 ms |
-| get by id | 2.5 µs | 17 µs | 2.1 µs | 3.1 µs |
-| 1000 documents by index | 0.98 ms | 2.1 ms | 1.2 ms | 2.1 ms |
-| count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.28 ms |
-| count of a range of 1000 | 0.01 ms | 0.02 ms | 0.03 ms | 0.37 ms |
-| count of all 100,000 | 0.09 ms | 0.02 ms | 0.00 ms | 25 ms |
-| oldest 20 of a status | 19 µs | 25 µs | 16 µs | 22 µs |
-| page 50 of 20 of a status | 27 µs | 58 µs | 47 µs | 277 µs |
-| first 50 by id | 33 µs | 40 µs | 25 µs | 33 µs |
-| 50 by id after skipping 5000 | 40 µs | 133 µs | 160 µs | 1.1 ms |
-| a tenant's first 20 by id | 23 µs | 1.3 ms | 21 µs | 23 µs |
-| scan, 100,000 for a fifth | 64 ms | 49 ms | 52 ms | 70 ms |
-| update, 1000 per commit | 9.1k/s | 12k/s | 17k/s | 21k/s |
-| delete, 1000 per commit | 15k/s | 17k/s | 21k/s | 33k/s |
-| compact | 1.1 s | 0.19 s | 0.44 s | — |
+| insert, 1000 per commit | 32k/s | 44k/s | 45k/s | 30k/s |
+| one commit | 4.7 ms | 4.7 ms | 4.9 ms | 10.2 ms |
+| get by id | 2.8 µs | 6.1 µs | 2.0 µs | 2.6 µs |
+| 1000 documents by index | 0.96 ms | 1.7 ms | 1.0 ms | 1.7 ms |
+| count of 1000 by index | 0.01 ms | 0.02 ms | 0.03 ms | 0.26 ms |
+| count of a range of 1000 | 0.01 ms | 0.02 ms | 0.03 ms | 0.34 ms |
+| count of all 100,000 | 0.08 ms | 0.01 ms | 0.00 ms | 24 ms |
+| oldest 20 of a status | 17.5 µs | 22.5 µs | 16.2 µs | 20.8 µs |
+| page 50 of 20 of a status | 25 µs | 53 µs | 40 µs | 253 µs |
+| first 50 by id | 32 µs | 37 µs | 23 µs | 28 µs |
+| 50 by id after skipping 5000 | 38 µs | 120 µs | 143 µs | 0.95 ms |
+| a tenant's first 20 by id | 22 µs | 1.2 ms | 20 µs | 24 µs |
+| scan, 100,000 for a fifth | 61 ms | 43 ms | 50 ms | 68 ms |
+| update, 1000 per commit | 13k/s | 16k/s | 19k/s | 24k/s |
+| delete, 1000 per commit | 26k/s | 20k/s | 20k/s | 37k/s |
+| compact | 1.2 s | 0.16 s | 0.42 s | — |
 | file size after compact | 31 MB | 22 MB | 30 MB | — |
 
 Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
@@ -588,13 +589,15 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
 - **Still behind:**
   - the count of all documents, which trunkdb counts leaf by leaf where
     the others keep a total;
-  - a scan, 1.3× SQLite: each document's filtered fields are decoded
+  - a scan, 1.4× SQLite: each document's filtered fields are decoded
     into a small object to be checked;
-  - "first 50 by id", 1.3× redb.
-- **Writes are about half as fast:** nearly every batch of 1,000 crosses
-  the default checkpoint threshold once the indexes are large (§53).
-  Compaction inserts its entries one by one (§48.4), and its file is
-  1.4× SQLite's.
+  - "first 50 by id", 1.4× redb.
+- **Writes:** inserts 0.7× SQLite's, updates 0.8×, deletes ahead, since
+  the checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
+  batches of 1,000 in 100 paid a checkpoint. Without flushes inserts
+  run at SQLite's speed; the rest is the WAL's whole pages, 10 MB a
+  commit (§123.5). Compaction inserts its entries one by one (§48.4),
+  and its file is 1.4× SQLite's.
 
 ```
 cd bench && cargo run --release
@@ -612,6 +615,7 @@ Each gap had a measured cause, fixed one at a time:
 | Lookup by id | 32 µs | a page cache, 256 MiB by default, CLOCK eviction [§50](spec/50-a-page-cache.md) |
 | One commit | 16 ms | one flush per commit; write-back at checkpoints [§51](spec/51-one-flush-per-commit.md) |
 | Batched inserts | 7.5k/s | B-tree pages changed in place [§52](spec/52-b-tree-pages-changed-in-place.md) |
+| Batched inserts | 22k/s | a checkpoint once 4,000 pages wait, not 1,000 [§123](spec/123-batched-writes-checkpoint-less-often.md) |
 | First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |

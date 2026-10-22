@@ -527,6 +527,12 @@ impl Pages {
     }
 
     /// How many committed pages wait for `checkpoint`.
+    /// Whether a compaction's image waits to be copied into the file
+    /// (SPEC §108).
+    pub(super) fn replacement_waits(&self) -> bool {
+        self.memory().replacement.is_some()
+    }
+
     pub(super) fn unwritten(&self) -> usize {
         self.memory().unwritten
     }
