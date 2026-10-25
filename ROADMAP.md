@@ -1,8 +1,9 @@
 # trunkdb — roadmap
 
-"v1" is a milestone name, not a semver promise: 0.x minor versions may
-still break API and file format. 1.0.0 is reserved for a stable format
-with a migration path — export/import (§30) is that path.
+trunkdb stays below 1.0. Its API and file format are kept stable by
+practice rather than by a version number; [A settled API and
+format](#a-settled-api-and-format) says how. Export and import (§30)
+move a file between formats where needed.
 
 Section numbers (§) refer to the spec, one file per section in
 [spec/](spec/README.md), which records why each step was taken. New
@@ -43,32 +44,30 @@ All of it is done:
 | 0.23.0 | `trunkdb find … --explain`: how a query ran instead of what it found, a line each: the plan in words, every index read with its bounds in the filter language, its entries and whether they decide the filter, the sort, the counts, and the time last. `#[trunkdb::document]`, with the `derive` feature: `#[id]` on a struct's id field instead of `#[serde(rename = "_id")]`, refused at compile time on a type that isn't `DocId` or `Option<DocId>`, on a second field, or with arguments; a macro crate of its own, `trunkdb-derive`, re-exported as serde re-exports `serde_derive`. **`in`:** `Condition::is_in` and `Filter::is_in`, one of a list of values, SQL's `IN`, the OR of an `eq` per value, so an index reads a point per value and `_id` looks each up; `in (…)` and `not in (…)` in the text, where an OR of `eq`s of one field prints as `in`. **A map of its own:** `Document::Object` holds a `trunkdb::Map`, `IndexMap` inside it and out of the API, its iterators its own types in `trunkdb::map`, the same methods and order as before (`remove` keeping the others' order), equal in any order; breaking for code that named `IndexMap`. **Variants that can grow:** `Condition`'s and `QueryPlan`'s variants with named fields `#[non_exhaustive]`, matched with `..` outside trunkdb, built with `Condition`'s methods; compile-fail tests for each. **The public API gone through**, from rustdoc's JSON: options and reports without `Copy` and `Eq`, two helpers private, `Document` no `Deserializer` (`into_value` the way), the `fuzzing` feature outside semver. **Unique indexes in the `queries` target**, the model asking the database's own `Eq` whether a write makes a duplicate, a batch op by op; **fixed**, found by it: an update of a long string past where its key is cut, which kept its key, wasn't checked, and could store a duplicate **Old files as fixtures:** a database each release from 0.23.0 wrote, in `tests/fixtures/`, opened by every build, read as written, queried through each index and written to; it alone catches a stored type tag changed in encoder and decoder alike. The minimum Rust version's policy in the README | §113–§120 |
 | next | `trunkdb fields <file> <collection> [filter]`: every path a collection's documents have, written as a filter writes it, in how many documents, and as which kinds of value, most first; a filter sums up only what it finds, `limit` a sample; read-only, at most 10,000 paths; an Agent Skill, `skills/trunkdb/`, for AI agents using the command. **Batched writes:** the default checkpoint threshold 4,000 pages instead of 1,000, the WAL limit following to 65.5 MB; with 1,000 documents a commit, 59 commits of 100 checkpointed, now 10; on 100,000 documents inserts about 1.35× faster, updates 1.35×, deletes 1.6×, single commits and reads unchanged; recovery after a crash with a full WAL 79 ms; a compaction's commit writes it back at once whatever its size, as §108 had it. **Fixed:** an OR of `eq`s of one field whose branches came wrapped alone in an AND or OR printed as an OR but read back as `in`, so its text didn't read back the same (a fix to §115). **`=` and `!=` on arrays, objects and binary:** compared by their contents, as `add_to_set` and `pull` compare them (objects in any field order, `[1]` equal to `[1.0]`), where `=` never held and `!=` always did, even against the very value; `in`, `not in` and `has (@ = …)` with them; `<` and the rest still never hold; an index entry with such a value in a compound key read from its document; groups of equal ones merged; unique indexes unchanged, still not checking them | §121–§124 |
 
-## Before 1.0
-No date: 1.0 comes after months of real use in more than one
-application, not after a list. What the list settles is everything that
-can't change after 1.0 without breaking a file, a program or a query,
-so nothing lands in the meantime that makes it harder.
+## A settled API and format
+trunkdb aims for an API and a file format that stay put. It doesn't
+give formal guarantees yet: those wait until use in more than one
+application shows what holds for a broader range of users. In practice:
 
-**What 1.0 promises**
-- Every 1.x build opens every file a 1.x build wrote; a file using
-  something an older 1.x build lacks is refused by it, clearly, as now
-  (§21.2, §33.4). Files from before 1.0 move up by export and import
-  (§30).
-- No breaking API change within 1.x: what compiles against 1.0
-  compiles against every 1.x, and means the same.
-- **The text language counts as API** (§111): a filter that reads in
-  one 1.x reads in every later one, and finds the same. So a new
-  operator comes in 1.x only where a field can't be (`in`, `has`,
-  `contains` are such), and no word becomes reserved: the eleven of
-  §111.3 are all there will be in 1.x, or a field of that name would
-  stop reading bare.
-- Public dependencies are named: a type from another crate in
-  trunkdb's API ties trunkdb's major version to that crate's. `serde`
-  is one, as for nearly every crate; any other is a decision, not an
-  accident.
+- **Files:** a release opens the files earlier releases wrote, from
+  0.23.0 on, and the fixtures (§120) check it. A file using something
+  an older build lacks is refused by it with a clear error (§21.2,
+  §33.4). Should a format ever not be readable in place, export and
+  import (§30) move a file up.
+- **Changes are deliberate:** each has its own spec section saying why,
+  and the changelog points out anything a program has to adapt to.
+- **The filter language** (§111) grows without taking names from
+  fields: a new operator comes only where a field can't be (`in`,
+  `has`, `contains`), and the eleven reserved words of §111.3 stay the
+  only ones.
+- **Public dependencies are chosen on purpose:** `serde` is one, as for
+  nearly every crate; any other is a decision, not an accident.
+
+This list settles early what would be expensive to change once
+applications rely on trunkdb.
 
 **Settled already.** The free-space map lives in memory, so a
-persisted one can come in 1.x (§75); a date-time type, file format 11
+persisted one can come later (§75); a date-time type, file format 11
 (§69); every document an object, format 12 (§95); snapshot reads in
 memory only, with nothing in the file (§77); `find_with_ids` removed and
 `cursor` handing out `T` (§74); the internals private, and `Error`,
@@ -76,50 +75,54 @@ memory only, with nothing in the file (§77); `find_with_ids` removed and
 matters less: it's empty after a clean close, so a change needs only a
 checkpoint before upgrading.
 
-**Must: breaking, or impossible, after 1.0**
+**Must: expensive to change once applications use it**
 - Done in §116: **`indexmap` out of the API.** `Document::Object`
   holds a `trunkdb::Map`, trunkdb's own type with the `IndexMap` inside
   it, so an `indexmap` 3 changes nothing a program sees.
 - Done in §117: **variants with public fields `#[non_exhaustive]`**,
-  `Condition`'s and `QueryPlan`'s, so a field can be added to one in
-  1.x; `All`, `Any`, `Not` and the unit variants left as they are.
+  `Condition`'s and `QueryPlan`'s, so a field can be added to one
+  without breaking a `match`; `All`, `Any`, `Not` and the unit
+  variants left as they are.
 - Done in §118: **one pass over the whole public API**, listed from
   rustdoc's JSON: options and reports no longer `Copy` or `Eq`, two
   helpers made private, `Document` no longer a serde `Deserializer`,
-  the `fuzzing` feature declared outside semver. Another pass, the same
-  way, right before 1.0, for what came since.
-- **On crates.io as 0.x first**, with its docs on docs.rs: 1.0 asks
-  for use in more than one application, and that starts with `cargo add
-  trunkdb`. Nothing is published yet.
+  the `fuzzing` feature declared outside the API. Another pass, the
+  same way, once the API settles, for what came since.
 
-**Should: cheap, and the promises are checked instead of kept by care**
+**Should: cheap, and checked instead of kept by care**
 - Done in §120: **old files as fixtures**, a small database written by
   each release from 0.23.0, kept in `tests/fixtures/`, and a test that
   opens every one, reads it as written and writes to it. It catches a
   change to how values are stored that no other test does.
-- **`cargo-semver-checks` in CI**, so a breaking change shows in the
-  commit that makes it, not in someone's build.
-- **Every public item documented** (the `missing_docs` lint). The
-  MSRV policy is written down, in the README.
+- **Every public item documented** (the `missing_docs` lint, 113 items
+  without docs on 2026-10-25). The MSRV policy is written down, in the
+  README.
 - Done in §119: **unique indexes in the `queries` target**, which
   found an update that could store a duplicate.
 
-**After 1.0: additive, so any 1.x**
+**Optional: where trunkdb is published**
+- **On crates.io**, with its docs on docs.rs, or GitHub alone, as now:
+  not decided. Use in more than one application is what settles the
+  API, and a git dependency pinned to a commit serves that as well as
+  `cargo add trunkdb`; neither changes a file, a program or a query.
+  Nothing is published on crates.io.
+
+**Later: additive, in any release**
 - **An index rebuilt at open, where its key format changed:** not
-  needed before 1.0 after all. Every open reads the file's format
-  version, so the 1.x build that changes a key — the `Int`/`Float` bit
-  and missing mark `sum` from index entries wants (§106.8) — bumps it
-  and rebuilds the indexes of older files then; nothing need be in a
-  1.0 file for it. What a read-only open does then, and how a long
-  first open shows its progress, is decided with that change.
+  needed now after all. Every open reads the file's format version, so
+  the release that changes a key — the `Int`/`Float` bit and missing
+  mark `sum` from index entries wants (§106.8) — bumps it and rebuilds
+  the indexes of older files then; nothing need be in today's files for
+  it. What a read-only open does then, and how a long first open shows
+  its progress, is decided with that change.
 - New types — a date without a time, a time without a date, a decimal:
   `Document` is `#[non_exhaustive]`, and a file holding one is refused
-  by an older 1.x build, which the promise allows.
+  by an older build, as above.
 - Everything under **Open** below: new operators, aggregate columns
   with conditions, parameters (`:` reads nowhere now), `serde_json`
   behind a feature, repairing what `check` finds, the planner,
-  performance, the PyO3 bindings. None changes a file a 1.0 build
-  writes or what a 1.0 program or query means.
+  performance, the PyO3 bindings. None changes a file today's build
+  writes or what a program or query means today.
 
 **What only use can tell:** whether the API holds up in two or three
 applications, and whether the format has anything that hurts over

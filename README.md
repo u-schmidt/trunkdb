@@ -45,7 +45,7 @@ It isn't the right choice (yet) for:
 - Encryption or schema validation in the database.
 - Joins, or a cost-based planner: the planner follows fixed rules, and
   `explain` says which one it took.
-- A stable file format: until 1.0, a new version may need an export and
+- A file format fixed for good: a new version may need an export and
   import to move a file up ([ROADMAP.md](ROADMAP.md)).
 
 ## Getting started
@@ -57,6 +57,9 @@ trunkdb isn't on crates.io yet. Add it from git:
 trunkdb = { git = "https://github.com/u-schmidt/trunkdb" }
 serde = { version = "1", features = ["derive"] }
 ```
+
+Pinning a commit with `rev = "…"` keeps updates in your hands;
+[CHANGELOG.md](CHANGELOG.md) lists what each release changes.
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -143,7 +146,7 @@ is what it is, and what each step changed are in
 - [DESIGN.md](DESIGN.md): how it works today, one subsystem at a time.
 - [spec/](spec/README.md): why, one numbered section per step (SPEC §N).
 - [CHANGELOG.md](CHANGELOG.md): every step so far, by release.
-- [ROADMAP.md](ROADMAP.md): what 1.0 has to settle, and what's open.
+- [ROADMAP.md](ROADMAP.md): what's left to settle the API and format, and what's open.
 
 ## Building
 

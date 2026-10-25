@@ -20,8 +20,8 @@ members = ["trunkdb-derive"]
 
 [features]
 # Hooks for the fuzz targets in `fuzz/` (SPEC §55); not for applications,
-# and outside the semver promise: they change with the fuzz targets, in
-# any release (SPEC §118).
+# and not part of the API: they change with the fuzz targets, in any
+# release (SPEC §118).
 # It switches nothing off: skipping the flush is `--cfg fuzzing`, which
 # `cargo fuzz` sets and a feature can't (SPEC §55.1).
 fuzzing = []
