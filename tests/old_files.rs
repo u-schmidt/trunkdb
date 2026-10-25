@@ -6,10 +6,10 @@
 //! `indexes.jsonl`, one `{"collection", "fields", "unique", "sparse"}`
 //! per line. Every fixture is opened and read here, then written to.
 //!
-//! A release adds its own with
+//! A release that changes how files are written adds its own with
 //! `cargo test --test old_files -- --ignored write_this_releases_fixture`,
 //! which writes `tests/fixtures/<the version in Cargo.toml>/` and refuses
-//! to write over one that's there.
+//! to write over one that's there (SPEC §120.4, §120.9).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,8 +46,9 @@ impl Numbers {
 }
 
 /// What this release writes: every kind of value, documents on overflow
-/// pages, indexes of each kind, deletes and updates that leave free
-/// space, and a dropped collection's pages on the free list.
+/// pages, indexes of each kind, one with a branch above its leaves,
+/// deletes and updates that leave free space, and a dropped collection's
+/// pages on the free list. Kept small (SPEC §120.9): 21 pages.
 fn write_database(path: &Path) {
     let db = Database::open(path).unwrap();
 
@@ -81,13 +82,13 @@ fn write_database(path: &Path) {
             r#"{{"kind": "id", "v": {{"$id": "{first}"}}}}"#
         )))
         .unwrap();
-    let long: String = (0..20_000)
+    let long: String = (0..9_000)
         .map(|i| char::from(b'a' + (i % 26) as u8))
         .collect();
     kinds
         .insert(doc(&format!(r#"{{"kind": "overflow", "v": "{long}"}}"#)))
         .unwrap();
-    let numbers: Vec<String> = (0..1_500).map(|i| (i * 7).to_string()).collect();
+    let numbers: Vec<String> = (0..1_000).map(|i| (i * 7).to_string()).collect();
     kinds
         .insert(doc(&format!(
             r#"{{"kind": "overflow", "v": [{}]}}"#,
@@ -105,10 +106,13 @@ fn write_database(path: &Path) {
         .ensure_index_with("owner", IndexOptions::new().sparse())
         .unwrap();
     let statuses = ["open", "blocked", "done", "dropped"];
-    let teams = ["red", "green", "blue", "gray", "black"];
+    // Long names, so the compound index has more than a leaf's worth of
+    // entries and a branch above them, with 60 documents.
+    let teams =
+        ["red", "green", "blue", "gray", "black"].map(|team| format!("{team}-{}", "t".repeat(150)));
     let mut random = Numbers(0x2545_f491_4f6c_dd1d);
     let mut ids = Vec::new();
-    for n in 0..300u64 {
+    for n in 0..60u64 {
         let hours = match n % 2 {
             0 => (random.next(40)).to_string(),
             _ => format!("{}.5", random.next(40)),
@@ -144,7 +148,7 @@ fn write_database(path: &Path) {
     }
 
     let scratch = db.collection::<Document>("scratch");
-    for n in 0..60 {
+    for n in 0..40 {
         scratch
             .insert(doc(&format!(
                 r#"{{"n": {n}, "pad": "{}"}}"#,

@@ -574,3 +574,11 @@ limit, batches and a write-ahead log. Since then:
     pipe`); it ends quietly now, as `find` does (§112). Its lines are
     gathered and written at once, and what was gathered before a
     failure is still printed.
+
+98. **Smaller fixtures** (§120.9): the generator writes 60 tasks
+    instead of 300 and overflow documents just over a page, keeping
+    every kind of value, every kind of index, a branch, free space and a
+    dropped collection. The 0.23.0 fixture was written again by
+    0.23.0's own code, 168 KB instead of 272, 9 KB compressed instead of
+    32. A release adds a fixture only where it changes how files are
+    written.

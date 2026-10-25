@@ -1,7 +1,7 @@
 # 120. Old files as fixtures (`tests/old_files.rs`, `tests/fixtures/`)
 
-A build promises to open every file an earlier one wrote (ROADMAP.md,
-Before 1.0). Until now that was tested by rewriting the version in a new
+A build opens every file an earlier one wrote (ROADMAP.md, A settled
+API and format). Until now that was tested by rewriting the version in a new
 file's header (§21.2, §33.4): it shows that a build accepts an older
 format, not that it reads what an older build really wrote. A change to
 how a value is stored that's made in the encoder and the decoder alike
@@ -26,16 +26,19 @@ than the export (§30), because the export's format may move on; the
 JSON a `Document` prints is a promise of its own (§71, §111.4).
 
 ## 120.2 What it holds
-What a release can write, kept small, about 270 KB and 34 pages:
+What a release can write, kept small: 168 KB and 21 pages since
+§120.9, 270 KB and 34 before:
 - **`kinds`**, every kind of value: null, both booleans, `i64`'s ends,
   `5.0`, `-0.0`, a subnormal, NaN and both infinities, the empty string
   and one with quotes, a newline and a NUL, binary empty and not,
   date-times before and after 1970 with nanoseconds, nested arrays and
   objects with the empty name and a dot in a name, an id, and two
   documents on overflow pages (§26).
-- **`tasks`**, 300 documents with four indexes, one of each kind: plain
+- **`tasks`**, 60 documents with four indexes, one of each kind: plain
   (`status`), compound (`team`, `created`), unique (`n`) and sparse
-  (`owner`), whose field is a string, null or missing. Every seventh
+  (`owner`), whose field is a string, null or missing. Team names of
+  over 150 bytes give the compound index more entries than a leaf
+  holds, so a branch above them. Every seventh
   deleted and every eleventh grown, so pages have free space and moved
   documents.
 - A collection made and dropped, its pages on the free list.
@@ -64,8 +67,10 @@ For every fixture, oldest first, on a copy:
 writes `tests/fixtures/<the version in Cargo.toml>/` and refuses to
 write over one that's there. It's ignored otherwise, so `cargo test`
 never writes into the repository. Run once at each release, after the
-version is set, and committed with it. A fixture is never rewritten: a
-later build that can't read one has broken a file somebody has.
+version is set, and committed with it, for a release that changes how
+files are written (§120.9). A fixture is never rewritten by a later
+build: a later build that can't read one has broken a file somebody
+has.
 
 The fixtures stay out of the crate's package, as `bench/` and `fuzz/`
 do, and git keeps them byte for byte (`.gitattributes`), so a checkout
@@ -104,3 +109,31 @@ Run against the fixture test, and against every other test:
 - A fixture doesn't catch a change that only an older build would
   notice, a newer file read by an older build; that's refused by the
   format version (§21.2).
+
+## 120.9 Smaller, and only where storage changed
+Added on 2026-10-25. A fixture per release is about 380 KB on disk,
+47 KB in git's packs, most of it the data's size, not the bytes worth
+keeping. Two changes:
+- **The generator writes less**: 60 tasks instead of 300, the overflow
+  documents just over a page each (9,000 characters, 1,000 numbers)
+  instead of several, 40 dropped documents instead of 60, and long team
+  names so the compound index still has a branch. What §120.2 lists is
+  all still there. The 0.23.0 fixture: 168 KB and 39 KB of lines on
+  disk, 9 KB compressed, from 272 KB, 104 KB and 32 KB.
+- **A fixture only for a release that changes how files are written**:
+  a document's or an index key's encoding, a page's layout, the
+  catalog, the header, the format version. A release that changes
+  queries, the command, the docs or the API alone writes what the one
+  before it wrote, and that one's fixture covers it. In doubt, a
+  fixture. Still one per such release, not per format version (§120.5).
+
+**"Never rewritten" means by a later build.** The 0.23.0 fixture was
+written again for the smaller generator, by 0.23.0's own code: its
+commit (`331e3fe`) checked out beside the repository, the generator's
+sizes changed there and nothing else, its `write_this_releases_fixture`
+run, and its own reader test passed before the three files came back.
+They are still the bytes 0.23.0 writes. Any fixture can be made smaller
+that way; none is replaced by what a newer build writes.
+
+The mutations of §120.7, run again: the Binary and DateTime type tags
+swapped still fail the fixture test and no other.
