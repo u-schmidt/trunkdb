@@ -139,3 +139,4 @@ say what changed, and DESIGN.md says what is true now.
 122. [A skill for AI agents (`skills/trunkdb/`)](122-a-skill-for-ai-agents.md)
 123. [Batched writes: a checkpoint less often (`database.rs`, `storage/file.rs`, `storage/pages.rs`)](123-batched-writes-checkpoint-less-often.md)
 124. [`=` and `!=` on arrays, objects and binary (`query.rs`, `aggregate.rs`, `update.rs`)](124-equal-arrays-objects-and-binary.md)
+125. [The release that wrote a file (`storage/file.rs`, `release.rs`)](125-the-release-that-wrote-a-file.md)

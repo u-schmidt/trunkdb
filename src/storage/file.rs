@@ -8,6 +8,7 @@ use super::snapshot::Commit;
 use super::snapshot::SnapshotStore;
 use super::{Page, PageId, PageStore, PageType, PendingPages, Scratch};
 use crate::FormatError;
+use crate::release::{RELEASE, Release};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
@@ -68,6 +69,8 @@ const NO_FREE_PAGE: PageId = 0;
 //   [12..20) page_count: u64
 //   [20..28) free_list_head: u64 (PageId, 0 = none)
 //   [28..32) format_version: u32 (FORMAT_VERSION)
+//   [32..38) created_by: three u16s, major, minor, patch (SPEC §125)
+//   [38..44) written_by: the same, the release that wrote it last
 #[derive(Clone, Copy)]
 pub(super) struct Header {
     page_size: u32,
@@ -77,6 +80,13 @@ pub(super) struct Header {
     /// build reads as it is, until the next header write stamps the
     /// current one. `encode` always writes `FORMAT_VERSION`.
     format_version: u32,
+    /// The release that created the file, `Release::UNKNOWN` where the
+    /// header doesn't say (SPEC §125.3). Kept by every header write.
+    pub(super) created_by: Release,
+    /// The release that wrote the file last, as the file on disk says,
+    /// until the next header write stamps `RELEASE`, as for
+    /// `format_version`. `encode` always writes `RELEASE`.
+    pub(super) written_by: Release,
 }
 
 impl Header {
@@ -87,7 +97,35 @@ impl Header {
         buf[12..20].copy_from_slice(&self.page_count.to_le_bytes());
         buf[20..28].copy_from_slice(&self.free_list_head.to_le_bytes());
         buf[28..32].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf[32..38].copy_from_slice(&self.created_by.to_bytes());
+        buf[38..44].copy_from_slice(&RELEASE.to_bytes());
         buf
+    }
+
+    /// A fresh file's header, before its first write: just the header
+    /// page, created and written by this build.
+    fn fresh() -> Self {
+        Header {
+            page_size: PAGE_SIZE as u32,
+            page_count: 1, // just the header page so far
+            free_list_head: NO_FREE_PAGE,
+            format_version: FORMAT_VERSION,
+            created_by: RELEASE,
+            written_by: RELEASE,
+        }
+    }
+
+    /// Whether a header write is due before the batch writes a page: the
+    /// file says an older format (SPEC §59, §62), or another release
+    /// wrote it last (SPEC §125.2).
+    fn is_stale(&self) -> bool {
+        self.format_version != FORMAT_VERSION || self.written_by != RELEASE
+    }
+
+    /// What the header says of the releases: created by, written by.
+    pub(super) fn releases(&self) -> (Option<Release>, Option<Release>) {
+        let known = |release: Release| (release != Release::UNKNOWN).then_some(release);
+        (known(self.created_by), known(self.written_by))
     }
 
     /// Whether `buf` has this build's magic and a format it reads: the
@@ -147,11 +185,18 @@ impl Header {
                 ),
             ));
         }
+        // Diagnosis only (SPEC §125): whatever they say, a file isn't
+        // refused for them, and zeros, which an older build leaves, are
+        // unknown.
+        let created_by = Release::from_bytes(&buf[32..38]).unwrap_or(Release::UNKNOWN);
+        let written_by = Release::from_bytes(&buf[38..44]).unwrap_or(Release::UNKNOWN);
         Ok(Header {
             page_size,
             page_count,
             free_list_head,
             format_version,
+            created_by,
+            written_by,
         })
     }
 }
@@ -315,12 +360,7 @@ impl FileStore {
         }
         let mut header_error = None;
         let header = if is_fresh {
-            Header {
-                page_size: PAGE_SIZE as u32,
-                page_count: 1, // just the header page so far
-                free_list_head: NO_FREE_PAGE,
-                format_version: FORMAT_VERSION,
-            }
+            Header::fresh()
         } else {
             let disk = read_disk_page(&file, HEADER_PAGE)?;
             match Header::decode(&disk[..USABLE_PAGE_SIZE]) {
@@ -331,12 +371,7 @@ impl FileStore {
                 // reported now: the WAL isn't opened beside it.
                 Err(e) if Header::is_ours(&disk[..USABLE_PAGE_SIZE]) => {
                     header_error = Some(e);
-                    Header {
-                        page_size: PAGE_SIZE as u32,
-                        page_count: 1,
-                        free_list_head: NO_FREE_PAGE,
-                        format_version: FORMAT_VERSION,
-                    }
+                    Header::fresh()
                 }
                 Err(e) => return Err(e),
             }
@@ -432,6 +467,7 @@ impl FileStore {
         let header = self.header.encode();
         self.write_raw(HEADER_PAGE, Page::from(&header[..]))?;
         self.header.format_version = FORMAT_VERSION;
+        self.header.written_by = RELEASE;
         Ok(())
     }
 
@@ -892,8 +928,10 @@ impl PageStore for FileStore {
         }
         // A page written by this build may use what an older format lacks
         // (a document without its `_id`, SPEC §59): the header says so in
-        // the same batch, and a rollback takes both back.
-        if self.header.format_version != FORMAT_VERSION {
+        // the same batch, and a rollback takes both back. So does a page
+        // written by another release than the header names (SPEC §125.2):
+        // once per release, the first batch it writes.
+        if self.header.is_stale() {
             self.write_header()?;
         }
         self.write_raw(id, data)
@@ -974,6 +1012,24 @@ pub(crate) fn rewrite_format_version(path: &Path, version: u32) {
         .unwrap();
     let mut header = read_page_at(&file, HEADER_PAGE).unwrap();
     header.make_mut()[28..32].copy_from_slice(&version.to_le_bytes());
+    write_page_at(&file, HEADER_PAGE, &header).unwrap();
+}
+
+/// Rewrites a closed file's releases (SPEC §125), with the header's
+/// checksum to match: a file another release wrote, for tests above this
+/// module. `None` is zeros, as an older build leaves them.
+#[cfg(test)]
+pub(crate) fn rewrite_releases(path: &Path, created: Option<Release>, written: Option<Release>) {
+    use super::pages::{read_page_at, write_page_at};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut header = read_page_at(&file, HEADER_PAGE).unwrap();
+    let bytes = |release: Option<Release>| release.unwrap_or(Release::UNKNOWN).to_bytes();
+    header.make_mut()[32..38].copy_from_slice(&bytes(created));
+    header.make_mut()[38..44].copy_from_slice(&bytes(written));
     write_page_at(&file, HEADER_PAGE, &header).unwrap();
 }
 
@@ -1140,6 +1196,7 @@ mod tests {
             page_count: 1,
             free_list_head: NO_FREE_PAGE,
             format_version: FORMAT_VERSION,
+            ..Header::fresh()
         }
         .encode();
         header[28..32].copy_from_slice(&version.to_le_bytes());
@@ -1231,6 +1288,7 @@ mod tests {
                 page_count: 2,
                 free_list_head: NO_FREE_PAGE,
                 format_version: FORMAT_VERSION,
+                ..Header::fresh()
             }
             .encode()
             .to_vec();
@@ -1242,6 +1300,104 @@ mod tests {
     }
 
     // ---------- checksums ----------
+
+    /// A header that names `created` and `written` (zeros for `None`)
+    /// over a two-page file: what another release, or an older build,
+    /// leaves (SPEC §125).
+    fn file_with_releases(path: &Path, created: Option<Release>, written: Option<Release>) {
+        let mut header = Header {
+            page_count: 2,
+            ..Header::fresh()
+        }
+        .encode();
+        let bytes = |release: Option<Release>| release.unwrap_or(Release::UNKNOWN).to_bytes();
+        header[32..38].copy_from_slice(&bytes(created));
+        header[38..44].copy_from_slice(&bytes(written));
+        write_file(path, &[(HEADER_PAGE, &header), (1, &[1; USABLE_PAGE_SIZE])]);
+    }
+
+    /// A new file names this build as the release that created it and
+    /// the one that wrote it (SPEC §125.2), on disk and after a reopen.
+    #[test]
+    fn a_fresh_file_is_created_and_written_by_this_release() {
+        let (_dir, path) = open_temp();
+        {
+            let mut store = FileStore::open(&path).unwrap();
+            assert_eq!(store.header.releases(), (Some(RELEASE), Some(RELEASE)));
+            store.allocate_page().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes[32..38], RELEASE.to_bytes());
+        assert_eq!(bytes[38..44], RELEASE.to_bytes());
+        let store = FileStore::open(&path).unwrap();
+        assert_eq!(store.header.releases(), (Some(RELEASE), Some(RELEASE)));
+    }
+
+    /// Another release's file is stamped by the first page a batch
+    /// writes, once: the batch's next page and the next batch write no
+    /// header. "Created by" stays as it was, and a rollback takes the
+    /// stamp back (SPEC §125.2).
+    #[test]
+    fn another_release_is_stamped_by_the_first_page_written_once() {
+        let (_dir, path) = open_temp();
+        let created = Release::new(0, 19, 0);
+        let written = Release::new(0, 20, 0);
+        file_with_releases(&path, Some(created), Some(written));
+
+        let mut store = FileStore::open(&path).unwrap();
+        assert_eq!(store.header.releases(), (Some(created), Some(written)));
+        store.begin();
+        store
+            .write_page(1, vec![2; USABLE_PAGE_SIZE].into())
+            .unwrap();
+        assert!(store.dirty_pages().any(|(id, _)| id == HEADER_PAGE));
+        assert_eq!(store.header.releases(), (Some(created), Some(RELEASE)));
+        store.rollback();
+        assert_eq!(
+            store.header.releases(),
+            (Some(created), Some(written)),
+            "rolled back with it"
+        );
+
+        store.begin();
+        store
+            .write_page(1, vec![3; USABLE_PAGE_SIZE].into())
+            .unwrap();
+        store.write_back().unwrap();
+        store.begin();
+        store
+            .write_page(1, vec![4; USABLE_PAGE_SIZE].into())
+            .unwrap();
+        assert!(
+            !store.dirty_pages().any(|(id, _)| id == HEADER_PAGE),
+            "stamped once, not by every batch"
+        );
+        store.write_back().unwrap();
+        drop(store);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes[32..38], created.to_bytes());
+        assert_eq!(bytes[38..44], RELEASE.to_bytes());
+    }
+
+    /// Zeros, as an older build leaves them, are unknown (SPEC §125.3):
+    /// opening alone writes nothing, and a write stamps "written by"
+    /// only — "created by" stays unknown for good.
+    #[test]
+    fn zeroed_releases_are_unknown_and_created_by_stays_unknown() {
+        let (_dir, path) = open_temp();
+        file_with_releases(&path, None, None);
+        let before = std::fs::read(&path).unwrap();
+        drop(FileStore::open(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "opening alone");
+
+        let mut store = FileStore::open(&path).unwrap();
+        assert_eq!(store.header.releases(), (None, None));
+        store.allocate_page().unwrap();
+        drop(store);
+        let store = FileStore::open(&path).unwrap();
+        assert_eq!(store.header.releases(), (None, Some(RELEASE)));
+    }
 
     /// A closed file with pages 1 and 2 written, `[1; …]` and `[2; …]`.
     /// SPEC §59: an older format's file is stamped with the current one
@@ -1255,6 +1411,7 @@ mod tests {
             page_count: 2,
             free_list_head: NO_FREE_PAGE,
             format_version: FORMAT_VERSION,
+            ..Header::fresh()
         }
         .encode();
         header[28..32].copy_from_slice(&8u32.to_le_bytes());
@@ -1430,6 +1587,7 @@ mod tests {
                 page_count,
                 free_list_head,
                 format_version: FORMAT_VERSION,
+                ..Header::fresh()
             }
             .encode();
             write_file(&path, &[(HEADER_PAGE, &header)]);
@@ -1474,6 +1632,7 @@ mod tests {
                 page_count,
                 free_list_head: NO_FREE_PAGE,
                 format_version: FORMAT_VERSION,
+                ..Header::fresh()
             };
             header.encode().to_vec()
         };
@@ -1515,6 +1674,7 @@ mod tests {
                 page_count,
                 free_list_head: NO_FREE_PAGE,
                 format_version: FORMAT_VERSION,
+                ..Header::fresh()
             }
             .encode()
             .to_vec()
@@ -1559,6 +1719,7 @@ mod tests {
                 page_count,
                 free_list_head: NO_FREE_PAGE,
                 format_version: FORMAT_VERSION,
+                ..Header::fresh()
             }
             .encode()
             .to_vec()

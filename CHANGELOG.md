@@ -556,3 +556,15 @@ limit, batches and a write-ahead log. Since then:
     compound index now read the document where an entry holds such a
     value, which it can't tell apart from its key. Unique indexes still
     don't check these values. No file format or API change.
+
+96. **The release that wrote a file** (§125): the header names the
+    trunkdb release that created the file and the one that wrote it
+    last, three `u16`s each after the fields that were there, from
+    `Cargo.toml`'s version. A new file, an import's too, is this
+    build's for both; the first page a batch of another release writes
+    stamps "written by", once; `compact` keeps "created by". Unknown,
+    `None`, for a file from before, and where an older build wrote the
+    header since: it zeroes them. `FileInfo::created_by` and
+    `written_by`, a new `Release` type and `trunkdb::RELEASE`; `trunkdb
+    info` prints `written by 0.24.0, created by 0.24.0`. Files stay
+    format 12, which older builds still open.

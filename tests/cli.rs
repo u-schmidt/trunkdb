@@ -168,6 +168,12 @@ fn import_info_check_and_export_round_trip() {
     assert!(output.status.success());
     let info = stdout(&output);
     assert!(info.contains("format 12"), "{info}");
+    // The releases (SPEC §125), beside the format.
+    let release = trunkdb::RELEASE;
+    assert!(
+        info.contains(&format!("\n  written by {release}, created by {release}\n")),
+        "{info}"
+    );
     assert!(
         info.contains(
             "users: 2 documents, indexes: age, email (unique), nick (sparse), \
@@ -820,4 +826,23 @@ fn fields_keeps_at_most_ten_thousand_paths() {
 /// `{field: value}`: every document is an object (SPEC §95).
 fn object(field: &str, value: trunkdb::Document) -> trunkdb::Document {
     trunkdb::Document::Object([(field.to_string(), value)].into_iter().collect())
+}
+
+/// A file from before §125 says neither release: `info` says unknown
+/// (SPEC §125.4). The 0.23.0 fixture (SPEC §120) is one, read from a
+/// copy.
+#[test]
+fn info_says_unknown_for_a_file_from_before_the_releases() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/0.23.0/trunkdb.db");
+    let db = path(dir.path(), "old.trunkdb");
+    std::fs::copy(fixture, &db).unwrap();
+
+    let output = trunkdb(&["info", &db]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let info = stdout(&output);
+    assert!(
+        info.contains("\n  written by unknown, created by unknown\n"),
+        "{info}"
+    );
 }

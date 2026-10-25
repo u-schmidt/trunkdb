@@ -9,6 +9,7 @@ use crate::data;
 use crate::database::{Database, ReadGuard};
 use crate::document::{DocId, Document};
 use crate::index::{BTreeIndex, Index, KeyRange, key};
+use crate::release::Release;
 use crate::storage::{PAGE_SIZE, PageId, RecordLocation, SnapshotStore};
 use std::collections::BTreeSet;
 
@@ -25,6 +26,12 @@ pub struct FileInfo {
     pub pages: u64,
     /// Pages on the free list, ready for reuse.
     pub free_pages: usize,
+    /// The release that created the file (SPEC §125); `None` for a file
+    /// made before §125, or whose header an older build wrote since.
+    pub created_by: Option<Release>,
+    /// The release that wrote the file last; `None` where an older build
+    /// did.
+    pub written_by: Option<Release>,
 }
 
 /// What `Database::check` found. `problems` is empty for a consistent
@@ -52,7 +59,8 @@ impl CheckReport {
 
 impl Database {
     /// The header's facts: format, page size, how many pages, how many
-    /// of them free.
+    /// of them free, and the releases that created and last wrote the
+    /// file (SPEC §125).
     pub fn file_info(&self) -> crate::Result<FileInfo> {
         Self::file_info_of(&self.read()?)
     }
@@ -60,11 +68,14 @@ impl Database {
     /// `file_info`, of the commit `state` reads.
     pub(crate) fn file_info_of(state: &ReadGuard<'_>) -> crate::Result<FileInfo> {
         let store = state.snapshot().store;
+        let (created_by, written_by) = store.releases();
         Ok(FileInfo {
             format_version: store.format_version()?,
             page_size: PAGE_SIZE,
             pages: store.page_count(),
             free_pages: store.free_pages()?.len(),
+            created_by,
+            written_by,
         })
     }
 

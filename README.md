@@ -92,7 +92,7 @@ snapshots, selecting fields and aggregates.
 
 ```
 cargo install --git https://github.com/u-schmidt/trunkdb
-trunkdb info app.trunkdb                 # format, pages and sizes, collections, indexes
+trunkdb info app.trunkdb                 # format, releases, pages and sizes, collections, indexes
 trunkdb check app.trunkdb                # consistency check; exit code 1 on problems
 trunkdb compact app.trunkdb              # rebuild into as few pages as needed
 trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output

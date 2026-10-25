@@ -55,6 +55,12 @@ impl SnapshotStore<'_> {
         Ok(u32::from_le_bytes(buf[28..32].try_into().unwrap()))
     }
 
+    /// The releases the header named (SPEC §125): the one that created
+    /// the file and the one that wrote it last, `None` where unknown.
+    pub(crate) fn releases(&self) -> (Option<crate::Release>, Option<crate::Release>) {
+        self.commit.header.releases()
+    }
+
     /// The pages on the free list, in list order (`free_list`).
     pub(crate) fn free_pages(&self) -> io::Result<Vec<PageId>> {
         free_list(&self.commit.header, |id| {

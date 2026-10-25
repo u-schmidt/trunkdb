@@ -7,9 +7,9 @@ mod slotted;
 mod snapshot;
 
 pub(crate) use file::HEADER_PAGE;
-#[cfg(test)]
-pub(crate) use file::rewrite_format_version;
 pub use file::{DEFAULT_CACHE_SIZE, FileStore};
+#[cfg(test)]
+pub(crate) use file::{rewrite_format_version, rewrite_releases};
 pub use page::Page;
 #[cfg(feature = "fuzzing")]
 pub(crate) use pages::checksum;

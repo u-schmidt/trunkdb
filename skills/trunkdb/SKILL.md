@@ -22,7 +22,8 @@ prints lands in your context. So learn the shape first, then ask
 narrow questions:
 
 1. **`trunkdb info <file>`** — the collections, how many documents
-   each holds, and their indexes. A few lines; start here.
+   each holds, and their indexes, and which trunkdb releases created
+   and last wrote the file. A few lines; start here.
 2. **`trunkdb fields <file> <collection>`** — every field path the
    documents have, in how many documents, and as which types. There is
    no schema, so this is the only way to know which fields exist

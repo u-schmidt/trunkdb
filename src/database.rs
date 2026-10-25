@@ -1753,6 +1753,105 @@ mod tests {
         assert!(err.to_string().contains("page 0 is damaged"), "{err}");
     }
 
+    /// `file_info` names the releases that created and last wrote the
+    /// file (SPEC §125): this build's for a new one; another's as the
+    /// header has them, kept by a read-only open and by an open that
+    /// writes nothing; "written by" stamped by the first write, and by a
+    /// compaction, which keeps "created by"; an import's new file this
+    /// build's alone.
+    #[test]
+    fn file_info_names_the_releases_that_created_and_wrote_the_file() {
+        use crate::release::{RELEASE, Release};
+        let releases = |db: &Database| {
+            let info = db.file_info().unwrap();
+            (info.created_by, info.written_by)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        assert_eq!(releases(&db), (Some(RELEASE), Some(RELEASE)), "new");
+        let tasks = db.collection::<Document>("tasks");
+        let pad = "x".repeat(1000);
+        for n in 0..200 {
+            let task = format!(r#"{{"n": {n}, "pad": "{pad}"}}"#);
+            tasks.insert(task.parse::<Document>().unwrap()).unwrap();
+        }
+        let mut export = Vec::new();
+        db.export(&mut export).unwrap();
+        drop((tasks, db));
+
+        let created = Release::new(0, 20, 0);
+        let written = Release::new(0, 21, 0);
+        crate::storage::rewrite_releases(&path, Some(created), Some(written));
+        let read_only = Database::open_with(&path, OpenOptions::default().read_only(true)).unwrap();
+        assert_eq!(releases(&read_only), (Some(created), Some(written)));
+        drop(read_only);
+        drop(Database::open(&path).unwrap());
+        let db = Database::open_with(&path, OpenOptions::default().read_only(true)).unwrap();
+        assert_eq!(
+            releases(&db),
+            (Some(created), Some(written)),
+            "an open that writes nothing stamps nothing"
+        );
+        drop(db);
+
+        let db = Database::open(&path).unwrap();
+        db.collection::<Document>("tasks")
+            .insert(r#"{"n": 20}"#.parse::<Document>().unwrap())
+            .unwrap();
+        assert_eq!(releases(&db), (Some(created), Some(RELEASE)));
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(releases(&db), (Some(created), Some(RELEASE)), "reopened");
+        drop(db);
+
+        crate::storage::rewrite_releases(&path, Some(created), Some(written));
+        let db = Database::open(&path).unwrap();
+        db.collection::<Document>("tasks")
+            .delete_many(Filter::new().lt("n", 150))
+            .unwrap();
+        drop(db);
+        crate::storage::rewrite_releases(&path, Some(created), Some(written));
+        let db = Database::open(&path).unwrap();
+        let compacted = db.compact().unwrap();
+        assert!(
+            compacted.pages_after < compacted.pages_before,
+            "{compacted:?}"
+        );
+        assert_eq!(releases(&db), (Some(created), Some(RELEASE)), "compacted");
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(releases(&db), (Some(created), Some(RELEASE)));
+        drop(db);
+
+        let imported = Database::open(dir.path().join("imported.trunkdb")).unwrap();
+        imported.import(&export[..]).unwrap();
+        assert_eq!(releases(&imported), (Some(RELEASE), Some(RELEASE)));
+    }
+
+    /// The stamp is in the batch's header image, so a crash after the
+    /// batch was logged restores it with the rest of the header (SPEC
+    /// §125.2, §85).
+    #[test]
+    fn a_crash_after_the_stamp_was_logged_restores_it() {
+        use crate::release::{RELEASE, Release};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+        let created = Release::new(0, 20, 0);
+        crate::storage::rewrite_releases(&path, Some(created), Some(Release::new(0, 21, 0)));
+
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+        let db = Database::open(&path).unwrap();
+        assert_two_collection_batch_present(&db);
+        let info = db.file_info().unwrap();
+        assert_eq!(
+            (info.created_by, info.written_by),
+            (Some(created), Some(RELEASE))
+        );
+        assert!(db.check().unwrap().is_ok());
+    }
+
     /// Damaged header fields (a page count of 0) in a file that is ours
     /// are replaced from the WAL's header image, and are damage when the
     /// WAL has none (SPEC §85).

@@ -235,6 +235,17 @@ fn releases() -> Vec<PathBuf> {
     dirs
 }
 
+/// The releases a fixture's header names (SPEC §125): its own, as
+/// "created by" and "written by", from 0.24.0 on, when the header began
+/// to name them; unknown for one before.
+fn named_releases(release: &str) -> Option<String> {
+    let parts: Vec<u16> = release
+        .split('.')
+        .map(|part| part.parse().unwrap_or_else(|_| panic!("{release}")))
+        .collect();
+    (parts[..] >= [0, 24, 0][..]).then(|| release.to_string())
+}
+
 /// What a fixture says each collection holds, by collection, in order.
 fn expected(dir: &Path) -> Vec<(String, Vec<Document>, Vec<Document>)> {
     let mut collections: Vec<(String, Vec<Document>, Vec<Document>)> = Vec::new();
@@ -334,6 +345,13 @@ fn every_release_since_0_23_reads_as_it_was_written() {
         let db = Database::open_with(&path, OpenOptions::default().read_only(true)).unwrap();
         let report = db.check().unwrap();
         assert!(report.is_ok(), "{release}: {:?}", report.problems);
+        let releases = |db: &Database| {
+            let info = db.file_info().unwrap();
+            let shown = |release: Option<trunkdb::Release>| release.map(|r| r.to_string());
+            (shown(info.created_by), shown(info.written_by))
+        };
+        let named = named_releases(&release);
+        assert_eq!(releases(&db), (named.clone(), named.clone()), "{release}");
         let names: Vec<String> = expected.iter().map(|(name, _, _)| name.clone()).collect();
         assert_eq!(db.collections().unwrap(), names, "{release}");
 
@@ -429,6 +447,11 @@ fn every_release_since_0_23_reads_as_it_was_written() {
             report.is_ok(),
             "{release}: after writing: {:?}",
             report.problems
+        );
+        assert_eq!(
+            releases(&db),
+            (named, Some(trunkdb::RELEASE.to_string())),
+            "{release}: after writing, it's written by this build"
         );
     }
 }

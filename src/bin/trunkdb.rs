@@ -135,6 +135,16 @@ fn info(file: &str, db: &Database) -> Outcome {
         "  format {}, {} pages of {} bytes, {} free",
         file_info.format_version, file_info.pages, file_info.page_size, file_info.free_pages
     );
+    // The releases (SPEC §125.4), with the file's other facts; the
+    // lines that were there before keep their words.
+    let release = |release: Option<trunkdb::Release>| {
+        release.map_or_else(|| "unknown".to_string(), |release| release.to_string())
+    };
+    println!(
+        "  written by {}, created by {}",
+        release(file_info.written_by),
+        release(file_info.created_by)
+    );
     // The sizes (SPEC §93) after the lines that were there before, which
     // scripts may read; on a file they can't be read from, those still are.
     let stats = match db.stats() {

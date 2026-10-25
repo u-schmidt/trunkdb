@@ -89,7 +89,7 @@ catches a page written to the wrong place. Above `FileStore`, a page is
 
 | Page | Layout |
 |---|---|
-| 0: header | magic `TRUNKDB1`, page size, page count, head of the free list, format version |
+| 0: header | magic `TRUNKDB1`, page size, page count, head of the free list, format version; the releases that created the file and last wrote it [§125](spec/125-the-release-that-wrote-a-file.md) |
 | 1: catalog | slotted: one cell per collection and per index |
 | data | slotted: documents of one collection |
 | index leaf, index branch | slotted: B-tree entries, in key order |
