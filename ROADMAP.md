@@ -94,9 +94,9 @@ checkpoint before upgrading.
   each release from 0.23.0, kept in `tests/fixtures/`, and a test that
   opens every one, reads it as written and writes to it. It catches a
   change to how values are stored that no other test does.
-- **Every public item documented** (the `missing_docs` lint, 113 items
-  without docs on 2026-10-25). The MSRV policy is written down, in the
-  README.
+- Done: **every public item documented**, and the `missing_docs` lint
+  on in `src/lib.rs`, so CI fails on a new item without docs. The MSRV
+  policy is written down, in the README.
 - Done in §119: **unique indexes in the `queries` target**, which
   found an update that could store a duplicate.
 

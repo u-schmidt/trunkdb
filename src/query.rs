@@ -1,3 +1,6 @@
+//! Filters: conditions, sorts, `skip`, `limit` and `select`, built in
+//! code or read from text (SPEC §111), and the plans `explain` reports.
+
 pub use crate::aggregate::Aggregate;
 use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
@@ -25,8 +28,11 @@ pub enum Op {
     /// `Lt` to `Gte` hold between values of one kind that have an order
     /// (SPEC §34.1): never for arrays, objects, binary or NaN.
     Lt,
+    /// Less than or equal, as `Lt`.
     Lte,
+    /// Greater than, as `Lt`.
     Gt,
+    /// Greater than or equal, as `Lt`.
     Gte,
     /// The field is a string containing the condition's string value,
     /// ignoring case — like LiteDB, whose string comparisons ignore case
@@ -51,19 +57,32 @@ pub enum Condition {
     /// `field op value`.
     #[non_exhaustive]
     Compare {
+        /// The field, a path (SPEC §31).
         field: String,
+        /// How it compares.
         op: Op,
+        /// What it's compared to.
         value: Document,
     },
     /// The field is there — even if it holds null, unlike `is_not_null`
     /// (SPEC §45.1). On a path with `[*]`: some element has it.
     #[non_exhaustive]
-    Exists { field: String },
+    Exists {
+        /// The field, a path (SPEC §31).
+        field: String,
+    },
     /// The field is an array whose length `op`-compares true against
     /// `size` (SPEC §45.2) — `Op::Eq` and 0 for an empty one. `Ne` is
     /// `Eq` negated, so it also holds where there's no array at all.
     #[non_exhaustive]
-    Size { field: String, op: Op, size: usize },
+    Size {
+        /// The field, a path (SPEC §31).
+        field: String,
+        /// How the length compares.
+        op: Op,
+        /// The length it's compared to.
+        size: usize,
+    },
     /// Some element of the array at `field` meets `condition` on its own
     /// (SPEC §46): `items` has an item with `sku == "A1"` *and* `qty >
     /// 2`, where `items[*].sku == "A1" AND items[*].qty > 2` may be met
@@ -71,7 +90,9 @@ pub enum Condition {
     /// element; `""` is the element itself.
     #[non_exhaustive]
     ElemMatch {
+        /// The array's field, a path.
         field: String,
+        /// What one element must meet, with paths starting at the element.
         condition: Box<Condition>,
     },
     /// Every one of them holds (AND) — true if there are none.
@@ -87,6 +108,7 @@ pub enum Condition {
 /// §36.2). Values convert as in `Filter`'s builder. `|`, `&` and `!`
 /// combine them: `Condition::eq("a", 1) | !Condition::eq("b", 2)`.
 impl Condition {
+    /// `field op value`.
     pub fn compare(field: impl Into<String>, op: Op, value: impl Into<Document>) -> Self {
         Condition::Compare {
             field: field.into(),
@@ -95,6 +117,8 @@ impl Condition {
         }
     }
 
+    /// `field == value`. Against null, also true for a missing field
+    /// (SPEC §32).
     pub fn eq(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Eq, value)
     }
@@ -106,30 +130,40 @@ impl Condition {
         Self::eq(ID_FIELD, id)
     }
 
+    /// `field != value` — true for a null or missing field unless `value`
+    /// is null (SPEC §32).
     pub fn ne(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Ne, value)
     }
 
+    /// `field < value`, between values of one kind that have an order
+    /// (SPEC §34.1): never for arrays, objects, binary or NaN.
     pub fn lt(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Lt, value)
     }
 
+    /// `field <= value`, as `lt`.
     pub fn lte(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Lte, value)
     }
 
+    /// `field > value`, as `lt`.
     pub fn gt(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Gt, value)
     }
 
+    /// `field >= value`, as `lt`.
     pub fn gte(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Gte, value)
     }
 
+    /// The field is a string containing `needle`, ignoring case (see
+    /// `Op::Contains`).
     pub fn contains(field: impl Into<String>, needle: impl Into<String>) -> Self {
         Self::compare(field, Op::Contains, needle.into())
     }
 
+    /// The field is null or missing (SPEC §32): `eq(field, Document::Null)`.
     pub fn is_null(field: impl Into<String>) -> Self {
         Self::compare(field, Op::Eq, Document::Null)
     }
@@ -158,6 +192,7 @@ impl Condition {
         )
     }
 
+    /// The field is there and not null: `ne(field, Document::Null)`.
     pub fn is_not_null(field: impl Into<String>) -> Self {
         Self::compare(field, Op::Ne, Document::Null)
     }
@@ -218,14 +253,19 @@ impl Condition {
         Condition::Any(conditions.into_iter().collect())
     }
 
+    /// Whether `doc` meets the condition, checked in memory as `find`
+    /// checks a document.
     pub fn matches(&self, doc: &Document) -> bool {
         Matcher::of(self).matches(doc)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which way a sort key runs, as `sort_asc` and `sort_desc` choose it.
 pub enum SortOrder {
+    /// Smallest first.
     Asc,
+    /// Largest first.
     Desc,
 }
 
@@ -350,18 +390,22 @@ impl Filter {
         self.condition(field, Op::Ne, value)
     }
 
+    /// `field < value` — see `Condition::lt`.
     pub fn lt(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
         self.condition(field, Op::Lt, value)
     }
 
+    /// `field <= value`, as `lt`.
     pub fn lte(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
         self.condition(field, Op::Lte, value)
     }
 
+    /// `field > value`, as `lt`.
     pub fn gt(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
         self.condition(field, Op::Gt, value)
     }
 
+    /// `field >= value`, as `lt`.
     pub fn gte(self, field: impl Into<String>, value: impl Into<Document>) -> Self {
         self.condition(field, Op::Gte, value)
     }
@@ -532,6 +576,9 @@ impl Filter {
 }
 
 impl Filter {
+    /// Whether `doc` meets every condition of the filter, checked in
+    /// memory as `find` checks a document; sort, skip, limit and select play
+    /// no part.
     pub fn matches(&self, doc: &Document) -> bool {
         self.matcher().matches(doc)
     }
@@ -759,18 +806,29 @@ pub enum QueryPlan {
     /// Only the documents in a range of the index on `field` are read,
     /// then checked against the whole filter.
     #[non_exhaustive]
-    Index { field: String },
+    Index {
+        /// The index, as `Collection::indexes` names it: `(status,
+        /// created)` for a compound one.
+        field: String,
+    },
     /// The index on the sort field `field` is read in sort order, and
     /// documents are checked one by one until `limit` of them match; the
     /// rest are never read (SPEC §34.2). For `_id`, the primary index
     /// (SPEC §96).
     #[non_exhaustive]
-    IndexOrder { field: String },
+    IndexOrder {
+        /// The index read, named as for `Index`: `_id` for the primary
+        /// index.
+        field: String,
+    },
     /// Several index ranges are read — one per branch of an OR, on the
     /// indexes on `fields` — each document once, then checked against
     /// the whole filter (SPEC §36.3).
     #[non_exhaustive]
-    IndexUnion { fields: Vec<String> },
+    IndexUnion {
+        /// The indexes read, one per branch, named as for `Index`.
+        fields: Vec<String>,
+    },
     /// The filter names its documents by id — `eq("_id", id)`, or an OR
     /// of such — and they are looked up in the primary index, as `get`
     /// does, then checked against the whole filter (SPEC §61).

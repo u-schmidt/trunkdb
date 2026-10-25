@@ -13,15 +13,28 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Document {
+    /// JSON's `null`, and what a `None` stores. `is null` finds it and a
+    /// missing field alike (SPEC §32).
     Null,
+    /// `true` or `false`.
     Bool(bool),
+    /// A whole number. It compares with a `Float` by exact value: `5`
+    /// equals `5.0` (SPEC §34.1).
     Int(i64),
+    /// A floating-point number. NaN equals nothing, itself included, and
+    /// has no order.
     Float(f64),
+    /// Text.
     String(String),
+    /// Bytes: `{"$binary": "<base64>"}` in JSON text (SPEC §30.1).
     Binary(Vec<u8>),
+    /// A list of values, in order.
     Array(Vec<Document>),
     /// An object: names to values, in order (SPEC §116).
     Object(Map),
+    /// A document id: a document's own `_id`, or a reference to another
+    /// document. `{"$id": "<uuid>"}` in JSON text; ids sort after strings,
+    /// by when they were made (SPEC §62).
     Id(DocId),
     /// A point in time, in UTC, to the nanosecond (SPEC §69, §70): what a
     /// `SystemTime` or `DateTime` field stores. Filters compare, sort and

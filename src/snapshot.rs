@@ -193,6 +193,7 @@ impl<T> Clone for View<T> {
 }
 
 impl<T> View<T> {
+    /// The collection's name.
     pub fn name(&self) -> &str {
         self.collection.name()
     }

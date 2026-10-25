@@ -16,7 +16,9 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Compacted {
+    /// Pages in the file before, the header included.
     pub pages_before: u64,
+    /// Pages after: as few as the database needs.
     pub pages_after: u64,
 }
 

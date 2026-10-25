@@ -86,14 +86,17 @@ impl IndexInfo {
         }
     }
 
+    /// The options it was built with.
     pub fn options(&self) -> IndexOptions {
         self.options.clone()
     }
 
+    /// Whether it's a unique index (SPEC §33).
     pub fn is_unique(&self) -> bool {
         self.options.unique
     }
 
+    /// Whether it's a sparse index (SPEC §44).
     pub fn is_sparse(&self) -> bool {
         self.options.sparse
     }
@@ -125,10 +128,12 @@ impl IndexOptions {
         self
     }
 
+    /// Whether `unique` is set.
     pub const fn is_unique(&self) -> bool {
         self.unique
     }
 
+    /// Whether `sparse` is set.
     pub const fn is_sparse(&self) -> bool {
         self.sparse
     }

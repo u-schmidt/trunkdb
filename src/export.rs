@@ -48,7 +48,9 @@ const CHUNK_BYTES: usize = 8 << 20;
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub struct Summary {
+    /// Collections written or read.
     pub collections: usize,
+    /// Documents written or read, every collection's together.
     pub documents: usize,
 }
 

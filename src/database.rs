@@ -533,6 +533,9 @@ impl Database {
         self.inner.recovered.clone()
     }
 
+    /// The collection `name`, its documents read and written as `T` —
+    /// `Document` for any of them. A handle only: nothing is read here, and
+    /// a collection that doesn't exist yet appears with its first write.
     pub fn collection<T>(&self, name: &str) -> Collection<T> {
         Collection::new(self.clone(), name)
     }

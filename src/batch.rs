@@ -101,10 +101,12 @@ impl Batch {
         self.ops.push(WriteOp::Delete(name, *id));
     }
 
+    /// How many ops the batch holds.
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
+    /// Whether it holds no ops.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }

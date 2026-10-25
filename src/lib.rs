@@ -50,6 +50,9 @@
 //! writer, and neither waits for the other. How it all works is in the
 //! repository's `DESIGN.md`, and why in its `spec/`.
 
+// Every public item documented (ROADMAP: a settled API and format).
+#![warn(missing_docs)]
+
 mod aggregate;
 mod batch;
 mod catalog;
@@ -128,10 +131,19 @@ pub use trunkdb_derive::document;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
+/// Everything a trunkdb call can fail with. `#[non_exhaustive]`: a
+/// `match` on it needs a `_` arm, so a new kind of failure isn't a
+/// breaking change.
 pub enum Error {
     #[error(transparent)]
+    /// Reading or writing the file or its WAL failed. Of kind
+    /// `InvalidData`, the file is damaged (SPEC §92); of kind `WouldBlock`
+    /// at an open, another process has it open.
     Io(std::io::Error),
     #[error(transparent)]
+    /// A value couldn't be converted between a `T` and a `Document` (SPEC
+    /// §13): a type serde can't map onto a document, or a stored document
+    /// that doesn't fit `T`.
     Document(#[from] serde_bridge::DocumentError),
     /// A batch was durably logged but writing it to the main file failed,
     /// even after a retry, so the file may be half-written. Every call
@@ -146,7 +158,9 @@ pub enum Error {
     #[non_exhaustive]
     #[error("collection {collection:?} already has a document with id {id}")]
     DuplicateId {
+        /// The collection.
         collection: String,
+        /// The id, which a document in the collection already has.
         id: document::DocId,
     },
     /// A write would give document `id` a value in a unique index's
@@ -159,9 +173,15 @@ pub enum Error {
         "collection {collection:?} has a unique index on {field:?}, and documents {existing} and {id} would have the same value there"
     )]
     DuplicateValue {
+        /// The collection.
         collection: String,
+        /// The unique index, as `Collection::indexes` names it.
         field: String,
+        /// The id of the document being written — or, from
+        /// `ensure_unique_index`, being added to the new index.
         id: document::DocId,
+        /// The id of the document that already has this value in
+        /// `field`.
         existing: document::DocId,
     },
     /// A batch tried to update or delete a document its collection
@@ -170,14 +190,21 @@ pub enum Error {
     #[non_exhaustive]
     #[error("collection {collection:?} has no document with id {id}")]
     NotFound {
+        /// The collection.
         collection: String,
+        /// The id, which no document in the collection has.
         id: document::DocId,
     },
     /// `upsert` found more than one document matching its filter, so it
     /// couldn't tell which to replace. Nothing was written.
     #[non_exhaustive]
     #[error("upsert into {collection:?}: {count} documents match the filter, expected at most one")]
-    MultipleMatches { collection: String, count: usize },
+    MultipleMatches {
+        /// The collection.
+        collection: String,
+        /// How many documents matched.
+        count: usize,
+    },
     /// `update_fields` couldn't make a change to document `id` (SPEC
     /// §68): an `inc` of something that isn't a number, or that
     /// overflows; a path through a value that isn't an object. The whole
@@ -185,8 +212,11 @@ pub enum Error {
     #[non_exhaustive]
     #[error("update of document {id} in collection {collection:?}: {message}")]
     Update {
+        /// The collection.
         collection: String,
+        /// The id of the document being updated.
         id: document::DocId,
+        /// What couldn't be done, as people read it.
         message: String,
     },
     /// `Database::compact` was called while a snapshot was open (SPEC
@@ -218,12 +248,20 @@ pub enum Error {
     #[error(
         "collection {collection:?}: a document must be an object (a struct or a map), not a plain value or an array"
     )]
-    NotAnObject { collection: String },
+    NotAnObject {
+        /// The collection written to.
+        collection: String,
+    },
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
     #[non_exhaustive]
     #[error("import, line {line}: {message}")]
-    Import { line: usize, message: String },
+    Import {
+        /// The line, counting from 1.
+        line: usize,
+        /// What's wrong with it.
+        message: String,
+    },
     /// An open found a file this build can't read at all: not a trunkdb
     /// file, or one of a format it doesn't read (SPEC §92). Nothing was
     /// changed. Damage is something else: `Io` of kind `InvalidData`.
@@ -253,7 +291,12 @@ pub enum FormatError {
     #[error(
         "file has format {found}, newer than this build's {current} — open it with a newer trunkdb"
     )]
-    Newer { found: u32, current: u32 },
+    Newer {
+        /// The file's format.
+        found: u32,
+        /// This build's format, the newest it reads.
+        current: u32,
+    },
     /// A format older than `oldest`, the oldest this build reads as it
     /// is: export it with the build that wrote it, and import the export
     /// with this one.
@@ -262,8 +305,11 @@ pub enum FormatError {
         "file has format {found}, older than this build's {current}: export it with the trunkdb version that wrote it (`trunkdb export`), and import the export into a new file with this one"
     )]
     Older {
+        /// The file's format.
         found: u32,
+        /// The oldest format this build reads as it is.
         oldest: u32,
+        /// This build's format.
         current: u32,
     },
     /// The WAL beside the file doesn't start with the WAL's magic — one
@@ -277,7 +323,10 @@ pub enum FormatError {
         "unsupported WAL version {found}, this build reads {}",
         durability::readable_wal_versions()
     )]
-    WalVersion { found: u32 },
+    WalVersion {
+        /// The WAL's version.
+        found: u32,
+    },
     /// A file of a format before 12 holds a document that isn't an
     /// object, which this build can't hold (SPEC §95): `id`, in
     /// `collection`, is the first one found. Open the file with trunkdb
@@ -288,7 +337,9 @@ pub enum FormatError {
         "collection {collection:?} has a document that isn't an object ({id}), which this build can't hold: open the file with trunkdb 0.19.0, delete or wrap such documents, and open it again"
     )]
     NotAnObject {
+        /// The collection holding it.
         collection: String,
+        /// The id of the first such document found.
         id: document::DocId,
     },
 }
@@ -323,6 +374,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// What trunkdb's calls return: a value, or an `Error`.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Helpers shared by tests in several modules.

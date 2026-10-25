@@ -33,6 +33,7 @@ pub struct Stats {
 pub struct PageUse {
     /// The header: always 1.
     pub header: u64,
+    /// The catalog, which lists the collections and their indexes.
     pub catalog: u64,
     /// On the free list: `FileInfo::free_pages`.
     pub free: u64,
@@ -51,10 +52,14 @@ pub struct PageUse {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct CollectionStats {
+    /// The collection's name.
     pub name: String,
+    /// Its documents.
     pub documents: u64,
     /// Its data pages, the current one included.
     pub data_pages: u64,
+    /// Its overflow pages: the parts of its large documents that don't fit
+    /// in a data page (SPEC §26).
     pub overflow_pages: u64,
     /// The documents as stored, encoded: inline and in chains.
     pub document_bytes: u64,
@@ -73,11 +78,14 @@ pub struct CollectionStats {
 pub struct IndexStats {
     /// `["_id"]` for the primary index.
     pub fields: Vec<String>,
+    /// Built with `IndexOptions::unique` (SPEC §33).
     pub unique: bool,
+    /// Built with `IndexOptions::sparse` (SPEC §44).
     pub sparse: bool,
     /// One per document with a value — one per element in a multikey
     /// index (SPEC §42).
     pub entries: u64,
+    /// Its pages, inner and leaf.
     pub pages: u64,
     /// Levels: 1 for a lone leaf.
     pub depth: u32,

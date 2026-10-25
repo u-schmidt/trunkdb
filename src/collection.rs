@@ -190,6 +190,7 @@ impl<T> Collection<T> {
         }
     }
 
+    /// The collection's name.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -463,6 +464,10 @@ impl<T> Collection<T> {
         Ok(trace.explained(plan, None, None, rows.len(), started.elapsed()))
     }
 
+    /// Runs `filter` as `find` does and says how it ran (SPEC §94): the
+    /// plan, each index read with its bounds, how it sorted, the entries
+    /// and documents examined, matched and returned, and the time. The
+    /// documents found aren't handed out.
     pub fn explain_run(&self, filter: Filter) -> crate::Result<Explained> {
         let started = std::time::Instant::now();
         let state = self.read()?;
@@ -511,11 +516,14 @@ where
         self.retyped()
     }
 
+    /// Inserts `doc`, under the id in its `_id` field if that's `Some`
+    /// (SPEC §59), and returns the id it's stored under.
     pub fn insert(&self, doc: T) -> crate::Result<DocId> {
         let document = crate::serde_bridge::to_document(&doc)?;
         self.as_document().insert(document)
     }
 
+    /// The document `id`, as a `T`; `None` if there's none.
     pub fn get(&self, id: &DocId) -> crate::Result<Option<T>> {
         match self.as_document().stored(id)? {
             Some(stored) => Ok(Some(stored.deserialize()?)),
@@ -523,11 +531,14 @@ where
         }
     }
 
+    /// Replaces document `id` with `doc`, which keeps its id. `false` if
+    /// there's no document `id`, as for the untyped `update`.
     pub fn update(&self, id: &DocId, doc: T) -> crate::Result<bool> {
         let document = crate::serde_bridge::to_document(&doc)?;
         self.as_document().update(id, document)
     }
 
+    /// Deletes document `id`. `false` if there's none, as for `update`.
     pub fn delete(&self, id: &DocId) -> crate::Result<bool> {
         self.as_document().delete(id)
     }
@@ -564,6 +575,8 @@ where
         self.as_document().delete_many(filter)
     }
 
+    /// What `filter` finds, as `T`s — see the untyped `find`. With a
+    /// `select`, `T` has to deserialize from the fields selected.
     pub fn find(&self, filter: Filter) -> crate::Result<Vec<T>> {
         let select = filter.selection();
         self.as_document()
@@ -627,6 +640,7 @@ pub enum Upserted {
 }
 
 impl Upserted {
+    /// The id of the document written, inserted or updated.
     pub fn id(&self) -> DocId {
         match self {
             Upserted::Inserted(id) | Upserted::Updated(id) => *id,
@@ -650,6 +664,7 @@ impl Collection<Document> {
         Ok(id)
     }
 
+    /// The document `id`; `None` if there's none.
     pub fn get(&self, id: &DocId) -> crate::Result<Option<Document>> {
         match self.stored(id)? {
             Some(stored) => Ok(Some(stored.decode()?)),

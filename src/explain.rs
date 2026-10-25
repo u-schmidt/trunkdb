@@ -18,6 +18,7 @@ pub struct Explained {
     /// The paths the filter selects (SPEC §106), as given; `None`
     /// without a selection: whole documents.
     pub select: Option<Vec<String>>,
+    /// What it read and returned, and how long it took.
     pub stats: ExecutionStats,
 }
 

@@ -18,6 +18,8 @@ use std::collections::BTreeSet;
 pub struct FileInfo {
     /// The format version in the header (SPEC §21.2, §33.4).
     pub format_version: u32,
+    /// The size of a page in bytes, the same for every file this build
+    /// reads.
     pub page_size: usize,
     /// Pages in the file, the header included.
     pub pages: u64,
@@ -30,13 +32,19 @@ pub struct FileInfo {
 #[derive(Debug, Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct CheckReport {
+    /// Collections checked.
     pub collections: usize,
+    /// Documents found, every collection's together.
     pub documents: usize,
+    /// Pages in the file, the header included.
     pub pages: u64,
+    /// What's wrong, one entry each, saying where; empty for a consistent
+    /// file.
     pub problems: Vec<String>,
 }
 
 impl CheckReport {
+    /// No problems found: the file is consistent.
     pub fn is_ok(&self) -> bool {
         self.problems.is_empty()
     }

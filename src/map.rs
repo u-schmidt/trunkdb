@@ -44,22 +44,27 @@ impl Map {
         Map(IndexMap::with_capacity(capacity))
     }
 
+    /// How many fields it has.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Whether it has no fields.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// The value of field `name`, if it has one.
     pub fn get(&self, name: &str) -> Option<&Document> {
         self.0.get(name)
     }
 
+    /// The value of field `name`, to change in place.
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Document> {
         self.0.get_mut(name)
     }
 
+    /// Whether it has a field `name`.
     pub fn contains_key(&self, name: &str) -> bool {
         self.0.contains_key(name)
     }
@@ -81,6 +86,7 @@ impl Map {
         self.0.retain(|name, value| keep(name, value));
     }
 
+    /// Removes every field.
     pub fn clear(&mut self) {
         self.0.clear();
     }
