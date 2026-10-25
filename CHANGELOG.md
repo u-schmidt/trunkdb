@@ -568,3 +568,9 @@ limit, batches and a write-ahead log. Since then:
     `written_by`, a new `Release` type and `trunkdb::RELEASE`; `trunkdb
     info` prints `written by 0.24.0, created by 0.24.0`. Files stay
     format 12, which older builds still open.
+
+97. **A fix to `trunkdb info`**: its reader gone, as `| head` goes once
+    it has its lines, it panicked (`failed printing to stdout: Broken
+    pipe`); it ends quietly now, as `find` does (§112). Its lines are
+    gathered and written at once, and what was gathered before a
+    failure is still printed.

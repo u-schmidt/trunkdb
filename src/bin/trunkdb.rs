@@ -127,11 +127,27 @@ fn open_with(file: &str, options: OpenOptions) -> Result<Database, String> {
     })
 }
 
+/// `trunkdb info`: what `info_text` gathers, written at once, so that a
+/// reader that goes, as `| head` does, ends it quietly, as for `find`
+/// (SPEC §112). What was gathered before a failure is still printed, as
+/// it was when every line went out on its own.
 fn info(file: &str, db: &Database) -> Outcome {
+    let mut text = String::new();
+    let gathered = info_text(file, db, &mut text);
+    if let Err(e) = io::stdout().lock().write_all(text.as_bytes()) {
+        stopped_writing(e)?;
+    }
+    gathered.map(|()| ExitCode::SUCCESS)
+}
+
+/// The lines `info` prints, into `text`.
+fn info_text(file: &str, db: &Database, text: &mut String) -> Result<(), String> {
+    use std::fmt::Write;
     let failed = |e: trunkdb::Error| e.to_string();
     let file_info = db.file_info().map_err(failed)?;
-    println!("{file}");
-    println!(
+    let _ = writeln!(text, "{file}");
+    let _ = writeln!(
+        text,
         "  format {}, {} pages of {} bytes, {} free",
         file_info.format_version, file_info.pages, file_info.page_size, file_info.free_pages
     );
@@ -140,7 +156,8 @@ fn info(file: &str, db: &Database) -> Outcome {
     let release = |release: Option<trunkdb::Release>| {
         release.map_or_else(|| "unknown".to_string(), |release| release.to_string())
     };
-    println!(
+    let _ = writeln!(
+        text,
         "  written by {}, created by {}",
         release(file_info.written_by),
         release(file_info.created_by)
@@ -149,17 +166,20 @@ fn info(file: &str, db: &Database) -> Outcome {
     // scripts may read; on a file they can't be read from, those still are.
     let stats = match db.stats() {
         Ok(stats) => {
-            print_page_use(&stats);
+            print_page_use(&stats, text);
             Some(stats)
         }
         Err(e) => {
-            println!("  sizes not available: {e} (`trunkdb check` says more)");
+            let _ = writeln!(
+                text,
+                "  sizes not available: {e} (`trunkdb check` says more)"
+            );
             None
         }
     };
     let collections = db.collections().map_err(failed)?;
     if collections.is_empty() {
-        println!("  no collections");
+        let _ = writeln!(text, "  no collections");
     }
     for name in collections {
         let collection = db.collection::<trunkdb::Document>(&name);
@@ -181,22 +201,27 @@ fn info(file: &str, db: &Database) -> Outcome {
             })
             .collect();
         let documents = count(documents, "document");
-        match indexes.is_empty() {
-            true => println!("  {name}: {documents}"),
-            false => println!("  {name}: {documents}, indexes: {}", indexes.join(", ")),
-        }
+        let _ = match indexes.is_empty() {
+            true => writeln!(text, "  {name}: {documents}"),
+            false => writeln!(
+                text,
+                "  {name}: {documents}, indexes: {}",
+                indexes.join(", ")
+            ),
+        };
         let sizes = stats
             .as_ref()
             .and_then(|stats| stats.collections.iter().find(|c| c.name == name));
         if let Some(sizes) = sizes {
-            print_collection_sizes(sizes);
+            print_collection_sizes(sizes, text);
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 /// `info`'s summary of where the pages go (SPEC §93).
-fn print_page_use(stats: &trunkdb::Stats) {
+fn print_page_use(stats: &trunkdb::Stats, text: &mut String) {
+    use std::fmt::Write;
     let pages = &stats.pages;
     let mut parts = vec![
         format!("{} header", pages.header),
@@ -209,21 +234,23 @@ fn print_page_use(stats: &trunkdb::Stats) {
     if pages.unaccounted > 0 {
         parts.push(format!("{} unaccounted", pages.unaccounted));
     }
-    println!("  pages: {}", parts.join(", "));
+    let _ = writeln!(text, "  pages: {}", parts.join(", "));
     let after = stats.compacted_pages_estimate();
-    match stats.file.pages - after {
-        0 => println!("  compact would not make it smaller"),
-        saved => println!(
+    let _ = match stats.file.pages - after {
+        0 => writeln!(text, "  compact would not make it smaller"),
+        saved => writeln!(
+            text,
             "  compact would leave {}, {} fewer",
             count(after as usize, "page"),
             bytes(saved * stats.file.page_size as u64)
         ),
-    }
+    };
     if let Some(wal) = stats.wal_bytes {
-        println!("  WAL: {}", bytes(wal));
+        let _ = writeln!(text, "  WAL: {}", bytes(wal));
     }
     if let Some(ref recovered) = stats.recovered {
-        println!(
+        let _ = writeln!(
+            text,
             "  recovered {} from the WAL{}",
             count(recovered.pages as usize, "page"),
             if recovered.in_memory {
@@ -236,7 +263,8 @@ fn print_page_use(stats: &trunkdb::Stats) {
 }
 
 /// One collection's sizes, under its line.
-fn print_collection_sizes(sizes: &trunkdb::CollectionStats) {
+fn print_collection_sizes(sizes: &trunkdb::CollectionStats, text: &mut String) {
+    use std::fmt::Write;
     let index_pages: u64 = std::iter::once(&sizes.primary)
         .chain(&sizes.indexes)
         .map(|index| index.pages)
@@ -245,7 +273,8 @@ fn print_collection_sizes(sizes: &trunkdb::CollectionStats) {
         0 => String::new(),
         n => format!(" and {}", count(n as usize, "overflow page")),
     };
-    println!(
+    let _ = writeln!(
+        text,
         "    {} of documents in {}{overflow}, {} free in them; indexes {}",
         bytes(sizes.document_bytes),
         count(sizes.data_pages as usize, "data page"),

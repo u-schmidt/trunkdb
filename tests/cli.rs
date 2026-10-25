@@ -676,6 +676,40 @@ fn find_stops_quietly_when_its_reader_goes() {
     assert_eq!(stderr(&output), "");
 }
 
+/// `info … | head`: the reader gone, `info` stops, and that's no error,
+/// as for `find`. Enough collections that their lines are more than a
+/// pipe holds, so the write after the reader goes fails.
+#[test]
+fn info_stops_quietly_when_its_reader_goes() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = path(dir.path(), "db.trunkdb");
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    let mut batch = db.batch();
+    for n in 0..3_000 {
+        let collection = db.collection::<trunkdb::Document>(&format!("collection{n:05}"));
+        batch
+            .insert(&collection, object("n", trunkdb::Document::Int(n)))
+            .unwrap();
+    }
+    batch.commit().unwrap();
+    close(db);
+
+    let mut child = spawn(
+        Command::new(env!("CARGO_BIN_EXE_trunkdb"))
+            .args(["info", &db_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let mut first = [0u8; 100];
+    let read = child.stdout.take().unwrap().read_exact(&mut first);
+    let output = child.wait_with_output().unwrap();
+    assert!(read.is_ok(), "{read:?}: {}", stderr(&output));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "");
+}
+
 /// Documents of every shape `fields` sums up (SPEC §121): kinds that
 /// differ from one document to the next, objects and arrays at any depth,
 /// names a filter writes in backticks, and one no path can name; a name
