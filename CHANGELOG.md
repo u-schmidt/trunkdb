@@ -582,3 +582,12 @@ limit, batches and a write-ahead log. Since then:
     0.23.0's own code, 168 KB instead of 272, 9 KB compressed instead of
     32. A release adds a fixture only where it changes how files are
     written.
+
+    Items 91–98 → 0.24.0: nothing breaking at compile time;
+    `FileInfo::created_by` and `written_by`, `Release` and `RELEASE`
+    are additions. **Changed answers:** `!=` with an array, object or
+    binary value finds fewer documents than before, and aggregates put
+    equal ones into one group (§124). The default checkpoint threshold
+    is 4,000 pages (§123). Files stay format 12 and exports as in
+    0.23.0, which opens what 0.24.0 writes; a header 0.23.0 writes again
+    loses the releases (§125.3).
