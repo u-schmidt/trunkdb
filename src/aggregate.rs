@@ -21,9 +21,13 @@ use std::collections::BTreeMap;
 ///
 /// let per_status = Aggregate::new()
 ///     .group_by("status")
+///     // A column named "n": how many documents the group has.
 ///     .count("n")
+///     // A column named "average_tries": the mean of `tries`.
 ///     .avg("tries", "average_tries")
+///     // A column named "newest": the largest `created`.
 ///     .max("created", "newest")
+///     // Rows whose column "n" is over 10.
 ///     .having(Condition::gt("n", 10))
 ///     .sort_desc("n")
 ///     .limit(5);
@@ -31,7 +35,9 @@ use std::collections::BTreeMap;
 /// ```
 ///
 /// Each row holds its group's values at their paths, then each column
-/// in the order added, and no `_id`. Without `group_by`, every match is
+/// in the order added, and no `_id`. A column's `name` is the key its
+/// value gets in the row, as SQL's `AS` names a column: in
+/// `count("n")`, `"n"` names; it doesn't say which documents count. Without `group_by`, every match is
 /// one group, and there is one row even for no matches.
 ///
 /// - **Groups:** a missing field groups with `null` (SPEC §32); values a
@@ -95,27 +101,44 @@ impl Aggregate {
         self
     }
 
-    /// A column `name`: how many documents the group has.
+    /// A column named `name`: how many documents the group has.
+    ///
+    /// `name` is only the key the count gets in the row (SQL's
+    /// `count(*) AS name`), not a field or a value to match:
+    /// `.count("n")` gives `{"n": 340}` for a group of 340.
     pub fn count(self, name: impl Into<String>) -> Self {
         self.column(Kind::Count, None, name)
     }
 
-    /// A column `name`: the sum of the numbers at `path`.
+    /// A column named `name`: the sum of the numbers at `path`.
+    ///
+    /// `path` is the field read; `name` only the key the sum gets in the
+    /// row (SQL's `sum(path) AS name`): `.sum("tries", "total")` gives
+    /// `{"total": 1234}`.
     pub fn sum(self, path: impl Into<String>, name: impl Into<String>) -> Self {
         self.column(Kind::Sum, Some(path.into()), name)
     }
 
-    /// A column `name`: the smallest value at `path`.
+    /// A column named `name`: the smallest value at `path`.
+    ///
+    /// `path` is the field read; `name` only the key the value gets in
+    /// the row (SQL's `min(path) AS name`).
     pub fn min(self, path: impl Into<String>, name: impl Into<String>) -> Self {
         self.column(Kind::Min, Some(path.into()), name)
     }
 
-    /// A column `name`: the largest value at `path`.
+    /// A column named `name`: the largest value at `path`.
+    ///
+    /// `path` is the field read; `name` only the key the value gets in
+    /// the row (SQL's `max(path) AS name`).
     pub fn max(self, path: impl Into<String>, name: impl Into<String>) -> Self {
         self.column(Kind::Max, Some(path.into()), name)
     }
 
-    /// A column `name`: the average of the numbers at `path`.
+    /// A column named `name`: the average of the numbers at `path`.
+    ///
+    /// `path` is the field read; `name` only the key the average gets in
+    /// the row (SQL's `avg(path) AS name`).
     pub fn avg(self, path: impl Into<String>, name: impl Into<String>) -> Self {
         self.column(Kind::Avg, Some(path.into()), name)
     }

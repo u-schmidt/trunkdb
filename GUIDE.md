@@ -197,14 +197,19 @@ let per_status = db.collection::<Document>("tasks").aggregate(
     Filter::new().eq("tenant", "t1"),
     &Aggregate::new()
         .group_by("status")
-        .count("n")
-        .avg("tries", "average_tries")
-        .max("created", "newest")
-        .having(Condition::gt("n", 10))
+        .count("n")                     // a column named "n": the group's documents
+        .avg("tries", "average_tries")  // read `tries`, name the column "average_tries"
+        .max("created", "newest")       // read `created`, name the column "newest"
+        .having(Condition::gt("n", 10)) // rows whose "n" is over 10
         .sort_desc("n"),
 )?;
 // [{"status": "Done", "n": 340, "average_tries": 4.5, "newest": ...}, ...]
 ```
+
+- A column's string is its name in the row, as SQL's `AS` gives one:
+  `count("n")` counts every document of the group and calls the number
+  `n`; it matches nothing. Where a column reads a field, the field comes
+  first and the name second, as in `sum(tries) AS total`.
 
 - The filter picks the documents, sort and limit included, as for
   `find`; the rows have the group's values and each column, no `_id`.

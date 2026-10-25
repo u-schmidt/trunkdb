@@ -88,6 +88,13 @@ checkpoint before upgrading.
   helpers made private, `Document` no longer a serde `Deserializer`,
   the `fuzzing` feature declared outside the API. Another pass, the
   same way, once the API settles, for what came since.
+- **Aggregate columns, name first or last:** in `count("n")` and
+  `sum("tries", "total")` the column's name is a bare string, and a
+  reader took `count("open")` for a match, not a name; the docs now
+  say so at every column (§107.1, §126.1). Name-last would need no
+  comment, `.count().named("n")`, `.sum("tries").named("total")`, as
+  Polars writes `.alias(..)`, but breaks every aggregate written so
+  far. Decided in that pass, together with the rest of the API.
 
 **Should: cheap, and checked instead of kept by care**
 - Done in §120: **old files as fixtures**, a small database written by
@@ -221,19 +228,11 @@ limit is described.
   `Int`/`Float` bit and a missing mark in every key, file format 13
   (§106.8); `min` and `max` that seek a group's ends instead of walking
   its entries; rows handed out as they are made rather than collected.
-- A condition on a column: a `count`, `sum`, `avg`, `min` or `max`
-  over only those of a group's documents that meet it, where a filter
-  in front would leave the others out of every column. So per team all
-  tasks counted, and the mean only of those with `hours >= 4`; or
-  several counts in one pass, `hours >= 1` and `status = "open"`, where
-  a filter gives one count per query. One condition any column can
-  take, as standard SQL's `FILTER (WHERE …)` (PostgreSQL, DuckDB,
-  SQLite) has it, rather than a function per kind (ClickHouse's
-  `countIf`, `avgIf`; BigQuery's `COUNTIF`, Spark's `count_if`):
-  one rule instead of five names. MongoDB has none; a `$cond` turning
-  the others into null, which `$avg` skips, does it. Not `count(hours
-  >= 1)`: in SQL `COUNT(x)` counts where `x` isn't null, so that counts
-  every document with `hours`, true and false alike.
+- A condition on a column, standard SQL's `FILTER (WHERE …)`: a
+  `count`, `sum`, `avg`, `min` or `max` over only those of a group's
+  documents that meet it, so per team all tasks counted and the mean
+  only of those with `hours >= 4`, or several counts in one pass.
+  Drafted in §126, not built.
 - Projection beyond paths, when asked (§106.8): arrays trimmed to a
   field of their elements (`items[*].sku`, which now selects `items`
   whole), and fields excluded instead of selected.
