@@ -233,6 +233,12 @@ limit is described.
   documents that meet it, so per team all tasks counted and the mean
   only of those with `hours >= 4`, or several counts in one pass.
   Drafted in §126, not built.
+- A leaf decided whole for a column's range after the group fields
+  (§126.4, §126.9): per status on `(status, created)`, those since
+  Monday, where a leaf's ends agree on their group values and both meet
+  the range, so every entry between does. A new case in `decide_all`;
+  until then such leaves are walked entry by entry, from their entries.
+  If §126's measurements show the walk costs enough.
 - Projection beyond paths, when asked (§106.8): arrays trimmed to a
   field of their elements (`items[*].sku`, which now selects `items`
   whole), and fields excluded instead of selected.

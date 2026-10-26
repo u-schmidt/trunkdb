@@ -129,9 +129,17 @@ condition joins that on the same terms:
    each condition is decided for the leaf at once (`decide_all`, as
    §101.3 does for the filter). True, its column adds the leaf's
    entries; false, nothing; undecided for any, the leaf is walked entry
-   by entry. "Per status, all and those since Monday" on
-   `(status, created)` counts the leaves wholly on either side of
-   Monday without reading them.
+   by entry. `decide_all` decides a leaf where its two ends agree on
+   the bytes the condition reads, or where the condition accepts one
+   interval of the index's keys (§104.4). So a condition on the group
+   fields, or on fields before the last of them, is decided a leaf at
+   a time: per team on `(team, status)`, all and the open ones, counts
+   leaves without reading them. A range on a field after the group
+   fields is neither: per status on `(status, created)`, all and those
+   since Monday, is one interval of keys per status, not one for the
+   index, and a leaf's ends differ in `created`. Such leaves are walked
+   entry by entry, from their entries still, no document read. Deciding
+   them whole is a follow-up (126.9).
 
 The run of a group (§107.5's last group remembered) is unchanged: the
 conditions are decided per entry within it.
@@ -171,8 +179,10 @@ condition's decisions aren't counted on their own.
   on §107.9's 3,000 tasks:
   - per tenant, all counted, mean `tries` where `tries >= 4`, on
     `(tenant, tries)`: 0 documents read;
+  - per team, all and the open ones, on `(team, status)`: 0 read,
+    leaves counted whole;
   - per status, all and those since a date, on `(status, created)`:
-    0 read, leaves on both sides of the date counted whole;
+    0 read, every entry walked, no leaf counted whole (126.4);
   - a condition on `status` with only `(tenant, tries)`: the documents;
   - a condition on a long string cut in the key: those entries'
     documents only.
@@ -212,6 +222,14 @@ Each against the unit tests and 300 smoke programs:
   what SQL calls it and what `Iterator::filter` does, keep those that
   meet it. Since the document filter is an argument of `aggregate`,
   not a method of `Aggregate`, the two don't meet in code.
+- **A leaf decided whole for a range after the group fields**
+  (126.4), in this step: where a leaf's ends agree on their group
+  values, a condition on the next field of the index accepts one
+  interval of the keys under that prefix, so both ends meeting it means
+  every entry between does. A new case in `decide_all`, with its own
+  tests and mutations; left as a follow-up (ROADMAP) until 126.10's
+  per-status count since a date shows the entry-by-entry walk costs
+  enough.
 - **Counts of everything as one `count` per column** (§100, §101):
   with an index for each, `filter ∧ condition` per column could be
   cheaper than one pass; without, it reads the documents once per
@@ -232,6 +250,8 @@ SQLite's `FILTER (WHERE …)` on the same indexes:
   expressions.
 - **A condition on a field the index lacks** reads the documents, even
   where the index holds everything else.
+- **A range on a field after the group fields** walks the index entry
+  by entry: no leaf is counted whole for it (126.4).
 - **One pass for a count of everything** with conditions, where §107.3
   counts without reading.
 - **Not in the text form yet:** aggregates as text are open (§111.11);
