@@ -634,3 +634,11 @@ limit, batches and a write-ahead log. Since then:
     miswritten file, not a bit flip. That the cells start inside the
     page is now checked first, so the open fails with `InvalidData`.
     The fuzz corpus has the page as an `open_raw` seed.
+
+103. **Fixed: compaction emptied what was under its file's name**
+    (§130, a fix to §108). On Unix the image's file, `<database>.compact`,
+    was opened to be emptied: a file left there was emptied, and so was
+    any file a link under that name pointed to, even where the
+    compaction then found nothing to gain. It is now always made new,
+    as on Windows, under the first free name (`.compact.1` and so on
+    after it), and only that name is removed. What was there stays.

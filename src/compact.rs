@@ -31,7 +31,9 @@ impl Database {
     ///
     /// The new file is built in a file beside the database,
     /// `<database>.compact`, which is gone once the compaction is (SPEC
-    /// §108). Then it is written like any batch — through the WAL, so a
+    /// §108). It is always a new file: whatever is under that name
+    /// already is left as it is, and the next free name, `.compact.1`
+    /// and so on, is taken (SPEC §130). Then it is written like any batch — through the WAL, so a
     /// crash leaves the old file or the new one, never a mix — and
     /// copied into the database. Memory stays a few megabytes whatever
     /// the file's size, besides the keys of each index while it is
@@ -502,6 +504,41 @@ mod tests {
         assert_eq!(contents(&db), before);
         drop(db);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// Something under the image's name, `<database>.compact` — a link
+    /// to someone's file, or the file itself — is passed by: a
+    /// compaction that shrinks the file and one that gains nothing both
+    /// leave it as it was. It emptied the file a link pointed to (SPEC
+    /// §130).
+    #[test]
+    fn a_compaction_leaves_what_is_under_its_images_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"someone's file").unwrap();
+        let db = churned(&path);
+        db.checkpoint().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, db.scratch_path()).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&victim, db.scratch_path()).unwrap();
+        let before = contents(&db);
+
+        let shrunk = db.compact().unwrap();
+        assert!(shrunk.pages_after < shrunk.pages_before, "{shrunk:?}");
+        let again = db.compact().unwrap();
+        assert_eq!(again.pages_after, again.pages_before, "nothing to gain");
+        assert_eq!(contents(&db), before);
+        drop(db);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"someone's file");
+        assert_eq!(
+            std::fs::read(crate::storage::scratch_path(&path)).unwrap(),
+            b"someone's file"
+        );
+        let db = Database::open(&path).unwrap();
+        assert_eq!(contents(&db), before);
+        assert!(db.check().unwrap().is_ok());
     }
 
     /// A compaction far below the checkpoint threshold is in the file

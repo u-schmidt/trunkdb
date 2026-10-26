@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 /// Where a compaction builds its image: `<database>.compact`, beside the
 /// WAL. Only ever there while a compaction runs, and gone as soon as
-/// it's opened (`ScratchStore::create`); on Windows, while it's open,
-/// and maybe under a number after it.
+/// it's opened (`ScratchStore::create`); on Windows, while it's open.
+/// Under a number after it where the name is taken (SPEC §130).
 pub(crate) fn scratch_path(db_path: &Path) -> PathBuf {
     let mut os_string = db_path.as_os_str().to_os_string();
     os_string.push(".compact");
@@ -52,12 +52,15 @@ impl ScratchStore {
     /// its name at once: it lives as long as its handle does, and a crash
     /// leaves nothing behind.
     ///
+    /// The file is always a new one, under the first name nobody holds:
+    /// `path`, or `path` with `.1`, `.2` and so on after it. What is
+    /// already under a name, a file, a link or a link's target, is left
+    /// as it is: emptying it would empty whatever it is (SPEC §130).
+    ///
     /// On Windows an open file can't lose its name, so it is removed when
     /// it's closed, or the process ends. Until then the name is taken:
-    /// the image of an earlier compaction keeps it until its checkpoint,
-    /// and opening it again would empty that image under its readers. So
-    /// a name nobody holds is taken, `path`, or `path` with `.1`, `.2`
-    /// and so on after it.
+    /// the image of an earlier compaction keeps it until its checkpoint.
+    /// Elsewhere the name is removed as soon as the file is open.
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
         #[cfg(test)]
         if FAIL_CREATE.with(|fail| fail.replace(false)) {
@@ -131,23 +134,11 @@ impl ScratchStore {
     }
 }
 
-#[cfg(not(windows))]
-fn open_new(path: &Path) -> io::Result<File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    std::fs::remove_file(path)?;
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn open_new(path: &Path) -> io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-    /// More images than this open at once is something else going on.
+/// A file made new (`create_new`, which follows no link) under the first
+/// of `path`, `path.1`, `path.2` and so on that nobody holds, and that
+/// name (SPEC §130).
+fn first_free(path: &Path, options: &std::fs::OpenOptions) -> io::Result<(File, PathBuf)> {
+    /// More names taken than this is something else going on.
     const NAMES: u32 = 1000;
     let mut taken = None;
     for n in 0..NAMES {
@@ -155,19 +146,36 @@ fn open_new(path: &Path) -> io::Result<File> {
         if n > 0 {
             name.push(format!(".{n}"));
         }
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-            .open(&name);
-        match opened {
-            Ok(file) => return Ok(file),
+        match options.open(&name) {
+            Ok(file) => return Ok((file, name.into())),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => taken = Some(e),
             Err(e) => return Err(e),
         }
     }
     Err(taken.expect("at least one name tried"))
+}
+
+#[cfg(not(windows))]
+fn open_new(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    let (file, name) = first_free(path, &options)?;
+    // Only the name made here: what was under `path` stays.
+    std::fs::remove_file(name)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_new(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    Ok(first_free(path, &options)?.0)
 }
 
 #[cfg(test)]
@@ -375,7 +383,7 @@ mod tests {
     /// follows one whose image no checkpoint has copied in yet: the
     /// second doesn't touch the first, on Windows too, where the first
     /// still has the name. And a file another program left under the
-    /// name is emptied, or passed by.
+    /// name is passed by and left as it was (SPEC §130).
     #[test]
     fn two_images_live_at_once_keep_their_pages() {
         let dir = tempfile::tempdir().unwrap();
@@ -396,8 +404,41 @@ mod tests {
         }
         drop(images);
         let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        // On Windows, the other program's file is its own.
-        assert_eq!(left.len(), usize::from(cfg!(windows)));
+        assert_eq!(left.len(), 1, "only the other program's file");
+        assert_eq!(std::fs::read(&path).unwrap(), b"left by another program");
+    }
+
+    /// A link under the name, to another file or to one that isn't
+    /// there, is passed by: neither the link nor its target changes, and
+    /// nothing is made where it points. It emptied the target (SPEC
+    /// §130).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_under_the_name_is_passed_by() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        let victim = dir.path().join("victim");
+        let nowhere = dir.path().join("nowhere");
+        std::fs::write(&victim, b"someone's file").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        std::fs::hard_link(&victim, dir.path().join("image.1")).unwrap();
+        std::os::unix::fs::symlink(&nowhere, dir.path().join("image.2")).unwrap();
+
+        let mut store = ScratchStore::create(&path).unwrap();
+        store.allocate_page().unwrap();
+        let image = store.finish().unwrap();
+        assert_eq!(image.read(1).unwrap(), page(0));
+        drop(image);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone's file");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"someone's file");
+        assert!(!nowhere.exists(), "made where a link points");
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["image", "image.1", "image.2", "victim"]);
     }
 
     /// Pages 1 and up land at their places with their checksums, a
