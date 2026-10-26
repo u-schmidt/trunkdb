@@ -1539,6 +1539,36 @@ mod tests {
         assert_eq!(std::fs::read_dir(&links).unwrap().count(), 4);
     }
 
+    /// A catalog page whose slot directory runs past the page's end,
+    /// behind a checksum that matches: the open says the file is damaged,
+    /// read-only or not, where it panicked (SPEC §129).
+    #[test]
+    fn a_page_whose_directory_runs_past_its_end_fails_the_open() {
+        use crate::storage::{USABLE_PAGE_SIZE, checksum};
+        let (_dir, path, db) = open_temp();
+        db.collection::<Document>("posts")
+            .insert(value_doc(1))
+            .unwrap();
+        drop(db);
+        let mut file = std::fs::read(&path).unwrap();
+        let page = &mut file[PAGE_SIZE..2 * PAGE_SIZE]; // the catalog's
+        page[9..11].copy_from_slice(&2048u16.to_le_bytes());
+        page[11..13].copy_from_slice(&9000u16.to_le_bytes());
+        // Every slot empty, so none is refused before the last ones,
+        // past the page's end, are read.
+        page[13..USABLE_PAGE_SIZE].fill(0);
+        let sum = checksum(1, &page[..USABLE_PAGE_SIZE]);
+        page[USABLE_PAGE_SIZE..].copy_from_slice(&sum);
+        std::fs::write(&path, file).unwrap();
+
+        for opened in [open_read_only(&path), Database::open(&path)] {
+            let Err(crate::Error::Io(err)) = opened else {
+                panic!("opened, or not as damage");
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        }
+    }
+
     /// The lock is shared: read-only opens go together, an open that
     /// writes goes with none of them, nor they with it.
     #[test]

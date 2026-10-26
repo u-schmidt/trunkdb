@@ -143,3 +143,4 @@ say what changed, and DESIGN.md says what is true now.
 126. [A condition on a column (`aggregate.rs`, `collection.rs`)](126-a-condition-on-a-column.md)
 127. [A database opened through a symlink (`database.rs`, `bin/trunkdb.rs`)](127-a-database-opened-through-a-symlink.md)
 128. [A checkpoint that fails after cutting the WAL (`durability/wal.rs`, `database.rs`)](128-a-checkpoint-that-fails-after-cutting-the-wal.md)
+129. [A slot directory past the page's end (`storage/slotted.rs`)](129-a-slot-directory-past-the-pages-end.md)

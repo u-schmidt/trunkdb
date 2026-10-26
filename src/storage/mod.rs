@@ -11,7 +11,7 @@ pub use file::{DEFAULT_CACHE_SIZE, FileStore};
 #[cfg(test)]
 pub(crate) use file::{rewrite_format_version, rewrite_releases};
 pub use page::Page;
-#[cfg(feature = "fuzzing")]
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use pages::checksum;
 pub(crate) use pages::{DEFAULT_VERSION_LIMIT, Pages, TooOld};
 pub use pages::{PAGE_SIZE, USABLE_PAGE_SIZE};

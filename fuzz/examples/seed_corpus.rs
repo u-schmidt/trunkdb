@@ -22,6 +22,14 @@ fn main() {
     let mut raw = vec![ALL];
     raw.extend_from_slice(base);
     write("open_raw", "base", &raw);
+    // The catalog page's slot directory past the page's end, every slot
+    // empty, cells said to start further on: it panicked (SPEC §129).
+    let at = 1 + USABLE_PAGE_SIZE;
+    let catalog = &mut raw[at..at + USABLE_PAGE_SIZE];
+    catalog[9..11].copy_from_slice(&2048u16.to_le_bytes());
+    catalog[11..13].copy_from_slice(&9000u16.to_le_bytes());
+    catalog[13..].fill(0);
+    write("open_raw", "directory_past_the_end", &raw);
 
     // recover_wal, raw mode: [mode, top bit clear][a WAL with one record
     // of the catalog page and the first data page, as they are].

@@ -625,3 +625,12 @@ limit, batches and a write-ahead log. Since then:
     after them were committed, but the next open refused the WAL. The
     length is now 0 as soon as the cut succeeds, and an undo never
     grows the WAL past where the file ended before the failed log.
+
+102. **Fixed: a slot directory past the page's end** (§129, a fix to
+    §55). A page with 2,044 slots or more and its cells said to start
+    after them got past the check that the directory ends before the
+    cells, and the check then read its slots past the page's end and
+    panicked. It takes a checksum that matches, so a crafted or
+    miswritten file, not a bit flip. That the cells start inside the
+    page is now checked first, so the open fails with `InvalidData`.
+    The fuzz corpus has the page as an `open_raw` seed.

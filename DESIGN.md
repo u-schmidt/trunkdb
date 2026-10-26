@@ -109,7 +109,8 @@ anything that points at it changing. On data pages a slot is an
 identity and a deleted one is reused; on B-tree pages slot order is key
 order, and a cell is inserted or removed in place by moving the
 directory [§52](spec/52-b-tree-pages-changed-in-place.md). A page's layout is checked when it's read: a slot
-outside the cell area is an error saying what is wrong, not a panic [§54](spec/54-checking-a-page-when-it-is-read.md).
+outside the cell area is an error saying what is wrong, not a panic [§54](spec/54-checking-a-page-when-it-is-read.md),
+and so is a slot directory past the page's end, refused before a slot is read [§129](spec/129-a-slot-directory-past-the-pages-end.md).
 A page is checked once, as it goes into the cache or its batch
 commits, and marked; reads of a marked page skip the check [§66](spec/66-a-page-checked-once.md).
 The same holds for everything decoded from a page: bytes that run out,

@@ -85,6 +85,19 @@ impl SlottedPage {
         let slot_count = field(9);
         let data_start = field(11) as usize;
 
+        // The cells start inside the page. Found by fuzzing (SPEC §55):
+        // with no live slot, the loops below have no cell to catch a
+        // data_start past the end, and the next insert wrote there. And
+        // before them (SPEC §129): with the directory below, it bounds
+        // every slot they read, which a directory past the page's end
+        // would otherwise take them to.
+        if data_start > USABLE_PAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cells start at {data_start}, past the page's end at {USABLE_PAGE_SIZE}"),
+            ));
+        }
+
         // The directory: slot_count and data_start are u16, so convert to usize.
         let directory_end = HEADER_LEN + slot_count as usize * SLOT_LEN;
         if data_start < directory_end {
@@ -128,16 +141,6 @@ impl SlottedPage {
                     format!("slot {slot} is {length} bytes, shorter than any entry"),
                 ));
             }
-        }
-
-        // The cells start inside the page. Found by fuzzing (SPEC §55):
-        // with no live slot, the loop above has no cell to catch a
-        // data_start past the end, and the next insert wrote there.
-        if data_start > USABLE_PAGE_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("cells start at {data_start}, past the page's end at {USABLE_PAGE_SIZE}"),
-            ));
         }
         Ok(())
     }
@@ -439,6 +442,34 @@ mod tests {
 
         let overflow = Page::from(vec![PageType::Overflow as u8; USABLE_PAGE_SIZE]);
         assert!(!overflow.checked().layout_checked(), "not a slotted page");
+    }
+
+    /// A slot directory that runs past the page's end, with cells said
+    /// to start further on still, is refused before a slot is read: it
+    /// panicked, reading past the buffer (SPEC §129). The most slots
+    /// that fit, all empty, before cells at the page's end, still pass.
+    #[test]
+    fn a_directory_past_the_page_is_refused_before_it_is_read() {
+        let page = |slot_count: u16, data_start: u16| {
+            let mut buf = vec![0u8; USABLE_PAGE_SIZE];
+            buf[0] = PageType::Data as u8;
+            buf[9..11].copy_from_slice(&slot_count.to_le_bytes());
+            buf[11..13].copy_from_slice(&data_start.to_le_bytes());
+            buf
+        };
+        let most = ((USABLE_PAGE_SIZE - HEADER_LEN) / SLOT_LEN) as u16;
+        let end = USABLE_PAGE_SIZE as u16;
+        assert!(SlottedPage::check_layout(&page(most, end)).is_ok());
+        for (slot_count, data_start) in [
+            (most + 1, end),     // the directory one slot past the cells
+            (most + 1, end + 1), // and both past the page's end
+            (most + 1, end + 4), // the last slot's length past the end
+            (2048, 9000),        // the robustness review's page
+            (u16::MAX, u16::MAX),
+        ] {
+            let err = SlottedPage::check_layout(&page(slot_count, data_start)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        }
     }
 
     /// A page's bytes are shared until it changes (SPEC §64): changing a
@@ -744,7 +775,10 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_offsets_past_page_end() {
-        let buf = page_bytes_with_slot(60000, 500);
+        let mut buf = page_bytes_with_slot(60000, 500);
+        // The cells inside the page, so the slot is what's refused: a
+        // start past the page is refused before any slot (SPEC §129).
+        buf[11..13].copy_from_slice(&(USABLE_PAGE_SIZE as u16).to_le_bytes());
         let error = SlottedPage::from_bytes(buf)
             .err()
             .expect("a slot past the page end must be rejected");
