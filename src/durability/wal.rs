@@ -29,8 +29,9 @@ use std::path::{Path, PathBuf};
 pub struct WalDurability {
     file: File,
     /// The file's length as of the last `log` that succeeded, or the
-    /// last `checkpoint`: every byte up to here belongs to a committed
-    /// batch.
+    /// last `checkpoint` that cut the file, whether or not its flush
+    /// then failed: every byte up to here belongs to a committed batch
+    /// (SPEC §128).
     len: u64,
     /// The most pages `log` puts into one record: `RECORD_PAGES`, but
     /// for tests of batches in several.
@@ -51,6 +52,10 @@ pub struct WalDurability {
     /// touching the file (and decrements this).
     #[cfg(test)]
     pub(crate) failing_undos: u32,
+    /// Test-only: while non-zero, each `checkpoint` cuts the file, then
+    /// fails as if its flush had (and decrements this).
+    #[cfg(test)]
+    pub(crate) failing_checkpoints: u32,
 }
 
 /// Every non-empty WAL file starts with this: magic, then a `u32` format
@@ -433,6 +438,8 @@ impl WalDurability {
             #[cfg(test)]
             failing_undos: 0,
             #[cfg(test)]
+            failing_checkpoints: 0,
+            #[cfg(test)]
             syncs: 0,
         };
         Ok((wal, pending))
@@ -465,6 +472,10 @@ impl WalDurability {
                 "the WAL holds records of an older version, or a torn header: checkpoint it before logging",
             ));
         }
+        // What `undo_failed_log` cuts back to if this fails: never past
+        // the file's end, whatever was kept (SPEC §128). Bytes past
+        // `len`, a failed log's not yet taken back, are cut too.
+        self.len = self.len.min(end);
         let records = count.div_ceil(self.record_pages);
         let largest = count.min(self.record_pages);
         let mut record = Vec::with_capacity(WAL_HEADER_LEN + 16 + largest * PAGE_ENTRY_LEN);
@@ -547,7 +558,8 @@ impl Durability for WalDurability {
             return Err(io::Error::other("injected undo failure"));
         }
         // To `len`, not to nothing: what's before it are committed
-        // batches no checkpoint has written back yet (SPEC §51).
+        // batches no checkpoint has written back yet (SPEC §51). `log`
+        // kept it within the file (SPEC §128).
         self.file.set_len(self.len)?;
         self.file.seek(SeekFrom::Start(self.len))?;
         crate::storage::sync(&self.file)
@@ -555,11 +567,17 @@ impl Durability for WalDurability {
 
     fn checkpoint(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        crate::storage::sync(&self.file)?;
+        // Cut: the file is empty from here, whatever fails next, and an
+        // undo must not grow it back to the old length (SPEC §128).
         self.len = 0;
         self.appendable = true;
-        Ok(())
+        self.file.seek(SeekFrom::Start(0))?;
+        #[cfg(test)]
+        if self.failing_checkpoints > 0 {
+            self.failing_checkpoints -= 1;
+            return Err(io::Error::other("injected checkpoint failure"));
+        }
+        crate::storage::sync(&self.file)
     }
 
     fn len(&self) -> u64 {
@@ -1081,6 +1099,51 @@ mod tests {
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
         let recovered = recovered.images();
         assert_eq!(recovered, two_page_batch());
+    }
+
+    // --- A checkpoint that fails after cutting the file (SPEC §128) ---
+
+    /// A checkpoint whose flush fails has cut the file all the same: its
+    /// length is 0 from then on. A log that fails after it is taken back
+    /// to the empty file, not grown with zeros to the old length, and
+    /// the next log is recovered.
+    #[test]
+    fn a_checkpoint_that_fails_after_cutting_the_file_counts_it_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        log(&mut wal, &[(3, page(1)), (4, page(2)), (5, page(3))]);
+        wal.failing_checkpoints = 1;
+        assert!(wal.checkpoint().is_err());
+        assert!(wal_bytes(&db_path).is_empty(), "the file was cut");
+        assert_eq!(wal.len(), 0);
+
+        wal.failing_logs = 1;
+        assert!(wal.log(&[(6, &page(4))]).is_err());
+        wal.undo_failed_log().unwrap();
+        assert!(wal_bytes(&db_path).is_empty(), "grown back");
+        log(&mut wal, &[(7, page(5))]);
+        drop(wal);
+        let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(recovered.images(), vec![(7, page(5))]);
+    }
+
+    /// An undo cuts back no further than the file's end before the
+    /// failed batch, even where the length kept from before was past it.
+    #[test]
+    fn an_undo_cuts_back_to_where_the_failed_batch_began() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        log(&mut wal, &[(3, page(1))]);
+        let good = wal_bytes(&db_path);
+        wal.len = 3 * good.len() as u64; // as if the bookkeeping had gone wrong
+
+        wal.failing_logs = 1;
+        assert!(wal.log(&[(4, &page(2))]).is_err());
+        wal.undo_failed_log().unwrap();
+        assert_eq!(wal_bytes(&db_path), good);
+        assert_eq!(wal.len(), good.len() as u64);
     }
 
     /// After a log that succeeded there is nothing to take back.

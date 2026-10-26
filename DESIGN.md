@@ -168,7 +168,9 @@ that fails keeps its pages waiting, and the next one tries again.
 
 A batch whose log fails is taken back alone: the WAL is cut to where
 it was before, which keeps the batches committed earlier and not yet
-written back [§81](spec/81-a-failed-log-taken-back-alone.md). Only if that fails too is the
+written back [§81](spec/81-a-failed-log-taken-back-alone.md). Where it
+was is never past the file's end as the log starts, and a checkpoint that cut
+the WAL counts it empty even if its flush then failed [§128](spec/128-a-checkpoint-that-fails-after-cutting-the-wal.md). Only if that fails too is the
 batch's fate unknown; the database then refuses every call with
 `Error::Poisoned` until it's reopened, which recovers from the WAL
 [§19](spec/19-durability-take-two-a-page-image-wal.md) [§27](spec/27-a-thread-safe-cloneable-database-handle.md).

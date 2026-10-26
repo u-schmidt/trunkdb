@@ -617,3 +617,11 @@ limit, batches and a write-ahead log. Since then:
     `InvalidInput`. `trunkdb export` through a link refuses the file's
     WAL as well. A hard link to the database is documented as
     unsupported.
+
+101. **Fixed: a failed log after a failed checkpoint** (§128, a fix to
+    §81). A checkpoint that cut the WAL and then failed to flush kept
+    the WAL's old length, and a log that failed next was taken back by
+    growing the empty WAL to that length with zeros; the batches logged
+    after them were committed, but the next open refused the WAL. The
+    length is now 0 as soon as the cut succeeds, and an undo never
+    grows the WAL past where the file ended before the failed log.

@@ -281,7 +281,9 @@ impl Writer {
     /// `Database::checkpoint`: the pages to the file, then the WAL
     /// emptied — only after they're durably in the file. If the WAL can't
     /// be emptied, its records are written back once more at the next
-    /// open: harmless, page images are idempotent. Beside the readers
+    /// open: harmless, page images are idempotent. One cut whose flush
+    /// failed is empty all the same, and logged after as such (SPEC
+    /// §128). Beside the readers
     /// (`Pages::checkpoint`).
     fn checkpoint(&mut self) -> std::io::Result<()> {
         let live = self.live();
@@ -2920,6 +2922,30 @@ mod tests {
         for (id, value) in [(1, Some(10)), (2, Some(20)), (3, None), (4, Some(40))] {
             assert_eq!(get(&crashed, "posts", id), value.map(Document::Int), "{id}");
         }
+    }
+
+    /// A checkpoint whose flush fails after it cut the WAL, then a batch
+    /// whose log fails: taken back to the empty WAL, so the next batch is
+    /// recovered after a crash, where the undo had grown the WAL with
+    /// zeros and the open failed (SPEC §128).
+    #[test]
+    fn a_failed_log_after_a_failed_checkpoint_loses_no_batch() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        db.state().wal().failing_checkpoints = 1;
+        db.checkpoint().unwrap(); // the pages are in the file: not an error
+        assert_eq!(wal_len(&path), 0);
+
+        db.state().wal().failing_logs = 1;
+        assert!(db.write_batch(vec![insert("posts", 2, 20)]).is_err());
+        assert_eq!(wal_len(&path), 0, "grown back");
+        db.write_batch(vec![insert("posts", 3, 30)]).unwrap();
+
+        let (_copy, crashed) = as_after_a_crash(&db, &path);
+        for (id, value) in [(1, Some(10)), (2, None), (3, Some(30))] {
+            assert_eq!(get(&crashed, "posts", id), value.map(Document::Int), "{id}");
+        }
+        assert!(crashed.check().unwrap().is_ok());
     }
 
     /// If the failed log can't be taken back either, nobody knows
