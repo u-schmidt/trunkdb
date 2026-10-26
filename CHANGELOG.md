@@ -651,3 +651,15 @@ limit, batches and a write-ahead log. Since then:
     **Changed answers:** such means are now finite, and some differ
     from before in their last bit; means of integers below 2^53, and of
     floats whose total is exact, are as before.
+
+    Items 99–104 → 0.25.0: nothing breaking at compile time;
+    `Aggregate::filter` is an addition. **Changed answers:** some
+    means differ from 0.24.0's in their last bit, and means whose
+    total passed `f64::MAX` are finite (§131). **Moving up:** a
+    database opened through a symlink now uses the WAL beside the file
+    the link names (§127); one that 0.24.0 left after a crash, opened
+    through a link, has its last batches in the WAL beside the link, so
+    open it once with 0.24.0 and close it before moving up. A file left
+    under `<database>.compact` stays where it was (§130). Files stay
+    format 12 and exports as in 0.24.0, which opens what 0.25.0 writes;
+    no new fixture, as nothing changes how files are written (§120.9).

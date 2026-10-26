@@ -109,6 +109,11 @@ Each made by hand and run against the two library tests:
 - A hard link to the database is a separate WAL, as before (127.2).
 - A symlink replaced by another between two opens points them at
   different files. Each open is consistent with its own target.
+- **Moving up from 0.24.0:** a database 0.24.0 left after a crash,
+  opened through a link, has its last batches in the WAL beside the
+  link, which this build doesn't look at. Opened once with 0.24.0 and
+  closed, those batches are in the file and the WAL beside the link is
+  empty, a file of no bytes that can be deleted.
 - A symlink in a directory part of the path is left to the OS, which
   is enough for the WAL (127.1); `Database` itself never shows its
   path.

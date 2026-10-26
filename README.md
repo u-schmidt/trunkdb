@@ -22,7 +22,7 @@ measurements.
 
 - Typed documents through serde, or untyped ones (`Document`).
 - Filters in code or as text, with sort, skip and limit; projection and
-  aggregates by group. Arrays, objects and binary compare by their
+  aggregates by group, with a condition per column. Arrays, objects and binary compare by their
   contents with `=` and `!=`.
 - Secondary indexes: unique, compound, on nested paths and array
   elements, and sparse.
@@ -160,7 +160,7 @@ The minimum Rust version is 1.89, and CI builds with it. It rises
 only when a dependency or a real need requires it, never for syntax
 alone; a rise is noted in the changelog and isn't counted as breaking.
 
-The current version is 0.24; 0.x versions may still change the API and
+The current version is 0.25; 0.x versions may still change the API and
 the file format, and each release says what breaks and how to move up.
 
 ## License
