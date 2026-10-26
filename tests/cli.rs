@@ -377,6 +377,21 @@ fn export_refuses_the_database_itself_and_replaces_the_output_whole() {
     }
     assert!(trunkdb(&["check", &db]).status.success());
 
+    // Through a symlink to the database, its WAL is the file's, beside
+    // it, and that is refused too (SPEC §127).
+    #[cfg(unix)]
+    {
+        let link = path(dir.path(), "link.trunkdb");
+        let wal = format!("{db}.wal");
+        std::os::unix::fs::symlink(&db, &link).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        let output = trunkdb(&["export", &link, &wal]);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(stderr(&output).contains("choose another file"));
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        std::fs::remove_file(&link).unwrap();
+    }
+
     // No temporary file is left behind, and an existing output is replaced whole.
     std::fs::write(&out, "old").unwrap();
     assert!(trunkdb(&["export", &db, &out]).status.success());

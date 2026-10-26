@@ -605,3 +605,15 @@ limit, batches and a write-ahead log. Since then:
     say that its string is its name in the row, not something matched.
     No file format change; aggregates without a condition answer and
     run as before.
+
+100. **Fixed: a database opened through a symlink** (§127). The WAL
+    was named after the path given, so an open through a link found a
+    WAL beside the link, not the file's. After a crash it missed the
+    batches still in the file's WAL, and writes through the link went
+    into a second WAL, so a later open of the file could replay old
+    pages over newer ones. `Database::open` now follows a symlink to
+    the file it names before the lock, the WAL or compaction's file is
+    opened; links to links too, a loop or more than 40 refused with
+    `InvalidInput`. `trunkdb export` through a link refuses the file's
+    WAL as well. A hard link to the database is documented as
+    unsupported.

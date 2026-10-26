@@ -360,7 +360,9 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// only once the export is complete: a failed export leaves an existing
 /// `out` alone, and `out` can never be the database itself.
 fn export_to_file(db: &Database, file: &str, out: &str) -> Result<trunkdb::Summary, String> {
-    let mut wal = std::ffi::OsString::from(file);
+    // The WAL beside the file a symlink names, as the open uses (SPEC §127).
+    let resolved = std::fs::canonicalize(file).unwrap_or_else(|_| file.into());
+    let mut wal = resolved.into_os_string();
     wal.push(".wal");
     for protected in [Path::new(file), Path::new(&wal)] {
         if same_file(Path::new(out), protected) {

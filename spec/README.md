@@ -141,3 +141,4 @@ say what changed, and DESIGN.md says what is true now.
 124. [`=` and `!=` on arrays, objects and binary (`query.rs`, `aggregate.rs`, `update.rs`)](124-equal-arrays-objects-and-binary.md)
 125. [The release that wrote a file (`storage/file.rs`, `release.rs`)](125-the-release-that-wrote-a-file.md)
 126. [A condition on a column (`aggregate.rs`, `collection.rs`)](126-a-condition-on-a-column.md)
+127. [A database opened through a symlink (`database.rs`, `bin/trunkdb.rs`)](127-a-database-opened-through-a-symlink.md)

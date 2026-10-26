@@ -360,6 +360,11 @@ impl Database {
     /// instance may be halfway through writing. To share one database
     /// within a process, clone the handle instead of opening it again.
     ///
+    /// `path` may be a symlink: it is followed to the file it names, and
+    /// the WAL is that file's, beside it, whichever name opened it (SPEC
+    /// §127). A hard link to the file is not supported: the WAL is named
+    /// after the path, and a second name for the file finds another WAL.
+    ///
     /// # Errors
     /// How an open fails says why, for a program to match on (SPEC §92):
     /// - `Error::Format`: the file, or the WAL beside it, is not one this
@@ -375,6 +380,8 @@ impl Database {
     ///   a real holder.
     /// - `Error::Io` of kind `InvalidData`: the file is trunkdb's but
     ///   damaged; the message says where.
+    /// - `Error::Io` of kind `InvalidInput`: `path` is a symlink that
+    ///   leads to itself, or through more than 40 links.
     /// - `Error::Io` of other kinds: the file system's, such as
     ///   `PermissionDenied`, or `NotFound` for a read-only open.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
@@ -393,7 +400,9 @@ impl Database {
     /// # Ok::<(), trunkdb::Error>(())
     /// ```
     pub fn open_with(path: impl AsRef<Path>, options: OpenOptions) -> crate::Result<Self> {
-        let path = path.as_ref();
+        // Before anything is opened: the WAL and the compaction's file are
+        // named after it (SPEC §127).
+        let path = &followed(path.as_ref())?;
         if options.read_only {
             let mut store = FileStore::open_read_only(path)?;
             store.set_cache_size(options.cache_size);
@@ -906,6 +915,42 @@ impl std::ops::DerefMut for TestState<'_> {
     }
 }
 
+/// How many symlinks `followed` goes through, as Linux's `open` does.
+const MAX_LINKS: usize = 40;
+
+/// `path`, or the file its symlinks lead to, so the WAL and the
+/// compaction's file beside it are the same for every name that reaches
+/// the database through a symlink (SPEC §127). Only the last part is
+/// followed: one directory reached by two names keeps one WAL already.
+/// A path that isn't there is left as it is, and so is a symlink's
+/// target that isn't there: the open creates it, and the WAL beside it.
+fn followed(given: &Path) -> std::io::Result<PathBuf> {
+    let mut path = given.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // A relative target is relative to the link's directory;
+                // `join` keeps an absolute one as it is.
+                let target = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(dir) => dir.join(target),
+                    None => target,
+                };
+            }
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{}: more than {MAX_LINKS} symlinks, or one that leads to itself",
+            given.display()
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1412,6 +1457,84 @@ mod tests {
         assert_two_collection_batch_present(&db);
         drop((posts, db));
         assert_eq!(files(&path), before);
+    }
+
+    /// A database opened through a symlink reads and writes the WAL of
+    /// the file it names (SPEC §127): after a crash, an open through the
+    /// link finds the batches the file's WAL holds, read-only or not, and
+    /// no WAL is made beside the link.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_through_a_symlink_recovers_from_the_files_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let link = dir.path().join("link.trunkdb");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        drop(Database::open(&path).unwrap());
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+
+        let db = open_read_only(&link).unwrap();
+        assert_two_collection_batch_present(&db);
+        drop(db);
+        let db = Database::open(&link).unwrap();
+        assert_two_collection_batch_present(&db);
+        assert_eq!(db.wal_path(), durability::wal_path(&path));
+        db.collection::<Document>("posts")
+            .insert(value_doc(30))
+            .unwrap();
+        drop(db);
+
+        let link_wal = durability::wal_path(&link);
+        assert!(!link_wal.exists(), "a WAL beside the link");
+        let db = Database::open(&path).unwrap();
+        assert_two_collection_batch_present(&db);
+        assert_eq!(
+            db.collection::<Document>("posts")
+                .count(Filter::new())
+                .unwrap(),
+            2
+        );
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// Links to links are followed, a relative target from the link's
+    /// directory; a link to a file that isn't there creates the file, and
+    /// its WAL beside it; a loop of links is refused, nothing created.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_followed_to_the_file_or_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let links = dir.path().join("links");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&links).unwrap();
+        let path = data.join("test.trunkdb");
+        symlink("../data/test.trunkdb", links.join("first")).unwrap();
+        symlink("first", links.join("second")).unwrap();
+
+        let db = Database::open(links.join("second")).unwrap();
+        assert!(path.is_file(), "the target created");
+        assert!(durability::wal_path(&path).is_file());
+        // The same place, spelled through `links/..`.
+        let scratch = db.scratch_path();
+        assert_eq!(
+            scratch.parent().unwrap().canonicalize().unwrap(),
+            data.canonicalize().unwrap()
+        );
+        assert_eq!(scratch.file_name().unwrap(), "test.trunkdb.compact");
+        drop(db);
+        let in_links: Vec<_> = std::fs::read_dir(&links).unwrap().collect();
+        assert_eq!(in_links.len(), 2, "only the two links");
+
+        symlink("loop_b", links.join("loop_a")).unwrap();
+        symlink("loop_a", links.join("loop_b")).unwrap();
+        let Err(crate::Error::Io(err)) = Database::open(links.join("loop_a")) else {
+            panic!("a loop of links opened");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("symlinks"), "{err}");
+        assert_eq!(std::fs::read_dir(&links).unwrap().count(), 4);
     }
 
     /// The lock is shared: read-only opens go together, an open that

@@ -66,6 +66,11 @@ they come from [§8](spec/08-ownership-one-refcell-boundary-not-one-per-componen
 | `app.trunkdb` | the database: pages of 8 KB |
 | `app.trunkdb.wal` | the write-ahead log: whole page images, one record per commit, several for a commit over 32 MiB |
 
+Both are named after the database file. An open through a symlink
+follows it to the file first, so every name for it finds one WAL; a
+hard link is a second name the open can't tell apart, and isn't
+supported [§127](spec/127-a-database-opened-through-a-symlink.md).
+
 The database file holds an OS advisory lock (`flock`, `LockFileEx`)
 while it's open, so a second `open` fails at once instead of reading a
 file another process is writing [§21](spec/21-an-exclusive-file-lock-and-a-format-version.md). Within one process, a handle is
