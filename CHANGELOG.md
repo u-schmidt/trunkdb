@@ -642,3 +642,12 @@ limit, batches and a write-ahead log. Since then:
     compaction then found nothing to gain. It is now always made new,
     as on Windows, under the first free name (`.compact.1` and so on
     after it), and only that name is removed. What was there stays.
+
+104. **Fixed: `avg` rounded twice** (§131, a fix to §107). The exact
+    total was rounded to a float and then divided by the count: two
+    `1e308` averaged to infinity, the total being past `f64::MAX`, and
+    other means could be a unit in the last place off. The exact total
+    is now divided, then rounded once, and a mean is never `-0.0`.
+    **Changed answers:** such means are now finite, and some differ
+    from before in their last bit; means of integers below 2^53, and of
+    floats whose total is exact, are as before.

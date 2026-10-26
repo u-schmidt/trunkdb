@@ -145,3 +145,4 @@ say what changed, and DESIGN.md says what is true now.
 128. [A checkpoint that fails after cutting the WAL (`durability/wal.rs`, `database.rs`)](128-a-checkpoint-that-fails-after-cutting-the-wal.md)
 129. [A slot directory past the page's end (`storage/slotted.rs`)](129-a-slot-directory-past-the-pages-end.md)
 130. [Compaction's file, always a new one (`storage/scratch.rs`)](130-compactions-file-always-a-new-one.md)
+131. [A mean rounded once (`aggregate.rs`)](131-a-mean-rounded-once.md)

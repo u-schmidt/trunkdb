@@ -420,11 +420,15 @@ impl ExactSum {
         }
     }
 
-    /// `avg`'s value.
+    /// `avg`'s value: the exact total divided by the count, rounded
+    /// once, so a mean of finite numbers is finite however large their
+    /// total (SPEC §131); never `-0.0`. Infinities and NaNs as IEEE
+    /// divides them.
     pub fn avg(&self) -> Document {
-        match self.n {
-            0 => Document::Null,
-            n => Document::Float(self.total() / n as f64),
+        match (self.n, self.special) {
+            (0, _) => Document::Null,
+            (n, Some(special)) => Document::Float(special / n as f64),
+            (n, None) => Document::Float(self.wide.div_to_f64(n)),
         }
     }
 }
@@ -477,6 +481,28 @@ impl Wide {
 
     /// Rounded to the nearest float, ties to even; zero is `0.0`.
     fn to_f64(&self) -> f64 {
+        let (negative, magnitude) = self.sign_and_magnitude();
+        rounded(negative, &magnitude, None)
+    }
+
+    /// Divided by `n`, then rounded once to the nearest float, ties to
+    /// even (SPEC §131); zero is `0.0`.
+    fn div_to_f64(&self, n: u64) -> f64 {
+        let (negative, mut quotient) = self.sign_and_magnitude();
+        // Long division, a limb at a time from the top: the remainder
+        // stays below `n`, so it and the next limb fit in a `u128`.
+        let mut remainder = 0u128;
+        for limb in quotient.iter_mut().rev() {
+            let current = (remainder << 64) | u128::from(*limb);
+            *limb = (current / u128::from(n)) as u64;
+            remainder = current % u128::from(n);
+        }
+        let rest = (remainder != 0).then(|| (2 * remainder).cmp(&u128::from(n)));
+        rounded(negative, &quotient, rest)
+    }
+
+    /// Whether it is below zero, and how far from zero.
+    fn sign_and_magnitude(&self) -> (bool, [u64; LIMBS]) {
         let negative = self.0[LIMBS - 1] >> 63 == 1;
         let mut magnitude = self.0;
         if negative {
@@ -488,20 +514,34 @@ impl Wide {
                 carry = over;
             }
         }
-        let Some(top) = (0..LIMBS).rev().find(|&i| magnitude[i] != 0) else {
-            return 0.0;
-        };
-        let high = top as u32 * 64 + (63 - magnitude[top].leading_zeros());
-        let bit = |at: u32| (magnitude[(at / 64) as usize] >> (at % 64)) & 1;
-        let value = if high <= 52 {
+        (negative, magnitude)
+    }
+}
+
+/// `magnitude` units of 2^-1074, and `rest` of a unit more where a
+/// division left one: how it compares to half a unit. Rounded to the
+/// nearest float, ties to even, signed; zero is `0.0`.
+fn rounded(negative: bool, magnitude: &[u64; LIMBS], rest: Option<Ordering>) -> f64 {
+    let top = (0..LIMBS).rev().find(|&i| magnitude[i] != 0);
+    let high = top.map(|top| top as u32 * 64 + (63 - magnitude[top].leading_zeros()));
+    let bit = |at: u32| (magnitude[(at / 64) as usize] >> (at % 64)) & 1;
+    let value = match high {
+        None | Some(0..=52) => {
             // Below 2^53 units: a float's bits as they are (subnormal, or
-            // the smallest exponent).
-            f64::from_bits(magnitude[0])
-        } else {
+            // the smallest exponent), and a unit more for a rest past
+            // half of one, or half of one beside an odd unit.
+            let mut units = magnitude[0];
+            if rest == Some(Ordering::Greater) || (rest == Some(Ordering::Equal) && units & 1 == 1)
+            {
+                units += 1;
+            }
+            f64::from_bits(units)
+        }
+        Some(high) => {
             let shift = high - 52;
             let mut mantissa = (0..53).fold(0u64, |m, k| m | (bit(shift + k) << k));
             let round = bit(shift - 1) == 1;
-            let sticky = (0..shift - 1).any(|at| bit(at) == 1);
+            let sticky = rest.is_some() || (0..shift - 1).any(|at| bit(at) == 1);
             let mut exponent = shift + 1;
             if round && (sticky || mantissa & 1 == 1) {
                 mantissa += 1;
@@ -514,8 +554,11 @@ impl Wide {
                 true => f64::INFINITY,
                 false => f64::from_bits((u64::from(exponent) << 52) | (mantissa & ((1 << 52) - 1))),
             }
-        };
-        if negative { -value } else { value }
+        }
+    };
+    match negative && value != 0.0 {
+        true => -value,
+        false => value,
     }
 }
 
@@ -1230,6 +1273,103 @@ mod tests {
             sum.add(&Document::Float(v));
         }
         assert!(sum.total().is_nan());
+    }
+
+    /// SPEC §131: a mean is the exact total divided by the count, then
+    /// rounded once. Finite numbers have a finite mean, however large
+    /// their total, and the mean of a large total isn't rounded twice.
+    #[test]
+    fn means_are_the_exact_total_divided_and_rounded_once() {
+        let mean = |values: &[f64]| {
+            let mut sum = ExactSum::default();
+            values
+                .iter()
+                .for_each(|v| _ = sum.add(&Document::Float(*v)));
+            match sum.avg() {
+                Document::Float(f) => f,
+                other => panic!("{other:?}"),
+            }
+        };
+        // Totals past f64::MAX: infinity, where the mean is finite.
+        let max = f64::MAX;
+        assert_eq!(mean(&[1e308, 1e308]), 1e308);
+        assert_eq!(mean(&[max, max, max]), max);
+        assert_eq!(mean(&[-max, -max]), -max);
+        assert_eq!(mean(&[max, -max, max]), max / 3.0);
+        assert_eq!(mean(&[1e308, 1e308, -1e308]), 1e308 / 3.0);
+        // Below the smallest float: half of one is a tie, to even, and
+        // a mean that rounds to zero is `0.0`.
+        assert_eq!(mean(&[5e-324, 0.0]), 0.0);
+        assert_eq!(mean(&[1.5e-323, 0.0]), 1e-323);
+        assert_eq!(mean(&[1.5e-323, 0.0, 0.0]), 5e-324);
+        assert_eq!(mean(&[-5e-324, 0.0]).to_bits(), 0.0f64.to_bits());
+        // Just above the subnormals the quotient's last bit is the one
+        // rounded on: a third of a unit past it, left by the division
+        // alone, rounds up, where it would tie and round to even.
+        let past_a_tie = f64::from_bits(0x0038_0000_0000_0001); // 3 * 2^53 + 4 units
+        assert_eq!(
+            mean(&[past_a_tie, 0.0, 0.0]).to_bits(),
+            0x0020_0000_0000_0001
+        );
+        // The total rounded first, then divided, was a unit off: means
+        // as Python's `Fraction` gives them.
+        for (values, expected) in [
+            (
+                &[0x41f50f0218270ee8, 0x420da917d65a1c44, 0x42b76d4e0c4d1583][..],
+                0x429f431ad48c844a,
+            ),
+            (
+                &[
+                    0x4167563a05110792,
+                    0x412af4a9084f854a,
+                    0x3effe62956aaf56a,
+                    0xc12bdbb2dc3eb5dd,
+                    0x43207d8ba6caf1a9,
+                ],
+                0x42fa62790d3249ff,
+            ),
+            (
+                &[
+                    0xbc395f27564dcbb2,
+                    0x40d145bbac604bed,
+                    0xbed85ebed2591610,
+                    0x3e133b81a24db572,
+                    0xc27c04b7777af4dc,
+                    0xc234534ff0e2139a,
+                    0xbc8c7cf28e8d5a1c,
+                ],
+                0xc250bc871cb21661,
+            ),
+        ] {
+            let values: Vec<f64> = values.iter().map(|&b| f64::from_bits(b)).collect();
+            assert_eq!(mean(&values).to_bits(), expected, "{values:?}");
+        }
+        // A count that is a power of two divides a normal total exactly:
+        // the mean is the rounded total, halved as often.
+        let mut rng = crate::testing::XorShift(0x0131_0a5e);
+        for _ in 0..300 {
+            let n = 1 << rng.below(6);
+            let values: Vec<f64> = (0..n)
+                .map(|_| {
+                    let mantissa = (rng.next() % (1 << 53)) as f64;
+                    let sign = if rng.below(2) == 0 { 1.0 } else { -1.0 };
+                    sign * mantissa * 2f64.powi(rng.below(400) as i32 - 200)
+                })
+                .collect();
+            let mut sum = ExactSum::default();
+            values
+                .iter()
+                .for_each(|v| _ = sum.add(&Document::Float(*v)));
+            let expected = sum.total() / n as f64;
+            assert_eq!(mean(&values).to_bits(), expected.to_bits(), "{values:?}");
+        }
+        // Infinities and NaN as IEEE divides them.
+        assert_eq!(mean(&[f64::INFINITY, 1.0]), f64::INFINITY);
+        assert!(mean(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
+        // Through `Aggregate`, as the robustness review asked it.
+        let aggregate = Aggregate::new().avg("n", "mean");
+        let docs = docs(&[r#"{"n": 1e308}"#, r#"{"n": 1e308}"#]);
+        assert_eq!(rows(&aggregate, docs), [r#"{"mean":1e+308}"#]);
     }
 
     /// SPEC §107.2: `having`, the row sort, skip and limit.

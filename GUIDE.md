@@ -214,7 +214,8 @@ let per_status = db.collection::<Document>("tasks").aggregate(
 - The filter picks the documents, sort and limit included, as for
   `find`; the rows have the group's values and each column, no `_id`.
 - A missing field groups with `null`; `5` and `5.0` are one group.
-- `sum` and `avg` add only numbers, exactly, in any order; `min` and
+- `sum` and `avg` add only numbers, exactly, in any order; a mean is
+  rounded once, so it is finite wherever the numbers are; `min` and
   `max` pass over nulls.
 - Without `group_by`, one row of everything, even of nothing.
 

@@ -388,6 +388,7 @@ sum, average, or find the smallest and largest value
 [§107](spec/107-aggregates.md). A missing field groups with null, values a
 filter finds equal are one group, and sums are exact (a fixed-point
 integer as wide as every float), so the plan doesn't change the answer.
+A mean is that exact total divided, then rounded once [§131](spec/131-a-mean-rounded-once.md).
 Where an index holds every path the aggregate reads, its entries are
 aggregated without their documents for `count`, `avg`, `min` and `max`,
 a document read only for a value the key doesn't hold as stored (a

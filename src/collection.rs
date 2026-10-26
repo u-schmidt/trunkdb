@@ -10088,6 +10088,43 @@ mod tests {
         assert!(matches!(&rows[0], Document::Object(f) if f["a"] == Document::Float(3.0)));
     }
 
+    /// A mean of large numbers, by scan and through an index: the same
+    /// finite mean either way, where both gave infinity (SPEC §131).
+    #[test]
+    fn a_mean_of_large_numbers_is_finite_however_it_is_read() {
+        use crate::query::Aggregate;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        for n in [1e308, 1e308, f64::MAX] {
+            docs.insert(object(vec![("n", Document::Float(n))]))
+                .unwrap();
+        }
+        let aggregate = Aggregate::new().avg("n", "mean");
+        let f = Filter::new().gte("n", Document::Float(0.0));
+        let expected = (2.0 * (1e308 / 3.0)) + f64::MAX / 3.0;
+        let mean = |rows: Vec<Document>| match &rows[..] {
+            [Document::Object(row)] => row["mean"].clone(),
+            other => panic!("{other:?}"),
+        };
+        let scanned = mean(docs.aggregate(f.clone(), &aggregate).unwrap());
+        docs.ensure_index("n").unwrap();
+        let run = docs.explain_aggregate(f.clone(), &aggregate).unwrap();
+        // Through the index, its documents read: an entry gives `avg` a
+        // number only below 2^53 (SPEC §107.5).
+        assert!(
+            matches!(run.plan, crate::query::QueryPlan::Index { .. }),
+            "{run:#?}"
+        );
+        let indexed = mean(docs.aggregate(f.clone(), &aggregate).unwrap());
+        assert_eq!(scanned, indexed);
+        let Document::Float(mean) = scanned else {
+            panic!("{scanned:?}");
+        };
+        assert!(mean.is_finite());
+        assert!((mean - expected).abs() <= expected * f64::EPSILON, "{mean}");
+    }
+
     #[test]
     fn aggregates_from_entries_agree_with_the_documents() {
         use crate::query::Aggregate;
