@@ -2017,11 +2017,12 @@ fn aggregate_in(
     let mut groups = Groups::new(aggregate);
     // Counts alone, of every match: `count`'s.
     let counts_only = aggregate.columns.iter().all(|c| c.kind == Kind::Count);
-    if aggregate.group_by.is_empty() && counts_only {
+    if aggregate.group_by.is_empty() && counts_only && !aggregate.has_conditions() {
         let n = count_matches(catalog, store, collection, filter, trace)?;
         trace.matched(n);
         if n > 0 {
-            groups.add_counted(Vec::new(), n as u64, Order::id(DocId::NIL), None);
+            let takes = vec![true; aggregate.columns.len()];
+            groups.add_counted(Vec::new(), n as u64, &takes, Order::id(DocId::NIL), None);
         }
         trace.groups(1);
         return Ok((
@@ -2033,8 +2034,7 @@ fn aggregate_in(
         aggregate_by_entries(catalog, store, collection, filter, &mut groups, trace)?
     {
         trace.groups(groups.len());
-        let paths = aggregate.paths();
-        let selection = Selection::new(paths.iter().copied());
+        let selection = aggregate_selection(aggregate);
         let mut records = data::Records::new(store);
         let rows = groups.finish(|loc| {
             trace.examined();
@@ -2043,8 +2043,7 @@ fn aggregate_in(
         })?;
         return Ok((rows, plan));
     }
-    let paths = aggregate.paths();
-    let selection = Selection::new(paths.iter().copied());
+    let selection = aggregate_selection(aggregate);
     let found = find_in(
         catalog,
         store,
@@ -2062,6 +2061,22 @@ fn aggregate_in(
     trace.groups(groups.len());
     let rows = groups.finish(|_| unreachable!("every value from its document"))?;
     Ok((rows, plan_for(filter, indexes)))
+}
+
+/// What an aggregate decodes of a document (SPEC §107.3): the group
+/// and column paths, and the fields each column's condition reads
+/// (§126.3) — the whole document where one starts at the document
+/// itself.
+fn aggregate_selection(aggregate: &Aggregate) -> Selection {
+    let filters = aggregate.column_filters();
+    let mut paths = aggregate.paths();
+    for filter in filters.iter().flatten() {
+        match filter.fields() {
+            Some(fields) => paths.extend(fields),
+            None => paths.push(""),
+        }
+    }
+    Selection::new(paths)
 }
 
 /// An aggregate from index entries (SPEC §107.5), into `groups`: where
@@ -2087,11 +2102,16 @@ fn aggregate_by_entries(
         return Ok(None);
     }
     let paths = aggregate.paths();
+    // Each column's condition, decided from the entries where they hold
+    // what it reads (SPEC §126.4).
+    let conditions = aggregate.column_filters();
     let holds = |index: &IndexMeta| {
         !index.fields.iter().any(|f| crate::query::is_multi(f))
             && paths
                 .iter()
                 .all(|path| index.fields.iter().any(|f| f == path))
+            && (conditions.iter().flatten())
+                .all(|condition| Covering::new(condition, Some(index), false).is_some())
     };
     let indexes = catalog.indexes(collection);
     // Only an index that holds every path can answer: the planner is
@@ -2154,6 +2174,19 @@ fn aggregate_by_entries(
     // them is in one group (keys are in order, values prefix-free).
     let through = group_at.iter().max().map_or(0, |last| last + 1);
     let mut decider = Covering::new(filter, Some(index), false).map(|c| c.decider(filter));
+    let mut column_deciders: Vec<Option<Decider>> = (conditions.iter())
+        .map(|condition| {
+            condition.as_ref().map(|condition| {
+                let covering = Covering::new(condition, Some(index), false);
+                covering.expect("held").decider(condition)
+            })
+        })
+        .collect();
+    // Which columns an entry goes to: every one without conditions, else
+    // decided into a list kept from entry to entry.
+    let every_column = vec![true; aggregate.columns.len()];
+    let conditional = column_deciders.iter().any(Option::is_some);
+    let mut takes: Vec<bool> = Vec::with_capacity(aggregate.columns.len());
     let read = trace.read(index.name(), bounds, false);
     if decider.is_some() || filter.conditions.is_empty() {
         trace.covering(read);
@@ -2194,13 +2227,22 @@ fn aggregate_by_entries(
                 }
                 _ => None,
             };
-            if let Some(group) = group {
+            // Each condition for the whole leaf, or the leaf walked.
+            let takes = group.as_ref().and_then(|_| {
+                (column_deciders.iter_mut())
+                    .map(|decider| match decider {
+                        Some(decider) => decider.decide_all(leaf.lowest, leaf.highest),
+                        None => Some(true),
+                    })
+                    .collect::<Option<Vec<bool>>>()
+            });
+            if let (Some(group), Some(takes)) = (group, takes) {
                 let n = leaf.entries;
                 let order = Order::id(key::doc_id(leaf.lowest));
                 trace.entries(read, n);
                 trace.matched(n);
                 (0..n).for_each(|_| trace.answered_from_entry());
-                groups.add_counted(group, n as u64, order, None);
+                groups.add_counted(group, n as u64, &takes, order, None);
                 last_group = low.map(<[u8]>::to_vec);
                 #[cfg(test)]
                 LEAVES_COUNTED.with(|c| c.set(c.get() + 1));
@@ -2230,14 +2272,32 @@ fn aggregate_by_entries(
                 .collect::<Option<Vec<_>>>()
         });
         let id = key::doc_id(key);
-        if let Some(Some(values)) = values {
+        // Each condition on the key; one it can't tell reads the document.
+        let decided: Option<&[bool]> = match &values {
+            Some(Some(_)) if !conditional => Some(&every_column),
+            Some(Some(_)) => {
+                takes.clear();
+                let told = (column_deciders.iter_mut()).try_for_each(|decider| {
+                    takes.push(match decider {
+                        Some(decider) => decider.decide(key)?,
+                        None => true,
+                    });
+                    Some(())
+                });
+                told.map(|()| &takes[..])
+            }
+            _ => None,
+        };
+        if let Some(Some(values)) = values
+            && let Some(takes) = decided
+        {
             // Entries come in key order: one whose bytes up to the last
             // group value are the last one's is in its group.
             let through = prefix(key, through);
             if last_group.is_some() && through == last_group.as_deref() {
                 trace.matched(1);
                 trace.answered_from_entry();
-                groups.add_entry_to_last(values, Order::id(id), loc);
+                groups.add_entry_to_last(values, takes, Order::id(id), loc);
                 continue;
             }
             let group = (group_at.iter())
@@ -2246,7 +2306,7 @@ fn aggregate_by_entries(
             if let (Some(group), Some(through)) = (group, through) {
                 trace.matched(1);
                 trace.answered_from_entry();
-                groups.add_entry(group, values, Order::id(id), loc);
+                groups.add_entry(group, values, takes, Order::id(id), loc);
                 let last = last_group.get_or_insert_with(Vec::new);
                 last.clear();
                 last.extend_from_slice(through);
@@ -5714,6 +5774,31 @@ mod tests {
                 grouped.push(path);
             }
         }
+        // A condition for a column (SPEC §126): on a path of the pool, so
+        // half the time on the index's fields, against a value of a
+        // document found or a random one; now and then negated, an OR of
+        // two, or an `exists`, which no entry decides.
+        let sample: Vec<Document> = whole.iter().map(|(_, d)| d.clone()).collect();
+        let leaf = |rng: &mut XorShift| -> Condition {
+            let path = pick(rng);
+            let value = match (rng.below(2), sample.is_empty()) {
+                (0, false) => {
+                    let doc = &sample[rng.below(sample.len())];
+                    crate::path::Path::new(&path).value_or_null(doc).clone()
+                }
+                _ => random_value(rng),
+            };
+            let ops = [Op::Eq, Op::Ne, Op::Lt, Op::Lte, Op::Gt, Op::Gte];
+            cond(&path, ops[rng.below(ops.len())].clone(), value)
+        };
+        let condition = |rng: &mut XorShift| -> Condition {
+            match rng.below(8) {
+                0 => !leaf(rng),
+                1 => Condition::any([leaf(rng), leaf(rng)]),
+                2 => Condition::exists(pick(rng)),
+                _ => leaf(rng),
+            }
+        };
         for c in 0..1 + rng.below(3) {
             let name = format!("c{c}");
             aggregate = match rng.below(5) {
@@ -5723,6 +5808,9 @@ mod tests {
                 3 => aggregate.max(pick(rng), name),
                 _ => aggregate.avg(pick(rng), name),
             };
+            for _ in 0..[0, 0, 1, 1, 2][rng.below(5)] {
+                aggregate = aggregate.filter(condition(rng));
+            }
         }
         if rng.below(3) == 0 {
             aggregate = aggregate.sort_desc("c0").limit(1 + rng.below(4));
@@ -10083,6 +10171,141 @@ mod tests {
         assert!(
             from_entries * 4 > matched,
             "{from_entries} of {matched} from entries"
+        );
+    }
+
+    /// SPEC §126.4: a column's condition decided from the entries, and
+    /// what reads documents.
+    #[test]
+    fn a_condition_on_a_column_reads_documents_only_where_entries_cannot_tell() {
+        use crate::query::Aggregate;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Document>("tasks");
+        tasks.ensure_index(["status", "created"]).unwrap();
+        tasks.ensure_index(["tenant", "tries"]).unwrap();
+        tasks.ensure_index(["tenant", "status"]).unwrap();
+        let start = 1_700_000_000;
+        let mut batch = db.batch();
+        for n in 0..3000i64 {
+            let created = crate::DateTime::from_unix(start + n, 0).unwrap();
+            batch
+                .insert(
+                    &tasks,
+                    object(vec![
+                        (
+                            "status",
+                            Document::String(["Queued", "Running", "Done"][n as usize % 3].into()),
+                        ),
+                        ("created", Document::DateTime(created)),
+                        ("tenant", Document::String(format!("t{}", n % 10))),
+                        ("tries", Document::Int(n % 7)),
+                    ]),
+                )
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        let run = |f: Filter, a: &Aggregate| {
+            LEAVES_COUNTED.with(|c| c.set(0));
+            let run = tasks.explain_aggregate(f.clone(), a).unwrap();
+            let expected = a.apply(tasks.find(f.clone()).unwrap()).unwrap();
+            assert_eq!(tasks.aggregate(f, a).unwrap(), expected);
+            (run, LEAVES_COUNTED.with(|c| c.get()))
+        };
+        // Per tenant, all counted and the mean of those tried four times
+        // or more: `(tenant, tries)` holds both, no document read.
+        let long = Aggregate::new()
+            .group_by("tenant")
+            .count("tasks")
+            .avg("tries", "mean_long")
+            .filter(Condition::gte("tries", 4));
+        let (r, _) = run(Filter::new(), &long);
+        assert_eq!(
+            r.plan,
+            QueryPlan::IndexOrder {
+                field: "(tenant, tries)".into()
+            }
+        );
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.from_entries),
+            (0, 3000),
+            "{r:?}"
+        );
+        // Per tenant, all and the running ones: `(tenant, status)`, its
+        // leaves of one status decided whole.
+        let running = Aggregate::new()
+            .group_by("tenant")
+            .count("tasks")
+            .count("running")
+            .filter(Condition::eq("status", "Running"));
+        let (r, leaves) = run(Filter::new(), &running);
+        assert_eq!(
+            r.plan,
+            QueryPlan::IndexOrder {
+                field: "(tenant, status)".into()
+            }
+        );
+        assert_eq!(r.stats.documents_examined, 0, "{r:?}");
+        assert!(leaves > 5, "{leaves} leaves counted whole");
+        // Per status, all and those since a date: from the entries, but
+        // entry by entry, as `decide_all` can't decide a leaf whose ends
+        // differ in `created` (SPEC §126.4).
+        let since = crate::DateTime::from_unix(start + 2000, 0).unwrap();
+        let recent = Aggregate::new()
+            .group_by("status")
+            .count("tasks")
+            .count("recent")
+            .filter(Condition::gte("created", Document::DateTime(since)));
+        let (r, leaves) = run(Filter::new(), &recent);
+        assert_eq!(
+            r.plan,
+            QueryPlan::IndexOrder {
+                field: "(status, created)".into()
+            }
+        );
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.from_entries, leaves),
+            (0, 3000, 0),
+            "{r:?}"
+        );
+        // A condition on a field no index holds beside the others: the
+        // documents.
+        let done = Aggregate::new()
+            .group_by("tenant")
+            .avg("tries", "mean_done")
+            .filter(Condition::eq("status", "Done"));
+        let (r, _) = run(Filter::new(), &done);
+        assert_eq!(r.plan, QueryPlan::Scan);
+        assert_eq!(r.stats.documents_examined, 3000, "{r:?}");
+        // A condition on a string cut in its key: those entries' documents
+        // only.
+        let notes = db.collection::<Document>("notes");
+        notes.ensure_index(["tenant", "note"]).unwrap();
+        let long_note = |end: &str| Document::String("x".repeat(1200) + end);
+        for n in 0..20 {
+            let note = match n % 4 {
+                0 => long_note("a"),
+                _ => Document::String(format!("short {n}")),
+            };
+            notes
+                .insert(object(vec![
+                    ("tenant", Document::String(format!("t{}", n % 2))),
+                    ("note", note),
+                ]))
+                .unwrap();
+        }
+        let a = Aggregate::new()
+            .group_by("tenant")
+            .count("all")
+            .count("long_a")
+            .filter(Condition::eq("note", long_note("a")));
+        let r = notes.explain_aggregate(Filter::new(), &a).unwrap();
+        let expected = a.apply(notes.find(Filter::new()).unwrap()).unwrap();
+        assert_eq!(notes.aggregate(Filter::new(), &a).unwrap(), expected);
+        assert_eq!(
+            (r.stats.documents_examined, r.stats.from_entries),
+            (5, 15),
+            "{r:?}"
         );
     }
 

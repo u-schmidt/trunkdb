@@ -591,3 +591,17 @@ limit, batches and a write-ahead log. Since then:
     is 4,000 pages (§123). Files stay format 12 and exports as in
     0.23.0, which opens what 0.24.0 writes; a header 0.23.0 writes again
     loses the releases (§125.3).
+
+99. **A condition on an aggregate column** (§126): `filter` right after
+    a column, SQL's `FILTER (WHERE …)`, so the column takes in only the
+    group's documents that meet it, while the groups, the row's values
+    and the other columns still see every document the filter finds.
+    `.count("tasks").count("open_tasks").filter(Condition::eq("status",
+    "open"))` gives each team both counts; a team without an open task
+    is still a row, `0` there. Any column takes one, two are ANDed, and
+    a `filter` before any column is refused. Index entries decide it
+    where the index holds the fields it names; a leaf of counts is
+    counted whole where its ends decide it. The docs of every column
+    say that its string is its name in the row, not something matched.
+    No file format change; aggregates without a condition answer and
+    run as before.

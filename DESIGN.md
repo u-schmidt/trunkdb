@@ -385,6 +385,11 @@ aggregated without their documents for `count`, `avg`, `min` and `max`,
 a document read only for a value the key doesn't hold as stored (a
 group's or an extreme's number); a walk counts whole leaves of a group.
 Without conditions, an index is walked only if it holds every document.
+A column can take a condition of its own, `filter` after it, SQL's
+`FILTER (WHERE …)` [§126](spec/126-a-condition-on-a-column.md): it takes
+in only the group's documents that meet it, while the groups and the
+other columns see every match. Index entries decide it where the index
+holds what it reads, a leaf of counts at a time where its ends agree.
 
 `explain_run` runs a query and says how it went: the plan, each index
 read with the conditions that bound it and whether its entries decided
@@ -501,7 +506,8 @@ more than four.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`
   too [§60](spec/60-a-smaller-public-api.md); or from text, `text.parse::<Filter>()`, and back with
   `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md);
-  `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md).
+  `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md), a
+  column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.
@@ -606,7 +612,7 @@ cd bench && cargo run --release
 cd bench && cargo run --release --bin reader_wait   # readers while a writer commits
 cd bench && cargo run --release --bin long_read     # one long snapshot beside single writes
 cd bench && cargo run --release --bin select        # reads with a selection (§106)
-cd bench && cargo run --release --bin aggregate     # aggregates by group (§107)
+cd bench && cargo run --release --bin aggregate     # aggregates by group (§107, §126)
 ```
 
 Each gap had a measured cause, fixed one at a time:
@@ -689,7 +695,7 @@ src/
 ├── query_text.rs      a filter as text, read and printed
 ├── path.rs            field paths, parsed once per query
 ├── select.rs          projection: the fields a read hands out
-├── aggregate.rs       Aggregate: count, sum, min, max, avg by group
+├── aggregate.rs       Aggregate: count, sum, min, max, avg by group, a condition per column
 ├── explain.rs         explain and explain_run: how a query ran
 ├── stats.rs           Database::stats: where a file's space goes
 ├── update.rs          Update: operators on dotted paths

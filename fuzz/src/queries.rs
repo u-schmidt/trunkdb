@@ -802,7 +802,8 @@ impl Run<'_> {
     /// Rule 2 for an aggregate (SPEC §107): `aggregate` answers as
     /// `Aggregate::apply` does on the model's matches. Half the time its
     /// filter neither sorts nor limits and its fields are an existing
-    /// index's, so that the entries may answer (§107.5).
+    /// index's, so that the entries may answer (§107.5); half its columns
+    /// have a condition (§126).
     fn aggregate(&mut self) {
         // A skip or a limit picks among matches only in a total order.
         let mut query = self.query().unselected().total();
@@ -846,6 +847,11 @@ impl Run<'_> {
                 3 => aggregate.max(path, name),
                 _ => aggregate.avg(path, name),
             };
+            // A condition on the column (SPEC §126), as a filter's
+            // conditions are made.
+            if self.program.one_in(2) {
+                aggregate = aggregate.filter(self.condition(1));
+            }
         }
         if self.program.one_in(4) {
             aggregate = aggregate.sort_desc("c0").limit(1 + self.program.below(3));

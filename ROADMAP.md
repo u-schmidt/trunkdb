@@ -43,6 +43,7 @@ All of it is done:
 | 0.22.0 | **Memory that doesn't grow with the file**, step 3: compaction's new image built in a file beside the database, `<database>.compact`, whose name is gone as soon as it's open, so a crash leaves nothing; logged to the WAL from there a record at a time, read from there until the checkpoint copies it in, a megabyte at a time. From 2.1 GB to 1.1 GB in 0.1 GB of memory instead of 1.25, in the same 11 s; the disk needs room for the new file twice more until it's done. **`check`** in memory that doesn't grow with the file: documents read one at a time, an index checked entry by entry against the documents its entries name, a second pass only to name what's missing; a page's owner in four bytes. On a file of 1.1 GB, 0.3 GB instead of 1.75 with the default cache, in the same time; 3 MB instead of 1.3 GB without one. **Fixed:** an aggregate from index entries showed a group's number as an earlier match had it (`3` for the first document's `3.0`) where its first document by id came late in the walk (a fix to §107). **Filters as text:** `FromStr` and `Display` for `Filter` and `Condition`, a language like SQL's `WHERE` with `select`, `order by`, `limit` and `offset`, `is null`, `exists(…)`, `size(…)`, `has (…)` with `@` for the element, values as JSON with `id("…")` and `date("…")`, names in backticks where they must be; it compiles to the same `Filter`; `ParseFilterError` with line and column; a fuzz target, `filter_text`, and the `queries` target reading through the text. **`trunkdb find <file> <collection> [filter]`**: what the filter finds, one JSON document per line, the count to stderr; read-only, streamed from a cursor, quiet when its reader goes; a filter's mistake shown under its line with a `^`, exit code 2 | §108–§112 |
 | 0.23.0 | `trunkdb find … --explain`: how a query ran instead of what it found, a line each: the plan in words, every index read with its bounds in the filter language, its entries and whether they decide the filter, the sort, the counts, and the time last. `#[trunkdb::document]`, with the `derive` feature: `#[id]` on a struct's id field instead of `#[serde(rename = "_id")]`, refused at compile time on a type that isn't `DocId` or `Option<DocId>`, on a second field, or with arguments; a macro crate of its own, `trunkdb-derive`, re-exported as serde re-exports `serde_derive`. **`in`:** `Condition::is_in` and `Filter::is_in`, one of a list of values, SQL's `IN`, the OR of an `eq` per value, so an index reads a point per value and `_id` looks each up; `in (…)` and `not in (…)` in the text, where an OR of `eq`s of one field prints as `in`. **A map of its own:** `Document::Object` holds a `trunkdb::Map`, `IndexMap` inside it and out of the API, its iterators its own types in `trunkdb::map`, the same methods and order as before (`remove` keeping the others' order), equal in any order; breaking for code that named `IndexMap`. **Variants that can grow:** `Condition`'s and `QueryPlan`'s variants with named fields `#[non_exhaustive]`, matched with `..` outside trunkdb, built with `Condition`'s methods; compile-fail tests for each. **The public API gone through**, from rustdoc's JSON: options and reports without `Copy` and `Eq`, two helpers private, `Document` no `Deserializer` (`into_value` the way), the `fuzzing` feature outside semver. **Unique indexes in the `queries` target**, the model asking the database's own `Eq` whether a write makes a duplicate, a batch op by op; **fixed**, found by it: an update of a long string past where its key is cut, which kept its key, wasn't checked, and could store a duplicate **Old files as fixtures:** a database each release from 0.23.0 wrote, in `tests/fixtures/`, opened by every build, read as written, queried through each index and written to; it alone catches a stored type tag changed in encoder and decoder alike. The minimum Rust version's policy in the README | §113–§120 |
 | 0.24.0 | `trunkdb fields <file> <collection> [filter]`: every path a collection's documents have, written as a filter writes it, in how many documents, and as which kinds of value, most first; a filter sums up only what it finds, `limit` a sample; read-only, at most 10,000 paths; an Agent Skill, `skills/trunkdb/`, for AI agents using the command. **Batched writes:** the default checkpoint threshold 4,000 pages instead of 1,000, the WAL limit following to 65.5 MB; with 1,000 documents a commit, 59 commits of 100 checkpointed, now 10; on 100,000 documents inserts about 1.35× faster, updates 1.35×, deletes 1.6×, single commits and reads unchanged; recovery after a crash with a full WAL 79 ms; a compaction's commit writes it back at once whatever its size, as §108 had it. **Fixed:** an OR of `eq`s of one field whose branches came wrapped alone in an AND or OR printed as an OR but read back as `in`, so its text didn't read back the same (a fix to §115). **`=` and `!=` on arrays, objects and binary:** compared by their contents, as `add_to_set` and `pull` compare them (objects in any field order, `[1]` equal to `[1.0]`), where `=` never held and `!=` always did, even against the very value; `in`, `not in` and `has (@ = …)` with them; `<` and the rest still never hold; an index entry with such a value in a compound key read from its document; groups of equal ones merged; unique indexes unchanged, still not checking them. **The release that wrote a file:** the header names the release that created the file and the one that last wrote it, `FileInfo::created_by` and `written_by`, `Release` and `trunkdb::RELEASE`, in `trunkdb info` too; unknown for older files and where an older build wrote since; still format 12. **Smaller fixtures:** 60 tasks instead of 300, the 0.23.0 fixture written again by 0.23.0's code, 9 KB compressed instead of 32; a fixture only for a release that changes how files are written. **Fixed:** `trunkdb info` panicked when its reader went (`| head`); it ends quietly, as `find` does | §120.9, §121–§125 |
+| next | **A condition on an aggregate column:** `filter` after a column, SQL's `FILTER (WHERE …)`, the column taking in only the group's documents that meet it, the groups and other columns every match; any column, two ANDed, one before any column refused; decided from index entries where the index holds its fields, a leaf of counts at a time where its ends decide it; the column methods' docs saying their string is the column's name | §126 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -126,10 +127,9 @@ checkpoint before upgrading.
 - New types — a date without a time, a time without a date, a decimal:
   `Document` is `#[non_exhaustive]`, and a file holding one is refused
   by an older build, as above.
-- Everything under **Open** below: new operators, aggregate columns
-  with conditions, parameters (`:` reads nowhere now), `serde_json`
-  behind a feature, repairing what `check` finds, the planner,
-  performance, the PyO3 bindings. None changes a file today's build
+- Everything under **Open** below: new operators, parameters (`:`
+  reads nowhere now), `serde_json` behind a feature, repairing what
+  `check` finds, the planner, performance, the PyO3 bindings. None changes a file today's build
   writes or what a program or query means today.
 
 **What only use can tell:** whether the API holds up in two or three
@@ -228,17 +228,15 @@ limit is described.
   `Int`/`Float` bit and a missing mark in every key, file format 13
   (§106.8); `min` and `max` that seek a group's ends instead of walking
   its entries; rows handed out as they are made rather than collected.
-- A condition on a column, standard SQL's `FILTER (WHERE …)`: a
-  `count`, `sum`, `avg`, `min` or `max` over only those of a group's
-  documents that meet it, so per team all tasks counted and the mean
-  only of those with `hours >= 4`, or several counts in one pass.
-  Drafted in §126, not built.
 - A leaf decided whole for a column's range after the group fields
   (§126.4, §126.9): per status on `(status, created)`, those since
   Monday, where a leaf's ends agree on their group values and both meet
   the range, so every entry between does. A new case in `decide_all`;
   until then such leaves are walked entry by entry, from their entries.
   If §126's measurements show the walk costs enough.
+- Counts of everything with conditions as one `count` per column
+  (§126.9), each through its index, where one pass reads every
+  document.
 - Projection beyond paths, when asked (§106.8): arrays trimmed to a
   field of their elements (`items[*].sku`, which now selects `items`
   whole), and fields excluded instead of selected.
@@ -259,7 +257,7 @@ limit is described.
   order, `group by team select count() as tasks, avg(hours) as
   mean_hours having tasks > 1`, the form most who'd want it know,
   documented with what goes in and what comes out; a column's
-  condition in it if it's there by then.
+  condition in it, `count() filter (where …) as n` (§126.11).
 - PyO3 bindings, for Python apps.
 
 Not planned: a cost-based query planner, joins, multiple writers,

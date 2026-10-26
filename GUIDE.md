@@ -218,9 +218,38 @@ let per_status = db.collection::<Document>("tasks").aggregate(
   `max` pass over nulls.
 - Without `group_by`, one row of everything, even of nothing.
 
+A column can count or sum only some of a group's documents: `filter`
+right after it gives that one column a condition, SQL's `FILTER (WHERE
+…)` (SPEC §126). The groups and the other columns still see every
+document the filter finds:
+
+```rust
+let per_team = db.collection::<Document>("tasks").aggregate(
+    Filter::new(),
+    &Aggregate::new()
+        .group_by("team")
+        .count("tasks")                          // every task of the team
+        .count("open_tasks")                     // a column named "open_tasks":
+        .filter(Condition::eq("status", "open")) //   only the open ones
+        .avg("hours", "mean_long_hours")         // the mean of `hours`,
+        .filter(Condition::gte("hours", 4)),     //   only over hours >= 4
+)?;
+// [{"team": "a", "tasks": 12, "open_tasks": 3, "mean_long_hours": 6.5},
+//  {"team": "b", "tasks": 4, "open_tasks": 0, "mean_long_hours": null}]
+```
+
+- `filter` belongs to the column just before it, not to the aggregate:
+  to leave documents out of every column, put the condition in the
+  `Filter` instead. Then a team with no open task has no row at all.
+- A team none of whose documents meets a column's condition is still a
+  row: `0` for a `count` or `sum`, `null` for the others.
+- Two `filter`s on one column are ANDed.
+
 Where an index holds the fields an aggregate reads, its entries answer
 `count`, `avg`, `min` and `max` without reading the documents: "tasks
 per status" on `(status, created)` counts the index's leaves. `sum`
 reads its numbers from the documents, as the key doesn't keep whether
-a number is an `Int` or a `Float`. `explain_aggregate` says how it ran.
+a number is an `Int` or a `Float`. A column's condition is decided from
+the entries too, where the index holds the fields it names.
+`explain_aggregate` says how it ran.
 

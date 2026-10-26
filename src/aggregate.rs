@@ -8,7 +8,7 @@
 use crate::document::{DocId, Document, ID_FIELD, encode_document};
 use crate::map::Map;
 use crate::path::Path;
-use crate::query::{Condition, Filter, SortOrder, canonical, is_unordered, sort_order};
+use crate::query::{Condition, Filter, Matcher, SortOrder, canonical, is_unordered, sort_order};
 use crate::storage::RecordLocation;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -68,6 +68,8 @@ pub struct Aggregate {
     /// `having`, the row sort, skip and limit: what a filter does to
     /// documents, done to the rows.
     pub(crate) rows: Filter,
+    /// Whether `filter` was called before any column (SPEC §126.2).
+    pub(crate) filter_without_column: bool,
 }
 
 /// One column of a row.
@@ -77,6 +79,9 @@ pub(crate) struct Column {
     pub kind: Kind,
     /// The values' path; `None` for `count`.
     pub path: Option<String>,
+    /// Which of the group's documents the column takes in (SPEC §126);
+    /// `None`: every one.
+    pub condition: Option<Condition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +153,39 @@ impl Aggregate {
             name: name.into(),
             kind,
             path,
+            condition: None,
         });
+        self
+    }
+
+    /// Lets the column added last take in only the documents that meet
+    /// `condition` (SPEC §126). It filters that one column, not the
+    /// aggregate: the other columns, and the groups, still see every
+    /// document the filter finds. SQL's `count(*) FILTER (WHERE ...)`.
+    /// Called again for the same column, the conditions are ANDed.
+    ///
+    /// ```
+    /// use trunkdb::query::{Aggregate, Condition};
+    ///
+    /// let per_team = Aggregate::new()
+    ///     .group_by("team")
+    ///     // A column named "tasks": every task of the team.
+    ///     .count("tasks")
+    ///     // A column named "open_tasks": only those whose status is "open".
+    ///     .count("open_tasks")
+    ///     .filter(Condition::eq("status", "open"));
+    /// # let _ = per_team;
+    /// ```
+    pub fn filter(mut self, condition: Condition) -> Self {
+        match self.columns.last_mut() {
+            Some(column) => {
+                column.condition = Some(match column.condition.take() {
+                    None => condition,
+                    Some(earlier) => Condition::all([earlier, condition]),
+                });
+            }
+            None => self.filter_without_column = true,
+        }
         self
     }
 
@@ -226,6 +263,11 @@ impl Aggregate {
         let refuse = |why: String| -> crate::Result<()> {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why).into())
         };
+        if self.filter_without_column {
+            return refuse(
+                "`filter` before any column: it filters the column added last".to_string(),
+            );
+        }
         let firsts: Vec<&str> = self.group_by.iter().map(|p| first_step(p)).collect();
         let paths = self
             .group_by
@@ -270,6 +312,20 @@ impl Aggregate {
             None => return refuse("`having` and the row sort name columns".to_string()),
         }
         Ok(())
+    }
+
+    /// Each column's condition as a filter of its own (SPEC §126), for
+    /// what a filter's conditions get: the fields it reads, whether an
+    /// index's entries decide it. `None` for a column without one.
+    pub(crate) fn column_filters(&self) -> Vec<Option<Filter>> {
+        (self.columns.iter())
+            .map(|c| c.condition.clone().map(|c| Filter::new().and(c)))
+            .collect()
+    }
+
+    /// Whether some column has a condition.
+    pub(crate) fn has_conditions(&self) -> bool {
+        self.columns.iter().any(|c| c.condition.is_some())
     }
 
     /// Every path it reads: the group fields', then the columns'.
@@ -530,6 +586,8 @@ pub(crate) struct Groups<'a> {
     aggregate: &'a Aggregate,
     group_paths: Vec<Path<'a>>,
     column_paths: Vec<Option<Path<'a>>>,
+    /// Each column's condition, compiled once (SPEC §126.3).
+    conditions: Vec<Option<Matcher<'a>>>,
     /// Each group's place in `list`, in the order of its values.
     groups: BTreeMap<GroupKey, usize>,
     list: Vec<Group>,
@@ -544,6 +602,9 @@ impl<'a> Groups<'a> {
             group_paths: aggregate.group_by.iter().map(|p| Path::new(p)).collect(),
             column_paths: (aggregate.columns.iter())
                 .map(|c| c.path.as_deref().map(Path::new))
+                .collect(),
+            conditions: (aggregate.columns.iter())
+                .map(|c| c.condition.as_ref().map(Matcher::of))
                 .collect(),
             groups: BTreeMap::new(),
             list: Vec::new(),
@@ -569,16 +630,24 @@ impl<'a> Groups<'a> {
         let values: Vec<Option<Document>> = (self.column_paths.iter())
             .map(|path| path.as_ref().and_then(|p| p.field_value(doc)).cloned())
             .collect();
-        self.add(group, &values, true, order, at);
+        // Which columns take this document in: those without a
+        // condition, and those whose condition it meets (SPEC §126.2).
+        let takes: Vec<bool> = (self.conditions.iter())
+            .map(|condition| condition.as_ref().is_none_or(|m| m.matches(doc)))
+            .collect();
+        self.add(group, &values, &takes, true, order, at);
     }
 
     /// A match from its index entry (SPEC §107.5): `group` and `values`
     /// as `add_document` takes them, each with whether it is as stored.
-    /// `values` holds `None` for `count` and for a missing value.
+    /// `values` holds `None` for `count` and for a missing value;
+    /// `takes`, per column, whether the entry meets its condition (SPEC
+    /// §126.4).
     pub fn add_entry(
         &mut self,
         group: Vec<(Document, bool)>,
         values: Vec<Option<(Document, bool)>>,
+        takes: &[bool],
         order: Order,
         at: RecordLocation,
     ) {
@@ -591,15 +660,16 @@ impl<'a> Groups<'a> {
             })
             .collect();
         let i = self.group_index(first);
-        self.add_values(i, values, order, at);
+        self.add_values(i, values, takes, order, at);
     }
 
     /// A match from its index entry in the group the last match went to
     /// — its key's bytes up to the group's values the same (SPEC
-    /// §107.5): `values` as `add_entry` takes them.
+    /// §107.5): `values` and `takes` as `add_entry` takes them.
     pub fn add_entry_to_last(
         &mut self,
         values: Vec<Option<(Document, bool)>>,
+        takes: &[bool],
         order: Order,
         at: RecordLocation,
     ) {
@@ -617,18 +687,26 @@ impl<'a> Groups<'a> {
                 }
             }
         }
-        self.add_values(i, values, order, at);
+        self.add_values(i, values, takes, order, at);
     }
 
     fn add_values(
         &mut self,
         i: usize,
         values: Vec<Option<(Document, bool)>>,
+        takes: &[bool],
         order: Order,
         at: RecordLocation,
     ) {
         let columns = &self.aggregate.columns;
-        for ((state, value), column) in (self.list[i].columns.iter_mut()).zip(values).zip(columns) {
+        for (((state, value), column), take) in (self.list[i].columns.iter_mut())
+            .zip(values)
+            .zip(columns)
+            .zip(takes)
+        {
+            if !take {
+                continue;
+            }
             let seen = value.map(|(value, stored)| Seen {
                 value,
                 order,
@@ -640,11 +718,13 @@ impl<'a> Groups<'a> {
     }
 
     /// `n` matches of one group whose every column is a `count` (SPEC
-    /// §107.5: a leaf counted whole), its values as stored.
+    /// §107.5: a leaf counted whole), its values as stored, counted in
+    /// the columns `takes` says they meet the condition of (§126.4).
     pub fn add_counted(
         &mut self,
         group: Vec<Document>,
         n: u64,
+        takes: &[bool],
         order: Order,
         at: Option<RecordLocation>,
     ) {
@@ -657,8 +737,8 @@ impl<'a> Groups<'a> {
             })
             .collect();
         let state = self.group_state(first);
-        for state in &mut state.columns {
-            if let State::Count(count) = state {
+        for (state, take) in state.columns.iter_mut().zip(takes) {
+            if let (State::Count(count), true) = (state, take) {
                 *count += n;
             }
         }
@@ -668,6 +748,7 @@ impl<'a> Groups<'a> {
         &mut self,
         group: Vec<Document>,
         values: &[Option<Document>],
+        takes: &[bool],
         stored: bool,
         order: Order,
         at: Option<RecordLocation>,
@@ -682,7 +763,14 @@ impl<'a> Groups<'a> {
             .collect();
         let columns = &self.aggregate.columns;
         let state = self.group_state(first);
-        for ((state, value), column) in (state.columns.iter_mut()).zip(values).zip(columns) {
+        for (((state, value), column), take) in (state.columns.iter_mut())
+            .zip(values)
+            .zip(columns)
+            .zip(takes)
+        {
+            if !take {
+                continue;
+            }
             let seen = value.as_ref().map(|value| Seen {
                 value: value.clone(),
                 order,
@@ -879,6 +967,78 @@ mod tests {
         (aggregate.apply(docs).unwrap().iter())
             .map(Document::to_string)
             .collect()
+    }
+
+    /// SPEC §126.2: a column with a condition takes in only the group's
+    /// documents that meet it; the groups, the row's values and the
+    /// other columns see every one.
+    #[test]
+    fn a_column_takes_only_what_its_condition_meets() {
+        let all = docs(&[
+            r#"{"team": 5.0, "status": "done", "hours": 2}"#,
+            r#"{"team": 5, "status": "open", "hours": 4}"#,
+            r#"{"team": 5, "status": "open", "hours": 7.5}"#,
+            r#"{"team": "b", "status": "done", "hours": 1, "tags": ["x"]}"#,
+            r#"{"team": "b", "hours": null, "tags": ["y", "x"]}"#,
+        ]);
+        let open = || Condition::eq("status", "open");
+        let long = || Condition::gte("hours", 4);
+        let per_team = Aggregate::new()
+            .group_by("team")
+            .count("tasks")
+            .count("open_tasks")
+            .filter(open())
+            .sum("hours", "open_hours")
+            .filter(open())
+            .avg("hours", "mean_long")
+            .filter(long())
+            .min("hours", "least_long")
+            .filter(long())
+            .max("hours", "most_open")
+            .filter(open());
+        assert_eq!(
+            rows(&per_team, all.clone()),
+            [
+                // Team 5 shows its first document's 5.0, which is in no
+                // column with a condition.
+                r#"{"team":5.0,"tasks":3,"open_tasks":2,"open_hours":11.5,"mean_long":5.75,"least_long":4,"most_open":7.5}"#,
+                // No document of team "b" is open or long: still a row.
+                r#"{"team":"b","tasks":2,"open_tasks":0,"open_hours":0,"mean_long":null,"least_long":null,"most_open":null}"#,
+            ]
+        );
+
+        // Two `filter`s on one column are ANDed; the column before keeps
+        // its own.
+        let both = Aggregate::new()
+            .count("open")
+            .filter(open())
+            .count("open_and_long")
+            .filter(open())
+            .filter(Condition::gt("hours", 5));
+        assert_eq!(
+            rows(&both, all.clone()),
+            [r#"{"open":2,"open_and_long":1}"#]
+        );
+
+        // Missing and null as a filter has them (SPEC §32), arrays through
+        // `[*]`, a field no group or other column names.
+        let fields = Aggregate::new()
+            .count("no_status")
+            .filter(Condition::is_null("status"))
+            .count("null_hours")
+            .filter(Condition::is_null("hours"))
+            .count("tagged_x")
+            .filter(Condition::eq("tags[*]", "x"));
+        assert_eq!(
+            rows(&fields, all.clone()),
+            [r#"{"no_status":1,"null_hours":1,"tagged_x":2}"#]
+        );
+
+        // Without `group_by` and no matches: still one row.
+        assert_eq!(
+            rows(&fields, Vec::new()),
+            [r#"{"no_status":0,"null_hours":0,"tagged_x":0}"#]
+        );
     }
 
     /// SPEC §107.2: which documents are one group, and what a row shows.
@@ -1122,6 +1282,10 @@ mod tests {
             err.to_string()
         };
         assert!(refused(Aggregate::new().count("n").count("n")).contains("two columns"));
+        assert!(
+            refused(Aggregate::new().filter(Condition::eq("s", 1)).count("n"))
+                .contains("before any column")
+        );
         assert!(refused(Aggregate::new().group_by("t").count("t")).contains("as a group field"));
         assert!(refused(Aggregate::new().group_by("t.x").count("t")).contains("as a group field"));
         assert!(refused(Aggregate::new().count("")).contains("plain name"));

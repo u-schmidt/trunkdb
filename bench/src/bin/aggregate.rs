@@ -2,13 +2,14 @@
 //! (§48) counted, summed and averaged by group — from every document,
 //! from index entries (§107.5), and as application code did it before,
 //! a `find` and a loop. SQLite beside them, `GROUP BY` on its columns.
+//! Then columns with a condition (§126.10), SQLite's `FILTER (WHERE …)`.
 //! `cargo run --release --bin aggregate [documents]`.
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-use trunkdb::query::{Aggregate, Filter};
+use trunkdb::query::{Aggregate, Condition, Filter};
 use trunkdb::{Database, DocId, Document};
 
 /// As in the comparison (`main.rs`).
@@ -265,5 +266,87 @@ fn main() {
                 &[],
             )
         }),
+    );
+
+    // SPEC §126.10: columns with a condition.
+    println!();
+    let long = Aggregate::new()
+        .group_by("tenant")
+        .count("n")
+        .avg("tries", "mean_long")
+        .filter(Condition::gte("tries", 4));
+    let long_sql =
+        "SELECT tenant, count(*), avg(tries) FILTER (WHERE tries >= 4) FROM tasks GROUP BY tenant";
+    row(
+        "per tenant, all and mean tries of tries >= 4, no index",
+        per_call(5, |_| plain.aggregate(Filter::new(), &long).unwrap().len()),
+        explain(&plain, Filter::new(), &long),
+        Duration::ZERO,
+    );
+    row(
+        "the same, on (tenant, tries)",
+        per_call(20, |_| {
+            indexed.aggregate(Filter::new(), &long).unwrap().len()
+        }),
+        explain(&indexed, Filter::new(), &long),
+        per_call(20, |_| rows(long_sql, &[])),
+    );
+
+    let since = (n * 4 / 5) as i64;
+    let recent = Aggregate::new()
+        .group_by("status")
+        .count("n")
+        .count("recent")
+        .filter(Condition::gte("created", since));
+    row(
+        "per status, all and those since a time, on (status, created)",
+        per_call(20, |_| {
+            indexed.aggregate(Filter::new(), &recent).unwrap().len()
+        }),
+        explain(&indexed, Filter::new(), &recent),
+        per_call(20, |_| {
+            rows(
+                "SELECT status, count(*), count(*) FILTER (WHERE created >= ?) FROM tasks GROUP BY status",
+                &[&since],
+            )
+        }),
+    );
+
+    // Three counts: in one aggregate, one pass over every document; as
+    // three `count`s, each through its index.
+    let queued = || Condition::eq("status", "Queued");
+    let tried = || Condition::gte("tries", 5);
+    let late = || Condition::gte("created", since);
+    let three = Aggregate::new()
+        .count("queued")
+        .filter(queued())
+        .count("tried")
+        .filter(tried())
+        .count("late")
+        .filter(late());
+    row(
+        "three counts in one aggregate",
+        per_call(5, |_| {
+            indexed.aggregate(Filter::new(), &three).unwrap().len()
+        }),
+        explain(&indexed, Filter::new(), &three),
+        per_call(20, |_| {
+            rows(
+                "SELECT count(*) FILTER (WHERE status = 'Queued'), \
+                 count(*) FILTER (WHERE tries >= 5), \
+                 count(*) FILTER (WHERE created >= ?) FROM tasks",
+                &[&since],
+            )
+        }),
+    );
+    row(
+        "the same as three `count`s",
+        per_call(20, |_| {
+            [queued(), tried(), late()]
+                .map(|c| indexed.count(Filter::new().and(c)).unwrap())
+                .len()
+        }),
+        "three index reads".into(),
+        Duration::ZERO,
     );
 }

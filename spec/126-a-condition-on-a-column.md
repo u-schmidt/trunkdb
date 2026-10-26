@@ -1,9 +1,5 @@
 # 126. A condition on a column (`aggregate.rs`, `collection.rs`)
 
-**Draft: planned, not built.** What follows is the design; tests,
-mutations and measurements are what the build has to show (126.7,
-126.8), and the section is rewritten as built when it lands.
-
 §107's filter picks the documents an aggregate sees, for every column
 at once. Some questions want a column to see fewer:
 - per team, all tasks counted, and the mean only of those with
@@ -56,9 +52,8 @@ property's name, the condition the predicate.
 - **`Aggregate::filter(condition)`**: a `Condition` for the column
   added last, as SQL writes `FILTER` after its aggregate; it filters
   that one column, not the aggregate, and its rustdoc says so first.
-  Called again
-  for the same column, the conditions are ANDed, as `having` ANDs its
-  own; an OR is `Condition::or`.
+  Called again for the same column, the conditions are ANDed, as
+  `having` ANDs its own; an OR is `Condition::any`.
 - **Any column takes it:** `count`, `sum`, `min`, `max`, `avg`, and
   those added later (`count_distinct`, `first`, …) without a variant
   of their own. One rule, not a name per kind.
@@ -104,7 +99,14 @@ The general way (§107.3), for any condition:
   (§106.4). Still never the whole document, unless a condition needs it
   (a path starting at `[*]`).
 - **Each condition is compiled once** into a `Matcher` (§102), as a
-  filter's conditions are, and checked per match for its column only.
+  filter's conditions are, when the groups are set up (`Groups::new`),
+  and checked per match: `add_document` makes a list of which columns
+  take the document, `takes`, one `bool` a column, and a column that
+  doesn't passes it over. Not by hiding its value: a `count` has none
+  and counts every document it's given.
+- **`aggregate_selection`** in `collection.rs` adds each condition's
+  fields to the group and column paths, the empty path (the whole
+  document) where a condition starts at it.
 - **A count of everything, no group** (§107.3's shortcut to `count`):
   unchanged where no column has a condition. Where one has, the
   general way, one pass for every column; 126.9 has the alternative.
@@ -119,6 +121,10 @@ condition joins that on the same terms:
    `hours >= 4` reads `(team, hours)`.
 2. **Its entries must decide it,** as a filter's (`Covering::new` on a
    filter of the condition alone, §100.1); otherwise the general way.
+   `holds`, the test of an index in `aggregate_by_entries`, asks
+   `Covering::new` of each condition's own filter
+   (`Aggregate::column_filters`), which says both: whether the index
+   holds what it reads, and whether its entries decide it.
 3. **Per entry, each condition is decided on the key** (`Decider`,
    §101.2, on its bytes where it can, §104): true, the column takes the
    entry's value; false, the column passes it over, while the other
@@ -129,7 +135,9 @@ condition joins that on the same terms:
    each condition is decided for the leaf at once (`decide_all`, as
    §101.3 does for the filter). True, its column adds the leaf's
    entries; false, nothing; undecided for any, the leaf is walked entry
-   by entry. `decide_all` decides a leaf where its two ends agree on
+   by entry; `add_counted` adds the leaf's entries to the columns whose
+   condition holds for it. `decide_all` decides a leaf where its two
+   ends agree on
    the bytes the condition reads, or where the condition accepts one
    interval of the index's keys (§104.4). So a condition on the group
    fields, or on fields before the last of them, is decided a leaf at
@@ -159,47 +167,71 @@ condition's decisions aren't counted on their own.
 - **`find`, `count`, writes, and aggregates without a condition** don't
   change.
 
-## 126.7 Tests (to build)
+## 126.7 Tests
 - **The meaning** (`aggregate.rs`, on `Aggregate::apply`),
-  `a_column_takes_only_what_its_condition_meets`: each kind with a
-  condition, one met by some, none and all of a group's documents; a
-  group no document of which meets it still a row; the row's group
-  values from a document that meets no condition; two `filter`s ANDed;
-  a condition on `null` and missing, on an array by contents, with
-  `[*]` and `elem_match`; a condition on a field no other column or
-  group names; without `group_by` and no matches.
+  `a_column_takes_only_what_its_condition_meets`, on five documents:
+  `count`, `sum`, `avg`, `min` and `max` each with a condition met by
+  some of a group's documents and by none; a group none of whose
+  documents meets any still a row, `0` for `count` and `sum`, `null`
+  for the others; the row's group value `5.0` from its first document,
+  which meets no condition, where the ones that do hold `5`; two
+  `filter`s on one column ANDed beside a column with one; `is null` on
+  a missing and a `null` field; `tags[*] = "x"` on arrays; conditions
+  on fields no group or other column names; without `group_by` and no
+  documents, one row of zeros.
 - **Refused:** `filter` before any column, in
   `a_wrong_aggregate_is_refused`.
-- **The two ways agree:** `aggregate_agrees` (§107.9) gives some
-  columns a random condition, half the time on the index's fields, so
-  the corpora of §106 and §107 run them through every plan against
-  `Aggregate::apply` on `find`'s documents.
+- **The two ways agree:** `aggregate_agrees` (§107.9) gives each column
+  up to two conditions, three times in five: a comparison with any
+  operator on a path of its pool, so half the time on the index's
+  fields, against the value of a document found or a random one; now
+  and then negated, an OR of two, or an `exists`, which no entry
+  decides. The corpora of §106 and §107 run them through every plan
+  against `Aggregate::apply` on `find`'s documents, and §100's still
+  aggregates more than a quarter of its matches from entries.
 - **What reads documents**
   (`a_condition_on_a_column_reads_documents_only_where_entries_cannot_tell`),
-  on §107.9's 3,000 tasks:
-  - per tenant, all counted, mean `tries` where `tries >= 4`, on
-    `(tenant, tries)`: 0 documents read;
-  - per team, all and the open ones, on `(team, status)`: 0 read,
-    leaves counted whole;
-  - per status, all and those since a date, on `(status, created)`:
-    0 read, every entry walked, no leaf counted whole (126.4);
-  - a condition on `status` with only `(tenant, tries)`: the documents;
-  - a condition on a long string cut in the key: those entries'
-    documents only.
-- **The `queries` target (§105):** its `aggregate` step gives columns a
-  random condition from the generator a filter's conditions come from;
-  a smoke run of 20,000 programs.
+  on §107.9's 3,000 tasks, with `(status, created)`, `(tenant, tries)`
+  and `(tenant, status)`:
+  - per tenant, all counted and the mean `tries` where `tries >= 4`:
+    `IndexOrder` on `(tenant, tries)`, 0 documents read, 3,000 from
+    entries;
+  - per tenant, all and the running ones: `IndexOrder` on
+    `(tenant, status)`, 0 read, more than five leaves counted whole;
+  - per status, all and those since a date: `IndexOrder` on
+    `(status, created)`, 0 read, 3,000 from entries, no leaf counted
+    whole (126.4);
+  - per tenant, the mean `tries` of the done ones: no index holds
+    `tenant`, `tries` and `status`, so a `Scan`, 3,000 read;
+  - on 20 notes with `(tenant, note)`, five of them 1,201 characters
+    long, a count of those equal to one such note: 5 read, the long
+    ones whose keys are cut, 15 from entries.
+- **The `queries` target (§105):** its `aggregate` step gives each
+  column a condition half the time, from the generator a filter's
+  conditions come from. 20,000 smoke programs (seed 126126, `--cfg
+  fuzzing`, 2,465 s on a machine busy with the mutations) found
+  nothing.
 
-## 126.8 Mutations (to run)
-Each against the unit tests and 300 smoke programs:
-- the condition ignored for one kind;
-- a column's condition applied to every column;
-- a group made only of documents meeting some condition;
-- the row's group values from the first document meeting a condition;
-- an entry the key leaves undecided taken as meeting it;
-- a leaf undecided by a condition counted whole;
-- a condition's fields left out of the `Selection`;
-- an index offered that doesn't hold a condition's paths.
+## 126.8 Mutations
+Each against the library's tests and 300 smoke programs (`--cfg
+fuzzing`):
+
+| Mutation | Unit tests | Smoke |
+|---|---|---|
+| the condition ignored for `min` | caught | survived |
+| a column's condition applied to every column | caught | caught |
+| a group made only of documents meeting every condition | caught | caught |
+| the row's group values from a document meeting the conditions | caught | survived |
+| an entry the key leaves undecided taken as meeting it | caught | survived |
+| a leaf undecided by a condition counted whole | caught | survived |
+| a condition's fields left out of the `Selection` | caught | caught |
+| an index offered that doesn't hold a condition's paths | caught | caught |
+
+The four smoke survivors are each caught by one test written for it:
+the meaning (`min`, the row's value) and what reads documents (a cut
+key, a leaf undecided). The random corpora and programs miss the last
+two: they rarely make a key cut inside a condition's value, or a leaf
+of counts whose ends differ in a condition's field.
 
 ## 126.9 Rejected
 - **A function per kind** (ClickHouse's `countIf`, `avgIf`; BigQuery's
@@ -236,14 +268,39 @@ Each against the unit tests and 300 smoke programs:
   column. One pass first; per-column counts if a workload shows the
   difference.
 
-## 126.10 Measurements (to take)
+## 126.10 Measurements
 `bench/src/bin/aggregate.rs`, on the 100,000 tasks of §107.10, with
-SQLite's `FILTER (WHERE …)` on the same indexes:
-- per tenant, count and mean `tries` where `tries >= 4`, without an
-  index and on `(tenant, tries)`;
-- per status, all and those since a date, on `(status, created)`;
-- three conditional counts in one aggregate, against three `count`
-  queries.
+SQLite's `FILTER (WHERE …)` on the same indexes. Release build, Apple
+M1 Pro, two runs, on a machine kept busy by other programs (a load of
+20 to 30): the times are wider apart than §107.10's.
+
+| Query | trunkdb | How | SQLite |
+|---|---:|---|---:|
+| per tenant, all and the mean tries of `tries >= 4`, no index | 141–180 ms | `Scan`, 100,000 read | — |
+| the same, on `(tenant, tries)` | 14.8–17.1 ms | `IndexOrder`, 0 read, every entry | 5.67–5.95 ms |
+| per status, all and those since a time, on `(status, created)` | 16.2–25.6 ms | `IndexOrder`, 0 read, every entry | 5.69–6.66 ms |
+| three counts in one aggregate, no group | 105–109 ms | `Scan`, 100,000 read | 11.8–13.7 ms |
+| the same as three `count`s | 64.5–68.2 ms | three index reads | — |
+
+- **A condition costs about what a column does:** per tenant on
+  `(tenant, tries)`, 14.8–17.1 ms with the condition against 13.8–14.1
+  ms for §107's count and average without one, in the same runs;
+  2.6–2.9× SQLite's, as there.
+- **Without conditions nothing changed,** once the entries' walk kept
+  one list of each column's decisions from entry to entry, and none
+  where no column has a condition: the first build made a list per
+  entry, and §107's aggregates from entries took 30–48% longer (one
+  tenant's average 192–199 µs against 134–135). The last commit's
+  benchmark and this one run one after the other: 139–148 µs against
+  137–144, 13.8–14.1 ms against 13.0–17.2 per tenant.
+- **Since a time, entry by entry** (126.4): 16–26 ms, against 0.7 ms
+  for §107's per status with its leaves counted whole. Deciding the
+  leaves whole for a range (126.9, ROADMAP) would close most of that.
+- **Three counts in one pass** read every document, 105–109 ms; three
+  `count`s through their indexes take 65–68 ms, two of the three
+  conditions served by an index. SQLite reads its row columns in
+  11.8–13.7 ms, 8× faster than the one pass, 5× than the three counts. Counts of everything as a `count` per column
+  (126.9) would pay here.
 
 ## 126.11 Limits
 - **Conditions are on documents,** paths only, as filters are: no
@@ -255,5 +312,5 @@ SQLite's `FILTER (WHERE …)` on the same indexes:
 - **One pass for a count of everything** with conditions, where §107.3
   counts without reading.
 - **Not in the text form yet:** aggregates as text are open (§111.11);
-  there it would read `count() filter (where hours >= 1) as long_tasks`, as
-  SQL writes it.
+  there it would read `count() filter (where hours >= 1) as long_tasks`,
+  as SQL writes it.
