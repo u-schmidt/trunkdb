@@ -238,6 +238,31 @@ over a window. Four steps, each useful alone, in this order:
   only if asked for. Hysteresis at the limit, as at a fence's edge, is
   the application's.
 
+What the hook, live queries and live aggregates share:
+- **Kept in memory, never in the file.** A subscription is registered
+  by the program, as an event handler is, and ends when it is dropped
+  or the program does; the program registers it again at its start.
+  What reacts to a change is the application's code, which a file
+  can't hold, so a stored query would have no one listening after a
+  restart anyway.
+- **The state first, then the changes.** A live query or aggregate
+  reports at its registration what matches now, then only what comes
+  to match and what no longer does, as Realm's do: a position already
+  in a fence at the start is reported so. The state that decides it,
+  the position in its document, is in the file, so the answer is
+  rebuilt after a restart, not remembered.
+- **Nothing missed while the program is down:** the file is locked to
+  one writing process (§21), so with the program gone nothing changes.
+  The one gap is a crash between a commit and its report. Where a
+  report must not be lost (a message sent once), the application
+  writes the event as a document in the same batch as the change that
+  caused it, and works those off apart (the transactional outbox, as
+  .NET's MassTransit and NServiceBus have it): both or neither.
+- **Through a channel, not a callback.** A report handed to a channel
+  is read on the application's own thread, which may then read and
+  write freely. A callback run inside the commit that writes to the
+  database would wait for the writer it runs in.
+
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).
 - A free-space map that survives a restart: now it's in memory only,
