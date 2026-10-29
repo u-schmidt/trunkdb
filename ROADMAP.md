@@ -191,8 +191,9 @@ limit is described.
 **Changes as they happen**
 
 The time-series workload (§5.1) asks when a position enters or leaves
-a geofence; the application works it out itself today. Three steps,
-each useful alone, in this order:
+a geofence; the application works it out itself today. Readings sent
+every few seconds, such as a server's load, ask the same of a mean
+over a window. Four steps, each useful alone, in this order:
 - A hook after each commit: the collection and the ids of the
   documents a batch inserted, changed or deleted, handed out once the
   batch is durable, never for one that failed. SQLite's
@@ -200,7 +201,15 @@ each useful alone, in this order:
 - Conditions on places: a point within a circle or a polygon, as
   MongoDB's `$geoWithin`, needed apart from the rest. With it an index
   on points, if a scan of the fences is too slow; with a few fences it
-  isn't.
+  isn't. Geometry runs deep (sphere or plane, the antimeridian,
+  polygons with holes), and SQLite and PostgreSQL keep it in extensions
+  (R*Tree, PostGIS). The alternative: a condition of the application's
+  own, a closure on the document (`Condition::custom`), so trunkdb
+  knows nothing of places and the application brings its geometry
+  crate; it serves `find`, the hook and live queries alike, and any
+  other test no operator covers. It never bounds an index and has no
+  text form (§111), which a few fences don't miss. Decided once the
+  hook is in use.
 - Live queries: a `Filter` kept as a subscription, which reports the
   documents that came to match it and those that no longer do. With a
   position kept in one document of state, updated with each ping,
@@ -213,6 +222,21 @@ each useful alone, in this order:
   flips a position in and out), and order: pings a tracker sends late,
   after being offline, are applied in the order of their time, not of
   their arrival, or a fence is entered after it was left.
+- Live aggregates: an `Aggregate` (§107) kept as a subscription, as a
+  `Filter` above: "the mean load of the last five minutes", reported as
+  it changes, while a process reports the load every few seconds. A
+  limit is a `having` (`mean > 0.8`), and crossing it is a row coming
+  to match or no longer matching, as a fence is entered or left. Run
+  again after each commit that touches the collection, over the
+  window's range of an index on the time; five minutes of a reading
+  every five seconds is 60 documents, so incremental maintenance isn't
+  needed here either. "The last five minutes" counted back from the
+  newest reading, not from the clock: then only a commit changes the
+  result, and the same readings give the same answer. Counted back from
+  the clock, readings age out with nothing written, and a timer would
+  have to run the aggregate again: a second source of events, decided
+  only if asked for. Hysteresis at the limit, as at a fence's edge, is
+  the application's.
 
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).
