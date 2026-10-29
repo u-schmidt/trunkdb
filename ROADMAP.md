@@ -188,6 +188,32 @@ limit is described.
   catalog would make it free, at a write to the catalog page in every
   batch that inserts or deletes.
 
+**Changes as they happen**
+
+The time-series workload (§5.1) asks when a position enters or leaves
+a geofence; the application works it out itself today. Three steps,
+each useful alone, in this order:
+- A hook after each commit: the collection and the ids of the
+  documents a batch inserted, changed or deleted, handed out once the
+  batch is durable, never for one that failed. SQLite's
+  `sqlite3_update_hook` and commit hook, MongoDB's change streams.
+- Conditions on places: a point within a circle or a polygon, as
+  MongoDB's `$geoWithin`, needed apart from the rest. With it an index
+  on points, if a scan of the fences is too slow; with a few fences it
+  isn't.
+- Live queries: a `Filter` kept as a subscription, which reports the
+  documents that came to match it and those that no longer do. With a
+  position kept in one document of state, updated with each ping,
+  entering a fence is that document coming to match, leaving it the
+  document no longer matching: no state of its own. Each commit checks
+  the live queries against the documents it changed; at a ping every
+  second or two that costs nothing worth counting, so no incremental
+  aggregates (DBSP, TimescaleDB's continuous aggregates) are needed.
+  Left to the application: hysteresis at a fence's edge (GPS noise
+  flips a position in and out), and order: pings a tracker sends late,
+  after being offline, are applied in the order of their time, not of
+  their arrival, or a fence is entered after it was left.
+
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).
 - A free-space map that survives a restart: now it's in memory only,
