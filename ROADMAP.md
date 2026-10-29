@@ -155,15 +155,23 @@ limit is described.
   order with a `limit` (§34.2) beside a range filter reads the whole
   index when matches are rare, where reading the range and sorting in
   memory costs the range, always. Both cost at most about a scan: waste,
-  not disaster. If it shows: count the candidate ranges before choosing,
-  with `BTreeIndex::count` (§101.4), each up to a cap (about 1,000
-  entries), or all together a leaf at a time until the smallest ends:
-  planning then costs at most a small multiple of the smallest range,
-  which the query reads anyway. Counted only where the rules see a tie,
-  or an `Eq` against a range, so other plans stay as they are. Still no
-  statistics kept, nothing to go stale (MySQL's index dives do the
-  same); `explain` would show the counts. Rules are enough while every
-  plan is bounded by one pass over one collection: with joins, or
+  not disaster. If it shows: a hint in the query, never a plan chosen
+  by the data, so the plan stays a function of the query and the
+  indexes, as everywhere else (§28.4). `Filter::use_index(name)` reads
+  the index named as `Collection::indexes` names it, `Filter::no_index()`
+  scans; the same in filters as text (§111) and `trunkdb find`. A hint
+  the index can't follow (no such index, no condition it can bound) is
+  an error, not a quiet fall back to the rules: a plan that changes
+  without a word is what pinning plans in SQL Server or PostgreSQL
+  tries to stop. `explain` names the plan as hinted. The data goes into
+  the diagnosis only: `explain_run` counts the ranges the rules passed
+  over, with `BTreeIndex::count` (§101.4), each up to a cap (about
+  1,000 entries), and says which would have read fewer. Rejected:
+  counting before choosing (MySQL's index dives): no statistics kept,
+  nothing to go stale, but the same query would get another plan on
+  other data, the one thing the rules promise not to do. Rules are
+  enough while every plan is bounded by one pass over one collection:
+  with joins, or
   lookups into another collection, that bound is gone and the choice
   of a rule-based planner wants a second look.
 - A sort by `_id` after an OR of `Eq`s, or after a compound index fixed
