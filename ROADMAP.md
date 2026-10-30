@@ -90,13 +90,52 @@ checkpoint before upgrading.
   helpers made private, `Document` no longer a serde `Deserializer`,
   the `fuzzing` feature declared outside the API. Another pass, the
   same way, once the API settles, for what came since.
-- **Aggregate columns, name first or last:** in `count("n")` and
-  `sum("tries", "total")` the column's name is a bare string, and a
-  reader took `count("open")` for a match, not a name; the docs now
-  say so at every column (§107.1, §126.1). Name-last would need no
-  comment, `.count().named("n")`, `.sum("tries").named("total")`, as
-  Polars writes `.alias(..)`, but breaks every aggregate written so
-  far. Decided in that pass, together with the rest of the API.
+- **Aggregate columns, the name last:** decided, next. In `count("n")`
+  and `sum("tries", "total")` the column's name is a bare string, and a
+  reader took `count("open")` for what is counted, as nearly everyone
+  writes it: SQL's `COUNT(open)` counts the rows where `open` isn't
+  null, LINQ's `Count(t => t.Open)` those that match, Spark's and
+  Polars' `count("open")` the values of `open`. Only MongoDB's `$count`
+  stage takes the name there, and §107's draft came from it. Comments
+  at every column (§107.1, §126.1) explain it; the API should say it.
+  Now:
+  ```rust
+  Aggregate::new()
+      .group_by("team")
+      .count().named("tasks")
+      .count().filter(Condition::eq("status", "open")).named("open_tasks")
+      .avg("hours").named("mean_hours")
+  ```
+  - `count()`, `sum(path)`, `min(path)`, `max(path)` and `avg(path)`
+    hand out an `UnnamedColumn` (`query`, `#[must_use]`), which holds
+    the aggregate. It has two methods: `filter(condition)`, ANDed when
+    called again, as §126's is, and `named(name)`, which adds the
+    column and hands the `Aggregate` back. The name comes last, after
+    the condition, as SQL writes `count(*) FILTER (WHERE …) AS n` and
+    as the planned text form does (`count() as tasks`, below).
+  - So the compiler checks two things a run checks now: a column with
+    no name doesn't compile, since an `UnnamedColumn` has no `count`,
+    `group_by` or `having` and isn't an `Aggregate`; and
+    `Aggregate::filter` is gone, so §126.2's refusal of a `filter`
+    before any column, and its flag, go too. `compile_fail` doctests
+    hold both.
+  - Breaking, with no way to keep the old methods beside the new:
+    Rust has no overloading, so `count("n")` and `count()` can't both
+    exist. Every aggregate changes the same way, `count("n")` to
+    `count().named("n")`, `sum("a", "n")` to `sum("a").named("n")`,
+    and a column's `.filter(c)` moves before its `named`; the
+    changelog says so. Files and query results don't change. Some 50
+    aggregates in the repo are rewritten, the fuzz target's, the
+    bench's and GUIDE's among them; §107 and §126 get a line pointing
+    to the new section.
+  - Rejected: `count_as("n")` and `sum_as("tries", "total")`, a rename
+    that still takes two strings in a row and keeps `filter` apart from
+    its column; a default name (`count`, the path), which two counts in
+    one aggregate would share; a check at run time for a missing name,
+    where the type can do it at compile time; the name first, a
+    `column("n", Column::count())`, which is MongoDB's order again; and
+    keeping today's form, documented.
+  - The second pass over the whole API stays apart, after this.
 
 **Should: cheap, and checked instead of kept by care**
 - Done in §120: **old files as fixtures**, a small database written by
