@@ -151,15 +151,32 @@ limit is described.
 **Queries**
 - A pattern language: regex or `LIKE`-style wildcards (§25.4).
 - Where the planner's rules are blind to the data, a hint chooses the
-  index since §132. Still open, the diagnosis that goes with it: the
-  data goes there only. `explain_run` counts the ranges the rules
-  passed over, with `BTreeIndex::count` (§101.4), each up to a cap
-  (about 1,000 entries), and says which would have read fewer, so a
-  program knows where a hint pays (§132.8). Counting before choosing,
-  MySQL's index dives, stays rejected (§132.5). Rules are enough while
-  every plan is bounded by one pass over one collection: with joins, or
-  lookups into another collection, that bound is gone and the choice
-  of a rule-based planner wants a second look.
+  index since §132. Still open, the diagnosis that goes with it, so a
+  program sees where a hint pays and by how much (§132.8): the data
+  goes there only. `explain_run`, every time, lists the plans it
+  passed over, `Explained::alternatives`: for each index, `_id` and a
+  scan, the filter hinted to it (§132.2), so the alternatives are the
+  rules' own plans and nothing about choosing is written twice; a
+  hinted run lists the rules' plan among them. Each says the index
+  entries it would read, `Exactly(n)` or `MoreThan(n)`, whether it
+  would also read a document per entry or decide from its entries
+  (§100), and whether that is fewer than the run read. Index ranges are
+  counted whole with `BTreeIndex::count` (§101.4), a leaf at a time from
+  its slot directory, no key decoded and no document read, so a hinted
+  read of 40 shows the 40,000 the rules' plan would read; only past a
+  safety cap, about 1,000 leaves (8 MB of pages, some 100,000 entries),
+  is it `MoreThan`. A walk in sort order (§34.2) costs what it takes to
+  find `limit` matches, which only reading its documents tells: it is
+  walked as far as the run read, and `MoreThan` past that. Counted on a
+  trace of its own, after `elapsed` is taken: the run's own numbers
+  don't change. `trunkdb find --explain` prints a line for each:
+  `instead: index on created, 10 entries, fewer`. Not for
+  `explain_aggregate`, whose reads from entries differ (§107.5), until
+  asked for. Counting before choosing, MySQL's index dives, stays
+  rejected (§132.5). Rules are enough while every plan is bounded by
+  one pass over one collection: with joins, or lookups into another
+  collection, that bound is gone and the choice of a rule-based planner
+  wants a second look.
 - A sort by `_id` after an OR of `Eq`s, or after a compound index fixed
   only in part: a merge of id-ordered ranges, where §103 walks one
   (§103.7).
