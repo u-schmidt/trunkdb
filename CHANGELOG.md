@@ -702,3 +702,11 @@ limit, batches and a write-ahead log. Since then:
     `count().named("n")`, `sum("a", "n")` becomes `sum("a").named("n")`,
     and a column's `.filter(c)` moves before its `.named(..)`. Files and
     results don't change.
+
+    Items 105–107 → 0.26.0: **breaking** for every aggregate, its
+    columns named last (§134); the changelog's item 107 says how to
+    adapt, the same way at each column. Hints and the plans
+    `explain_run` passed over are additions; a filter without a hint
+    reads as before. Files stay format 12 and exports as in 0.25.0,
+    which opens what 0.26.0 writes; no new fixture, as nothing changes
+    how files are written (§120.9).

@@ -25,13 +25,14 @@ measurements.
   aggregates by group, with a condition per column. Arrays, objects and binary compare by their
   contents with `=` and `!=`.
 - Secondary indexes: unique, compound, on nested paths and array
-  elements, and sparse.
+  elements, and sparse; a hint in the query names the one to read.
 - Atomic batches across collections; every commit crash-safe through a
   write-ahead log.
 - Readers in parallel beside one writer, and snapshots for reads that
   must agree.
-- `explain_run` and `stats` to see how a query ran and where the space
-  goes; `check`, `compact`, export and import; a `trunkdb` command line.
+- `explain_run` and `stats` to see how a query ran, what the plans it
+  passed over would have read, and where the space goes; `check`,
+  `compact`, export and import; a `trunkdb` command line.
 
 ## When to use it, and when not
 
@@ -160,7 +161,7 @@ The minimum Rust version is 1.89, and CI builds with it. It rises
 only when a dependency or a real need requires it, never for syntax
 alone; a rise is noted in the changelog and isn't counted as breaking.
 
-The current version is 0.25; 0.x versions may still change the API and
+The current version is 0.26; 0.x versions may still change the API and
 the file format, and each release says what breaks and how to move up.
 
 ## License
