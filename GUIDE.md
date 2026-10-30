@@ -279,5 +279,20 @@ let recent = Filter::new()
   it (nor a sort with a limit it can give). Dropping an index a hint
   names makes those reads fail, so you hear about it.
 - `explain_run` says `hinted`, and `trunkdb find … --explain` says
-  `as hinted`. Compare `keys_examined` with and without the hint before
-  keeping it.
+  `as hinted`.
+
+`explain_run` also lists the plans it passed over, in `alternatives`,
+each with the index entries it would read. That tells you whether a
+hint pays before you add it, and whether it still does afterwards:
+
+```
+plan: index on status
+read: status, where status = "done", 190 entries
+instead: index on created, 10 entries, fewer
+instead: scan of every document, 200 entries
+```
+
+An index range is counted whole, without reading documents, so the
+numbers show how much a hint saves. Past about 100,000 entries, it
+says "more than". A walk in sort order is followed only as far as the
+query itself read.

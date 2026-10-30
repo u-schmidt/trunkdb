@@ -147,3 +147,4 @@ say what changed, and DESIGN.md says what is true now.
 130. [Compaction's file, always a new one (`storage/scratch.rs`)](130-compactions-file-always-a-new-one.md)
 131. [A mean rounded once (`aggregate.rs`)](131-a-mean-rounded-once.md)
 132. [A hint in the query (`query.rs`, `collection.rs`, `query_text.rs`)](132-a-hint-in-the-query.md)
+133. [The plans `explain_run` passed over (`collection.rs`, `explain.rs`, `index/btree.rs`)](133-the-plans-explain-run-passed-over.md)

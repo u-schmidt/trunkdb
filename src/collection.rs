@@ -4,7 +4,7 @@ use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
 use crate::database::{Committed, Database, ReadGuard};
 use crate::document::{DocId, Document, encode_document, with_id};
-use crate::explain::Trace;
+use crate::explain::{Alternative, EntryCount, Trace};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::query::{
@@ -508,6 +508,14 @@ impl<T> Collection<T> {
             started.elapsed(),
         );
         explained.hinted = filter.hint.is_some();
+        explained.alternatives = alternatives(
+            at.catalog,
+            &at.store,
+            &self.name,
+            &filter,
+            &explained.plan,
+            explained.stats.keys_examined,
+        )?;
         Ok(explained)
     }
 }
@@ -1108,6 +1116,133 @@ fn plan_for(filter: &Filter, indexes: &[IndexMeta]) -> QueryPlan {
     }
 }
 
+/// How many leaves an alternative's index ranges are counted through
+/// (SPEC §133.3): 8 MB of pages, some 100,000 entries or more. A few in
+/// the unit tests, which reach it with a few thousand documents.
+#[cfg(not(test))]
+const ALTERNATIVE_LEAVES: usize = 1_000;
+#[cfg(test)]
+const ALTERNATIVE_LEAVES: usize = 4;
+
+/// The plans `explain_run` passed over (SPEC §133): `filter` hinted to
+/// each index, to `_id` and to a scan, and without its hint if it has
+/// one — each the planner's own plan for that hint (§132.2) — less the
+/// hints it can't follow and the plans already listed, `plan` first,
+/// the one it ran, which read `read` entries.
+fn alternatives(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    plan: &QueryPlan,
+    read: u64,
+) -> crate::Result<Vec<Alternative>> {
+    let indexes = catalog.indexes(collection);
+    let mut hinted: Vec<Filter> = Vec::new();
+    if filter.hint.is_some() {
+        hinted.push(Filter {
+            hint: None,
+            ..filter.clone()
+        });
+    }
+    hinted.extend(
+        indexes
+            .iter()
+            .map(|i| filter.clone().use_index(i.fields.clone())),
+    );
+    hinted.push(filter.clone().use_index(crate::document::ID_FIELD));
+    hinted.push(filter.clone().no_index());
+    let mut listed = vec![plan.clone()];
+    let mut found = Vec::new();
+    for hinted in hinted {
+        if follow_hint(collection, &hinted, indexes).is_err() {
+            continue;
+        }
+        let other = plan_for(&hinted, indexes);
+        if listed.contains(&other) {
+            continue;
+        }
+        listed.push(other.clone());
+        let (entries, reads_documents) =
+            would_read(catalog, store, collection, &hinted, &other, read)?;
+        found.push(Alternative {
+            plan: other,
+            fewer: matches!(entries, EntryCount::Exactly(n) if n < read),
+            entries,
+            reads_documents,
+        });
+    }
+    Ok(found)
+}
+
+/// What `filter`, run as `plan`, would read (SPEC §133.3, §133.4): its
+/// index entries, and whether it reads a document for each. A range or
+/// a scan counted a leaf at a time, through `ALTERNATIVE_LEAVES` at
+/// most; ids by how many; a walk in sort order walked, as far as `read`.
+fn would_read(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    plan: &QueryPlan,
+    read: u64,
+) -> crate::Result<(EntryCount, bool)> {
+    let indexes = catalog.indexes(collection);
+    let checks = |index: Option<&IndexMeta>| Covering::new(filter, index, false).is_none();
+    let Some(meta) = catalog.get(collection) else {
+        return Ok((EntryCount::Exactly(0), false));
+    };
+    let counted = |ranges: Vec<(PageId, KeyRange)>| -> std::io::Result<EntryCount> {
+        let (mut entries, mut leaves) = (0, 0);
+        for (root, range) in ranges {
+            let left = ALTERNATIVE_LEAVES.saturating_sub(leaves);
+            let counted = BTreeIndex::new(root).count_at_most(store, range, left)?;
+            entries += counted.entries as u64;
+            leaves += counted.leaves;
+            if !counted.whole {
+                return Ok(EntryCount::MoreThan(entries));
+            }
+        }
+        Ok(EntryCount::Exactly(entries))
+    };
+    Ok(match plan {
+        QueryPlan::ById => {
+            let ids = filter.ids().map_or(0, |ids| ids.len());
+            (EntryCount::Exactly(ids as u64), checks(None))
+        }
+        QueryPlan::Scan => {
+            let all = vec![(meta.index_root, KeyRange::everything())];
+            (counted(all)?, checks(None))
+        }
+        QueryPlan::IndexOrder { .. } => {
+            let order = filter.index_order(indexes).expect("a walk's plan");
+            let reads = checks(order.index);
+            let trace = Trace::with_budget(read);
+            find_in(catalog, store, collection, filter, false, None, &trace)?;
+            let entries = match trace.spent() {
+                true => EntryCount::MoreThan(read),
+                false => EntryCount::Exactly(trace.entries_read()),
+            };
+            (entries, reads)
+        }
+        _ => {
+            let ranges = filter.index_ranges(indexes).expect("a range's plan");
+            let reads = match &ranges[..] {
+                [] => false,
+                [first, rest @ ..] if rest.iter().all(|r| std::ptr::eq(r.index, first.index)) => {
+                    checks(Some(first.index))
+                }
+                _ => true,
+            };
+            let ranges = ranges
+                .into_iter()
+                .map(|r| (r.index.root, r.range))
+                .collect();
+            (counted(ranges)?, reads)
+        }
+    })
+}
+
 /// Refuses a hint the plan can't follow (SPEC §132.3), before anything
 /// is read: an index the collection lacks, or one the rules, offered it
 /// alone, would not read — a scan instead. Every read checks here, so
@@ -1635,6 +1770,9 @@ fn walk_in_index_order(
     let mut group: Group = Vec::new();
     let mut shared: Vec<u8> = Vec::new();
     loop {
+        if trace.spent() {
+            return Ok(page.results); // an alternative's budget (SPEC §133.4)
+        }
         if direct && group.is_empty() {
             // A leaf passed whole: its entries all rejected, or all
             // matches the skip passes over — where the group its last
@@ -1712,6 +1850,9 @@ fn walk_in_index_order(
         let primary = BTreeIndex::new(meta.index_root).scan(store)?;
         let scan = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
         trace.entries(scan, primary.len());
+        if trace.spent() {
+            return Ok(page.results);
+        }
         let wanted = page.skip.saturating_add(limit);
         for (_key, loc) in primary {
             let (id, doc) = read(&loc)?;
@@ -5476,6 +5617,98 @@ mod tests {
             .collect();
         assert_eq!(docs.index_names().unwrap(), names);
         check(&docs, &mut rng);
+    }
+
+    /// Past `ALTERNATIVE_LEAVES`, an alternative's ranges are counted
+    /// no further (SPEC §133.3): `MoreThan` what they counted, a union's
+    /// ranges together. Below it, exactly.
+    #[test]
+    fn an_alternative_is_counted_through_so_many_leaves() {
+        use crate::query::EntryCount;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("t.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let mut batch = db.batch();
+        for n in 0..3000i64 {
+            let doc: Document = format!(r#"{{"a": {}, "b": {n}}}"#, n % 2).parse().unwrap();
+            batch.insert(&docs, doc).unwrap();
+        }
+        batch.commit().unwrap();
+        docs.ensure_index("a").unwrap();
+        docs.ensure_index("b").unwrap();
+        let entries = |run: &Explained, field: &str| {
+            let other = run.alternatives.iter().find(|a| {
+                matches!(&a.plan, QueryPlan::Index { field: f, .. } if f == field)
+                    || matches!(&a.plan, QueryPlan::IndexUnion { fields, .. } if fields[0] == field)
+            });
+            other
+                .unwrap_or_else(|| panic!("{field}: {:?}", run.alternatives))
+                .entries
+        };
+        // 1,500 entries of `a = 0` over more than four leaves.
+        let run = docs
+            .explain_run(Filter::new().eq("a", 0).use_index("b").gte("b", 0))
+            .unwrap();
+        let EntryCount::MoreThan(counted) = entries(&run, "a") else {
+            panic!("{:?}", run.alternatives);
+        };
+        assert!(counted > 0 && counted < 1500, "{counted}");
+        // A few, in one leaf: exactly.
+        let run = docs
+            .explain_run(Filter::new().eq("a", 0).lt("b", 10).use_index("a"))
+            .unwrap();
+        assert_eq!(entries(&run, "b"), EntryCount::Exactly(11)); // 10 too, which the check leaves out (§28.3)
+        // A union: each branch alone fits, the two together don't.
+        let either = Filter::new()
+            .any_of([
+                Condition::compare("b", Op::Lt, 400),
+                Condition::compare("b", Op::Gte, 2600),
+            ])
+            .no_index();
+        for alone in [Filter::new().lt("b", 400), Filter::new().gte("b", 2600)] {
+            let run = docs.explain_run(alone.no_index()).unwrap();
+            assert!(matches!(entries(&run, "b"), EntryCount::Exactly(400..=401)));
+        }
+        let run = docs.explain_run(either).unwrap();
+        let both = entries(&run, "b");
+        assert!(
+            matches!(both, EntryCount::MoreThan(n) if n >= 400),
+            "{both:?}"
+        );
+    }
+
+    /// A walk passed over stops once it has read what the run read
+    /// (SPEC §133.4): its documents too, never the rest of the walk.
+    #[test]
+    fn a_walk_passed_over_reads_no_more_than_the_run() {
+        use crate::query::EntryCount;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("t.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let mut batch = db.batch();
+        for n in 0..3000i64 {
+            let doc: Document = format!(r#"{{"b": {n}, "c": {}}}"#, n % 100)
+                .parse()
+                .unwrap();
+            batch.insert(&docs, doc).unwrap();
+        }
+        batch.commit().unwrap();
+        docs.ensure_index("b").unwrap();
+        docs.ensure_index("c").unwrap();
+        // The rules read the 30 of `c = 99`; walking `b` down would read
+        // some 400 to find 5.
+        let filter = Filter::new().eq("c", 99).sort_desc("b").limit(5);
+        let mut run = None;
+        let read = records_read(|| run = Some(docs.explain_run(filter.clone()).unwrap()));
+        let run = run.unwrap();
+        assert_eq!(run.stats.keys_examined, 30);
+        let walk = run
+            .alternatives
+            .iter()
+            .find(|a| matches!(&a.plan, QueryPlan::IndexOrder { field, .. } if field == "b"))
+            .unwrap();
+        assert_eq!(walk.entries, EntryCount::MoreThan(30));
+        assert!(read <= 2 * 30 + 2, "{read}");
     }
 
     /// `explain`'s plan for `f`, after checking `explain_run` against it

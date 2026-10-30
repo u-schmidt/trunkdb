@@ -532,18 +532,9 @@ fn filter_error(filter: &str, e: &ParseFilterError) -> String {
 /// How a query ran (SPEC §113), a line for each thing `explain_run` says.
 fn explanation(explained: &trunkdb::query::Explained) -> String {
     use std::fmt::Write;
-    use trunkdb::query::QueryPlan;
+    use trunkdb::query::EntryCount;
     let mut text = String::new();
-    let plan = match &explained.plan {
-        QueryPlan::Scan => "scan of every document".to_string(),
-        QueryPlan::Index { field, .. } => format!("index on {field}"),
-        QueryPlan::IndexOrder { field, .. } => format!("index on {field}, in its order"),
-        QueryPlan::IndexUnion { fields, .. } => {
-            format!("indexes on {}, together", fields.join(", "))
-        }
-        QueryPlan::ById => "by id".to_string(),
-        other => format!("{other:?}"),
-    };
+    let plan = plan_words(&explained.plan);
     let hinted = if explained.hinted { ", as hinted" } else { "" };
     let _ = writeln!(text, "plan: {plan}{hinted}");
     for read in &explained.reads {
@@ -579,6 +570,26 @@ fn explanation(explained: &trunkdb::query::Explained) -> String {
             sort.in_memory
         );
     }
+    // The plans passed over (SPEC §133.5), after what the run did.
+    for other in &explained.alternatives {
+        let entries = |n: u64| match n {
+            1 => "1 entry".to_string(),
+            n => format!("{n} entries"),
+        };
+        let entries = match other.entries {
+            EntryCount::Exactly(n) => entries(n),
+            EntryCount::MoreThan(n) => format!("more than {}", entries(n)),
+            _ => format!("{:?}", other.entries),
+        };
+        let _ = write!(text, "instead: {}, {entries}", plan_words(&other.plan));
+        if !other.reads_documents {
+            text.push_str(", its entries decide the filter");
+        }
+        if other.fewer {
+            text.push_str(", fewer");
+        }
+        text.push('\n');
+    }
     let stats = &explained.stats;
     let _ = writeln!(text, "keys examined: {}", stats.keys_examined);
     let _ = writeln!(text, "documents examined: {}", stats.documents_examined);
@@ -587,6 +598,21 @@ fn explanation(explained: &trunkdb::query::Explained) -> String {
     let _ = writeln!(text, "answered from index entries: {}", stats.from_entries);
     let _ = writeln!(text, "time: {:.2} ms", stats.elapsed.as_secs_f64() * 1000.0);
     text
+}
+
+/// A plan in words, as `--explain` names it (SPEC §113).
+fn plan_words(plan: &trunkdb::query::QueryPlan) -> String {
+    use trunkdb::query::QueryPlan;
+    match plan {
+        QueryPlan::Scan => "scan of every document".to_string(),
+        QueryPlan::Index { field, .. } => format!("index on {field}"),
+        QueryPlan::IndexOrder { field, .. } => format!("index on {field}, in its order"),
+        QueryPlan::IndexUnion { fields, .. } => {
+            format!("indexes on {}, together", fields.join(", "))
+        }
+        QueryPlan::ById => "by id".to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// At most this many paths are kept (SPEC §121.4): documents whose keys

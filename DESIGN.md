@@ -352,7 +352,11 @@ the wrong one [§132](spec/132-a-hint-in-the-query.md): `use_index(fields)`, or 
 The rules then choose among that index alone, so the plan is still a
 function of the query and the indexes. A hint the index can't follow,
 no such index or nothing to read it by, fails every read with
-`Error::Hint`; it is never dropped quietly.
+`Error::Hint`; it is never dropped quietly. `explain_run` lists the
+plans it passed over, the filter hinted to each index, `_id` and a scan,
+with the index entries each would read [§133](spec/133-the-plans-explain-run-passed-over.md): ranges counted whole a
+leaf at a time, without a document read, up to 1,000 leaves; a walk in
+sort order as far as the run read.
 
 A document from an index range is checked against the whole filter,
 since a range may hold more than its conditions match. Where the index

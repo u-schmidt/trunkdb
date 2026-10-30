@@ -23,6 +23,52 @@ pub struct Explained {
     pub select: Option<Vec<String>>,
     /// What it read and returned, and how long it took.
     pub stats: ExecutionStats,
+    /// The plans the planner passed over, and what each would have read
+    /// (SPEC §133): one for each index the filter could be hinted to,
+    /// for `_id` and for a scan, and for a hinted run the planner's own
+    /// plan. Counted after the run, on the same snapshot; `stats` and
+    /// `elapsed` are the run's alone. Empty for `explain_aggregate`.
+    pub alternatives: Vec<Alternative>,
+}
+
+/// A plan `explain_run` passed over (SPEC §133): what the same filter,
+/// hinted to one index (§132), would have read.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Alternative {
+    /// The plan, as `explain` would name it for that hint.
+    pub plan: QueryPlan,
+    /// The index entries it would read, every read together, as
+    /// `keys_examined` counts them for the run.
+    pub entries: EntryCount,
+    /// Whether it would read a document for each entry, to check it
+    /// against the filter; `false` where its entries decide (SPEC §100),
+    /// and a document is read only to be handed out.
+    pub reads_documents: bool,
+    /// It would read fewer entries than the run did: a hint to it pays.
+    pub fewer: bool,
+}
+
+/// How many index entries an `Alternative` would read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EntryCount {
+    /// This many: an index range counted whole, ids looked up, or a walk
+    /// in sort order that met its limit within what the run read.
+    Exactly(u64),
+    /// More than this many: an index range past about 1,000 leaves
+    /// (SPEC §133.3), or a walk in sort order still short of its limit
+    /// when it had read as much as the run.
+    MoreThan(u64),
+}
+
+impl EntryCount {
+    /// The number either way: exact, or the most that was counted.
+    pub fn at_least(self) -> u64 {
+        match self {
+            EntryCount::Exactly(n) | EntryCount::MoreThan(n) => n,
+        }
+    }
 }
 
 /// One read of an index.
@@ -95,6 +141,8 @@ pub(crate) struct Trace {
     matched: Cell<u64>,
     from_entries: Cell<u64>,
     groups: Cell<u64>,
+    /// Entries past which `spent` holds; `None`: no limit.
+    budget: Option<u64>,
 }
 
 impl Trace {
@@ -165,6 +213,28 @@ impl Trace {
             reads,
             sort,
             select,
+            alternatives: Vec::new(),
+        }
+    }
+
+    /// Every entry counted so far, every read together.
+    pub fn entries_read(&self) -> u64 {
+        self.reads.borrow().iter().map(|read| read.entries).sum()
+    }
+
+    /// Whether a budget was set (`with_budget`) and more entries than
+    /// it were read: a read for an `Alternative` stops there.
+    pub fn spent(&self) -> bool {
+        self.budget
+            .is_some_and(|budget| self.entries_read() > budget)
+    }
+
+    /// A trace that says `spent` once more than `budget` entries were
+    /// read (SPEC §133.4).
+    pub fn with_budget(budget: u64) -> Self {
+        Trace {
+            budget: Some(budget),
+            ..Trace::default()
         }
     }
 }

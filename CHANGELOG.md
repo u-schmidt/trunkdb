@@ -676,3 +676,15 @@ limit, batches and a write-ahead log. Since then:
     filter: `use index created`, `use index (status, created)`,
     `use no index`, also for `trunkdb find`. A field named `use` is
     still a field.
+
+106. **The plans `explain_run` passed over** (§133). `Explained` has
+    `alternatives`: the filter hinted to each index, to `_id` and to a
+    scan, and for a hinted run the planner's own plan. Each says the
+    index entries it would read (`EntryCount::Exactly` or `MoreThan`),
+    whether it reads a document per entry, and whether that's fewer.
+    Index ranges are counted whole, a leaf at a time without a
+    document read, so a hinted read of 40 shows the 40,000 the rules'
+    plan would read. Only past 1,000 leaves is it `MoreThan`. A walk
+    in sort order is walked as far as the run read. The run's own
+    numbers don't change. `trunkdb find --explain` adds an `instead:`
+    line for each.

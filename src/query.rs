@@ -4,7 +4,7 @@
 pub use crate::aggregate::Aggregate;
 use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
-pub use crate::explain::{ExecutionStats, Explained, IndexRead, SortWork};
+pub use crate::explain::{Alternative, EntryCount, ExecutionStats, Explained, IndexRead, SortWork};
 use crate::index::{KeyRange, key};
 use crate::map::Map;
 use crate::path::Path;

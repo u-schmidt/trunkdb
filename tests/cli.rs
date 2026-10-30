@@ -563,6 +563,7 @@ fn find_explain_says_how_it_found_them() {
         explained(&["find", &db, "users", "age > 40", "--explain"]),
         "plan: index on age\n\
          read: age, where age > 40, 1 entry, its entries decide the filter\n\
+         instead: scan of every document, 2 entries\n\
          keys examined: 1\n\
          documents examined: 1\n\
          documents matched: 1\n\
@@ -607,6 +608,8 @@ fn find_explain_says_how_it_found_them() {
          read: email, where email = \"b@x\", 1 entry\n\
          read: age, where age < 40, 1 entry\n\
          sort: 0 keys from the index order, 1 in memory\n\
+         instead: index on age, in its order, 2 entries\n\
+         instead: scan of every document, 2 entries\n\
          keys examined: 2\n\
          documents examined: 2\n\
          documents matched: 2\n\
@@ -641,6 +644,7 @@ fn find_explain_says_how_it_found_them() {
         text,
         "plan: index on email\n\
          read: email, where email = \"a@x\", 1 entry, its entries decide the filter\n\
+         instead: scan of every document, 2 entries\n\
          keys examined: 1\n\
          documents examined: 0\n\
          documents matched: 1\n\
@@ -652,6 +656,11 @@ fn find_explain_says_how_it_found_them() {
     let text = explained(&["find", &db, "users", "age > 40 use no index", "--explain"]);
     assert!(
         text.starts_with("plan: scan of every document, as hinted\n"),
+        "{text}"
+    );
+    // The planner's own plan among the ones passed over (SPEC §133).
+    assert!(
+        text.contains("instead: index on age, 1 entry, its entries decide the filter, fewer\n"),
         "{text}"
     );
     let output = trunkdb(&["find", &db, "users", "age > 40 use index name"]);

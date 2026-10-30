@@ -279,6 +279,7 @@ impl BTreeIndex {
             path: Vec::new(),
             done: false,
             seen: std::collections::HashSet::new(),
+            leaves: 0,
         }
     }
 }
@@ -288,23 +289,66 @@ impl BTreeIndex {
     /// its slot directory, without looking at a key; only the leaves at
     /// the range's ends entry by entry (SPEC §101.4).
     pub fn count(&self, store: &dyn PageStore, range: KeyRange) -> std::io::Result<usize> {
+        let counted = self.count_at_most(store, range, usize::MAX)?;
+        Ok(counted.entries)
+    }
+
+    /// `count`, entering at most `leaves` leaves (SPEC §133.3): past
+    /// them, the entries counted so far, and `whole` false. A leaf all
+    /// inside the range costs its page and no key decoded.
+    pub fn count_at_most(
+        &self,
+        store: &dyn PageStore,
+        range: KeyRange,
+        leaves: usize,
+    ) -> std::io::Result<Counted> {
         let mut walk = self.walk(store, range, false);
-        let mut count = 0;
+        let mut entries = 0;
         loop {
+            if walk.leaves >= leaves && walk.used_up() {
+                // The next step would enter a leaf past the cap: whole
+                // only if there's no entry left at all.
+                let whole = match walk.step() {
+                    None => true,
+                    Some(Ok(_)) => false,
+                    Some(Err(e)) => return Err(e),
+                };
+                return Ok(Counted {
+                    entries,
+                    whole,
+                    leaves: walk.leaves,
+                });
+            }
             if let Some(leaf) = walk.whole_leaf()? {
-                count += leaf.entries;
+                entries += leaf.entries;
                 walk.pass_leaf();
                 continue;
             }
             match walk.step() {
                 Some(entry) => {
                     entry?;
-                    count += 1;
+                    entries += 1;
                 }
-                None => return Ok(count),
+                None => {
+                    return Ok(Counted {
+                        entries,
+                        whole: true,
+                        leaves: walk.leaves,
+                    });
+                }
             }
         }
     }
+}
+
+/// What `BTreeIndex::count_at_most` counted: the entries, and whether
+/// that is all of the range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counted {
+    pub entries: usize,
+    pub whole: bool,
+    /// The leaves entered to count them.
+    pub leaves: usize,
 }
 
 /// `BTreeIndex::walk`: an iterator of index entries. An I/O error ends
@@ -337,6 +381,8 @@ pub struct Walk<'s> {
     /// Forward: every leaf read, so sibling links that go round a loop
     /// are damage, not a walk that never ends (SPEC §55).
     seen: std::collections::HashSet<PageId>,
+    /// How many leaves it has entered.
+    leaves: usize,
 }
 
 impl Walk<'_> {
@@ -463,6 +509,16 @@ impl Walk<'_> {
         }))
     }
 
+    /// Whether the current leaf has no entry left to hand out in the
+    /// walk's direction: the next step enters another leaf.
+    fn used_up(&self) -> bool {
+        match (&self.leaf, self.backward) {
+            (None, _) => true,
+            (Some(_), true) => self.at == 0,
+            (Some(leaf), false) => self.at >= leaf.slot_count(),
+        }
+    }
+
     /// Passes over the leaf `whole_leaf` just described, all of it.
     pub fn pass_leaf(&mut self) {
         if let Some(leaf) = &self.leaf {
@@ -520,6 +576,7 @@ impl Walk<'_> {
                 }
             }
         };
+        self.leaves += 1;
         self.next_leaf = leaf.next_page();
         self.at = match self.backward {
             true => leaf.slot_count(),
@@ -1232,6 +1289,62 @@ mod tests {
         let per_leaf = crate::storage::USABLE_PAGE_SIZE / key(0).len();
         assert!(stepped.len() < 2 * per_leaf, "{}", stepped.len());
         assert_eq!(index.count(&store, range).unwrap(), 3000);
+    }
+
+    /// `count_at_most` counts through as many leaves as it may, and says
+    /// whether that was all (SPEC §133.3).
+    #[test]
+    fn a_count_at_most_stops_after_its_leaves() {
+        let (_dir, mut store, mut index) = fresh();
+        let loc = RecordLocation { page: 1, slot: 0 };
+        let key = |i: u32| format!("{i:05}{}", "x".repeat(40)).into_bytes();
+        for i in 0..5000 {
+            index.insert(&mut store, &key(i), loc).unwrap();
+        }
+        let range = KeyRange {
+            start: key(1000),
+            end: Some(key(4000)),
+        };
+        let count = |leaves| index.count_at_most(&store, range.clone(), leaves).unwrap();
+        let all = count(usize::MAX);
+        assert_eq!((all.entries, all.whole), (3000, true));
+        assert!(all.leaves > 3, "{}", all.leaves);
+        let enough = count(all.leaves);
+        assert_eq!((enough.entries, enough.whole), (3000, true));
+        let short = count(all.leaves - 1);
+        assert!(!short.whole);
+        assert!(
+            short.entries < 3000 && short.entries > 2000,
+            "{}",
+            short.entries
+        );
+        let per_leaf = crate::storage::USABLE_PAGE_SIZE / key(0).len();
+        let one = count(1);
+        assert!(!one.whole);
+        assert!(
+            one.entries > 0 && one.entries <= per_leaf,
+            "{}",
+            one.entries
+        );
+        let none = count(0);
+        assert_eq!((none.entries, none.whole), (0, false));
+        // A range with no end, its last leaf passed whole: at a cap of
+        // as many leaves, whole, by a look one entry ahead.
+        let rest = KeyRange {
+            start: key(1000),
+            end: None,
+        };
+        let open = |leaves| index.count_at_most(&store, rest.clone(), leaves).unwrap();
+        let all = open(usize::MAX);
+        let enough = open(all.leaves);
+        assert_eq!((enough.entries, enough.whole), (4000, true));
+        // A range inside one leaf is whole in one.
+        let small = KeyRange {
+            start: key(10),
+            end: Some(key(12)),
+        };
+        let in_one = index.count_at_most(&store, small, 1).unwrap();
+        assert_eq!((in_one.entries, in_one.whole), (2, true));
     }
 
     /// How many pages from the root to a leaf, both counted.

@@ -1482,10 +1482,67 @@ impl Run<'_> {
         };
         let context = format!("{} via {:?}", self.at(), explained.plan);
         answers.agree(query, &expected, &self.model, &context);
+        self.alternative_holds(filter, &explained);
         self.read_hinted(query, &expected);
         for at in 0..self.snapshots.len() {
             self.read_snapshot(at, query);
         }
+    }
+
+    /// One of the plans `explain_run` passed over, at random, run under
+    /// its hint (SPEC §133): the plan it named, and the entries it
+    /// counted — exactly, or more than it said.
+    fn alternative_holds(&mut self, filter: &Filter, run: &trunkdb::query::Explained) {
+        use trunkdb::query::{EntryCount, QueryPlan};
+        if run.alternatives.is_empty() {
+            return;
+        }
+        let other = &run.alternatives[self.program.below(run.alternatives.len())];
+        let name = |fields: &[&str]| match fields {
+            [one] => one.to_string(),
+            several => format!("({})", several.join(", ")),
+        };
+        let index = |field: &str| -> Option<Vec<&'static str>> {
+            if field == "_id" {
+                return Some(vec!["_id"]);
+            }
+            INDEXES
+                .iter()
+                .find(|f| name(f) == field)
+                .map(|f| f.to_vec())
+        };
+        let hinted = match &other.plan {
+            QueryPlan::Scan => filter.clone().no_index(),
+            QueryPlan::ById => filter.clone().use_index("_id"),
+            QueryPlan::Index { field, .. } | QueryPlan::IndexOrder { field, .. } => filter
+                .clone()
+                .use_index(index(field).expect("a made index")),
+            QueryPlan::IndexUnion { fields, .. } => match fields.first() {
+                Some(first) => filter
+                    .clone()
+                    .use_index(index(first).expect("a made index")),
+                None => return, // `false`, under any secondary index's hint
+            },
+            other => panic!("{}: {other:?}", self.at()),
+        };
+        let ran = self.docs().explain_run(hinted.clone()).unwrap();
+        let context = format!("{}: {hinted} for {:?}", self.at(), other);
+        assert_eq!(ran.plan, other.plan, "{context}");
+        let read = ran.stats.keys_examined;
+        match other.entries {
+            EntryCount::Exactly(n) => assert_eq!(read, n, "{context}"),
+            EntryCount::MoreThan(n) => assert!(read > n, "{context}: {read}"),
+            _ => unreachable!(),
+        }
+        let fewer = matches!(other.entries, EntryCount::Exactly(n) if n < run.stats.keys_examined);
+        assert_eq!(other.fewer, fewer, "{context}");
+        self.ran.plans.insert(
+            format!("alternative {:?}", other.entries)
+                .split('(')
+                .next()
+                .unwrap()
+                .to_string(),
+        );
     }
 
     /// The same read under a hint (SPEC §132): no index, the primary

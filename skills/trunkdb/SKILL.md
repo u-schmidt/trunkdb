@@ -45,6 +45,9 @@ narrow questions:
 5. **`--explain`** after a filter says how it ran instead of what it
    found: the index used, entries and documents examined, the time. Use
    it when the user asks why a query is slow or whether an index helps.
+   Its `instead:` lines are the plans it passed over, with the entries
+   each would read; one marked `fewer` is the index to hint with
+   `use index …`.
 
 The filter language is SQL's `WHERE` with a few additions for nested
 documents and arrays. Wrap the whole filter in single quotes for the
