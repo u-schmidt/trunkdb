@@ -176,10 +176,53 @@ The time-series workload (§5.1) asks when a position enters or leaves
 a geofence; the application works it out itself today. Readings sent
 every few seconds, such as a server's load, ask the same of a mean
 over a window. Four steps, each useful alone, in this order:
-- A hook after each commit: the collection and the ids of the
+- A hook after each commit, next: the collection and the ids of the
   documents a batch inserted, changed or deleted, handed out once the
   batch is durable, never for one that failed. SQLite's
   `sqlite3_update_hook` and commit hook, MongoDB's change streams.
+  Planned:
+  ```rust
+  let changes = db.subscribe();
+  std::thread::spawn(move || {
+      for commit in changes {
+          for change in &commit.changes {
+              // change.collection, change.id, change.kind
+          }
+      }
+  });
+  ```
+  - **`Database::subscribe()`** hands out a receiver of its own, a
+    trunkdb type over `std::sync::mpsc` (no new dependency), with
+    `recv`, `try_recv`, `recv_timeout` and iteration. Dropping it ends
+    the subscription; the iteration ends when the database is dropped.
+  - **One report per batch, in commit order:** a `Commit` with its
+    `changes`, so a batch stays whole for whoever reads it. Sent after
+    the batch is in the WAL and published, under the writer's lock, so
+    the order is the commits' and a `get` of an id finds what was
+    committed, or something newer.
+  - **One change per document, the batch's net effect:** inserted then
+    updated is `Inserted`, updated then deleted `Deleted`, inserted and
+    deleted in one batch nothing. A report is the difference between
+    two states, which live queries compare. Recorded in
+    `apply_write_op`, which every write of a document goes through:
+    `Batch`, `insert`, `update`, `delete`, `update_many`,
+    `update_fields`, `delete_many`, `upsert`, `import`.
+  - **`drop_collection` as one change**, the collection dropped, not
+    an id for each document it held.
+  - **Ids only, no documents:** the reader reads what it needs. A
+    snapshot of the commit with each report would show its exact
+    state, but keep its pages in memory for as long as the report
+    waits.
+  - **Unbounded, never waiting:** a bounded channel that waits when
+    full deadlocks a reader that writes, which waits for the writer
+    waiting for it. A reader far behind costs memory instead.
+  - **Nothing without a subscriber:** changes are recorded only while
+    one is open. Not reported: indexes built or dropped, `compact`,
+    `check`, a failed batch, a batch that changed nothing.
+  - A crash between a commit and its report loses the report; the
+    outbox below is for where that matters. Rejected: a callback, as
+    below; every op in order, which live queries would have to fold
+    into the net effect themselves.
 - Conditions on places: a point within a circle or a polygon, as
   MongoDB's `$geoWithin`, needed apart from the rest. With it an index
   on points, if a scan of the fences is too slow; with a few fences it
