@@ -710,3 +710,15 @@ limit, batches and a write-ahead log. Since then:
     reads as before. Files stay format 12 and exports as in 0.25.0,
     which opens what 0.26.0 writes; no new fixture, as nothing changes
     how files are written (§120.9).
+
+108. **A hook after each commit** (§135). `Database::subscribe` hands
+    out a `Changes`, which receives a `Commit` for every batch committed
+    after it, in commit order, sent once the batch is durable and new
+    reads see it; a failed batch is never reported. Each document is
+    listed once, with the batch's net effect: `Change::Inserted`,
+    `Updated` or `Deleted`, with its collection and id;
+    `drop_collection` is one `Dropped`. Ids only. `recv`, `try_recv`,
+    `recv_timeout`, or a `for` loop, which ends when the database is
+    dropped. The channel is `std`'s and unbounded: a writer never
+    waits, so a subscriber may write. Nothing is recorded while no one
+    subscribes.

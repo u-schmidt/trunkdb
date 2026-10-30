@@ -45,6 +45,7 @@ All of it is done:
 | 0.24.0 | `trunkdb fields <file> <collection> [filter]`: every path a collection's documents have, written as a filter writes it, in how many documents, and as which kinds of value, most first; a filter sums up only what it finds, `limit` a sample; read-only, at most 10,000 paths; an Agent Skill, `skills/trunkdb/`, for AI agents using the command. **Batched writes:** the default checkpoint threshold 4,000 pages instead of 1,000, the WAL limit following to 65.5 MB; with 1,000 documents a commit, 59 commits of 100 checkpointed, now 10; on 100,000 documents inserts about 1.35× faster, updates 1.35×, deletes 1.6×, single commits and reads unchanged; recovery after a crash with a full WAL 79 ms; a compaction's commit writes it back at once whatever its size, as §108 had it. **Fixed:** an OR of `eq`s of one field whose branches came wrapped alone in an AND or OR printed as an OR but read back as `in`, so its text didn't read back the same (a fix to §115). **`=` and `!=` on arrays, objects and binary:** compared by their contents, as `add_to_set` and `pull` compare them (objects in any field order, `[1]` equal to `[1.0]`), where `=` never held and `!=` always did, even against the very value; `in`, `not in` and `has (@ = …)` with them; `<` and the rest still never hold; an index entry with such a value in a compound key read from its document; groups of equal ones merged; unique indexes unchanged, still not checking them. **The release that wrote a file:** the header names the release that created the file and the one that last wrote it, `FileInfo::created_by` and `written_by`, `Release` and `trunkdb::RELEASE`, in `trunkdb info` too; unknown for older files and where an older build wrote since; still format 12. **Smaller fixtures:** 60 tasks instead of 300, the 0.23.0 fixture written again by 0.23.0's code, 9 KB compressed instead of 32; a fixture only for a release that changes how files are written. **Fixed:** `trunkdb info` panicked when its reader went (`| head`); it ends quietly, as `find` does | §120.9, §121–§125 |
 | 0.25.0 | **A condition on an aggregate column:** `filter` after a column, SQL's `FILTER (WHERE …)`, the column taking in only the group's documents that meet it, the groups and other columns every match; any column, two ANDed, one before any column refused; decided from index entries where the index holds its fields, a leaf of counts at a time where its ends decide it; the column methods' docs saying their string is the column's name. **Fixed:** a database opened through a symlink found a WAL beside the link instead of the file's, so after a crash it missed committed batches, and a write through it could have the file's old WAL replayed over newer pages later; the link is now followed to the file before the WAL is named, a loop of links refused; `trunkdb export` through a link protects the file's WAL; a hard link documented as unsupported. **Fixed:** a checkpoint whose flush failed after it had cut the WAL left the WAL's length as before, so a failed log after it was taken back by growing the WAL with zeros, and the next open refused it; the length is 0 once the cut succeeds, and an undo never grows the WAL past its end before the failed log (a fix to §81). **Fixed:** a page whose slot directory ran past its end, the cells said to start further on and its checksum matching, panicked as it was checked, reading past the page; refused as damage before a slot is read, a seed for `open_raw` with it. **Fixed:** on Unix, a compaction opened `<database>.compact` emptying what was there, following a link: whatever file a link under that name pointed to was emptied, even where the compaction gained nothing; the file is now always a new one, as on Windows, under the first name free (a fix to §108). **Fixed:** `avg` rounded the exact total to a float before dividing it, so finite numbers whose total passed `f64::MAX` had an infinite mean, and other means could be a unit off; the exact total is now divided, then rounded once, never `-0.0` (a fix to §107) | §126–§131 |
 | 0.26.0 | **A hint in the query:** `Filter::use_index(fields)` reads that index where the rules would read another, `Filter::no_index()` scans, `"_id"` the primary index; the rules choose the rest among it alone; a hint that can't be followed, no such index or nothing to read it by, is `Error::Hint` from every read, never a quiet fall back; `explain_run` says `hinted`; `use index …` and `use no index` last in a filter's text and `trunkdb find`; a panic on `false` under a hint, found by the `queries` fuzz target, fixed before release ; **the plans `explain_run` passed over:** `Explained::alternatives`, the filter hinted to each index, `_id` and a scan, each with the entries it would read, `Exactly` or `MoreThan`, whether it reads a document per entry, and whether that's fewer; ranges counted whole a leaf at a time up to 1,000 leaves, walks in sort order as far as the run read; `instead:` lines in `trunkdb find --explain`; **aggregate columns named last** (breaking): `count().named("n")`, `sum("tries").named("total")`, a column's `filter` before its name, an `UnnamedColumn` until it has one, so a column without a name or a `filter` before any column doesn't compile | §132–§134 |
+| next | **A hook after each commit:** `Database::subscribe`, a `Changes` receiving a `Commit` for every batch committed after it, in commit order, once it is durable and new reads see it, never for a failed batch; each document once with the batch's net effect, `Inserted`, `Updated` or `Deleted`, `drop_collection` one `Dropped`; ids only; an unbounded `std` channel, so a writer never waits and a subscriber may write; nothing recorded without a subscriber | §135 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -176,53 +177,13 @@ The time-series workload (§5.1) asks when a position enters or leaves
 a geofence; the application works it out itself today. Readings sent
 every few seconds, such as a server's load, ask the same of a mean
 over a window. Four steps, each useful alone, in this order:
-- A hook after each commit, next: the collection and the ids of the
-  documents a batch inserted, changed or deleted, handed out once the
-  batch is durable, never for one that failed. SQLite's
-  `sqlite3_update_hook` and commit hook, MongoDB's change streams.
-  Planned:
-  ```rust
-  let changes = db.subscribe();
-  std::thread::spawn(move || {
-      for commit in changes {
-          for change in &commit.changes {
-              // change.collection, change.id, change.kind
-          }
-      }
-  });
-  ```
-  - **`Database::subscribe()`** hands out a receiver of its own, a
-    trunkdb type over `std::sync::mpsc` (no new dependency), with
-    `recv`, `try_recv`, `recv_timeout` and iteration. Dropping it ends
-    the subscription; the iteration ends when the database is dropped.
-  - **One report per batch, in commit order:** a `Commit` with its
-    `changes`, so a batch stays whole for whoever reads it. Sent after
-    the batch is in the WAL and published, under the writer's lock, so
-    the order is the commits' and a `get` of an id finds what was
-    committed, or something newer.
-  - **One change per document, the batch's net effect:** inserted then
-    updated is `Inserted`, updated then deleted `Deleted`, inserted and
-    deleted in one batch nothing. A report is the difference between
-    two states, which live queries compare. Recorded in
-    `apply_write_op`, which every write of a document goes through:
-    `Batch`, `insert`, `update`, `delete`, `update_many`,
-    `update_fields`, `delete_many`, `upsert`, `import`.
-  - **`drop_collection` as one change**, the collection dropped, not
-    an id for each document it held.
-  - **Ids only, no documents:** the reader reads what it needs. A
-    snapshot of the commit with each report would show its exact
-    state, but keep its pages in memory for as long as the report
-    waits.
-  - **Unbounded, never waiting:** a bounded channel that waits when
-    full deadlocks a reader that writes, which waits for the writer
-    waiting for it. A reader far behind costs memory instead.
-  - **Nothing without a subscriber:** changes are recorded only while
-    one is open. Not reported: indexes built or dropped, `compact`,
-    `check`, a failed batch, a batch that changed nothing.
-  - A crash between a commit and its report loses the report; the
-    outbox below is for where that matters. Rejected: a callback, as
-    below; every op in order, which live queries would have to fold
-    into the net effect themselves.
+- Done in §135: **a hook after each commit.** `Database::subscribe`
+  hands out a `Changes`, a receiver over `std`'s `mpsc`: one `Commit`
+  per batch, in commit order, sent once it is durable and published,
+  never for one that failed. Each document once, with the batch's net
+  effect (`Inserted`, `Updated`, `Deleted`); `drop_collection` one
+  `Dropped`. Ids only; unbounded, so a writer never waits; nothing
+  recorded without a subscriber.
 - Conditions on places: a point within a circle or a polygon, as
   MongoDB's `$geoWithin`, needed apart from the rest. With it an index
   on points, if a scan of the fences is too slow; with a few fences it

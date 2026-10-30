@@ -192,6 +192,16 @@ old file's index keys). The file and the WAL stay as they are, and the
 next open that writes recovers from the WAL. Every write fails with
 `Error::ReadOnly` [§88](spec/88-a-read-only-open.md).
 
+**Reported after it commits** [§135](spec/135-a-hook-after-each-commit.md): while a
+`Database::subscribe` is open, a batch records in its own catalog what
+it does to each document, as `apply_write_op` applies it, and
+`drop_collection` the collection it drops. Taken out before step 4, the
+record is sent after it, still under the writer's lock, to each
+subscriber's `std` channel: one `Commit` per batch, in commit order,
+each document once with the batch's net effect. A failed batch drops
+its record with its catalog. The channel is unbounded, so a writer
+never waits for a subscriber, and a subscriber may write.
+
 ## 6. Documents and data pages
 
 **The value type** is `Document`: `Null`, `Bool`, `Int`, `Float`,
@@ -524,6 +534,9 @@ more than four.
   `explain_run` and `indexes` and nothing that writes; `collections`, `export`, `check`
   and `file_info` on the snapshot too. A `cursor` shows the moment it
   was made [§82](spec/82-a-snapshot-to-keep.md).
+- **Changes:** `db.subscribe()`, a `Changes` receiving a `Commit` for
+  each batch committed after it, its documents `Inserted`, `Updated`
+  or `Deleted` and its collections `Dropped` [§135](spec/135-a-hook-after-each-commit.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`
@@ -535,7 +548,7 @@ more than four.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.
 - **What's public** is only this: `Database`, `Collection`, `Batch`,
-  `Cursor`, `Snapshot`, `View`, `Document`, `DocId`, `Map`, the options, reports and errors, and
+  `Cursor`, `Snapshot`, `View`, `Changes`, `Document`, `DocId`, `Map`, the options, reports and errors, and
   `query`. Types a caller passes in are built with methods; types it
   gets back are `#[non_exhaustive]`, like `Error` and `Document` [§60](spec/60-a-smaller-public-api.md), and so is every
   variant with named fields, matched with `..` [§117](spec/117-variants-that-can-grow.md). Options and reports
@@ -710,6 +723,7 @@ src/
 ├── collection.rs      Collection<T>: CRUD, find, indexes, update_many,
 │                        update_fields
 ├── batch.rs           Batch: typed atomic multi-op writes
+├── changes.rs         Changes, Commit, Change: what each commit changed
 ├── cursor.rs          Cursor: streaming find, of one moment
 ├── snapshot.rs        Snapshot and View<T>: the database at one
 │                        moment, to keep reading

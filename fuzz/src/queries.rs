@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use trunkdb::query::{Aggregate, Condition, Filter, Op, SortOrder, Update};
-use trunkdb::{Database, DocId, Document, Error, IndexOptions, Map, Upserted};
+use trunkdb::{Change, Database, DocId, Document, Error, IndexOptions, Map, Upserted};
 
 /// Steps a program runs at most, and documents it keeps at most.
 const MAX_STEPS: usize = 64;
@@ -135,6 +135,8 @@ pub struct Ran {
     /// Writes refused as duplicates in a unique index, where the model
     /// said they must be, and unique indexes refused over duplicates.
     pub refused_duplicates: u64,
+    /// Documents reported changed by `Database::subscribe` (SPEC §135).
+    pub reported: u64,
 }
 
 pub const STEP_NAMES: [&str; 15] = [
@@ -334,6 +336,9 @@ struct Run<'p> {
     /// rare: runs of one value over several leaves, with a short run
     /// between, which is where a range's bounds meet whole leaves.
     runs: bool,
+    /// A subscription to the database's commits (SPEC §135), made after
+    /// the prelude and again at every reopen.
+    changes: Option<trunkdb::Changes>,
     ran: Ran,
     step: usize,
     /// `QUERIES_TRACE` set: each step said on stderr, for a replay.
@@ -357,12 +362,14 @@ pub fn run(input: &[u8]) -> Ran {
         next_id: 0,
         long: 1,
         runs: false,
+        changes: None,
         ran: Ran::default(),
         step: 0,
         trace: std::env::var_os("QUERIES_TRACE").is_some(),
         program: Program::new(input),
     };
     run.prelude();
+    run.changes = Some(run.db().subscribe().unwrap());
     while !run.program.done() && run.step < MAX_STEPS {
         run.step();
         run.step += 1;
@@ -433,6 +440,8 @@ impl Run<'_> {
                 self.snapshots.len()
             );
         }
+        // The steps that write documents, and the model before them.
+        let before = (2..=8).contains(&kind).then(|| self.model.clone());
         match kind {
             0 => self.ensure_index(),
             1 => self.drop_index(),
@@ -453,6 +462,7 @@ impl Run<'_> {
                 self.read(&query);
             }
         }
+        self.changes_are_reported(kind, before);
         // Rule 1 in full on one write step in four, and after a
         // compaction or a reopen; on the others, the count and a few
         // documents (SPEC §105.4: reading every document every step was
@@ -1358,7 +1368,72 @@ impl Run<'_> {
         self.snapshots.clear();
         self.db = None;
         self.db = Some(Database::open(&self.path).unwrap());
+        // The old subscription ended with the database it was on.
+        assert_eq!(self.changes.take().and_then(|old| old.try_recv()), None);
+        self.changes = Some(self.db().subscribe().unwrap());
         self.check();
+    }
+
+    /// What the subscription received for the step (SPEC §135): at most
+    /// one commit, from a step that writes documents, which names
+    /// exactly the documents the model gained and lost, and as updated
+    /// only some it kept, among them every one whose contents changed.
+    fn changes_are_reported(&mut self, kind: usize, before: Option<BTreeMap<DocId, Document>>) {
+        let changes = self.changes.as_ref().expect("subscribed");
+        let commits: Vec<_> = std::iter::from_fn(|| changes.try_recv()).collect();
+        let Some(before) = before else {
+            assert!(
+                commits.is_empty(),
+                "{}: {} reported {commits:?}",
+                self.at(),
+                STEP_NAMES[kind]
+            );
+            return;
+        };
+        assert!(commits.len() <= 1, "{}: {commits:?}", self.at());
+        let (mut inserted, mut updated, mut deleted) =
+            (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        for change in commits.iter().flat_map(|commit| &commit.changes) {
+            assert_eq!(change.collection(), COLLECTION, "{}", self.at());
+            let (set, id) = match change {
+                Change::Inserted { id, .. } => (&mut inserted, id),
+                Change::Updated { id, .. } => (&mut updated, id),
+                Change::Deleted { id, .. } => (&mut deleted, id),
+                other => panic!("{}: {other:?}", self.at()),
+            };
+            assert!(set.insert(*id), "{}: {id} twice: {commits:?}", self.at());
+            self.ran.reported += 1;
+        }
+        let gained: BTreeSet<DocId> = self
+            .model
+            .keys()
+            .filter(|id| !before.contains_key(id))
+            .copied()
+            .collect();
+        let lost: BTreeSet<DocId> = before
+            .keys()
+            .filter(|id| !self.model.contains_key(id))
+            .copied()
+            .collect();
+        let changed: BTreeSet<DocId> = self
+            .model
+            .iter()
+            .filter(|(id, doc)| before.get(id).is_some_and(|was| !same(was, doc)))
+            .map(|(id, _)| *id)
+            .collect();
+        let at = self.at();
+        assert_eq!(inserted, gained, "{at}: inserted");
+        assert_eq!(deleted, lost, "{at}: deleted");
+        assert!(
+            changed.is_subset(&updated),
+            "{at}: changed {changed:?}, updated {updated:?}"
+        );
+        assert!(
+            updated
+                .iter()
+                .all(|id| before.contains_key(id) && self.model.contains_key(id)),
+            "{at}: updated {updated:?}"
+        );
     }
 
     fn keep_snapshot(&mut self) {

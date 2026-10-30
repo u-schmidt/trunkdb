@@ -109,6 +109,45 @@ batch.insert(&events, Event { user: grace, what: "joined".into() })?; // the id 
 batch.commit()?; // both, or neither: after a crash too
 ```
 
+## Hearing about changes
+
+`subscribe` hands out a receiver that hears of every batch committed
+after it, from any thread (SPEC §135):
+
+```rust
+use trunkdb::Change;
+
+let changes = db.subscribe()?;
+let watcher = std::thread::spawn(move || {
+    for commit in changes {                // waits for each commit
+        for change in &commit.changes {
+            match change {
+                Change::Inserted { collection, id, .. } => println!("new in {collection}: {id}"),
+                Change::Updated { collection, id, .. } => println!("{id} in {collection} written"),
+                Change::Deleted { collection, id, .. } => println!("{id} gone from {collection}"),
+                Change::Dropped { collection, .. } => println!("{collection} dropped"),
+                _ => {}
+            }
+        }
+    }                                      // ends when the database is dropped
+});
+```
+
+- **One report per batch**, in the order they committed, sent once the
+  batch is durable and reads see it: a `get` of the id finds it. A
+  batch that failed is never reported.
+- **Each document once, with what the batch did to it in all:**
+  inserted and then updated is `Inserted`, inserted and deleted in one
+  batch isn't listed at all. `drop_collection` is one `Dropped`.
+- **Ids, not documents:** read the document if you need it. A later
+  commit may have changed it since.
+- **The writer never waits** for a subscriber, so the receiving thread
+  may write to the database itself. Reports it hasn't read yet wait in
+  memory.
+- **A report is lost if the program stops** between a commit and its
+  report. Where an event must not be lost, write it as a document in
+  the same batch as the change, and work those off.
+
 ## Reads that agree with each other
 
 Each call reads the database as it is at that moment, so a write on

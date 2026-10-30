@@ -27,7 +27,7 @@ measurements.
 - Secondary indexes: unique, compound, on nested paths and array
   elements, and sparse; a hint in the query names the one to read.
 - Atomic batches across collections; every commit crash-safe through a
-  write-ahead log.
+  write-ahead log, and reported to subscribers once it is.
 - Readers in parallel beside one writer, and snapshots for reads that
   must agree.
 - `explain_run` and `stats` to see how a query ran, what the plans it

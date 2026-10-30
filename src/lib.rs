@@ -56,6 +56,7 @@
 mod aggregate;
 mod batch;
 mod catalog;
+mod changes;
 mod check;
 mod collection;
 mod compact;
@@ -92,6 +93,7 @@ mod update;
 
 pub use batch::{Batch, IntoDocument};
 pub use catalog::{IndexInfo, IndexOptions};
+pub use changes::{Change, Changes, Commit};
 pub use check::{CheckReport, FileInfo};
 pub use collection::{Collection, IndexFields, Upserted};
 pub use compact::Compacted;

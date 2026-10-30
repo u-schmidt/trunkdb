@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::changes::ChangeLog;
 use crate::decode::{take, take_u8, take_u64};
 use crate::free_space::FreeSpace;
 use crate::storage::{PageId, PageStore, PageType, SlottedPage};
@@ -190,9 +191,44 @@ pub struct Catalog {
     /// only, empty at open; restored with the rest on rollback, so it
     /// never names a page a failed batch freed or never wrote.
     free_space: HashMap<String, FreeSpace>,
+    /// What the batch has changed so far, while a subscriber listens
+    /// (SPEC §135): the batch's own, like the rest of its catalog, and
+    /// taken out before the catalog is published. `None` otherwise.
+    changes: Option<ChangeLog>,
 }
 
 impl Catalog {
+    /// Records from here on what the batch changes (SPEC §135).
+    pub(crate) fn record_changes(&mut self) {
+        self.changes = Some(ChangeLog::default());
+    }
+
+    /// Whether the batch records what it changes.
+    #[cfg(test)]
+    pub(crate) fn records_changes(&self) -> bool {
+        self.changes.is_some()
+    }
+
+    /// What the batch changed, if it recorded it; nothing is recorded
+    /// after.
+    pub(crate) fn take_changes(&mut self) -> Option<ChangeLog> {
+        self.changes.take()
+    }
+
+    /// `op`, just applied, for the record.
+    pub(crate) fn written(&mut self, op: &crate::txn::WriteOp) {
+        if let Some(changes) = &mut self.changes {
+            changes.written(op);
+        }
+    }
+
+    /// `collection`, just dropped, for the record.
+    pub(crate) fn dropped(&mut self, collection: &str) {
+        if let Some(changes) = &mut self.changes {
+            changes.dropped(collection);
+        }
+    }
+
     /// Reads the catalog page chain (from page 1), decoding its cells into
     /// collections and indexes. If the file is fresh and page 1 doesn't
     /// exist yet, creates and initializes an empty catalog page first,
@@ -270,6 +306,7 @@ impl Catalog {
             collections,
             indexes,
             free_space: HashMap::new(),
+            changes: None,
         })
     }
 

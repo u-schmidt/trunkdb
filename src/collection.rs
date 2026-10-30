@@ -2665,7 +2665,9 @@ pub(crate) fn apply_write_op(
             });
         }
     }
-    apply_unchecked(catalog, store, op)
+    apply_unchecked(catalog, store, op)?;
+    catalog.written(op);
+    Ok(())
 }
 
 /// `apply_write_op` without its check that the document is an object:

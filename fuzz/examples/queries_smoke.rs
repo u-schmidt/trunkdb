@@ -68,6 +68,7 @@ fn main() {
                 total.aggregated += ran.aggregated;
                 total.unique_indexes += ran.unique_indexes;
                 total.refused_duplicates += ran.refused_duplicates;
+                total.reported += ran.reported;
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -92,6 +93,7 @@ fn main() {
         "  refused as duplicates (§119): {}",
         total.refused_duplicates
     );
+    println!("  reported changed (§135): {}", total.reported);
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

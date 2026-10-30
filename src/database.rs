@@ -1,5 +1,6 @@
 use crate::batch::Batch;
 use crate::catalog::Catalog;
+use crate::changes::{self, Changes};
 use crate::collection::{Collection, apply_write_op};
 use crate::data;
 use crate::durability::{self, Durability, WalDurability};
@@ -9,7 +10,7 @@ use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak, mpsc};
 
 /// Opens the file and owns the whole stack — as a cheap, cloneable,
 /// thread-safe handle (SPEC §27): every clone refers to the same open
@@ -95,6 +96,10 @@ pub(crate) struct Writer {
     /// reading (SPEC §80). Weak, so a snapshot ends when its last reader
     /// lets go, and is found gone here.
     past: Vec<Weak<CommittedInner>>,
+    /// Where each commit's changes go (SPEC §135), one sender for each
+    /// `Changes` handed out. A sender whose `Changes` is gone is dropped
+    /// at the next report. While there is none, batches record nothing.
+    subscribers: Vec<mpsc::Sender<changes::Commit>>,
     /// Test-only: called once, by the next batch, when it is logged and
     /// flushed and not yet published — to see what goes on beside it.
     #[cfg(test)]
@@ -272,6 +277,18 @@ impl OpenOptions {
 const DEFAULT_CHECKPOINT_PAGES: usize = 4000;
 
 impl Writer {
+    /// Sends a commit's changes to every subscriber, dropping those
+    /// whose `Changes` is gone. Nothing for a batch whose writes left
+    /// every document as it was.
+    fn report(&mut self, changes: Vec<changes::Change>) {
+        if changes.is_empty() {
+            return;
+        }
+        let commit = changes::Commit { changes };
+        self.subscribers
+            .retain(|subscriber| subscriber.send(commit.clone()).is_ok());
+    }
+
     /// The WAL, for tests that look at it or make it fail.
     #[cfg(test)]
     pub(crate) fn wal(&mut self) -> &mut WalDurability {
@@ -519,6 +536,7 @@ impl Database {
                             .saturating_mul(2 * crate::storage::PAGE_SIZE as u64),
                     ),
                     past: Vec::new(),
+                    subscribers: Vec::new(),
                     #[cfg(test)]
                     after_log: None,
                 }),
@@ -575,8 +593,33 @@ impl Database {
             for index in indexes {
                 BTreeIndex::new(index.root).free_all(store)?;
             }
+            catalog.dropped(name);
             Ok(true)
         })
+    }
+
+    /// A subscription to what each commit changes (SPEC §135): a
+    /// `Commit` for every batch committed from here on, with the
+    /// documents it inserted, updated or deleted and the collections it
+    /// dropped, sent once the batch is durable and new reads see it.
+    /// See [`Changes`].
+    ///
+    /// It waits for a batch being committed to finish, so the first
+    /// report is of the first batch after. A database opened read-only
+    /// commits nothing, so reports nothing. `Err(Error::Poisoned)` as
+    /// for any other call.
+    pub fn subscribe(&self) -> crate::Result<Changes> {
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| crate::Error::Poisoned)?;
+        if self.inner.poisoned.load(Ordering::Relaxed) {
+            return Err(crate::Error::Poisoned);
+        }
+        let (sender, receiver) = mpsc::channel();
+        writer.subscribers.push(sender);
+        Ok(Changes::new(receiver))
     }
 
     /// Starts a typed, atomic multi-op write — see `Batch`.
@@ -739,6 +782,9 @@ impl Database {
         // the batch fails (SPEC §19.5, §78). No commit can come between
         // this and ours: we hold the writer's lock.
         let mut catalog = self.current().catalog().clone();
+        if !writer.subscribers.is_empty() {
+            catalog.record_changes();
+        }
 
         writer.store.begin();
         let result = match apply(&mut catalog, &mut writer.store) {
@@ -748,6 +794,9 @@ impl Database {
                 return Err(e);
             }
         };
+        // Out of the catalog before it is published: what the batch did
+        // is for this one report (SPEC §135).
+        let changes = catalog.take_changes();
 
         if writer.store.staged_count() == 0 {
             // Nothing changed (e.g. an index that already existed):
@@ -822,6 +871,13 @@ impl Database {
         drop(alone);
         // The catalog before, if no read holds it, freed outside the lock.
         drop(before);
+
+        // Reported now that it is durable and new reads see it, still
+        // under the writer's lock, so in the order of the commits (SPEC
+        // §135). A send never waits.
+        if let Some(changes) = changes {
+            writer.report(changes.finish());
+        }
 
         // A compaction's image is written back at once, however small:
         // the file shrinks when `compact` returns (SPEC §108.3, §123.3).
@@ -1740,6 +1796,38 @@ mod tests {
         }
         std::fs::remove_file(&wal).unwrap();
         assert_two_collection_batch_present(&Database::open(&path).unwrap());
+    }
+
+    /// A batch records its changes only while somebody subscribes, and a
+    /// subscription dropped is forgotten at the next report (SPEC §135).
+    #[test]
+    fn changes_are_recorded_only_for_a_subscriber() {
+        let (_dir, _path, db) = open_temp();
+        let records = |db: &Database| {
+            db.transact(|catalog, store| {
+                let recording = catalog.records_changes();
+                apply_write_op(catalog, store, &insert("posts", 9, 9))?;
+                apply_write_op(
+                    catalog,
+                    store,
+                    &WriteOp::Delete("posts".into(), DocId([9; 16])),
+                )?;
+                Ok(recording)
+            })
+            .unwrap()
+        };
+        let subscribers = |db: &Database| db.inner.writer.lock().unwrap().subscribers.len();
+        assert!(!records(&db));
+        let changes = db.subscribe().unwrap();
+        assert!(records(&db));
+        // The published catalog holds nothing of it.
+        assert!(!db.current().catalog().records_changes());
+        assert_eq!(changes.try_recv(), None, "a batch that changed nothing");
+        drop(changes);
+        assert_eq!(subscribers(&db), 1, "not noticed before a report");
+        db.write_batch(vec![insert("posts", 1, 1)]).unwrap();
+        assert_eq!(subscribers(&db), 0);
+        assert!(!records(&db));
     }
 
     /// What isn't a format question stays `Error::Io`: damage is
