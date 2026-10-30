@@ -262,7 +262,7 @@ fn the_run_stays_its_own() {
     assert_eq!(run.reads.len(), 1);
     assert_eq!(run.stats.documents_examined, 190);
     let summed = tasks
-        .explain_aggregate(filter, &Aggregate::new().count("n"))
+        .explain_aggregate(filter, &Aggregate::new().count().named("n"))
         .unwrap();
     assert!(summed.alternatives.is_empty());
     let none = tasks.explain_run(Filter::new().ne("tag", "a")).unwrap();

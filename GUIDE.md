@@ -197,20 +197,18 @@ let per_status = db.collection::<Document>("tasks").aggregate(
     Filter::new().eq("tenant", "t1"),
     &Aggregate::new()
         .group_by("status")
-        .count("n")                     // a column named "n": the group's documents
-        .avg("tries", "average_tries")  // read `tries`, name the column "average_tries"
-        .max("created", "newest")       // read `created`, name the column "newest"
-        .having(Condition::gt("n", 10)) // rows whose "n" is over 10
+        .count().named("n")                  // the group's documents
+        .avg("tries").named("average_tries") // the mean of `tries`
+        .max("created").named("newest")      // the largest `created`
+        .having(Condition::gt("n", 10))      // rows whose "n" is over 10
         .sort_desc("n"),
 )?;
 // [{"status": "Done", "n": 340, "average_tries": 4.5, "newest": ...}, ...]
 ```
 
-- A column's string is its name in the row, as SQL's `AS` gives one:
-  `count("n")` counts every document of the group and calls the number
-  `n`; it matches nothing. Where a column reads a field, the field comes
-  first and the name second, as in `sum(tries) AS total`.
-
+- A column says what it computes, then `named` gives it its name in
+  the row, as SQL's `AS` does: `sum("tries").named("total")` is
+  `sum(tries) AS total`. A column without a name doesn't compile.
 - The filter picks the documents, sort and limit included, as for
   `find`; the rows have the group's values and each column, no `_id`.
 - A missing field groups with `null`; `5` and `5.0` are one group.
@@ -220,26 +218,28 @@ let per_status = db.collection::<Document>("tasks").aggregate(
 - Without `group_by`, one row of everything, even of nothing.
 
 A column can count or sum only some of a group's documents: `filter`
-right after it gives that one column a condition, SQL's `FILTER (WHERE
-…)` (SPEC §126). The groups and the other columns still see every
-document the filter finds:
+before its `named` gives that one column a condition, SQL's `FILTER
+(WHERE …)` (SPEC §126). The groups and the other columns still see
+every document the filter finds:
 
 ```rust
 let per_team = db.collection::<Document>("tasks").aggregate(
     Filter::new(),
     &Aggregate::new()
         .group_by("team")
-        .count("tasks")                          // every task of the team
-        .count("open_tasks")                     // a column named "open_tasks":
-        .filter(Condition::eq("status", "open")) //   only the open ones
-        .avg("hours", "mean_long_hours")         // the mean of `hours`,
-        .filter(Condition::gte("hours", 4)),     //   only over hours >= 4
+        .count().named("tasks") // every task of the team
+        .count()                // only the open ones
+        .filter(Condition::eq("status", "open"))
+        .named("open_tasks")
+        .avg("hours")           // the mean of `hours`, only over hours >= 4
+        .filter(Condition::gte("hours", 4))
+        .named("mean_long_hours"),
 )?;
 // [{"team": "a", "tasks": 12, "open_tasks": 3, "mean_long_hours": 6.5},
 //  {"team": "b", "tasks": 4, "open_tasks": 0, "mean_long_hours": null}]
 ```
 
-- `filter` belongs to the column just before it, not to the aggregate:
+- `filter` belongs to its column, not to the aggregate:
   to leave documents out of every column, put the condition in the
   `Filter` instead. Then a team with no open task has no row at all.
 - A team none of whose documents meets a column's condition is still a

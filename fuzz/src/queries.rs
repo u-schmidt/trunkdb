@@ -840,18 +840,19 @@ impl Run<'_> {
         for c in 0..1 + self.program.below(3) {
             let name = format!("c{c}");
             let path = fields[self.program.below(fields.len())];
-            aggregate = match self.program.below(5) {
-                0 => aggregate.count(name),
-                1 => aggregate.sum(path, name),
-                2 => aggregate.min(path, name),
-                3 => aggregate.max(path, name),
-                _ => aggregate.avg(path, name),
+            let mut column = match self.program.below(5) {
+                0 => aggregate.count(),
+                1 => aggregate.sum(path),
+                2 => aggregate.min(path),
+                3 => aggregate.max(path),
+                _ => aggregate.avg(path),
             };
             // A condition on the column (SPEC §126), as a filter's
             // conditions are made.
             if self.program.one_in(2) {
-                aggregate = aggregate.filter(self.condition(1));
+                column = column.filter(self.condition(1));
             }
+            aggregate = column.named(name);
         }
         if self.program.one_in(4) {
             aggregate = aggregate.sort_desc("c0").limit(1 + self.program.below(3));

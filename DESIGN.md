@@ -406,7 +406,9 @@ aggregated without their documents for `count`, `avg`, `min` and `max`,
 a document read only for a value the key doesn't hold as stored (a
 group's or an extreme's number); a walk counts whole leaves of a group.
 Without conditions, an index is walked only if it holds every document.
-A column can take a condition of its own, `filter` after it, SQL's
+A column is named last, `count().named("n")`, so the string in
+`sum("tries")` is always the field read [§134](spec/134-aggregate-columns-named-last.md).
+A column can take a condition of its own, `filter` before its name, SQL's
 `FILTER (WHERE …)` [§126](spec/126-a-condition-on-a-column.md): it takes
 in only the group's documents that meet it, while the groups and the
 other columns see every match. Index entries decide it where the index

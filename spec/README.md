@@ -148,3 +148,4 @@ say what changed, and DESIGN.md says what is true now.
 131. [A mean rounded once (`aggregate.rs`)](131-a-mean-rounded-once.md)
 132. [A hint in the query (`query.rs`, `collection.rs`, `query_text.rs`)](132-a-hint-in-the-query.md)
 133. [The plans `explain_run` passed over (`collection.rs`, `explain.rs`, `index/btree.rs`)](133-the-plans-explain-run-passed-over.md)
+134. [Aggregate columns, named last (`aggregate.rs`)](134-aggregate-columns-named-last.md)

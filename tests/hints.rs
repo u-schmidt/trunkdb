@@ -236,12 +236,12 @@ fn a_hint_that_cant_be_followed_fails_every_read() {
         is_hint_error(tasks.cursor(filter.clone()).map(|_| ()));
         is_hint_error(tasks.cursor(filter.clone().sort_asc("score")).map(|_| ()));
         is_hint_error(tasks.explain_run(filter.clone()));
-        let counted = Aggregate::new().group_by("tag").count("n");
+        let counted = Aggregate::new().group_by("tag").count().named("n");
         is_hint_error(tasks.aggregate(filter.clone(), &counted));
         is_hint_error(tasks.explain_aggregate(filter.clone(), &counted));
-        let summed = Aggregate::new().sum("total", "score");
+        let summed = Aggregate::new().sum("total").named("score");
         is_hint_error(tasks.aggregate(filter.clone(), &summed));
-        is_hint_error(tasks.aggregate(filter.clone(), &Aggregate::new().count("n")));
+        is_hint_error(tasks.aggregate(filter.clone(), &Aggregate::new().count().named("n")));
         is_hint_error(tasks.delete_many(filter.clone()));
         is_hint_error(tasks.update_many(filter.clone(), |doc| *doc = Document::Null));
         is_hint_error(tasks.update_fields(filter.clone(), &Update::new().set("x", 1)));
@@ -275,7 +275,7 @@ fn an_aggregate_follows_the_hint() {
     let (_dir, db) = open();
     let tasks = tasks(&db);
     let filter = Filter::new().eq("status", "done").gte("created", 100);
-    let counted = Aggregate::new().count("n");
+    let counted = Aggregate::new().count().named("n");
     let ruled = tasks.aggregate(filter.clone(), &counted).unwrap();
     for hinted in [
         filter.clone().use_index("created"),
@@ -284,7 +284,7 @@ fn an_aggregate_follows_the_hint() {
         assert_eq!(tasks.aggregate(hinted.clone(), &counted).unwrap(), ruled);
         assert_eq!(tasks.count(hinted).unwrap(), 95);
     }
-    let by_tag = Aggregate::new().group_by("tag").count("n");
+    let by_tag = Aggregate::new().group_by("tag").count().named("n");
     let walked = Filter::new().eq("tag", "a");
     let explained = tasks.explain_aggregate(walked.clone(), &by_tag).unwrap();
     assert_eq!(read(&explained.plan), "(tag, created)");

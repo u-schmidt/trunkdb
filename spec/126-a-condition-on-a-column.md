@@ -64,7 +64,9 @@ property's name, the condition the predicate.
   `find` matches it: `null` and missing as §32 has them, `=` on arrays,
   objects and binary by contents (§124), `[*]`, `elem_match`, `_id`.
 - **Called before any column,** `filter` has no column to go to: the
-  aggregate is refused when it runs (126.2).
+  aggregate is refused when it runs (126.2). Since §134 the condition
+  is given on the column, before its name, `count().filter(c).named(n)`,
+  and a `filter` before any column doesn't compile.
 
 ## 126.2 What a column with a condition holds
 For each group, the column takes in exactly the group's documents that

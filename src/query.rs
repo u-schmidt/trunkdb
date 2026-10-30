@@ -1,7 +1,7 @@
 //! Filters: conditions, sorts, `skip`, `limit` and `select`, built in
 //! code or read from text (SPEC §111), and the plans `explain` reports.
 
-pub use crate::aggregate::Aggregate;
+pub use crate::aggregate::{Aggregate, UnnamedColumn};
 use crate::catalog::IndexMeta;
 use crate::document::{DocId, Document, ID_FIELD};
 pub use crate::explain::{Alternative, EntryCount, ExecutionStats, Explained, IndexRead, SortWork};

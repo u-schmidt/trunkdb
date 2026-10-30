@@ -1,5 +1,9 @@
 # 107. Aggregates: count, sum, min, max and avg by group (`aggregate.rs`, `collection.rs`, `query.rs`, `snapshot.rs`, `explain.rs`)
 
+**Since §134** a column is named last, `count().named("n")` and
+`sum("tries").named("total")`, where this section has `count("n")`
+and `sum("tries", "total")`. The rest holds as written.
+
 v0 left aggregates to application code (§5.1, §6): a `find`, then a
 loop. Then that cost what the engine would have paid, since `count`
 read every document too. It doesn't any more:

@@ -160,7 +160,7 @@ fn main() {
         println!("| {what} | {} | {how} | {} |", show(ours), show(theirs));
     };
 
-    let per_status = Aggregate::new().group_by("status").count("n");
+    let per_status = Aggregate::new().group_by("status").count().named("n");
     let status_sql = "SELECT status, count(*) FROM tasks GROUP BY status";
     row(
         "per status, a find and a loop",
@@ -193,8 +193,10 @@ fn main() {
 
     let per_tenant = Aggregate::new()
         .group_by("tenant")
-        .count("n")
-        .avg("tries", "average");
+        .count()
+        .named("n")
+        .avg("tries")
+        .named("average");
     row(
         "per tenant, count and average tries, no index",
         per_call(5, |_| {
@@ -218,7 +220,7 @@ fn main() {
     );
 
     let tenant = |i: usize| format!("t{}", i * 37 % 100);
-    let sum = Aggregate::new().sum("tries", "total");
+    let sum = Aggregate::new().sum("tries").named("total");
     row(
         "one tenant's sum of tries (1,000)",
         per_call(100, |i| {
@@ -235,7 +237,7 @@ fn main() {
             )
         }),
     );
-    let average = Aggregate::new().avg("tries", "average");
+    let average = Aggregate::new().avg("tries").named("average");
     row(
         "one tenant's average tries (1,000)",
         per_call(100, |i| {
@@ -253,7 +255,10 @@ fn main() {
         }),
     );
 
-    let newest = Aggregate::new().group_by("status").max("created", "newest");
+    let newest = Aggregate::new()
+        .group_by("status")
+        .max("created")
+        .named("newest");
     row(
         "newest per status, on (status, created)",
         per_call(20, |_| {
@@ -272,9 +277,11 @@ fn main() {
     println!();
     let long = Aggregate::new()
         .group_by("tenant")
-        .count("n")
-        .avg("tries", "mean_long")
-        .filter(Condition::gte("tries", 4));
+        .count()
+        .named("n")
+        .avg("tries")
+        .filter(Condition::gte("tries", 4))
+        .named("mean_long");
     let long_sql =
         "SELECT tenant, count(*), avg(tries) FILTER (WHERE tries >= 4) FROM tasks GROUP BY tenant";
     row(
@@ -295,9 +302,11 @@ fn main() {
     let since = (n * 4 / 5) as i64;
     let recent = Aggregate::new()
         .group_by("status")
-        .count("n")
-        .count("recent")
-        .filter(Condition::gte("created", since));
+        .count()
+        .named("n")
+        .count()
+        .filter(Condition::gte("created", since))
+        .named("recent");
     row(
         "per status, all and those since a time, on (status, created)",
         per_call(20, |_| {
@@ -318,12 +327,15 @@ fn main() {
     let tried = || Condition::gte("tries", 5);
     let late = || Condition::gte("created", since);
     let three = Aggregate::new()
-        .count("queued")
+        .count()
         .filter(queued())
-        .count("tried")
+        .named("queued")
+        .count()
         .filter(tried())
-        .count("late")
-        .filter(late());
+        .named("tried")
+        .count()
+        .filter(late())
+        .named("late");
     row(
         "three counts in one aggregate",
         per_call(5, |_| {

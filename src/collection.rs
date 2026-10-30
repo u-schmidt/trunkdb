@@ -6069,16 +6069,17 @@ mod tests {
         };
         for c in 0..1 + rng.below(3) {
             let name = format!("c{c}");
-            aggregate = match rng.below(5) {
-                0 => aggregate.count(name),
-                1 => aggregate.sum(pick(rng), name),
-                2 => aggregate.min(pick(rng), name),
-                3 => aggregate.max(pick(rng), name),
-                _ => aggregate.avg(pick(rng), name),
+            let mut column = match rng.below(5) {
+                0 => aggregate.count(),
+                1 => aggregate.sum(pick(rng)),
+                2 => aggregate.min(pick(rng)),
+                3 => aggregate.max(pick(rng)),
+                _ => aggregate.avg(pick(rng)),
             };
             for _ in 0..[0, 0, 1, 1, 2][rng.below(5)] {
-                aggregate = aggregate.filter(condition(rng));
+                column = column.filter(condition(rng));
             }
+            aggregate = column.named(name);
         }
         if rng.below(3) == 0 {
             aggregate = aggregate.sort_desc("c0").limit(1 + rng.below(4));
@@ -10341,7 +10342,7 @@ mod tests {
             docs.insert(object(vec![("a", a), ("b", Document::String(b))]))
                 .unwrap();
         }
-        let aggregate = Aggregate::new().group_by("a").min("b", "first_b");
+        let aggregate = Aggregate::new().group_by("a").min("b").named("first_b");
         let rows = docs.aggregate(Filter::new(), &aggregate).unwrap();
         let run = docs.explain_aggregate(Filter::new(), &aggregate).unwrap();
         // The cut string's document, and the first document's, for its
@@ -10368,7 +10369,7 @@ mod tests {
             docs.insert(object(vec![("n", Document::Float(n))]))
                 .unwrap();
         }
-        let aggregate = Aggregate::new().avg("n", "mean");
+        let aggregate = Aggregate::new().avg("n").named("mean");
         let f = Filter::new().gte("n", Document::Float(0.0));
         let expected = (2.0 * (1e308 / 3.0)) + f64::MAX / 3.0;
         let mean = |rows: Vec<Document>| match &rows[..] {
@@ -10453,11 +10454,12 @@ mod tests {
                 let path = fields[rng.below(3)];
                 let name = format!("c{c}");
                 aggregate = match rng.below(4) {
-                    0 => aggregate.count(name),
-                    1 => aggregate.min(path, name),
-                    2 => aggregate.max(path, name),
-                    _ => aggregate.avg(path, name),
-                };
+                    0 => aggregate.count(),
+                    1 => aggregate.min(path),
+                    2 => aggregate.max(path),
+                    _ => aggregate.avg(path),
+                }
+                .named(name);
             }
             let expected: Vec<String> = (aggregate.apply(docs.find(f.clone()).unwrap()).unwrap())
                 .iter()
@@ -10521,9 +10523,11 @@ mod tests {
         // or more: `(tenant, tries)` holds both, no document read.
         let long = Aggregate::new()
             .group_by("tenant")
-            .count("tasks")
-            .avg("tries", "mean_long")
-            .filter(Condition::gte("tries", 4));
+            .count()
+            .named("tasks")
+            .avg("tries")
+            .filter(Condition::gte("tries", 4))
+            .named("mean_long");
         let (r, _) = run(Filter::new(), &long);
         assert_eq!(
             r.plan,
@@ -10540,9 +10544,11 @@ mod tests {
         // leaves of one status decided whole.
         let running = Aggregate::new()
             .group_by("tenant")
-            .count("tasks")
-            .count("running")
-            .filter(Condition::eq("status", "Running"));
+            .count()
+            .named("tasks")
+            .count()
+            .filter(Condition::eq("status", "Running"))
+            .named("running");
         let (r, leaves) = run(Filter::new(), &running);
         assert_eq!(
             r.plan,
@@ -10558,9 +10564,11 @@ mod tests {
         let since = crate::DateTime::from_unix(start + 2000, 0).unwrap();
         let recent = Aggregate::new()
             .group_by("status")
-            .count("tasks")
-            .count("recent")
-            .filter(Condition::gte("created", Document::DateTime(since)));
+            .count()
+            .named("tasks")
+            .count()
+            .filter(Condition::gte("created", Document::DateTime(since)))
+            .named("recent");
         let (r, leaves) = run(Filter::new(), &recent);
         assert_eq!(
             r.plan,
@@ -10577,8 +10585,9 @@ mod tests {
         // documents.
         let done = Aggregate::new()
             .group_by("tenant")
-            .avg("tries", "mean_done")
-            .filter(Condition::eq("status", "Done"));
+            .avg("tries")
+            .filter(Condition::eq("status", "Done"))
+            .named("mean_done");
         let (r, _) = run(Filter::new(), &done);
         assert_eq!(r.plan, QueryPlan::Scan);
         assert_eq!(r.stats.documents_examined, 3000, "{r:?}");
@@ -10601,9 +10610,11 @@ mod tests {
         }
         let a = Aggregate::new()
             .group_by("tenant")
-            .count("all")
-            .count("long_a")
-            .filter(Condition::eq("note", long_note("a")));
+            .count()
+            .named("all")
+            .count()
+            .filter(Condition::eq("note", long_note("a")))
+            .named("long_a");
         let r = notes.explain_aggregate(Filter::new(), &a).unwrap();
         let expected = a.apply(notes.find(Filter::new()).unwrap()).unwrap();
         assert_eq!(notes.aggregate(Filter::new(), &a).unwrap(), expected);
@@ -10651,7 +10662,7 @@ mod tests {
         };
         // Per status: three runs of the compound index, no document, its
         // leaves counted whole.
-        let per_status = Aggregate::new().group_by("status").count("n");
+        let per_status = Aggregate::new().group_by("status").count().named("n");
         LEAVES_COUNTED.with(|c| c.set(0));
         let r = run(Filter::new(), &per_status);
         let leaves = LEAVES_COUNTED.with(|c| c.get());
@@ -10669,15 +10680,17 @@ mod tests {
         );
         assert_eq!(r.stats.groups, 3);
         // The newest per status: a date-time, from the entries.
-        let newest = per_status.clone().max("created", "newest");
+        let newest = per_status.clone().max("created").named("newest");
         let r = run(Filter::new(), &newest);
         assert_eq!(r.stats.documents_examined, 0, "{r:?}");
         // Per tenant, average and fewest tries: numbers. The average from
         // the entries; the fewest read from their one document each.
         let tries = Aggregate::new()
             .group_by("tenant")
-            .avg("tries", "avg")
-            .min("tries", "least");
+            .avg("tries")
+            .named("avg")
+            .min("tries")
+            .named("least");
         let r = run(Filter::new().gte("tenant", "t5"), &tries);
         assert_eq!(
             r.plan,
@@ -10691,7 +10704,7 @@ mod tests {
             "{r:?}"
         );
         // Grouped by a number: one document per group, for `5` or `5.0`.
-        let by_tries = Aggregate::new().group_by("tries").count("n");
+        let by_tries = Aggregate::new().group_by("tries").count().named("n");
         let r = run(Filter::new(), &by_tries);
         assert_eq!(
             (r.stats.documents_examined, r.stats.groups),
@@ -10705,7 +10718,10 @@ mod tests {
             }
         );
         // `sum` reads every document.
-        let sum = Aggregate::new().group_by("tenant").sum("tries", "total");
+        let sum = Aggregate::new()
+            .group_by("tenant")
+            .sum("tries")
+            .named("total");
         let r = run(Filter::new().eq("tenant", "t1"), &sum);
         assert_eq!(
             (r.stats.documents_examined, r.stats.from_entries),
@@ -10715,7 +10731,7 @@ mod tests {
         // An index `find` would take for `tenant == x` doesn't hold
         // `tries`: the compound one that does is read instead.
         tasks.ensure_index("tenant").unwrap();
-        let average = Aggregate::new().avg("tries", "avg");
+        let average = Aggregate::new().avg("tries").named("avg");
         let r = run(Filter::new().eq("tenant", "t1"), &average);
         assert_eq!(
             r.plan,
@@ -10764,7 +10780,7 @@ mod tests {
         assert_eq!(
             run(
                 Filter::new().eq("status", "Done").limit(20),
-                &Aggregate::new().count("n")
+                &Aggregate::new().count().named("n")
             )
             .stats
             .documents_returned,

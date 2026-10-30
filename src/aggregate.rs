@@ -21,12 +21,9 @@ use std::collections::BTreeMap;
 ///
 /// let per_status = Aggregate::new()
 ///     .group_by("status")
-///     // A column named "n": how many documents the group has.
-///     .count("n")
-///     // A column named "average_tries": the mean of `tries`.
-///     .avg("tries", "average_tries")
-///     // A column named "newest": the largest `created`.
-///     .max("created", "newest")
+///     .count().named("n")
+///     .avg("tries").named("average_tries")
+///     .max("created").named("newest")
 ///     // Rows whose column "n" is over 10.
 ///     .having(Condition::gt("n", 10))
 ///     .sort_desc("n")
@@ -35,10 +32,11 @@ use std::collections::BTreeMap;
 /// ```
 ///
 /// Each row holds its group's values at their paths, then each column
-/// in the order added, and no `_id`. A column's `name` is the key its
-/// value gets in the row, as SQL's `AS` names a column: in
-/// `count("n")`, `"n"` names; it doesn't say which documents count. Without `group_by`, every match is
-/// one group, and there is one row even for no matches.
+/// in the order added, and no `_id`. A column is added by what it
+/// computes, then `named` (an [`UnnamedColumn`]): the name is the key
+/// its value gets in the row, as SQL's `AS` names a column. Without
+/// `group_by`, every match is one group, and there is one row even for
+/// no matches.
 ///
 /// - **Groups:** a missing field groups with `null` (SPEC §32); values a
 ///   filter finds equal are one group (`5` and `5.0`); values no
@@ -68,8 +66,6 @@ pub struct Aggregate {
     /// `having`, the row sort, skip and limit: what a filter does to
     /// documents, done to the rows.
     pub(crate) rows: Filter,
-    /// Whether `filter` was called before any column (SPEC §126.2).
-    pub(crate) filter_without_column: bool,
 }
 
 /// One column of a row.
@@ -93,6 +89,77 @@ pub(crate) enum Kind {
     Avg,
 }
 
+/// A column of an [`Aggregate`] that has no name yet (SPEC §134):
+/// `count()`, `sum(path)`, `min(path)`, `max(path)` or `avg(path)`,
+/// then `filter` if only some of the group's documents count, and
+/// `named` last, which adds it and hands the `Aggregate` back. SQL
+/// writes it in the same order: `count(*) FILTER (WHERE …) AS n`.
+///
+/// ```
+/// use trunkdb::query::{Aggregate, Condition};
+///
+/// let per_team = Aggregate::new()
+///     .group_by("team")
+///     .count().named("tasks")
+///     .count().filter(Condition::eq("status", "open")).named("open_tasks")
+///     .avg("hours").named("mean_hours");
+/// # let _ = per_team;
+/// ```
+///
+/// A column without a name doesn't compile, as it isn't an
+/// `Aggregate` yet:
+///
+/// ```compile_fail,E0599
+/// use trunkdb::query::Aggregate;
+///
+/// let per_team = Aggregate::new().group_by("team").count().sum("hours");
+/// ```
+///
+/// Nor does a condition with no column before it:
+///
+/// ```compile_fail,E0599
+/// use trunkdb::query::{Aggregate, Condition};
+///
+/// let open = Aggregate::new().filter(Condition::eq("status", "open"));
+/// ```
+#[must_use = "a column is added to the aggregate only once it is `named`"]
+#[derive(Debug, Clone)]
+pub struct UnnamedColumn {
+    aggregate: Aggregate,
+    kind: Kind,
+    path: Option<String>,
+    condition: Option<Condition>,
+}
+
+impl UnnamedColumn {
+    /// Lets this column take in only the documents that meet
+    /// `condition` (SPEC §126). It filters this one column, not the
+    /// aggregate: the other columns, and the groups, still see every
+    /// document the filter finds. SQL's `count(*) FILTER (WHERE ...)`.
+    /// Called again, the conditions are ANDed.
+    pub fn filter(mut self, condition: Condition) -> Self {
+        self.condition = Some(match self.condition.take() {
+            None => condition,
+            Some(earlier) => Condition::all([earlier, condition]),
+        });
+        self
+    }
+
+    /// Adds the column to the aggregate, under `name`, and hands the
+    /// aggregate back. `name` is the key the value gets in each row, as
+    /// SQL's `AS` names a column; `having` and the row sort refer to it.
+    pub fn named(self, name: impl Into<String>) -> Aggregate {
+        let mut aggregate = self.aggregate;
+        aggregate.columns.push(Column {
+            name: name.into(),
+            kind: self.kind,
+            path: self.path,
+            condition: self.condition,
+        });
+        aggregate
+    }
+}
+
 impl Aggregate {
     /// Every match one group, no columns yet.
     pub fn new() -> Self {
@@ -106,87 +173,41 @@ impl Aggregate {
         self
     }
 
-    /// A column named `name`: how many documents the group has.
-    ///
-    /// `name` is only the key the count gets in the row (SQL's
-    /// `count(*) AS name`), not a field or a value to match:
-    /// `.count("n")` gives `{"n": 340}` for a group of 340.
-    pub fn count(self, name: impl Into<String>) -> Self {
-        self.column(Kind::Count, None, name)
+    /// A column counting the group's documents, to be `named`:
+    /// `.count().named("n")` gives `{"n": 340}` for a group of 340.
+    pub fn count(self) -> UnnamedColumn {
+        self.column(Kind::Count, None)
     }
 
-    /// A column named `name`: the sum of the numbers at `path`.
-    ///
-    /// `path` is the field read; `name` only the key the sum gets in the
-    /// row (SQL's `sum(path) AS name`): `.sum("tries", "total")` gives
-    /// `{"total": 1234}`.
-    pub fn sum(self, path: impl Into<String>, name: impl Into<String>) -> Self {
-        self.column(Kind::Sum, Some(path.into()), name)
+    /// A column summing the numbers at `path`, to be `named`:
+    /// `.sum("tries").named("total")` gives `{"total": 1234}`, as SQL's
+    /// `sum(tries) AS total`.
+    pub fn sum(self, path: impl Into<String>) -> UnnamedColumn {
+        self.column(Kind::Sum, Some(path.into()))
     }
 
-    /// A column named `name`: the smallest value at `path`.
-    ///
-    /// `path` is the field read; `name` only the key the value gets in
-    /// the row (SQL's `min(path) AS name`).
-    pub fn min(self, path: impl Into<String>, name: impl Into<String>) -> Self {
-        self.column(Kind::Min, Some(path.into()), name)
+    /// A column of the smallest value at `path`, to be `named`.
+    pub fn min(self, path: impl Into<String>) -> UnnamedColumn {
+        self.column(Kind::Min, Some(path.into()))
     }
 
-    /// A column named `name`: the largest value at `path`.
-    ///
-    /// `path` is the field read; `name` only the key the value gets in
-    /// the row (SQL's `max(path) AS name`).
-    pub fn max(self, path: impl Into<String>, name: impl Into<String>) -> Self {
-        self.column(Kind::Max, Some(path.into()), name)
+    /// A column of the largest value at `path`, to be `named`.
+    pub fn max(self, path: impl Into<String>) -> UnnamedColumn {
+        self.column(Kind::Max, Some(path.into()))
     }
 
-    /// A column named `name`: the average of the numbers at `path`.
-    ///
-    /// `path` is the field read; `name` only the key the average gets in
-    /// the row (SQL's `avg(path) AS name`).
-    pub fn avg(self, path: impl Into<String>, name: impl Into<String>) -> Self {
-        self.column(Kind::Avg, Some(path.into()), name)
+    /// A column of the average of the numbers at `path`, to be `named`.
+    pub fn avg(self, path: impl Into<String>) -> UnnamedColumn {
+        self.column(Kind::Avg, Some(path.into()))
     }
 
-    fn column(mut self, kind: Kind, path: Option<String>, name: impl Into<String>) -> Self {
-        self.columns.push(Column {
-            name: name.into(),
+    fn column(self, kind: Kind, path: Option<String>) -> UnnamedColumn {
+        UnnamedColumn {
+            aggregate: self,
             kind,
             path,
             condition: None,
-        });
-        self
-    }
-
-    /// Lets the column added last take in only the documents that meet
-    /// `condition` (SPEC §126). It filters that one column, not the
-    /// aggregate: the other columns, and the groups, still see every
-    /// document the filter finds. SQL's `count(*) FILTER (WHERE ...)`.
-    /// Called again for the same column, the conditions are ANDed.
-    ///
-    /// ```
-    /// use trunkdb::query::{Aggregate, Condition};
-    ///
-    /// let per_team = Aggregate::new()
-    ///     .group_by("team")
-    ///     // A column named "tasks": every task of the team.
-    ///     .count("tasks")
-    ///     // A column named "open_tasks": only those whose status is "open".
-    ///     .count("open_tasks")
-    ///     .filter(Condition::eq("status", "open"));
-    /// # let _ = per_team;
-    /// ```
-    pub fn filter(mut self, condition: Condition) -> Self {
-        match self.columns.last_mut() {
-            Some(column) => {
-                column.condition = Some(match column.condition.take() {
-                    None => condition,
-                    Some(earlier) => Condition::all([earlier, condition]),
-                });
-            }
-            None => self.filter_without_column = true,
         }
-        self
     }
 
     /// Keeps only the rows `condition` matches, by column name and group
@@ -263,11 +284,6 @@ impl Aggregate {
         let refuse = |why: String| -> crate::Result<()> {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why).into())
         };
-        if self.filter_without_column {
-            return refuse(
-                "`filter` before any column: it filters the column added last".to_string(),
-            );
-        }
         let firsts: Vec<&str> = self.group_by.iter().map(|p| first_step(p)).collect();
         let paths = self
             .group_by
@@ -1028,17 +1044,23 @@ mod tests {
         let long = || Condition::gte("hours", 4);
         let per_team = Aggregate::new()
             .group_by("team")
-            .count("tasks")
-            .count("open_tasks")
+            .count()
+            .named("tasks")
+            .count()
             .filter(open())
-            .sum("hours", "open_hours")
+            .named("open_tasks")
+            .sum("hours")
             .filter(open())
-            .avg("hours", "mean_long")
+            .named("open_hours")
+            .avg("hours")
             .filter(long())
-            .min("hours", "least_long")
+            .named("mean_long")
+            .min("hours")
             .filter(long())
-            .max("hours", "most_open")
-            .filter(open());
+            .named("least_long")
+            .max("hours")
+            .filter(open())
+            .named("most_open");
         assert_eq!(
             rows(&per_team, all.clone()),
             [
@@ -1051,27 +1073,32 @@ mod tests {
         );
 
         // Two `filter`s on one column are ANDed; the column before keeps
-        // its own.
+        // its own. Either condition alone counts more: 2 open, 3 short.
         let both = Aggregate::new()
-            .count("open")
+            .count()
             .filter(open())
-            .count("open_and_long")
+            .named("open")
+            .count()
             .filter(open())
-            .filter(Condition::gt("hours", 5));
+            .filter(Condition::lt("hours", 5))
+            .named("open_and_short");
         assert_eq!(
             rows(&both, all.clone()),
-            [r#"{"open":2,"open_and_long":1}"#]
+            [r#"{"open":2,"open_and_short":1}"#]
         );
 
         // Missing and null as a filter has them (SPEC §32), arrays through
         // `[*]`, a field no group or other column names.
         let fields = Aggregate::new()
-            .count("no_status")
+            .count()
             .filter(Condition::is_null("status"))
-            .count("null_hours")
+            .named("no_status")
+            .count()
             .filter(Condition::is_null("hours"))
-            .count("tagged_x")
-            .filter(Condition::eq("tags[*]", "x"));
+            .named("null_hours")
+            .count()
+            .filter(Condition::eq("tags[*]", "x"))
+            .named("tagged_x");
         assert_eq!(
             rows(&fields, all.clone()),
             [r#"{"no_status":1,"null_hours":1,"tagged_x":2}"#]
@@ -1098,7 +1125,7 @@ mod tests {
             r#"{"g":[2,1]}"#,
             r#"{"g":[1,2]}"#,
         ]);
-        let by_g = Aggregate::new().group_by("g").count("n");
+        let by_g = Aggregate::new().group_by("g").count().named("n");
         // Null (and missing) first, numbers, strings, unordered last.
         assert_eq!(
             rows(&by_g, all.clone()),
@@ -1121,7 +1148,11 @@ mod tests {
             r#"{"o":{"p":1,"q":"y"}}"#,
             r#"{"o":{"p":1,"q":"x"}}"#,
         ]);
-        let by_o = Aggregate::new().group_by("o.q").group_by("o.p").count("n");
+        let by_o = Aggregate::new()
+            .group_by("o.q")
+            .group_by("o.p")
+            .count()
+            .named("n");
         assert_eq!(
             rows(&by_o, nested),
             [
@@ -1157,11 +1188,16 @@ mod tests {
             r#"{"v":[9]}"#,
         ]);
         let columns = Aggregate::new()
-            .count("n")
-            .sum("v", "sum")
-            .avg("v", "avg")
-            .min("v", "min")
-            .max("v", "max");
+            .count()
+            .named("n")
+            .sum("v")
+            .named("sum")
+            .avg("v")
+            .named("avg")
+            .min("v")
+            .named("min")
+            .max("v")
+            .named("max");
         assert_eq!(
             rows(&columns, all),
             [r#"{"n":6,"sum":3,"avg":1.5,"min":1,"max":"text"}"#]
@@ -1173,13 +1209,14 @@ mod tests {
         );
         // Values nothing orders count only where nothing else is there.
         let unordered = docs(&[r#"{"v":[2]}"#, r#"{"v":[1]}"#]);
-        let extremes = Aggregate::new().min("v", "min").max("v", "max");
+        let extremes = Aggregate::new().min("v").named("min").max("v").named("max");
         assert_eq!(rows(&extremes, unordered), [r#"{"min":[2],"max":[2]}"#]);
         // Equal extremes: the first document's by id.
         let equal = docs(&[r#"{"v":5.0}"#, r#"{"v":5}"#]);
         assert_eq!(rows(&extremes, equal), [r#"{"min":5.0,"max":5.0}"#]);
         // Sums: `Int` while every value is one and the total fits.
-        let sum = |lines: &[&str]| rows(&Aggregate::new().sum("v", "s"), docs(lines))[0].clone();
+        let sum =
+            |lines: &[&str]| rows(&Aggregate::new().sum("v").named("s"), docs(lines))[0].clone();
         assert_eq!(sum(&[r#"{"v":2}"#, r#"{"v":3}"#]), r#"{"s":5}"#);
         assert_eq!(sum(&[r#"{"v":2}"#, r#"{"v":0.5}"#]), r#"{"s":2.5}"#);
         assert_eq!(sum(&[r#"{"v":2.5}"#, r#"{"v":2.5}"#]), r#"{"s":5.0}"#);
@@ -1367,7 +1404,7 @@ mod tests {
         assert_eq!(mean(&[f64::INFINITY, 1.0]), f64::INFINITY);
         assert!(mean(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
         // Through `Aggregate`, as the robustness review asked it.
-        let aggregate = Aggregate::new().avg("n", "mean");
+        let aggregate = Aggregate::new().avg("n").named("mean");
         let docs = docs(&[r#"{"n": 1e308}"#, r#"{"n": 1e308}"#]);
         assert_eq!(rows(&aggregate, docs), [r#"{"mean":1e+308}"#]);
     }
@@ -1383,7 +1420,14 @@ mod tests {
             r#"{"t":"c","v":2}"#,
             r#"{"t":"c","v":2}"#,
         ]);
-        let per_t = || Aggregate::new().group_by("t").count("n").sum("v", "total");
+        let per_t = || {
+            Aggregate::new()
+                .group_by("t")
+                .count()
+                .named("n")
+                .sum("v")
+                .named("total")
+        };
         assert_eq!(
             rows(&per_t().having(Condition::gte("n", 2)), all.clone()),
             [
@@ -1421,29 +1465,40 @@ mod tests {
             }
             err.to_string()
         };
-        assert!(refused(Aggregate::new().count("n").count("n")).contains("two columns"));
         assert!(
-            refused(Aggregate::new().filter(Condition::eq("s", 1)).count("n"))
-                .contains("before any column")
+            refused(Aggregate::new().count().named("n").count().named("n")).contains("two columns")
         );
-        assert!(refused(Aggregate::new().group_by("t").count("t")).contains("as a group field"));
-        assert!(refused(Aggregate::new().group_by("t.x").count("t")).contains("as a group field"));
-        assert!(refused(Aggregate::new().count("")).contains("plain name"));
-        assert!(refused(Aggregate::new().count("a.b")).contains("plain name"));
+        assert!(
+            refused(Aggregate::new().group_by("t").count().named("t")).contains("as a group field")
+        );
+        assert!(
+            refused(Aggregate::new().group_by("t.x").count().named("t"))
+                .contains("as a group field")
+        );
+        assert!(refused(Aggregate::new().count().named("")).contains("plain name"));
+        assert!(refused(Aggregate::new().count().named("a.b")).contains("plain name"));
         assert!(refused(Aggregate::new().group_by("tags[*]")).contains("[*]"));
-        assert!(refused(Aggregate::new().sum("", "s")).contains("name a field"));
+        assert!(refused(Aggregate::new().sum("").named("s")).contains("name a field"));
         assert!(
             refused(Aggregate::new().group_by("a").group_by("a.b")).contains("one in the other")
         );
         assert!(refused(Aggregate::new().group_by("a").group_by("a")).contains("one in the other"));
-        assert!(refused(Aggregate::new().count("n").sort_asc("m")).contains("`m` is no column"));
         assert!(
-            refused(Aggregate::new().count("n").having(Condition::eq("v", 1)))
-                .contains("`v` is no")
+            refused(Aggregate::new().count().named("n").sort_asc("m")).contains("`m` is no column")
+        );
+        assert!(
+            refused(
+                Aggregate::new()
+                    .count()
+                    .named("n")
+                    .having(Condition::eq("v", 1))
+            )
+            .contains("`v` is no")
         );
         Aggregate::new()
             .group_by("a.b")
-            .count("n")
+            .count()
+            .named("n")
             .sort_desc("a.b")
             .apply(Vec::new())
             .unwrap();

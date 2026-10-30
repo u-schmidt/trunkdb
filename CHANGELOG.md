@@ -688,3 +688,17 @@ limit, batches and a write-ahead log. Since then:
     in sort order is walked as far as the run read. The run's own
     numbers don't change. `trunkdb find --explain` adds an `instead:`
     line for each.
+
+107. **Aggregate columns, named last** (§134), breaking. A column says
+    what it computes, then its name: `count().named("n")`,
+    `sum("tries").named("total")`, and the same for `min`, `max` and
+    `avg`. `count("open")` read as what is counted, as SQL, LINQ, Spark
+    and Polars write `count(x)`. Until `named`, a column is an
+    `UnnamedColumn`, with `filter` for its condition (§126), given
+    before the name: `count().filter(c).named("open")`.
+    `Aggregate::filter` is gone. A column without a name, or a `filter`
+    before any column, no longer compiles; the latter was refused when
+    the aggregate ran. To adapt: `count("n")` becomes
+    `count().named("n")`, `sum("a", "n")` becomes `sum("a").named("n")`,
+    and a column's `.filter(c)` moves before its `.named(..)`. Files and
+    results don't change.

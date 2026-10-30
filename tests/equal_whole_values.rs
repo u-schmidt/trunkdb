@@ -237,7 +237,10 @@ fn equal_values_are_one_group() {
     let (_db, c) = things(&dir);
     for (field, groups) in [("meta", 3), ("tags", 3), ("bin", 3), ("items", 4)] {
         let rows = c
-            .aggregate(Filter::new(), &Aggregate::new().group_by(field).count("n"))
+            .aggregate(
+                Filter::new(),
+                &Aggregate::new().group_by(field).count().named("n"),
+            )
             .unwrap();
         assert_eq!(rows.len(), groups, "{field}: {rows:?}");
         // Each group's `=` finds what it counted (§107.2, §124.4).
@@ -257,7 +260,7 @@ fn equal_values_are_one_group() {
     let rows = c
         .aggregate(
             Filter::new().and(r#"name in ("a", "b")"#.parse().unwrap()),
-            &Aggregate::new().group_by("meta").count("n"),
+            &Aggregate::new().group_by("meta").count().named("n"),
         )
         .unwrap();
     let Document::Object(fields) = &rows[0] else {
