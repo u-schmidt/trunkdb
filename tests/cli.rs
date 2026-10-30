@@ -648,6 +648,23 @@ fn find_explain_says_how_it_found_them() {
          answered from index entries: 1\n"
     );
 
+    // A hint (SPEC §132): the plan it asked for, said so.
+    let text = explained(&["find", &db, "users", "age > 40 use no index", "--explain"]);
+    assert!(
+        text.starts_with("plan: scan of every document, as hinted\n"),
+        "{text}"
+    );
+    let output = trunkdb(&["find", &db, "users", "age > 40 use index name"]);
+    assert_eq!(
+        (output.status.code(), stdout(&output)),
+        (Some(1), String::new())
+    );
+    assert!(
+        stderr(&output).contains("no such index"),
+        "{}",
+        stderr(&output)
+    );
+
     // Its mistakes are `find`'s.
     let output = trunkdb(&["find", &db, "users", "age >", "--explain"]);
     assert_eq!(

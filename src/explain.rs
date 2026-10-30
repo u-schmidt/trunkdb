@@ -11,6 +11,9 @@ use std::time::Duration;
 pub struct Explained {
     /// What `explain` says for the same filter, on the same snapshot.
     pub plan: QueryPlan,
+    /// The plan is the one the filter's hint asked for (SPEC §132):
+    /// `Filter::use_index` or `Filter::no_index`, not the planner's rules.
+    pub hinted: bool,
     /// The index reads, in the order they ran.
     pub reads: Vec<IndexRead>,
     /// How the results were put in order; `None` without a sort.
@@ -149,6 +152,7 @@ impl Trace {
         let reads = self.reads.into_inner();
         Explained {
             plan,
+            hinted: false,
             stats: ExecutionStats {
                 keys_examined: reads.iter().map(|read| read.entries).sum(),
                 documents_examined: self.examined.get(),

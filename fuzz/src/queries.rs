@@ -1482,9 +1482,81 @@ impl Run<'_> {
         };
         let context = format!("{} via {:?}", self.at(), explained.plan);
         answers.agree(query, &expected, &self.model, &context);
+        self.read_hinted(query, &expected);
         for at in 0..self.snapshots.len() {
             self.read_snapshot(at, query);
         }
+    }
+
+    /// The same read under a hint (SPEC §132): no index, the primary
+    /// one, or any of `INDEXES`, made or not. A hint chooses how, never
+    /// which: the same answers — or, where it can't be followed,
+    /// `Error::Hint` from every read alike.
+    fn read_hinted(&mut self, query: &Query, expected: &[Document]) {
+        let choice = self.program.below(INDEXES.len() + 2);
+        let hint = |filter: Filter| match choice {
+            0 => filter.no_index(),
+            1 => filter.use_index("_id"),
+            at => filter.use_index(INDEXES[at - 2]),
+        };
+        let hinted = hint(query.filter());
+        let text = hinted.to_string();
+        let from_text: Filter = text
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: {text}: {e}", self.at()));
+        assert_eq!(from_text.to_string(), text, "{}", self.at());
+        let docs = self.docs();
+        let typed = self.db().collection::<IdOnly>(COLLECTION);
+        let explained = match docs.explain_run(hinted.clone()) {
+            Ok(explained) => explained,
+            Err(Error::Hint { .. }) => {
+                let refused = |result: Result<(), Error>| matches!(result, Err(Error::Hint { .. }));
+                assert!(
+                    refused(docs.explain(&hinted).map(drop))
+                        && refused(docs.find(hinted.clone()).map(drop))
+                        && refused(typed.find(from_text).map(drop))
+                        && refused(docs.cursor(hinted.clone()).map(drop))
+                        && refused(docs.count(hinted.clone()).map(drop)),
+                    "{}: {text} refused by explain_run only",
+                    self.at()
+                );
+                // `find_one` reads its filter with a limit of one, which
+                // a walk in sort order can follow where no limit can't.
+                let first = hint(query.first());
+                assert_eq!(
+                    refused(docs.find_one(hinted.clone()).map(drop)),
+                    refused(docs.explain(&first).map(drop)),
+                    "{}: find_one of {text}",
+                    self.at()
+                );
+                self.ran.plans.insert("refused hint".to_string());
+                return;
+            }
+            Err(e) => panic!("{}: {text}: {e}", self.at()),
+        };
+        assert!(explained.hinted, "{}: {text}", self.at());
+        self.ran
+            .plans
+            .insert(format!("hinted {}", plan_name(&explained.plan)));
+        let answers = Answers {
+            find: docs.find(hinted.clone()).unwrap(),
+            typed: typed
+                .find(from_text)
+                .unwrap()
+                .into_iter()
+                .map(|d| d.id)
+                .collect(),
+            cursor: docs
+                .cursor(hinted.clone())
+                .unwrap()
+                .map(Result::unwrap)
+                .collect(),
+            one: docs.find_one(hinted.clone()).unwrap(),
+            count: docs.count(hinted).unwrap(),
+            returned: explained.stats.documents_returned as usize,
+        };
+        let context = format!("{}, {text}, via {:?}", self.at(), explained.plan);
+        answers.agree(query, expected, &self.model, &context);
     }
 
     /// Rule 2 on a kept snapshot, against the model as it was.

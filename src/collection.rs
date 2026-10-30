@@ -372,7 +372,9 @@ impl<T> Collection<T> {
     /// primary index, or ranges of secondary indexes.
     pub fn explain(&self, filter: &Filter) -> crate::Result<QueryPlan> {
         let state = self.read()?;
-        Ok(plan_for(filter, state.catalog().indexes(&self.name)))
+        let indexes = state.catalog().indexes(&self.name);
+        follow_hint(&self.name, filter, indexes)?;
+        Ok(plan_for(filter, indexes))
     }
 
     /// Runs `filter` as `find` does and says how (SPEC §94): the plan,
@@ -461,7 +463,9 @@ impl<T> Collection<T> {
         let (rows, plan) = aggregate_in(
             at.catalog, &at.store, &self.name, &filter, aggregate, &trace,
         )?;
-        Ok(trace.explained(plan, None, None, rows.len(), started.elapsed()))
+        let mut explained = trace.explained(plan, None, None, rows.len(), started.elapsed());
+        explained.hinted = filter.hint.is_some();
+        Ok(explained)
     }
 
     /// Runs `filter` as `find` does and says how it ran (SPEC §94): the
@@ -473,6 +477,7 @@ impl<T> Collection<T> {
         let state = self.read()?;
         let at = state.snapshot();
         let indexes = at.catalog.indexes(&self.name);
+        follow_hint(&self.name, &filter, indexes)?;
         let plan = plan_for(&filter, indexes);
         let sort = match filter.sort.len() {
             0 => None,
@@ -495,13 +500,15 @@ impl<T> Collection<T> {
             select.as_ref(),
             &trace,
         )?;
-        Ok(trace.explained(
+        let mut explained = trace.explained(
             plan,
             sort,
             filter.select.clone(),
             found.len(),
             started.elapsed(),
-        ))
+        );
+        explained.hinted = filter.hint.is_some();
+        Ok(explained)
     }
 }
 
@@ -912,13 +919,13 @@ impl Collection<Document> {
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
         let state = self.read()?;
         let at = state.snapshot();
-        Ok(count_matches(
+        count_matches(
             at.catalog,
             &at.store,
             &self.name,
             &filter,
             &Trace::default(),
-        )?)
+        )
     }
 
     /// A streaming `find`: yields matches one at a time, holding only
@@ -954,6 +961,7 @@ impl Collection<Document> {
         };
         let state = kept.read()?;
         let at = state.snapshot();
+        follow_hint(&self.name, &filter, at.catalog.indexes(&self.name))?;
         let (entries, indexed) = candidate_entries(
             at.catalog,
             &at.store,
@@ -1004,6 +1012,7 @@ impl Collection<Document> {
     pub fn upsert(&self, filter: Filter, doc: Document) -> crate::Result<Upserted> {
         let id_if_new = id_for_insert(&self.db, &doc);
         self.db.transact(|catalog, store| {
+            follow_hint(&self.name, &filter, catalog.indexes(&self.name))?;
             let names = filter.fields_with(false);
             let trace = Trace::default();
             let matcher = filter.matcher();
@@ -1099,6 +1108,28 @@ fn plan_for(filter: &Filter, indexes: &[IndexMeta]) -> QueryPlan {
     }
 }
 
+/// Refuses a hint the plan can't follow (SPEC §132.3), before anything
+/// is read: an index the collection lacks, or one the rules, offered it
+/// alone, would not read — a scan instead. Every read checks here, so
+/// that each refuses what `explain` refuses.
+fn follow_hint(collection: &str, filter: &Filter, indexes: &[IndexMeta]) -> crate::Result<()> {
+    let Some(index) = filter.hinted_index() else {
+        return Ok(());
+    };
+    let reason = if index != crate::document::ID_FIELD && filter.offered(indexes).is_empty() {
+        "the collection has no such index"
+    } else if plan_for(filter, indexes) == QueryPlan::Scan {
+        "the filter has no condition it can bound, and no sort with a limit it can give the order of"
+    } else {
+        return Ok(());
+    };
+    Err(crate::Error::Hint {
+        collection: collection.to_string(),
+        index,
+        reason: reason.to_string(),
+    })
+}
+
 /// Every match with its id, against a catalog and store the caller
 /// has locked — for a read, or inside a write batch (`delete_many`).
 /// What it read and matched goes to `trace` (SPEC §94.3).
@@ -1112,6 +1143,7 @@ fn find_in(
     trace: &Trace,
 ) -> crate::Result<Vec<Found>> {
     let indexes = catalog.indexes(collection);
+    follow_hint(collection, filter, indexes)?;
     let mut records = data::Records::new(store);
     if let Some(order) = filter.index_order(indexes) {
         // The skipped matches are passed over by the walk (SPEC §72),
@@ -1365,11 +1397,9 @@ fn candidate_entries<'a>(
                 // One range of an index with one key per document holds
                 // each once; several ranges, or a multikey index, may
                 // hold one several times.
-                let multikey = ranges[0]
-                    .index
-                    .fields
-                    .iter()
-                    .any(|f| crate::query::is_multi(f));
+                let multikey = ranges
+                    .first()
+                    .is_some_and(|r| r.index.fields.iter().any(|f| crate::query::is_multi(f)));
                 let once = ranges.len() == 1 && !multikey;
                 let mut seen = std::collections::HashSet::new();
                 let mut entries = Vec::new();
@@ -1974,7 +2004,8 @@ fn count_matches(
     collection: &str,
     filter: &Filter,
     trace: &Trace,
-) -> std::io::Result<usize> {
+) -> crate::Result<usize> {
+    follow_hint(collection, filter, catalog.indexes(collection))?;
     let count = match count_in(catalog, store, collection, filter)? {
         Some(count) => count,
         None => {
@@ -2014,6 +2045,7 @@ fn aggregate_in(
 ) -> crate::Result<(Vec<Document>, QueryPlan)> {
     aggregate.check()?;
     let indexes = catalog.indexes(collection);
+    follow_hint(collection, filter, indexes)?;
     let mut groups = Groups::new(aggregate);
     // Counts alone, of every match: `count`'s.
     let counts_only = aggregate.columns.iter().all(|c| c.kind == Kind::Count);
@@ -2113,7 +2145,8 @@ fn aggregate_by_entries(
             && (conditions.iter().flatten())
                 .all(|condition| Covering::new(condition, Some(index), false).is_some())
     };
-    let indexes = catalog.indexes(collection);
+    // Among those the hint leaves (SPEC §132.2).
+    let indexes = filter.offered(catalog.indexes(collection));
     // Only an index that holds every path can answer: the planner is
     // offered those, so `tenant == x` averaging `tries` reads `(tenant,
     // tries)` rather than the `tenant` index `find` would take.
@@ -4923,6 +4956,7 @@ mod tests {
             skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
             select: None,
+            hint: None,
         }
     }
 
@@ -5296,6 +5330,7 @@ mod tests {
             skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
             select: None,
+            hint: None,
         }
     }
 

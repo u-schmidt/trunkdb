@@ -327,6 +327,19 @@ pub struct Filter {
     /// The paths a read hands out, besides `_id` (SPEC §106); `None`:
     /// whole documents.
     pub(crate) select: Option<Vec<String>>,
+    /// Which index to read, where the planner's rules would choose
+    /// another (SPEC §132); `None`: the rules choose.
+    pub(crate) hint: Option<Hint>,
+}
+
+/// A filter's hint (SPEC §132): `Filter::use_index`, `Filter::no_index`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Hint {
+    /// The index on these fields, as `ensure_index` takes them; `["_id"]`
+    /// for the primary index.
+    Index(Vec<String>),
+    /// No index: every document is read.
+    NoIndex,
 }
 
 /// Building a filter one call at a time (SPEC §35) — every condition is
@@ -572,6 +585,88 @@ impl Filter {
     pub(crate) fn selection(&self) -> Option<Selection> {
         let selection = Selection::new(self.select.as_ref()?.iter().map(String::as_str));
         (!selection.is_whole()).then_some(selection)
+    }
+
+    /// Reads the index on `fields`, where the planner's rules would read
+    /// another or none (SPEC §132): SQL Server's `WITH (INDEX(...))`.
+    /// `fields` as `ensure_index` takes them, `"status"` or `["status",
+    /// "created"]`; `"_id"` for the primary index, which lookups by id
+    /// and a sort by `_id` read.
+    ///
+    /// ```
+    /// use trunkdb::query::Filter;
+    ///
+    /// // 99% of the documents are "done": the few since yesterday are
+    /// // fewer, but the rules take the `Eq` (SPEC §28.4).
+    /// # let yesterday = 0;
+    /// let recent = Filter::new()
+    ///     .eq("status", "done")
+    ///     .gt("created", yesterday)
+    ///     .use_index("created");
+    /// # let _ = recent;
+    /// ```
+    ///
+    /// The plan is still the rules' among that one index: the same
+    /// ranges, the same walk in sort order (§34.2), only no other index.
+    /// What the rules would do with no index at all, they never do:
+    /// where that index can't be read for the filter — no index on
+    /// `fields`, no condition it can bound, no sort with a limit it can
+    /// give the order of — every read with this filter fails with
+    /// `Error::Hint`, and reads nothing. A hint is never quietly
+    /// dropped.
+    ///
+    /// The results are the same with any hint, or none: a hint chooses
+    /// how they are found, not which. Replaces an earlier hint.
+    pub fn use_index(mut self, fields: impl crate::IndexFields) -> Self {
+        self.hint = Some(Hint::Index(fields.into_fields()));
+        self
+    }
+
+    /// Reads every document and reads no index for the filter (SPEC
+    /// §132): not a secondary index, and not the primary index by id —
+    /// a lookup by `_id` is scanned too. Where a range or a walk in sort
+    /// order would read most of the collection, a scan costs less. Never
+    /// fails. Replaces an earlier hint.
+    pub fn no_index(mut self) -> Self {
+        self.hint = Some(Hint::NoIndex);
+        self
+    }
+
+    /// The indexes the planner may choose among, as the hint leaves them
+    /// (SPEC §132.2): every one without a hint, the hinted one alone, or
+    /// none. A slice of `indexes`, so narrowing twice is narrowing once.
+    pub(crate) fn offered<'a>(&self, indexes: &'a [IndexMeta]) -> &'a [IndexMeta] {
+        match &self.hint {
+            None => indexes,
+            Some(Hint::NoIndex) => &[],
+            Some(Hint::Index(fields)) => match indexes.iter().position(|i| i.fields == *fields) {
+                Some(at) => &indexes[at..=at],
+                None => &[],
+            },
+        }
+    }
+
+    /// Whether the planner may read the primary index for the filter,
+    /// to look up ids or walk in `_id` order: without a hint, or hinted
+    /// to it (SPEC §132.2). A scan reads it whatever the hint.
+    fn primary_offered(&self) -> bool {
+        match &self.hint {
+            None => true,
+            Some(Hint::NoIndex) => false,
+            Some(Hint::Index(fields)) => fields.len() == 1 && fields[0] == ID_FIELD,
+        }
+    }
+
+    /// The index the hint names, as `Collection::indexes` names it —
+    /// `None` without one, or for `no_index`.
+    pub(crate) fn hinted_index(&self) -> Option<String> {
+        match &self.hint {
+            Some(Hint::Index(fields)) => Some(match &fields[..] {
+                [single] => single.clone(),
+                fields => format!("({})", fields.join(", ")),
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -1164,6 +1259,9 @@ impl Filter {
     /// the whole filter, so an id that doesn't exist, or whose document
     /// fails another condition, is no match.
     pub(crate) fn ids(&self) -> Option<Vec<DocId>> {
+        if !self.primary_offered() {
+            return None; // hinted elsewhere (SPEC §132.2)
+        }
         let mut ids = ids_for_all(&self.conditions)?;
         ids.sort_unstable();
         ids.dedup();
@@ -1177,6 +1275,12 @@ impl Filter {
     /// the filter rejects, never the other way around; the same document
     /// may be in several.
     pub(crate) fn index_ranges<'a>(&self, indexes: &'a [IndexMeta]) -> Option<Vec<IndexRange<'a>>> {
+        let indexes = self.offered(indexes);
+        if indexes.is_empty() {
+            // Not even an OR of no branches, which no index bounds as
+            // well as any: with none to read, a scan (SPEC §132.2).
+            return None;
+        }
         bounds_for_all(&self.conditions, indexes).map(|b| b.ranges)
     }
 
@@ -1203,6 +1307,7 @@ impl Filter {
     /// A sort by `_id` walks the primary index (SPEC §96): see
     /// `id_order`.
     pub(crate) fn index_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
+        let indexes = self.offered(indexes);
         let sort = self.sort.first()?;
         self.limit?;
         if self.ids().is_some() {
@@ -1289,6 +1394,9 @@ impl Filter {
             .unzip();
         let on_id = ranges.into_iter().reduce(KeyRange::intersect);
         if !self.found_by_value(ID_FIELD, indexes) {
+            if !self.primary_offered() {
+                return None; // hinted to an index it can't walk (SPEC §132.2)
+            }
             return Some(OrderedRead {
                 index: None,
                 range: on_id,
@@ -3981,6 +4089,7 @@ mod tests {
             skip: 1,
             limit: Some(5),
             select: None,
+            hint: None,
         };
         // `Filter` has no `PartialEq` (a `Float` NaN isn't equal to itself).
         assert_eq!(format!("{built:?}"), format!("{spelled_out:?}"));
@@ -4382,6 +4491,7 @@ mod tests {
             skip: 0,
             limit: Some(2),
             select: None,
+            hint: None,
         };
 
         assert_eq!(

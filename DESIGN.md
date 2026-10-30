@@ -32,7 +32,8 @@ many small documents queried by time, a large-document desktop
 workload, and a small sync app that replaced MongoDB with it [§5](spec/05-reference-workloads.md).
 
 Deliberately not there: a cost-based planner (the planner follows
-fixed rules, and `explain` says which), joins, several writers at once,
+fixed rules, `explain` says which, and a hint in the query picks the
+index where the rules can't know better), joins, several writers at once,
 several processes on one file, encryption and schema validation [§6](spec/06-v0-feature-set.md).
 Aggregates were on that list; they came back in [§107](spec/107-aggregates.md).
 
@@ -345,6 +346,13 @@ what it picked (`QueryPlan`):
   equal served keys [§47](spec/47-sorting-by-several-fields.md). A sort by `_id` walks the primary index,
   whose order is `_id`'s, and `_id` comparisons with an id narrow the
   walk exactly [§96](spec/96-sorting-by-id-through-the-primary-index.md).
+
+**A hint** names the index where the rules, blind to the data, pick
+the wrong one [§132](spec/132-a-hint-in-the-query.md): `use_index(fields)`, or `no_index()` to scan.
+The rules then choose among that index alone, so the plan is still a
+function of the query and the indexes. A hint the index can't follow,
+no such index or nothing to read it by, fails every read with
+`Error::Hint`; it is never dropped quietly.
 
 A document from an index range is checked against the whole filter,
 since a range may hold more than its conditions match. Where the index

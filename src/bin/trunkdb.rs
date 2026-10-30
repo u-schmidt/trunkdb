@@ -544,7 +544,8 @@ fn explanation(explained: &trunkdb::query::Explained) -> String {
         QueryPlan::ById => "by id".to_string(),
         other => format!("{other:?}"),
     };
-    let _ = writeln!(text, "plan: {plan}");
+    let hinted = if explained.hinted { ", as hinted" } else { "" };
+    let _ = writeln!(text, "plan: {plan}{hinted}");
     for read in &explained.reads {
         let bounds = match read.bounds.as_slice() {
             [] => "the whole index".to_string(),

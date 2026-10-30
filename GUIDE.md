@@ -254,3 +254,30 @@ a number is an `Int` or a `Float`. A column's condition is decided from
 the entries too, where the index holds the fields it names.
 `explain_aggregate` says how it ran.
 
+## Telling the planner which index
+
+The planner follows fixed rules, which don't look at the data. Where
+they pick badly, say which index in the query:
+
+```rust
+// Nearly every task is "done": the rules read the whole `status = "done"`
+// range, where the few created since yesterday are a short range.
+let recent = Filter::new()
+    .eq("status", "done")
+    .gt("created", yesterday)
+    .use_index("created");
+// As text: status = "done" and created > … use index created
+```
+
+- `use_index` takes the fields as `ensure_index` does: `"created"`,
+  `["status", "created"]`. `"_id"` is the primary index.
+- `no_index()` scans every document, lookups by id too.
+- The results are the same with any hint. Only how they're found
+  changes.
+- A hint that can't be followed is `Error::Hint`, from every read:
+  there's no index on those fields, or the filter has no condition on
+  it (nor a sort with a limit it can give). Dropping an index a hint
+  names makes those reads fail, so you hear about it.
+- `explain_run` says `hinted`, and `trunkdb find … --explain` says
+  `as hinted`. Compare `keys_examined` with and without the hint before
+  keeping it.

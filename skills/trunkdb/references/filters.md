@@ -16,13 +16,21 @@ anyway: strings, `>` and `*` mean something to the shell.
 ## A query
 
 ```text
-[select <paths>] [where] [<condition>] [order by <path> [asc|desc], …] [limit <n>] [offset <n>]
+[select <paths>] [where] [<condition>] [order by <path> [asc|desc], …] [limit <n>] [offset <n>] [use index <fields> | use no index]
 ```
 
 Every part may be left out; nothing at all means every document.
 `where` is needed only after a `select`, to say where the paths end.
 Keywords can be in any case. `_id` is always handed out, selected or
 not; a selected field a document lacks is left out of its line.
+
+`use index created` (or `use index (status, created)` for a compound
+index, `use index _id` for the primary one) reads that index where the
+planner would pick another; `use no index` scans. It changes how, never
+which documents are found. A hint the index can't follow (no such
+index, no condition on it) is an error, not ignored. Reach for it only
+when `--explain` shows the planner reading far more entries than the
+query returns.
 
 ## Conditions
 

@@ -663,3 +663,16 @@ limit, batches and a write-ahead log. Since then:
     under `<database>.compact` stays where it was (§130). Files stay
     format 12 and exports as in 0.24.0, which opens what 0.25.0 writes;
     no new fixture, as nothing changes how files are written (§120.9).
+
+105. **A hint in the query** (§132). `Filter::use_index(fields)` reads
+    the index on those fields where the planner's rules would read
+    another or none: an `Eq` on a value most documents have, beside a
+    range that holds a few. `Filter::no_index()` scans, and
+    `use_index("_id")` is the primary index. The rules choose the rest
+    among that index alone. A hint that can't be followed, no such
+    index or nothing to read it by, fails every read with the new
+    `Error::Hint`, `explain` included; it is never dropped quietly.
+    `Explained::hinted` says the plan was hinted. As text, last in a
+    filter: `use index created`, `use index (status, created)`,
+    `use no index`, also for `trunkdb find`. A field named `use` is
+    still a field.

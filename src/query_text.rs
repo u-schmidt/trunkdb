@@ -5,7 +5,7 @@
 
 use crate::datetime::DateTime;
 use crate::document::{DocId, Document};
-use crate::query::{Condition, Filter, Op, Sort, SortOrder};
+use crate::query::{Condition, Filter, Hint, Op, Sort, SortOrder};
 use std::fmt::{self, Formatter, Write};
 use std::str::FromStr;
 
@@ -231,7 +231,41 @@ impl<'t> Parser<'t> {
         if self.keyword("offset") {
             filter.skip = self.count()?;
         }
+        filter.hint = self.hint()?;
         Ok(filter)
+    }
+
+    /// Whether `use index` or `use no index` is next (SPEC §132.4): two
+    /// words, so that a field named `use` stays free.
+    fn at_hint(&mut self) -> bool {
+        let start = self.at;
+        let hint = self.keyword("use") && (self.keyword("index") || self.keyword("no"));
+        self.at = start;
+        hint
+    }
+
+    /// `use index <fields>` or `use no index`, if next: `use_index` and
+    /// `no_index` (SPEC §132.4). The fields as an index is named, one
+    /// path or several in parentheses: `use index (status, created)`.
+    fn hint(&mut self) -> Parsed<Option<Hint>> {
+        if !self.at_hint() {
+            return Ok(None);
+        }
+        self.keyword("use");
+        if self.keyword("no") {
+            self.expect_keyword("index")?;
+            return Ok(Some(Hint::NoIndex));
+        }
+        self.keyword("index");
+        if !self.eat("(") {
+            return Ok(Some(Hint::Index(vec![self.path()?])));
+        }
+        let mut fields = vec![self.path()?];
+        while self.eat(",") {
+            fields.push(self.path()?);
+        }
+        self.expect(")")?;
+        Ok(Some(Hint::Index(fields)))
     }
 
     /// Nothing but the clauses after a condition left: no condition.
@@ -242,6 +276,7 @@ impl<'t> Parser<'t> {
             || ["order", "limit", "offset"]
                 .iter()
                 .any(|k| word.eq_ignore_ascii_case(k))
+            || self.at_hint()
     }
 
     /// `or` binds least, then `and`, then `not` (SPEC §111.2).
@@ -636,6 +671,22 @@ impl fmt::Display for Filter {
         }
         if self.skip > 0 {
             write!(f, "{gap}offset {}", self.skip)?;
+            gap = " ";
+        }
+        match &self.hint {
+            None => {}
+            Some(Hint::NoIndex) => write!(f, "{gap}use no index")?,
+            Some(Hint::Index(fields)) => {
+                write!(f, "{gap}use index ")?;
+                match &fields[..] {
+                    [one] => write_path(f, one)?,
+                    several => {
+                        f.write_char('(')?;
+                        write_list(f, several, |f, path| write_path(f, path))?;
+                        f.write_char(')')?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -859,6 +910,59 @@ mod tests {
             format!("{filter:?}"),
             "{text}"
         );
+    }
+
+    /// A hint last (SPEC §132.4): `use index` with a path or several in
+    /// parentheses, `use no index`; printed back as it reads.
+    #[test]
+    fn a_hint_reads_as_use_index_and_no_index() {
+        same(
+            r#"status = "done" and created > 5 use index created"#,
+            Filter::new()
+                .eq("status", "done")
+                .gt("created", 5)
+                .use_index("created"),
+        );
+        same(
+            "a = 1 order by b limit 2 offset 3 USE INDEX (a, b.c)",
+            Filter::new()
+                .eq("a", 1)
+                .sort_asc("b")
+                .limit(2)
+                .skip(3)
+                .use_index(["a", "b.c"]),
+        );
+        same("use no index", Filter::new().no_index());
+        same(
+            "select a use index `first name`",
+            Filter::new().select(["a"]).use_index("first name"),
+        );
+        for text in [
+            r#"status = "done" use index created"#,
+            "a = 1 order by b limit 2 offset 3 use index (a, b.c)",
+            "use no index",
+            "offset 3 use no index",
+            "use index _id",
+            "select a use index `first name`",
+            "tags[*] = 1 use index tags[*]",
+        ] {
+            assert_eq!(parse(text).to_string(), text);
+        }
+        // `use` without `index` or `no` after it is a field.
+        same("use = 1", Filter::new().eq("use", 1));
+        same(
+            "use = 1 use index use",
+            Filter::new().eq("use", 1).use_index("use"),
+        );
+        same(
+            "index = 1 or no = 2",
+            "index = 1 or no = 2".parse().unwrap(),
+        );
+        assert!(error("a = 1 use index").contains("expected"));
+        assert!(error("a = 1 use no").contains("expected `index`"));
+        assert!(error("a = 1 use index (a, b").contains("expected `)`"));
+        // Last, after `offset`: anywhere else it's not the end.
+        assert!(error("a = 1 use no index limit 2").contains("expected the end"));
     }
 
     #[test]

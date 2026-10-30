@@ -254,6 +254,23 @@ pub enum Error {
         /// The collection written to.
         collection: String,
     },
+    /// A filter's hint, `Filter::use_index` (SPEC §132), can't be
+    /// followed: the collection has no index on those fields, or the
+    /// index can't be read for the filter — no condition it can bound,
+    /// no sort with a limit it can give the order of. Nothing was read,
+    /// and a write was rolled back. The planner never drops a hint
+    /// quietly, as it would have to do to read anything.
+    #[non_exhaustive]
+    #[error("collection {collection:?}: the hint to use index {index} can't be followed: {reason}")]
+    Hint {
+        /// The collection read.
+        collection: String,
+        /// The hinted index, as `Collection::indexes` names it: `_id`
+        /// for the primary index.
+        index: String,
+        /// Why not, as people read it.
+        reason: String,
+    },
     /// `Database::import` found a line it can't use. Every chunk before
     /// the one holding this line was already imported (SPEC §30.3).
     #[non_exhaustive]

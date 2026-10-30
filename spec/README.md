@@ -146,3 +146,4 @@ say what changed, and DESIGN.md says what is true now.
 129. [A slot directory past the page's end (`storage/slotted.rs`)](129-a-slot-directory-past-the-pages-end.md)
 130. [Compaction's file, always a new one (`storage/scratch.rs`)](130-compactions-file-always-a-new-one.md)
 131. [A mean rounded once (`aggregate.rs`)](131-a-mean-rounded-once.md)
+132. [A hint in the query (`query.rs`, `collection.rs`, `query_text.rs`)](132-a-hint-in-the-query.md)
