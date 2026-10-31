@@ -213,21 +213,97 @@ over a window. Five steps, each useful alone, in this order:
   alone with `Error::ClosurePanicked`; `drop_collection` is a `Left`
   for each match. Hysteresis at a fence's edge and late pings stay
   with the application.
-- Live aggregates: an `Aggregate` (§107) kept as a subscription, as a
-  `Filter` above: "the mean load of the last five minutes", reported as
-  it changes, while a process reports the load every few seconds. A
-  limit is a `having` (`mean > 0.8`), and crossing it is a row coming
-  to match or no longer matching, as a fence is entered or left. Run
-  again after each commit that touches the collection, over the
-  window's range of an index on the time; five minutes of a reading
-  every five seconds is 60 documents, so incremental maintenance isn't
-  needed here either. "The last five minutes" counted back from the
-  newest reading, not from the clock: then only a commit changes the
-  result, and the same readings give the same answer. Counted back from
-  the clock, readings age out with nothing written, and a timer would
-  have to run the aggregate again: a second source of events, decided
-  only if asked for. Hysteresis at the limit, as at a fence's edge, is
-  the application's.
+- Live aggregates, next: an `Aggregate` (§107) kept as a subscription,
+  as a `Filter` is in §138: "the mean load of each server over the
+  last five minutes", reported as it changes, while each server
+  reports its load every few seconds. A limit is a `having`
+  (`mean > 0.8`), and crossing it is a row coming to match or no
+  longer matching, as a fence is entered or left. Planned:
+  ```rust
+  let load = Aggregate::new()
+      .group_by("server")
+      .avg("load").named("mean")
+      .window("at", Duration::from_secs(300))
+      .having(Condition::gt("mean", 0.8));
+  let alerts = readings.watch_aggregate(Filter::new(), load)?;
+  for event in alerts {
+      match event? {
+          LiveRow::Entered { row, .. } => { /* over the limit */ }
+          LiveRow::Left { row, .. } => { /* back under; None if gone */ }
+          LiveRow::Changed { row, .. } => { /* still over, a new mean */ }
+          _ => {}
+      }
+  }
+  ```
+  - **Run again whole inside each commit** that changes its
+    collection, under the writer's lock, against the state that commit
+    left, as §138 checks a live query: every crossing seen, in order,
+    by a reader however late. Any change to the collection, not only
+    to the documents that match: a reading that no longer matches
+    changes the result too, and its version before isn't read. Five
+    minutes of a reading every five seconds is 60 documents read
+    through an index on the time, so no incremental maintenance (DBSP,
+    TimescaleDB's continuous aggregates) is needed.
+  - **`Aggregate::window(path, duration)`, the last five minutes:** the
+    documents whose `path` is within `duration` of the newest one
+    among the filter's matches. A filter can't say it: `at >= now - 5
+    min` is fixed as it is made. Counted back from the newest reading,
+    not from the clock: then only a commit changes the result, and the
+    same readings give the same answer. Counted back from the clock,
+    readings age out with nothing written, and a timer would have to
+    run the aggregate again: a second source of events, decided only
+    if asked for.
+    - One newest for the whole aggregate, not one for each group: a
+      server gone silent ages out as the others report on, and leaves
+      the alert. With a newest of its own, its last five minutes would
+      stay for ever.
+    - The path a `DateTime` (§69); a document where it is anything
+      else is outside the window. A width on numbers can come later.
+    - Part of `Aggregate`, not of live use alone: `aggregate`,
+      `explain_aggregate` and `Aggregate::apply` take it too, so an
+      aggregate answers the same run once or live. The planner reads
+      the newest first, then the window as a condition
+      (`at >= newest - duration`), so an index on the path bounds the
+      read.
+  - **The last ten readings need nothing new:** the filter picks the
+    documents as `find` would (§107), so
+    `Filter::new().sort_desc("at").limit(10)` is a window by count,
+    once and live.
+  - **Reported by row,** a row known by its group values: `Entered`
+    for a row there now and not before; `Left` for one there before,
+    with the row as it is now if its group is still there but fails
+    the `having`, `None` if no document of the group is left;
+    `Changed` for one there before and now, with other values. First,
+    every row as `Entered`. Unlike a live query's `Changed`, only where
+    a value changed: both rows are in hand to compare.
+  - **Rows as `Document`s,** as `aggregate` hands them out. Typed rows
+    may come later.
+  - **Sort, skip and limit allowed,** the filter's and the rows':
+    the aggregate runs again whole, so "the three busiest servers" is
+    live too. A server pushed out of the three is `Left`, the one
+    taking its place `Entered`; a new order within them is no event.
+  - **`LiveAggregate`** reads as `LiveQuery` does: `recv`, `try_recv`,
+    `recv_timeout`, an `Iterator`; dropped, it ends. `LiveRow` is an
+    enum of its own, as a row has no `DocId`.
+  - As §138: a panic in a `Condition::custom` ends that live aggregate
+    alone with `Error::ClosurePanicked`, the commit standing;
+    `drop_collection` makes every row `Left` with `None`, and it goes
+    on. Hysteresis at the limit, as at a fence's edge, and readings
+    sent late are the application's.
+  - Limits: without a window, every commit to the collection runs the
+    aggregate over every match, under the writer's lock: 100,000
+    readings are 100,000 read for each commit. A window, and an index
+    on its path, are what make it cheap. A `group_by` of many groups
+    compares as many rows at each commit.
+  - Rejected: incremental maintenance (above); a window from the
+    clock (above); a `Live` reused for rows, which has a `DocId`.
+  - Later, if asked for: **a window for each group,** by count or by
+    time, "the last ten readings of each server", which neither the
+    filter's limit, counted over every group, nor one newest for the
+    whole aggregate gives. SQL's window functions:
+    `ROW_NUMBER() OVER (PARTITION BY server ORDER BY at DESC) <= 10`.
+    It matters where groups report at rates far apart; ten readings
+    in all may then be one busy server's.
 
 What the hook, live queries and live aggregates share:
 - **Kept in memory, never in the file.** A subscription is registered
