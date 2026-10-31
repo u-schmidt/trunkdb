@@ -783,3 +783,10 @@ limit, batches and a write-ahead log. Since then:
     of another's, are now a problem `Database::check` and `trunkdb
     check` report, by page, owner and slots. A page's own check on
     reading still leaves them out (§54.2). No measurable cost.
+
+114. **`mul`, `pop` and `push_all`** (§142): three more update
+    operators for `update_fields`. `mul(path, by)` multiplies a number,
+    a missing field becoming zero, as MongoDB's `$mul`;
+    `pop_first(path)` and `pop_last(path)` take an element from an end
+    of an array, a queue's next item; `push_all(path, values)` pushes
+    each value in order, `$push` with `$each`.

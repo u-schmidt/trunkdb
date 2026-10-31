@@ -1239,7 +1239,7 @@ impl Run<'_> {
         for _ in 0..1 + self.program.below(3) {
             let path = fields[self.program.below(fields.len())];
             let value = self.value();
-            update = match self.program.below(9) {
+            update = match self.program.below(13) {
                 0 => update.set(path, value),
                 1 => update.unset(path),
                 2 => update.inc(path, Document::Int(self.program.below(3) as i64)),
@@ -1248,6 +1248,10 @@ impl Run<'_> {
                 5 => update.push(path, value),
                 6 => update.pull(path, value),
                 7 => update.add_to_set(path, value),
+                8 => update.mul(path, Document::Int(self.program.below(3) as i64 - 1)),
+                9 => update.push_all(path, [value.clone(), value]),
+                10 => update.pop_first(path),
+                11 => update.pop_last(path),
                 _ => update.rename(path, fields[self.program.below(fields.len())]),
             };
         }

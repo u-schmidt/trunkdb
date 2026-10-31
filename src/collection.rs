@@ -9021,7 +9021,7 @@ mod tests {
                 let other = ["v", "t", "o.y"][rng.below(3)];
                 let number = [Document::Int(1), Document::Float(0.5)][rng.below(2)].clone();
                 let element = Document::Int(rng.below(4) as i64);
-                update = match rng.below(9) {
+                update = match rng.below(13) {
                     0 => update.set(path, random_value(&mut rng)),
                     1 => update.unset(path),
                     2 => update.inc(path, number),
@@ -9030,6 +9030,13 @@ mod tests {
                     5 if path != other => update.rename(path, other),
                     6 => update.push("t", element),
                     7 => update.add_to_set("t", element),
+                    8 => update.mul(
+                        path,
+                        [Document::Int(2), Document::Float(-0.5)][rng.below(2)].clone(),
+                    ),
+                    9 => update.push_all("t", (0..rng.below(3)).map(|i| i as i64)),
+                    10 => update.pop_first("t"),
+                    11 => update.pop_last("t"),
                     _ => update.pull("t", element),
                 };
             }
@@ -9083,6 +9090,105 @@ mod tests {
         for path in ["v", "w", "o.x", "t[*]"] {
             assert_index_agrees_with_scan(&docs, &mut rng, path);
         }
+    }
+
+    /// SPEC §142 on typed workers: jobs queued with `push_all`, taken
+    /// with `pop_first` and dropped with `pop_last`, found through a
+    /// multikey index on them; a rate multiplied, through an index on it.
+    #[test]
+    fn update_fields_queues_and_multiplies() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Worker {
+            #[serde(rename = "_id")]
+            id: Option<DocId>,
+            jobs: Vec<String>,
+            rate: f64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let workers = db.collection::<Worker>("workers");
+        workers.ensure_index("jobs[*]").unwrap();
+        workers.ensure_index("rate").unwrap();
+        let ids: Vec<DocId> = (0..4)
+            .map(|n| {
+                let worker = Worker {
+                    id: None,
+                    jobs: Vec::new(),
+                    rate: n as f64,
+                };
+                workers.insert(worker).unwrap()
+            })
+            .collect();
+        let jobs = |worker: DocId| workers.get(&worker).unwrap().unwrap().jobs;
+        let holding = |job: &str| workers.count(Filter::new().eq("jobs[*]", job)).unwrap();
+
+        let queued = Update::new().push_all("jobs", ["a", "b", "c"]);
+        assert_eq!(workers.update_fields(Filter::new(), &queued).unwrap(), 4);
+        assert_eq!(jobs(ids[0]), ["a", "b", "c"]);
+        let take = Update::new().pop_first("jobs");
+        assert_eq!(
+            workers
+                .update_fields(Filter::new().id(ids[0]), &take)
+                .unwrap(),
+            1
+        );
+        assert_eq!(jobs(ids[0]), ["b", "c"]);
+        assert_eq!((holding("a"), holding("b")), (3, 4), "the index follows");
+        let drop_last = Update::new().pop_last("jobs").pop_last("jobs");
+        assert_eq!(
+            workers
+                .update_fields(Filter::new().gte("rate", 2), &drop_last)
+                .unwrap(),
+            2
+        );
+        assert_eq!(jobs(ids[3]), ["a"]);
+        assert_eq!((holding("b"), holding("c")), (2, 2));
+        let emptied = Update::new()
+            .pop_first("jobs")
+            .pop_first("jobs")
+            .pop_first("jobs");
+        assert_eq!(workers.update_fields(Filter::new(), &emptied).unwrap(), 4);
+        assert_eq!(
+            workers.update_fields(Filter::new(), &emptied).unwrap(),
+            0,
+            "popping an empty array changes nothing"
+        );
+        assert_eq!(holding("a") + holding("b") + holding("c"), 0);
+
+        let doubled = Update::new().mul("rate", 2);
+        assert_eq!(
+            workers
+                .update_fields(Filter::new().gt("rate", 0), &doubled)
+                .unwrap(),
+            3
+        );
+        let rates: Vec<f64> = workers
+            .find(Filter::new().sort_asc("rate"))
+            .unwrap()
+            .iter()
+            .map(|w| w.rate)
+            .collect();
+        assert_eq!(rates, [0.0, 2.0, 4.0, 6.0]);
+        assert_eq!(
+            workers.count(Filter::new().gte("rate", 4)).unwrap(),
+            2,
+            "the index on rate follows"
+        );
+
+        // A `pop_first` on a string fails the batch, nothing written.
+        let untyped = db.collection::<Document>("workers");
+        untyped
+            .update_fields(Filter::new().id(ids[1]), &Update::new().set("jobs", "x"))
+            .unwrap();
+        let failed = untyped.update_fields(
+            Filter::new(),
+            &Update::new().mul("rate", 3).pop_first("jobs"),
+        );
+        assert!(
+            matches!(failed, Err(crate::Error::Update { .. })),
+            "{failed:?}"
+        );
+        assert_eq!(workers.count(Filter::new().eq("rate", 6)).unwrap(), 1);
     }
 
     /// SPEC §73 on typed devices: tags as a set, the latest time seen, a

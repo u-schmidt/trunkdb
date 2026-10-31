@@ -49,6 +49,7 @@ let third_page = users.find(Filter::new().sort_asc("name").skip(40).limit(20))?;
 
 let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new().set("team", "platform").inc("age", 1))?;
 let tagged = users.update_fields(Filter::new().id(id), &Update::new().add_to_set("tags", "admin").pull("tags", "guest"))?;
+let queued = users.update_fields(Filter::new().id(id), &Update::new().mul("age", 2).push_all("tags", ["new", "beta"]).pop_first("tags"))?;
 ```
 
 ## The id without serde's rename

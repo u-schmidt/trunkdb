@@ -83,9 +83,11 @@ Rejected:
   update. Possible later; removing by value is the common case.
 - **`push` of several values at once** (`$each`), positions, sorting
   and slicing: several `push`es say the first; the rest is rarely used.
+  §142 added the first, `push_all`.
 - **`add_to_set` by exact type** (MongoDB tells `1` from `1.0`): a
   filter's `eq` doesn't, and an `add_to_set` then `eq` should agree.
 - **`mul` and `pop`** now: nobody has asked; each is a small addition.
+  §142 added them.
 
 ## 73.4 Tests
 - `update.rs`: `min` and `max` on integers, floats and a mix, strings

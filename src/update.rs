@@ -4,10 +4,10 @@ use crate::query::equal_values;
 use std::cmp::Ordering;
 
 /// Changes to make to every document a filter finds, named by field
-/// instead of written as a closure (SPEC §68, §73): MongoDB's `$set`,
-/// `$unset`, `$inc`, `$min`, `$max`, `$rename`, and `$push`, `$addToSet`
-/// and `$pull` on arrays, on dotted paths (§31). For
-/// `Collection::update_fields`.
+/// instead of written as a closure (SPEC §68, §73, §142): MongoDB's
+/// `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, and
+/// `$push`, `$addToSet`, `$pull` and `$pop` on arrays, on dotted paths
+/// (§31). For `Collection::update_fields`.
 ///
 /// ```
 /// use trunkdb::query::Update;
@@ -29,12 +29,16 @@ enum Change {
     Set(String, Document),
     Unset(String),
     Inc(String, Document),
+    Mul(String, Document),
     Min(String, Document),
     Max(String, Document),
     Rename(String, String),
-    Push(String, Document),
+    /// One `push` or a `push_all`: the values in order.
+    Push(String, Vec<Document>),
     AddToSet(String, Document),
     Pull(String, Document),
+    /// `pop_first` (`true`) or `pop_last`.
+    Pop(String, bool),
 }
 
 impl Change {
@@ -44,11 +48,13 @@ impl Change {
             Change::Set(path, _)
             | Change::Unset(path)
             | Change::Inc(path, _)
+            | Change::Mul(path, _)
             | Change::Min(path, _)
             | Change::Max(path, _)
             | Change::Push(path, _)
             | Change::AddToSet(path, _)
-            | Change::Pull(path, _) => vec![path],
+            | Change::Pull(path, _)
+            | Change::Pop(path, _) => vec![path],
             Change::Rename(from, to) => vec![from, to],
         }
     }
@@ -82,6 +88,17 @@ impl Update {
     /// update, null included.
     pub fn inc(mut self, path: impl Into<String>, by: impl Into<Document>) -> Self {
         self.changes.push(Change::Inc(path.into(), by.into()));
+        self
+    }
+
+    /// The number at `path` multiplied by `by`, an integer or a float
+    /// (SPEC §142): two integers stay an integer (and overflowing `i64`
+    /// fails the update), anything with a float is a float. A missing
+    /// field becomes zero, `0` or `0.0` as `by` is, as MongoDB's `$mul`
+    /// makes it. Anything but a number there fails the update, null
+    /// included.
+    pub fn mul(mut self, path: impl Into<String>, by: impl Into<Document>) -> Self {
+        self.changes.push(Change::Mul(path.into(), by.into()));
         self
     }
 
@@ -119,7 +136,29 @@ impl Update {
     /// field becomes `[value]`; anything but an array there fails the
     /// update, null included.
     pub fn push(mut self, path: impl Into<String>, value: impl Into<Document>) -> Self {
-        self.changes.push(Change::Push(path.into(), value.into()));
+        self.changes
+            .push(Change::Push(path.into(), vec![value.into()]));
+        self
+    }
+
+    /// `push` of every value, in order (SPEC §142): MongoDB's `$push`
+    /// with `$each`. A missing field becomes an array of them, `[]` if
+    /// there are none; anything but an array there fails the update,
+    /// even with no values.
+    ///
+    /// ```
+    /// use trunkdb::query::Update;
+    ///
+    /// let tagged = Update::new().push_all("tags", ["new", "urgent"]);
+    /// # let _ = tagged;
+    /// ```
+    pub fn push_all<V: Into<Document>>(
+        mut self,
+        path: impl Into<String>,
+        values: impl IntoIterator<Item = V>,
+    ) -> Self {
+        let values = values.into_iter().map(Into::into).collect();
+        self.changes.push(Change::Push(path.into(), values));
         self
     }
 
@@ -142,10 +181,26 @@ impl Update {
         self
     }
 
+    /// The first element of the array at `path` is removed (SPEC
+    /// §142): MongoDB's `$pop: -1`, a queue's next item. An empty array,
+    /// or nothing at `path`, is no change; anything but an array there
+    /// fails the update, null included.
+    pub fn pop_first(mut self, path: impl Into<String>) -> Self {
+        self.changes.push(Change::Pop(path.into(), true));
+        self
+    }
+
+    /// `pop_first`, from the other end: the last element, MongoDB's
+    /// `$pop: 1`.
+    pub fn pop_last(mut self, path: impl Into<String>) -> Self {
+        self.changes.push(Change::Pop(path.into(), false));
+        self
+    }
+
     /// What's wrong with the update as written, before any document is
     /// read: a path that's empty, has an empty step, uses brackets (no
     /// `[*]`: an update names one field), or reaches into `_id`, which no
-    /// update changes; an `inc` by something that isn't a number; a `min`
+    /// update changes; an `inc` or `mul` by something that isn't a number; a `min`
     /// or `max` by something nothing compares with; a `rename` to the
     /// same field, or into or out of itself.
     pub(crate) fn check(&self) -> Result<(), String> {
@@ -154,8 +209,11 @@ impl Update {
                 check_path(path)?;
             }
             match change {
-                Change::Inc(path, by) if !matches!(by, Document::Int(_) | Document::Float(_)) => {
+                Change::Inc(path, by) if !is_number(by) => {
                     return Err(format!("{path:?}: `inc` needs a number, not {by:?}"));
+                }
+                Change::Mul(path, by) if !is_number(by) => {
+                    return Err(format!("{path:?}: `mul` needs a number, not {by:?}"));
                 }
                 Change::Min(path, value) | Change::Max(path, value) if !orders(value) => {
                     return Err(format!(
@@ -192,6 +250,10 @@ impl Update {
                     (at, true) => *at = by.clone(),
                     (at, false) => *at = add(at, by).map_err(|e| format!("{path:?}: {e}"))?,
                 },
+                Change::Mul(path, by) => match slot(doc, path)? {
+                    (at, true) => *at = zero_like(by),
+                    (at, false) => *at = multiply(at, by).map_err(|e| format!("{path:?}: {e}"))?,
+                },
                 Change::Min(path, value) => bound(doc, path, value, Ordering::Greater, "min")?,
                 Change::Max(path, value) => bound(doc, path, value, Ordering::Less, "max")?,
                 Change::Rename(from, to) => {
@@ -199,8 +261,8 @@ impl Update {
                         *slot(doc, to)?.0 = value;
                     }
                 }
-                Change::Push(path, value) => {
-                    array_at(doc, path, "push")?.push(value.clone());
+                Change::Push(path, values) => {
+                    array_at(doc, path, "push")?.extend(values.iter().cloned());
                 }
                 Change::AddToSet(path, value) => {
                     let items = array_at(doc, path, "add_to_set")?;
@@ -208,16 +270,21 @@ impl Update {
                         items.push(value.clone());
                     }
                 }
-                Change::Pull(path, value) => match get_mut(doc, path) {
-                    None => {}
-                    Some(Document::Array(items)) => items.retain(|item| !equal_values(item, value)),
-                    Some(other) => {
-                        return Err(format!(
-                            "{path:?}: `pull` needs an array there, not {}",
-                            kind(other)
-                        ));
+                Change::Pull(path, value) => {
+                    if let Some(items) = existing_array(doc, path, "pull")? {
+                        items.retain(|item| !equal_values(item, value));
                     }
-                },
+                }
+                Change::Pop(path, first) => {
+                    let op = if *first { "pop_first" } else { "pop_last" };
+                    if let Some(items) = existing_array(doc, path, op)? {
+                        if !*first {
+                            items.pop();
+                        } else if !items.is_empty() {
+                            items.remove(0);
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -305,6 +372,23 @@ fn array_at<'a>(
     }
 }
 
+/// The array at `path`, for `pull` and `pop`: `None` if nothing is
+/// there; anything else there is an error.
+fn existing_array<'a>(
+    doc: &'a mut Document,
+    path: &str,
+    op: &str,
+) -> Result<Option<&'a mut Vec<Document>>, String> {
+    match get_mut(doc, path) {
+        None => Ok(None),
+        Some(Document::Array(items)) => Ok(Some(items)),
+        Some(other) => Err(format!(
+            "{path:?}: `{op}` needs an array there, not {}",
+            kind(other)
+        )),
+    }
+}
+
 /// The value at `path`, to change, and whether it was missing: then it's
 /// created as `Null`, with every object missing on the way. A step that
 /// isn't an object is an error: an update doesn't turn a value into an
@@ -379,6 +463,32 @@ fn add(at: &Document, by: &Document) -> Result<Document, String> {
         (Document::Float(a), Document::Float(b)) => Document::Float(a + b),
         (other, _) => return Err(format!("`inc` needs a number there, not {}", kind(other))),
     })
+}
+
+/// `at * by` for `mul`, `by` a number (`Update::check`).
+fn multiply(at: &Document, by: &Document) -> Result<Document, String> {
+    Ok(match (at, by) {
+        (Document::Int(a), Document::Int(b)) => Document::Int(
+            a.checked_mul(*b)
+                .ok_or_else(|| format!("{a} × {b} overflows a 64-bit integer"))?,
+        ),
+        (Document::Int(a), Document::Float(b)) => Document::Float(*a as f64 * b),
+        (Document::Float(a), Document::Int(b)) => Document::Float(a * *b as f64),
+        (Document::Float(a), Document::Float(b)) => Document::Float(a * b),
+        (other, _) => return Err(format!("`mul` needs a number there, not {}", kind(other))),
+    })
+}
+
+/// What `mul` makes a missing field: zero, of `by`'s kind.
+fn zero_like(by: &Document) -> Document {
+    match by {
+        Document::Float(_) => Document::Float(0.0),
+        _ => Document::Int(0),
+    }
+}
+
+fn is_number(value: &Document) -> bool {
+    matches!(value, Document::Int(_) | Document::Float(_))
 }
 
 fn kind(value: &Document) -> &'static str {
@@ -699,6 +809,121 @@ mod tests {
         }
     }
 
+    /// SPEC §142: `mul` as `inc` multiplies, a missing field zero of
+    /// `by`'s kind, overflow and anything but a number failing.
+    #[test]
+    fn mul_multiplies_integers_and_floats_and_makes_a_missing_field_zero() {
+        let mul = |by: Document, to: &str| applied(Update::new().mul("n", by), to);
+        assert_eq!(mul(3.into(), r#"{"n": 14}"#).unwrap(), doc(r#"{"n": 42}"#));
+        assert_eq!(
+            mul((-2).into(), r#"{"n": 5}"#).unwrap(),
+            doc(r#"{"n": -10}"#)
+        );
+        assert_eq!(
+            mul(0.5.into(), r#"{"n": 3}"#).unwrap(),
+            doc(r#"{"n": 1.5}"#)
+        );
+        assert_eq!(
+            mul(2.into(), r#"{"n": 1.25}"#).unwrap(),
+            doc(r#"{"n": 2.5}"#)
+        );
+        assert_eq!(
+            mul(1.5.into(), r#"{"n": 0.5}"#).unwrap(),
+            doc(r#"{"n": 0.75}"#)
+        );
+        // Zero of `by`'s kind: `Int` and `Float` are told apart by Debug.
+        let missing = |by: Document| format!("{:?}", mul(by, r#"{"m": 1}"#).unwrap());
+        assert_eq!(
+            missing(3.into()),
+            format!("{:?}", doc(r#"{"m": 1, "n": 0}"#))
+        );
+        assert_eq!(
+            missing(3.5.into()),
+            format!("{:?}", doc(r#"{"m": 1, "n": 0.0}"#))
+        );
+        let nested = applied(Update::new().mul("a.n", 4), "{}").unwrap();
+        assert_eq!(nested, doc(r#"{"a": {"n": 0}}"#));
+
+        let overflow = mul(2.into(), &format!(r#"{{"n": {}}}"#, i64::MAX / 2 + 1)).unwrap_err();
+        assert!(overflow.contains("overflows"), "{overflow}");
+        assert_eq!(
+            mul(2.into(), &format!(r#"{{"n": {}}}"#, i64::MAX / 2)).unwrap(),
+            doc(&format!(r#"{{"n": {}}}"#, i64::MAX / 2 * 2))
+        );
+        for not_a_number in [r#"{"n": null}"#, r#"{"n": "2"}"#, r#"{"n": [2]}"#] {
+            let error = mul(2.into(), not_a_number).unwrap_err();
+            assert!(
+                error.contains("`mul` needs a number there"),
+                "{not_a_number}: {error}"
+            );
+        }
+    }
+
+    /// SPEC §142: `push_all` pushes each value in order; `pop_first` and
+    /// `pop_last` take one from an end.
+    #[test]
+    fn push_all_and_pop_change_arrays() {
+        let with = |update: Update, to: &str| applied(update, to);
+        assert_eq!(
+            with(
+                Update::new().push_all("t", ["b", "c", "b"]),
+                r#"{"t": ["a"]}"#
+            )
+            .unwrap(),
+            doc(r#"{"t": ["a", "b", "c", "b"]}"#)
+        );
+        assert_eq!(
+            with(Update::new().push_all("o.t", [1, 2]), "{}").unwrap(),
+            doc(r#"{"o": {"t": [1, 2]}}"#)
+        );
+        let none: [Document; 0] = [];
+        assert_eq!(
+            with(Update::new().push_all("t", none.clone()), "{}").unwrap(),
+            doc(r#"{"t": []}"#)
+        );
+        assert_eq!(
+            with(Update::new().push_all("t", none.clone()), r#"{"t": [1]}"#).unwrap(),
+            doc(r#"{"t": [1]}"#)
+        );
+
+        let queue = r#"{"t": [1, 2, 3]}"#;
+        assert_eq!(
+            with(Update::new().pop_first("t"), queue).unwrap(),
+            doc(r#"{"t": [2, 3]}"#)
+        );
+        assert_eq!(
+            with(Update::new().pop_last("t"), queue).unwrap(),
+            doc(r#"{"t": [1, 2]}"#)
+        );
+        assert_eq!(
+            with(Update::new().pop_first("t").pop_last("t"), queue).unwrap(),
+            doc(r#"{"t": [2]}"#)
+        );
+        assert_eq!(
+            with(Update::new().pop_last("o.t"), r#"{"o": {"t": ["x"]}}"#).unwrap(),
+            doc(r#"{"o": {"t": []}}"#)
+        );
+        for same in [r#"{"t": []}"#, r#"{"a": 1}"#, r#"{"x": 1}"#] {
+            for update in [Update::new().pop_first("t"), Update::new().pop_last("t")] {
+                assert_eq!(with(update, same).unwrap(), doc(same), "{same}");
+            }
+        }
+
+        for (update, op) in [
+            (Update::new().push_all("t", none), "`push`"),
+            (Update::new().pop_first("t"), "`pop_first`"),
+            (Update::new().pop_last("t"), "`pop_last`"),
+        ] {
+            for to in [r#"{"t": null}"#, r#"{"t": "a"}"#, r#"{"t": {"a": 1}}"#] {
+                let error = with(update.clone(), to).unwrap_err();
+                assert!(
+                    error.contains(&format!("{op} needs an array there")),
+                    "{to}: {error}"
+                );
+            }
+        }
+    }
+
     /// Each change sees what the ones before it left.
     #[test]
     fn changes_apply_in_order() {
@@ -740,6 +965,11 @@ mod tests {
         }
         assert!(refused(Update::new().inc("n", "1")).contains("needs a number"));
         assert!(refused(Update::new().inc("n", Document::Null)).contains("needs a number"));
+        assert!(refused(Update::new().mul("n", "2")).contains("`mul` needs a number"));
+        assert!(refused(Update::new().mul("n", Document::Null)).contains("`mul` needs a number"));
+        assert!(refused(Update::new().pop_first("t[*]")).contains("brackets"));
+        assert!(refused(Update::new().pop_last("_id")).contains("`_id`"));
+        assert!(refused(Update::new().push_all("", [1])).contains("a name between"));
         assert!(
             refused(Update::new().set("ok", 1).inc("n", DocId::NIL)).contains("needs a number")
         );
@@ -773,6 +1003,10 @@ mod tests {
                 .min("m", "text")
                 .max("m", 1.5)
                 .push("t", Document::Null)
+                .push_all("t", [1, 2])
+                .mul("n", 2)
+                .pop_first("t")
+                .pop_last("t")
                 .pull("t", Document::Array(vec![]))
                 .check()
                 .is_ok()
