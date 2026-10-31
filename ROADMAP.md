@@ -201,18 +201,81 @@ over a window. Five steps, each useful alone, in this order:
   SQLite and PostgreSQL keep it in extensions (R*Tree, PostGIS); the
   file would need pages of a new kind. Only if `Condition::custom`,
   with a coarse key indexed, is too slow for a program that uses it.
-- Live queries: a `Filter` kept as a subscription, which reports the
-  documents that came to match it and those that no longer do. With a
-  position kept in one document of state, updated with each ping,
-  entering a fence is that document coming to match, leaving it the
-  document no longer matching: no state of its own. Each commit checks
-  the live queries against the documents it changed; at a ping every
-  second or two that costs nothing worth counting, so no incremental
-  aggregates (DBSP, TimescaleDB's continuous aggregates) are needed.
-  Left to the application: hysteresis at a fence's edge (GPS noise
-  flips a position in and out), and order: pings a tracker sends late,
-  after being offline, are applied in the order of their time, not of
-  their arrival, or a fence is entered after it was left.
+- Live queries, next: a `Filter` kept as a subscription, which reports
+  the documents that came to match it, those that no longer do, and
+  those written that still do (also called continuous queries).
+  With a position kept in one document of state, updated with each
+  ping, entering a fence is that document coming to match, leaving it
+  the document no longer matching: no state of its own. Planned:
+  ```rust
+  let live = vans.watch(Filter::new().eq("device", "van-7").and(in_depot))?;
+  for event in live {
+      match event? {
+          Live::Entered(van) => { /* came to match */ }
+          Live::Left(van) => { /* no longer matches; None if deleted */ }
+          Live::Changed(van) => { /* written, still matches */ }
+          _ => {}
+      }
+  }
+  ```
+  - **`Collection::watch(filter) -> Result<LiveQuery<T>>`**, on a typed
+    collection as on one of `Document`. `LiveQuery` reads as `Changes`
+    does (§135.1): `recv`, `try_recv`, `recv_timeout`, an `Iterator`,
+    each of a `Result<Live<T>>`; dropped, the query ends. One channel
+    for each live query: a hundred fences are a hundred of them.
+  - **The state first, then the changes:** `watch` takes the writer's
+    lock, reads what matches now and hands each as `Entered` before
+    anything else, so a van already in the depot at the start is
+    reported so. No commit falls between the read and the first change
+    checked.
+  - **Checked inside the commit:** after a batch is durable and
+    published, still under the writer's lock, each live query on a
+    collection the batch changed checks the documents it changed (the
+    ids §135's `ChangeLog` records, kept whenever a live query is
+    open). So every transition is seen, in commit order, each against
+    the state its own commit left. Checked later, on the reader's
+    thread, a newer commit may have moved the van on already: an entry
+    and a leaving between two reads would both be lost. At a ping every
+    second or two the check costs nothing worth counting, so no
+    incremental view maintenance (DBSP, TimescaleDB's continuous
+    aggregates) is needed.
+  - **Matched before: a set of ids** each live query keeps, of what
+    matches now. A changed document that matches and isn't in it has
+    `Entered`, one in it that no longer matches has `Left`, one in it
+    that still matches has `Changed`. One id for each document that
+    matches: few for a fence. Reading the document's version before the
+    commit instead would cost a read for each change.
+  - **Documents, not ids:** the commit holds the document as its own
+    batch left it, the position that entered the fence and not a later
+    one, which §135's ids can't give. `Left` holds the document, or
+    `None` if it was deleted. A typed `T` is converted on the reader's
+    thread as it receives, not under the writer's lock. `select`
+    (§106) applies to what is handed out.
+  - **`Changed`, though a fence needs only the other two:** what a
+    live list on a screen needs ("the vans in the depot, and their
+    speed"), and it costs nothing more. As `Updated` in §135, written,
+    not necessarily changed.
+  - **Not live: `sort`, `skip`, `limit`.** A live window of the first
+    ten moves with every write; `watch` refuses them with an error.
+    A hint (`use_index`, §132) steers the first read only.
+  - **A panic in a `Condition::custom`** while a commit is checked:
+    that live query receives `Error::ClosurePanicked` and ends, as its
+    set can no longer be trusted. The commit stands, and the other
+    subscriptions go on (§136.2).
+  - **`drop_collection`:** each document in the set `Left`, without a
+    document; the query goes on, for a collection made again under the
+    name.
+  - **Unbounded, as `Changes`:** a writer never waits for a reader,
+    and a reader may write.
+  - Left to the application: hysteresis at a fence's edge (GPS noise
+    flips a position in and out), and order: pings a tracker sends
+    late, after being offline, are applied in the order of their time,
+    not of their arrival, or a fence is entered after it was left.
+  - Rejected: checking on the reader's thread from §135's reports
+    (transitions lost between two reads); ids only (a read for each,
+    of a state a newer commit may have changed); a callback (§135.5);
+    a first state handed apart, as `(Vec<T>, LiveQuery)`, where
+    `Entered` says the same in one way; a live `sort` and `limit`.
 - Live aggregates: an `Aggregate` (§107) kept as a subscription, as a
   `Filter` above: "the mean load of the last five minutes", reported as
   it changes, while a process reports the load every few seconds. A
