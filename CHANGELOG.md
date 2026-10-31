@@ -768,3 +768,12 @@ limit, batches and a write-ahead log. Since then:
     "the last five minutes", for one-off aggregates too; it is refused
     beside a filter's sort, skip or limit. New types: `LiveAggregate`,
     `LiveRow`.
+
+    Items 108–112 → 0.27.0: additions only, nothing to adapt. A hook
+    after each commit, `Condition::custom` with `Document`'s readers,
+    live queries, live aggregates and `Aggregate::window` are new; a
+    panic in `update_many`'s change no longer poisons the database. New
+    errors, `ClosurePanicked` and `NotLive`, are variants of the
+    `#[non_exhaustive]` `Error`. Files stay format 12 and exports as in
+    0.26.0, which opens what 0.27.0 writes; no new fixture, as nothing
+    changes how files are written (§120.9).
