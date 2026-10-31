@@ -1,3 +1,4 @@
+use crate::aggregate::Aggregate;
 use crate::batch::Batch;
 use crate::catalog::Catalog;
 use crate::changes::{self, Changes};
@@ -7,7 +8,7 @@ use crate::document::Document;
 use crate::durability::{self, Durability, WalDurability};
 use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
-use crate::live::{self, LiveQuery};
+use crate::live::{self, LiveAggregate, LiveQuery};
 use crate::query::Filter;
 use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
@@ -107,6 +108,9 @@ pub(crate) struct Writer {
     /// the documents it changed. While there is one, batches record
     /// their changes, as for a subscriber.
     watchers: Vec<live::Watcher>,
+    /// The live aggregates (SPEC §139), run again after each commit to
+    /// their collection. Batches record their changes for them too.
+    aggregates: Vec<live::AggregateWatcher>,
     /// Test-only: called once, by the next batch, when it is logged and
     /// flushed and not yet published — to see what goes on beside it.
     #[cfg(test)]
@@ -545,6 +549,7 @@ impl Database {
                     past: Vec::new(),
                     subscribers: Vec::new(),
                     watchers: Vec::new(),
+                    aggregates: Vec::new(),
                     #[cfg(test)]
                     after_log: None,
                 }),
@@ -665,6 +670,33 @@ impl Database {
             sender,
         ));
         Ok(LiveQuery::new(receiver, convert))
+    }
+
+    /// `Collection::watch_aggregate` (SPEC §139): under the writer's
+    /// lock, as `watch`.
+    pub(crate) fn watch_aggregate(
+        &self,
+        collection: &str,
+        filter: Filter,
+        aggregate: &Aggregate,
+    ) -> crate::Result<LiveAggregate> {
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| crate::Error::Poisoned)?;
+        if self.inner.poisoned.load(Ordering::Relaxed) {
+            return Err(crate::Error::Poisoned);
+        }
+        let current = self.current();
+        let (watcher, live) = live::AggregateWatcher::start(
+            &current.reading(&self.inner.pages),
+            collection,
+            filter,
+            aggregate.clone(),
+        )?;
+        writer.aggregates.push(watcher);
+        Ok(live)
     }
 
     /// Starts a typed, atomic multi-op write — see `Batch`.
@@ -827,7 +859,10 @@ impl Database {
         // the batch fails (SPEC §19.5, §78). No commit can come between
         // this and ours: we hold the writer's lock.
         let mut catalog = self.current().catalog().clone();
-        if !writer.subscribers.is_empty() || !writer.watchers.is_empty() {
+        if !writer.subscribers.is_empty()
+            || !writer.watchers.is_empty()
+            || !writer.aggregates.is_empty()
+        {
             catalog.record_changes();
         }
 
@@ -925,13 +960,12 @@ impl Database {
             // The live queries first, against the state this commit left
             // (SPEC §138.2): the snapshot just published, the writer's
             // lock still held, so no commit comes between.
-            if !writer.watchers.is_empty() && !changes.is_empty() {
+            let live = !writer.watchers.is_empty() || !writer.aggregates.is_empty();
+            if live && !changes.is_empty() {
                 let current = self.current();
-                live::check(
-                    &mut writer.watchers,
-                    &changes,
-                    &current.reading(&self.inner.pages),
-                );
+                let at = current.reading(&self.inner.pages);
+                live::check(&mut writer.watchers, &changes, &at);
+                live::check_aggregates(&mut writer.aggregates, &changes, &at);
             }
             writer.report(changes);
         }
@@ -1909,6 +1943,34 @@ mod tests {
         assert_eq!(watchers(&db), 1);
         db.write_batch(vec![insert("posts", 3, 3)]).unwrap();
         assert_eq!(watchers(&db), 0);
+        assert!(!records(&db));
+    }
+
+    #[test]
+    fn a_live_aggregate_records_changes_until_it_is_dropped() {
+        let (_dir, _path, db) = open_temp();
+        let records = |db: &Database| {
+            db.transact(|catalog, _| Ok(catalog.records_changes()))
+                .unwrap()
+        };
+        let aggregates = |db: &Database| db.inner.writer.lock().unwrap().aggregates.len();
+        let count = crate::query::Aggregate::new().count().named("n");
+        let live = Collection::<Document>::new(db.clone(), "posts")
+            .watch_aggregate(Filter::new(), &count)
+            .unwrap();
+        assert!(records(&db), "a live aggregate alone records");
+        assert!(live.try_recv().is_some(), "the first row");
+        db.write_batch(vec![insert("posts", 1, 1)]).unwrap();
+        assert!(live.try_recv().is_some());
+        drop(live);
+        db.write_batch(vec![insert("other", 2, 2)]).unwrap();
+        assert_eq!(
+            aggregates(&db),
+            1,
+            "not noticed before its collection changes"
+        );
+        db.write_batch(vec![insert("posts", 3, 3)]).unwrap();
+        assert_eq!(aggregates(&db), 0);
         assert!(!records(&db));
     }
 

@@ -350,6 +350,51 @@ a number is an `Int` or a `Float`. A column's condition is decided from
 the entries too, where the index holds the fields it names.
 `explain_aggregate` says how it ran.
 
+## The last five minutes, live
+
+`window` keeps the documents close to the newest one, and
+`watch_aggregate` runs an aggregate again at every commit to its
+collection, telling you how its rows changed (SPEC §139). An alert
+for each server whose mean load over the last five minutes is over
+0.8:
+
+```rust
+use std::time::Duration;
+use trunkdb::LiveRow;
+
+readings.ensure_index("at")?;                 // the window reads through it
+let busy = Aggregate::new()
+    .group_by("server")
+    .avg("load").named("mean")
+    .window("at", Duration::from_secs(300))   // within 5 minutes of the newest
+    .having(Condition::gt("mean", 0.8));
+let alerts = readings.watch_aggregate(Filter::new(), &busy)?;
+std::thread::spawn(move || {
+    for event in alerts {
+        match event {
+            Ok(LiveRow::Entered { row, .. }) => println!("busy: {row:?}"),
+            Ok(LiveRow::Left { group, .. }) => println!("calm again: {group:?}"),
+            Ok(LiveRow::Changed { row, .. }) => println!("still busy: {row:?}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("{e}"),       // it has ended
+        }
+    }
+});
+```
+
+- **Five minutes back from the newest reading, not from the clock:**
+  only a write changes the answer. A server that stops reporting ages
+  out as the others report on, and its alert ends with `Left`.
+- **Every row first,** as `Entered`, then only what changed: a row in
+  or out of the result, or `Changed` where a value really changed.
+- **`Left` has the row as it is now,** under the limit, or `None` once
+  the group has no readings left; `group` says which it was.
+- **"The last ten readings"** is a filter, `sort_desc("at").limit(10)`,
+  not a window; the two together are refused.
+- **It runs whole at every commit to the collection:** with a window
+  and an index on its path it reads a few documents. Without one, it
+  reads every match each time.
+
 ## Telling the planner which index
 
 The planner follows fixed rules, which don't look at the data. Where

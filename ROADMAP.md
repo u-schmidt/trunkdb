@@ -45,7 +45,7 @@ All of it is done:
 | 0.24.0 | `trunkdb fields <file> <collection> [filter]`: every path a collection's documents have, written as a filter writes it, in how many documents, and as which kinds of value, most first; a filter sums up only what it finds, `limit` a sample; read-only, at most 10,000 paths; an Agent Skill, `skills/trunkdb/`, for AI agents using the command. **Batched writes:** the default checkpoint threshold 4,000 pages instead of 1,000, the WAL limit following to 65.5 MB; with 1,000 documents a commit, 59 commits of 100 checkpointed, now 10; on 100,000 documents inserts about 1.35× faster, updates 1.35×, deletes 1.6×, single commits and reads unchanged; recovery after a crash with a full WAL 79 ms; a compaction's commit writes it back at once whatever its size, as §108 had it. **Fixed:** an OR of `eq`s of one field whose branches came wrapped alone in an AND or OR printed as an OR but read back as `in`, so its text didn't read back the same (a fix to §115). **`=` and `!=` on arrays, objects and binary:** compared by their contents, as `add_to_set` and `pull` compare them (objects in any field order, `[1]` equal to `[1.0]`), where `=` never held and `!=` always did, even against the very value; `in`, `not in` and `has (@ = …)` with them; `<` and the rest still never hold; an index entry with such a value in a compound key read from its document; groups of equal ones merged; unique indexes unchanged, still not checking them. **The release that wrote a file:** the header names the release that created the file and the one that last wrote it, `FileInfo::created_by` and `written_by`, `Release` and `trunkdb::RELEASE`, in `trunkdb info` too; unknown for older files and where an older build wrote since; still format 12. **Smaller fixtures:** 60 tasks instead of 300, the 0.23.0 fixture written again by 0.23.0's code, 9 KB compressed instead of 32; a fixture only for a release that changes how files are written. **Fixed:** `trunkdb info` panicked when its reader went (`| head`); it ends quietly, as `find` does | §120.9, §121–§125 |
 | 0.25.0 | **A condition on an aggregate column:** `filter` after a column, SQL's `FILTER (WHERE …)`, the column taking in only the group's documents that meet it, the groups and other columns every match; any column, two ANDed, one before any column refused; decided from index entries where the index holds its fields, a leaf of counts at a time where its ends decide it; the column methods' docs saying their string is the column's name. **Fixed:** a database opened through a symlink found a WAL beside the link instead of the file's, so after a crash it missed committed batches, and a write through it could have the file's old WAL replayed over newer pages later; the link is now followed to the file before the WAL is named, a loop of links refused; `trunkdb export` through a link protects the file's WAL; a hard link documented as unsupported. **Fixed:** a checkpoint whose flush failed after it had cut the WAL left the WAL's length as before, so a failed log after it was taken back by growing the WAL with zeros, and the next open refused it; the length is 0 once the cut succeeds, and an undo never grows the WAL past its end before the failed log (a fix to §81). **Fixed:** a page whose slot directory ran past its end, the cells said to start further on and its checksum matching, panicked as it was checked, reading past the page; refused as damage before a slot is read, a seed for `open_raw` with it. **Fixed:** on Unix, a compaction opened `<database>.compact` emptying what was there, following a link: whatever file a link under that name pointed to was emptied, even where the compaction gained nothing; the file is now always a new one, as on Windows, under the first name free (a fix to §108). **Fixed:** `avg` rounded the exact total to a float before dividing it, so finite numbers whose total passed `f64::MAX` had an infinite mean, and other means could be a unit off; the exact total is now divided, then rounded once, never `-0.0` (a fix to §107) | §126–§131 |
 | 0.26.0 | **A hint in the query:** `Filter::use_index(fields)` reads that index where the rules would read another, `Filter::no_index()` scans, `"_id"` the primary index; the rules choose the rest among it alone; a hint that can't be followed, no such index or nothing to read it by, is `Error::Hint` from every read, never a quiet fall back; `explain_run` says `hinted`; `use index …` and `use no index` last in a filter's text and `trunkdb find`; a panic on `false` under a hint, found by the `queries` fuzz target, fixed before release ; **the plans `explain_run` passed over:** `Explained::alternatives`, the filter hinted to each index, `_id` and a scan, each with the entries it would read, `Exactly` or `MoreThan`, whether it reads a document per entry, and whether that's fewer; ranges counted whole a leaf at a time up to 1,000 leaves, walks in sort order as far as the run read; `instead:` lines in `trunkdb find --explain`; **aggregate columns named last** (breaking): `count().named("n")`, `sum("tries").named("total")`, a column's `filter` before its name, an `UnnamedColumn` until it has one, so a column without a name or a `filter` before any column doesn't compile | §132–§134 |
-| next | **A hook after each commit:** `Database::subscribe`, a `Changes` receiving a `Commit` for every batch committed after it, in commit order, once it is durable and new reads see it, never for a failed batch; each document once with the batch's net effect, `Inserted`, `Updated` or `Deleted`, `drop_collection` one `Dropped`; ids only; an unbounded `std` channel, so a writer never waits and a subscriber may write; nothing recorded without a subscriber; **a condition of the application's own:** `Condition::custom(fields, test)`, a closure `Fn(&Document) -> bool + Send + Sync` given a document of the fields it names, never more; it never bounds an index read nor is decided on an entry; a panic in it fails the call with `Error::ClosurePanicked`, a write with nothing written, the writer's lock not poisoned; no text form, the parser refusing `custom(…)`; readers on `Document`: `get(path)`, `as_bool`, `as_i64`, `as_f64`, `as_str` and the others; **a panic in `update_many`'s change** or in its `T`'s conversions, under the writer's lock, fails the call with `Error::ClosurePanicked`, nothing written, the lock not poisoned; **live queries:** `Collection::watch(filter)`, a `LiveQuery<T>` reporting first what matches, then for each commit the documents `Entered`, `Left` or `Changed`, with their id and the document as that commit left it; checked inside the commit against the documents it changed, so no transition is lost; a sort, a skip or a limit refused with `Error::NotLive`; a panic in a `custom` condition ending that query alone | §135–§138 |
+| next | **A hook after each commit:** `Database::subscribe`, a `Changes` receiving a `Commit` for every batch committed after it, in commit order, once it is durable and new reads see it, never for a failed batch; each document once with the batch's net effect, `Inserted`, `Updated` or `Deleted`, `drop_collection` one `Dropped`; ids only; an unbounded `std` channel, so a writer never waits and a subscriber may write; nothing recorded without a subscriber; **a condition of the application's own:** `Condition::custom(fields, test)`, a closure `Fn(&Document) -> bool + Send + Sync` given a document of the fields it names, never more; it never bounds an index read nor is decided on an entry; a panic in it fails the call with `Error::ClosurePanicked`, a write with nothing written, the writer's lock not poisoned; no text form, the parser refusing `custom(…)`; readers on `Document`: `get(path)`, `as_bool`, `as_i64`, `as_f64`, `as_str` and the others; **a panic in `update_many`'s change** or in its `T`'s conversions, under the writer's lock, fails the call with `Error::ClosurePanicked`, nothing written, the lock not poisoned; **live queries:** `Collection::watch(filter)`, a `LiveQuery<T>` reporting first what matches, then for each commit the documents `Entered`, `Left` or `Changed`, with their id and the document as that commit left it; checked inside the commit against the documents it changed, so no transition is lost; a sort, a skip or a limit refused with `Error::NotLive`; a panic in a `custom` condition ending that query alone; **live aggregates:** `Collection::watch_aggregate(filter, &aggregate)`, a `LiveAggregate` reporting every row, then for each commit to the collection the rows `Entered`, `Left` or `Changed`, each with its group values; the aggregate run again whole inside the commit; **a window:** `Aggregate::window(path, duration)`, the documents within `duration` of the newest date-time among the matches, for `aggregate` and `apply` too, refused beside a filter's sort, skip or limit | §135–§139 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -213,97 +213,21 @@ over a window. Five steps, each useful alone, in this order:
   alone with `Error::ClosurePanicked`; `drop_collection` is a `Left`
   for each match. Hysteresis at a fence's edge and late pings stay
   with the application.
-- Live aggregates, next: an `Aggregate` (§107) kept as a subscription,
-  as a `Filter` is in §138: "the mean load of each server over the
-  last five minutes", reported as it changes, while each server
-  reports its load every few seconds. A limit is a `having`
-  (`mean > 0.8`), and crossing it is a row coming to match or no
-  longer matching, as a fence is entered or left. Planned:
-  ```rust
-  let load = Aggregate::new()
-      .group_by("server")
-      .avg("load").named("mean")
-      .window("at", Duration::from_secs(300))
-      .having(Condition::gt("mean", 0.8));
-  let alerts = readings.watch_aggregate(Filter::new(), load)?;
-  for event in alerts {
-      match event? {
-          LiveRow::Entered { row, .. } => { /* over the limit */ }
-          LiveRow::Left { row, .. } => { /* back under; None if gone */ }
-          LiveRow::Changed { row, .. } => { /* still over, a new mean */ }
-          _ => {}
-      }
-  }
-  ```
-  - **Run again whole inside each commit** that changes its
-    collection, under the writer's lock, against the state that commit
-    left, as §138 checks a live query: every crossing seen, in order,
-    by a reader however late. Any change to the collection, not only
-    to the documents that match: a reading that no longer matches
-    changes the result too, and its version before isn't read. Five
-    minutes of a reading every five seconds is 60 documents read
-    through an index on the time, so no incremental maintenance (DBSP,
-    TimescaleDB's continuous aggregates) is needed.
-  - **`Aggregate::window(path, duration)`, the last five minutes:** the
-    documents whose `path` is within `duration` of the newest one
-    among the filter's matches. A filter can't say it: `at >= now - 5
-    min` is fixed as it is made. Counted back from the newest reading,
-    not from the clock: then only a commit changes the result, and the
-    same readings give the same answer. Counted back from the clock,
-    readings age out with nothing written, and a timer would have to
-    run the aggregate again: a second source of events, decided only
-    if asked for.
-    - One newest for the whole aggregate, not one for each group: a
-      server gone silent ages out as the others report on, and leaves
-      the alert. With a newest of its own, its last five minutes would
-      stay for ever.
-    - The path a `DateTime` (§69); a document where it is anything
-      else is outside the window. A width on numbers can come later.
-    - Part of `Aggregate`, not of live use alone: `aggregate`,
-      `explain_aggregate` and `Aggregate::apply` take it too, so an
-      aggregate answers the same run once or live. The planner reads
-      the newest first, then the window as a condition
-      (`at >= newest - duration`), so an index on the path bounds the
-      read.
-  - **The last ten readings need nothing new:** the filter picks the
-    documents as `find` would (§107), so
-    `Filter::new().sort_desc("at").limit(10)` is a window by count,
-    once and live.
-  - **Reported by row,** a row known by its group values: `Entered`
-    for a row there now and not before; `Left` for one there before,
-    with the row as it is now if its group is still there but fails
-    the `having`, `None` if no document of the group is left;
-    `Changed` for one there before and now, with other values. First,
-    every row as `Entered`. Unlike a live query's `Changed`, only where
-    a value changed: both rows are in hand to compare.
-  - **Rows as `Document`s,** as `aggregate` hands them out. Typed rows
-    may come later.
-  - **Sort, skip and limit allowed,** the filter's and the rows':
-    the aggregate runs again whole, so "the three busiest servers" is
-    live too. A server pushed out of the three is `Left`, the one
-    taking its place `Entered`; a new order within them is no event.
-  - **`LiveAggregate`** reads as `LiveQuery` does: `recv`, `try_recv`,
-    `recv_timeout`, an `Iterator`; dropped, it ends. `LiveRow` is an
-    enum of its own, as a row has no `DocId`.
-  - As §138: a panic in a `Condition::custom` ends that live aggregate
-    alone with `Error::ClosurePanicked`, the commit standing;
-    `drop_collection` makes every row `Left` with `None`, and it goes
-    on. Hysteresis at the limit, as at a fence's edge, and readings
-    sent late are the application's.
-  - Limits: without a window, every commit to the collection runs the
-    aggregate over every match, under the writer's lock: 100,000
-    readings are 100,000 read for each commit. A window, and an index
-    on its path, are what make it cheap. A `group_by` of many groups
-    compares as many rows at each commit.
-  - Rejected: incremental maintenance (above); a window from the
-    clock (above); a `Live` reused for rows, which has a `DocId`.
-  - Later, if asked for: **a window for each group,** by count or by
-    time, "the last ten readings of each server", which neither the
-    filter's limit, counted over every group, nor one newest for the
-    whole aggregate gives. SQL's window functions:
-    `ROW_NUMBER() OVER (PARTITION BY server ORDER BY at DESC) <= 10`.
-    It matters where groups report at rates far apart; ten readings
-    in all may then be one busy server's.
+- Done in §139: **live aggregates, and a window.**
+  `Collection::watch_aggregate(filter, &aggregate)` hands out a
+  `LiveAggregate`: every row first as `Entered`, then for each commit
+  to the collection the rows `Entered`, `Left` (with the row as it is
+  now, `None` if its group is gone) or `Changed` (only where a value
+  changed), each with its `group`. The aggregate runs again whole,
+  inside the commit, so no crossing of a `having` is lost; the
+  filter's and the rows' sort, skip and limit go. `Aggregate::window
+  (path, duration)` keeps the documents within `duration` of the
+  newest date-time among the matches, counted back from it, not from
+  the clock, one newest for the whole aggregate; for `aggregate` and
+  `apply` too, through an index on `path`. Refused beside a filter's
+  sort, skip or limit, a window by count. Later, if asked for: a
+  window for each group, by count or by time, "the last ten readings
+  of each server" (SQL's `ROW_NUMBER() OVER (PARTITION BY …)`).
 
 What the hook, live queries and live aggregates share:
 - **Kept in memory, never in the file.** A subscription is registered

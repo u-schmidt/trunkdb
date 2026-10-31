@@ -756,3 +756,15 @@ limit, batches and a write-ahead log. Since then:
     fence entered and left between two reads is reported both times.
     A sort, a skip or a limit is refused with the new
     `Error::NotLive`. New types: `Live`, `LiveQuery`.
+
+112. **Live aggregates, and a window** (§139):
+    `Collection::watch_aggregate(filter, &aggregate)` keeps an
+    aggregate as a subscription. A `LiveAggregate` first reports every
+    row as `Entered`, then, for each commit to the collection, the rows
+    that came into the result, left it, or changed their values. With
+    a `having` (`mean > 0.8`), crossing the limit is a row entering or
+    leaving. `Aggregate::window(path, duration)` keeps only the
+    documents within `duration` of the newest date-time at `path`,
+    "the last five minutes", for one-off aggregates too; it is refused
+    beside a filter's sort, skip or limit. New types: `LiveAggregate`,
+    `LiveRow`.

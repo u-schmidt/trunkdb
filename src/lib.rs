@@ -104,7 +104,7 @@ pub use datetime::{DateTime, ParseDateTimeError};
 pub use document::{DocId, Document, ParseIdError};
 pub use export::{ImportOptions, Summary};
 pub use json::ParseDocumentError;
-pub use live::{Live, LiveQuery};
+pub use live::{Live, LiveAggregate, LiveQuery, LiveRow};
 pub use map::Map;
 pub use release::{RELEASE, Release};
 pub use serde_bridge::DocumentError;

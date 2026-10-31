@@ -5,6 +5,7 @@
 //! matches come in, from their documents or from their index entries
 //! (§107.5), and turns them into rows.
 
+use crate::datetime::DateTime;
 use crate::document::{DocId, Document, ID_FIELD, encode_document};
 use crate::map::Map;
 use crate::path::Path;
@@ -14,6 +15,7 @@ use crate::query::{
 use crate::storage::RecordLocation;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// What `Collection::aggregate` computes from the documents its filter
 /// finds (SPEC §107):
@@ -68,6 +70,35 @@ pub struct Aggregate {
     /// `having`, the row sort, skip and limit: what a filter does to
     /// documents, done to the rows.
     pub(crate) rows: Filter,
+    /// `window`: only the documents this close to the newest (SPEC §139).
+    pub(crate) window: Option<Window>,
+}
+
+/// `Aggregate::window`: the documents whose `path` is within `duration`
+/// of the newest one's (SPEC §139.2).
+#[derive(Debug, Clone)]
+pub(crate) struct Window {
+    pub path: String,
+    pub duration: Duration,
+}
+
+impl Window {
+    /// The condition that keeps the window, `newest` the latest
+    /// date-time at its path among the matches: at or after `duration`
+    /// before it. With no date-time there, one nothing meets.
+    pub fn condition(&self, newest: Option<DateTime>) -> Condition {
+        match newest {
+            Some(newest) => Condition::gte(&self.path, newest.back(self.duration)),
+            None => Condition::lt(&self.path, DateTime::EARLIEST),
+        }
+    }
+
+    /// The latest date-time at its path among `docs`.
+    pub fn newest<'d>(&self, docs: impl IntoIterator<Item = &'d Document>) -> Option<DateTime> {
+        (docs.into_iter())
+            .filter_map(|doc| doc.get(&self.path).and_then(Document::as_datetime))
+            .max()
+    }
 }
 
 /// One column of a row.
@@ -168,6 +199,37 @@ impl Aggregate {
         Self::default()
     }
 
+    /// Only the documents whose date-time at `path` is within `duration`
+    /// of the newest one's, among those the filter finds (SPEC §139.2):
+    /// "the last five minutes", counted back from the newest reading, not
+    /// from the clock, so only a write changes the answer. The newest
+    /// itself is in, and so is one exactly `duration` before it. A
+    /// document whose value there isn't a `DateTime`, or is missing,
+    /// is out; with none, nothing is.
+    ///
+    /// One newest for the whole aggregate, not one per group: a group
+    /// whose documents stopped coming ages out as the others come on.
+    /// An index on `path` bounds the read. A filter with a sort, a skip
+    /// or a limit, a window by count, is refused beside it.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use trunkdb::query::Aggregate;
+    ///
+    /// let load = Aggregate::new()
+    ///     .group_by("server")
+    ///     .avg("load").named("mean")
+    ///     .window("at", Duration::from_secs(300));
+    /// # let _ = load;
+    /// ```
+    pub fn window(mut self, path: impl Into<String>, duration: Duration) -> Self {
+        self.window = Some(Window {
+            path: path.into(),
+            duration,
+        });
+        self
+    }
+
     /// Groups by the value at `path` too: call it again for several
     /// fields. A dotted path is nested in the row as stored.
     pub fn group_by(mut self, path: impl Into<String>) -> Self {
@@ -264,7 +326,13 @@ impl Aggregate {
     pub fn apply(&self, docs: impl IntoIterator<Item = Document>) -> crate::Result<Vec<Document>> {
         self.check()?;
         let mut groups = Groups::new(self);
-        for (seq, doc) in docs.into_iter().enumerate() {
+        let docs: Vec<Document> = docs.into_iter().collect();
+        let window =
+            (self.window.as_ref()).map(|w| Filter::new().and(w.condition(w.newest(&docs))));
+        let docs = docs
+            .into_iter()
+            .filter(|doc| window.as_ref().is_none_or(|w| w.matches(doc)));
+        for (seq, doc) in docs.enumerate() {
             let order = match &doc {
                 Document::Object(map) => match map.get(ID_FIELD) {
                     Some(Document::Id(id)) => Order::id(*id),
@@ -287,6 +355,14 @@ impl Aggregate {
         let refuse = |why: String| -> crate::Result<()> {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why).into())
         };
+        if let Some(window) = &self.window {
+            let path = window.path.as_str();
+            if path.is_empty() || path.contains("[*]") || path == ID_FIELD {
+                return refuse(format!(
+                    "a window's path must name a field of date-times, without `[*]`: `{path}`"
+                ));
+            }
+        }
         let firsts: Vec<&str> = self.group_by.iter().map(|p| first_step(p)).collect();
         let paths = self
             .group_by

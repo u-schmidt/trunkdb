@@ -153,3 +153,4 @@ say what changed, and DESIGN.md says what is true now.
 136. [A condition of the application's own (`query.rs`, `document.rs`, `collection.rs`)](136-a-condition-of-the-applications-own.md)
 137. [A panic in `update_many`'s change (`collection.rs`)](137-a-panic-in-update-many-s-change.md)
 138. [Live queries (`live.rs`, `database.rs`, `collection.rs`)](138-live-queries.md)
+139. [Live aggregates, and a window (`live.rs`, `aggregate.rs`, `collection.rs`, `database.rs`, `datetime.rs`)](139-live-aggregates-and-a-window.md)

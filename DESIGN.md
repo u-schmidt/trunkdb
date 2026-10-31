@@ -212,6 +212,11 @@ watched collection is read from the snapshot just published and
 checked against each filter there. Against the set, that is
 `Entered`, `Left` or `Changed`, sent to the live query's own unbounded
 channel. A panic in a `custom` condition ends that query alone.
+Beside them the writer keeps each `watch_aggregate` with the rows of
+its result, and after the live queries runs it again, whole, on the
+same snapshot, for each commit that changed its collection; rows known
+by their canonical group values are compared with those before
+[§139](spec/139-live-aggregates-and-a-window.md).
 
 ## 6. Documents and data pages
 
@@ -429,6 +434,11 @@ group's or an extreme's number); a walk counts whole leaves of a group.
 Without conditions, an index is walked only if it holds every document.
 A column is named last, `count().named("n")`, so the string in
 `sum("tries")` is always the field read [§134](spec/134-aggregate-columns-named-last.md).
+A window, `Aggregate::window(path, duration)`, keeps the documents
+within `duration` of the newest date-time at `path` among the matches:
+read first, as the first match sorted newest first, then a condition
+ANDed with the filter's, so an index on `path` bounds both reads
+[§139](spec/139-live-aggregates-and-a-window.md).
 A column can take a condition of its own, `filter` before its name, SQL's
 `FILTER (WHERE …)` [§126](spec/126-a-condition-on-a-column.md): it takes
 in only the group's documents that meet it, while the groups and the
@@ -552,7 +562,9 @@ more than four.
 - **Live queries:** `collection.watch(filter)`, a `LiveQuery<T>`
   reporting what matches, then each document that `Entered`, `Left` or
   `Changed`; a sort, a skip or a limit refused with `Error::NotLive`
-  [§138](spec/138-live-queries.md).
+  [§138](spec/138-live-queries.md); `collection.watch_aggregate(filter,
+  &aggregate)`, a `LiveAggregate` reporting its rows `Entered`, `Left`
+  or `Changed`, and `Aggregate::window` [§139](spec/139-live-aggregates-and-a-window.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`

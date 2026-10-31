@@ -29,7 +29,8 @@ measurements.
   elements, and sparse; a hint in the query names the one to read.
 - Atomic batches across collections; every commit crash-safe through a
   write-ahead log, and reported to subscribers once it is; live
-  queries that report what comes to match a filter and what leaves it.
+  queries that report what comes to match a filter and what leaves it,
+  and live aggregates over a window of the last minutes.
 - Readers in parallel beside one writer, and snapshots for reads that
   must agree.
 - `explain_run` and `stats` to see how a query ran, what the plans it

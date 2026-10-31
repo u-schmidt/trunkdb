@@ -41,6 +41,27 @@ impl DateTime {
     /// 1970-01-01T00:00:00Z.
     pub const UNIX_EPOCH: DateTime = DateTime { secs: 0, nanos: 0 };
 
+    /// The earliest time there is: every date-time is at or after it.
+    pub(crate) const EARLIEST: DateTime = DateTime {
+        secs: i64::MIN,
+        nanos: 0,
+    };
+
+    /// `duration` before this time, or `EARLIEST` if that is before it
+    /// (SPEC §139.2).
+    pub(crate) fn back(self, duration: Duration) -> DateTime {
+        let nanos = i128::from(self.secs) * i128::from(NANOS_PER_SECOND) + i128::from(self.nanos)
+            - duration.as_nanos() as i128;
+        let secs = nanos.div_euclid(i128::from(NANOS_PER_SECOND));
+        match i64::try_from(secs) {
+            Ok(secs) => DateTime {
+                secs,
+                nanos: nanos.rem_euclid(i128::from(NANOS_PER_SECOND)) as u32,
+            },
+            Err(_) => DateTime::EARLIEST,
+        }
+    }
+
     /// The current time, from `SystemTime::now()`.
     pub fn now() -> Self {
         SystemTime::now().into()
@@ -338,6 +359,20 @@ mod tests {
 
     fn at(secs: i64, nanos: u32) -> DateTime {
         DateTime::from_unix(secs, nanos).unwrap()
+    }
+
+    #[test]
+    fn back_counts_back_through_seconds_and_stops_at_the_earliest() {
+        let d = |secs, nanos| Duration::new(secs, nanos);
+        assert_eq!(at(10, 500).back(d(3, 200)), at(7, 300));
+        assert_eq!(at(10, 100).back(d(0, 200)), at(9, 999_999_900));
+        assert_eq!(at(0, 0).back(d(1, 1)), at(-2, 999_999_999));
+        assert_eq!(at(5, 0).back(d(0, 0)), at(5, 0));
+        assert_eq!(at(i64::MIN, 5).back(d(0, 5)), DateTime::EARLIEST);
+        assert_eq!(at(i64::MIN, 5).back(d(0, 6)), DateTime::EARLIEST);
+        // u64::MAX seconds back from the latest time: before i64::MIN.
+        assert_eq!(at(i64::MAX, 0).back(Duration::MAX), DateTime::EARLIEST);
+        assert_eq!(at(0, 0).back(Duration::MAX), DateTime::EARLIEST);
     }
 
     #[test]

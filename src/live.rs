@@ -2,12 +2,17 @@
 //! subscription, and reports the documents that come to match it, those
 //! that no longer do, and those written that still do. `Watcher` is the
 //! writer's side, checked inside each commit against the documents the
-//! commit changed; `LiveQuery` the application's.
+//! commit changed; `LiveQuery` the application's. Live aggregates
+//! (SPEC §139) are kept beside them: `AggregateWatcher`, run again whole
+//! after each commit to their collection, and `LiveAggregate`.
 
+use crate::aggregate::Aggregate;
 use crate::changes::Change;
+use crate::collection::aggregate_in;
 use crate::database::Reading;
-use crate::document::{DocId, Document};
-use crate::query::{Filter, Panicked};
+use crate::document::{DocId, Document, encode_document};
+use crate::explain::Trace;
+use crate::query::{Filter, Panicked, canonical};
 use crate::select::Selection;
 use std::collections::BTreeSet;
 use std::sync::mpsc;
@@ -320,4 +325,274 @@ pub(crate) fn check(watchers: &mut Vec<Watcher>, changes: &[Change], at: &Readin
             }
         });
     }
+}
+
+/// What a live aggregate reports (SPEC §139): a row that came to be in
+/// its result, one that no longer is, or one whose values changed. A row
+/// is known by its group values, as `group_by` names them, which each
+/// event holds as `group`; without `group_by` there is one row, always
+/// there, and its `group` is `{}`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveRow {
+    /// The row is in the result, and wasn't before this commit; or it
+    /// was when `watch_aggregate` was called, reported first.
+    #[non_exhaustive]
+    Entered {
+        /// Its group values, at their paths as in the row.
+        group: Document,
+        /// The row as it is now.
+        row: Document,
+    },
+    /// The row was in the result before this commit, and no longer is.
+    #[non_exhaustive]
+    Left {
+        /// Its group values, at their paths as in the row.
+        group: Document,
+        /// The row as it is now, where its group still has documents but
+        /// the row fails the `having`, or the row sort's `skip` or `limit`
+        /// leave it out; `None` where no document of the group is left.
+        row: Option<Document>,
+    },
+    /// The row was in the result before this commit and still is, with
+    /// other values.
+    #[non_exhaustive]
+    Changed {
+        /// Its group values, at their paths as in the row.
+        group: Document,
+        /// The row as it is now.
+        row: Document,
+    },
+}
+
+impl LiveRow {
+    /// The group values of the row reported on: `{}` without
+    /// `group_by`.
+    pub fn group(&self) -> &Document {
+        match self {
+            LiveRow::Entered { group, .. }
+            | LiveRow::Left { group, .. }
+            | LiveRow::Changed { group, .. } => group,
+        }
+    }
+}
+
+/// What an aggregate watcher sends: an event, or the error that ended it.
+type SentRow = Result<LiveRow, crate::Error>;
+
+/// A live aggregate, from `Collection::watch_aggregate` (SPEC §139):
+/// first an `Entered` for every row of the aggregate's result, then, for
+/// each commit that changes the collection, the rows that came into the
+/// result, those that left it, and those whose values changed.
+///
+/// The aggregate runs again, whole, as each such commit commits, on the
+/// state it left: no crossing of a `having` is lost between two reads.
+/// Reports wait in memory, without limit, until they are read; a writer
+/// never waits for them. Dropping the `LiveAggregate` ends it.
+///
+/// An item is `Err` once, as it ends: a `Condition::custom` that
+/// panicked as the aggregate ran (`Error::ClosurePanicked`), or a
+/// document that couldn't be read.
+///
+/// ```
+/// # let dir = tempfile::tempdir().unwrap();
+/// # let db = trunkdb::Database::open(dir.path().join("app.trunkdb"))?;
+/// use trunkdb::{Document, LiveRow, query::{Aggregate, Condition, Filter}};
+///
+/// let readings = db.collection::<Document>("readings");
+/// let busy = Aggregate::new()
+///     .group_by("server")
+///     .avg("load").named("mean")
+///     .having(Condition::gt("mean", 0.8));
+/// let alerts = readings.watch_aggregate(Filter::new(), &busy)?;
+///
+/// readings.insert(r#"{"server": "a", "load": 0.9}"#.parse()?)?;
+/// assert!(matches!(alerts.recv(), Some(Ok(LiveRow::Entered { .. }))));
+/// readings.insert(r#"{"server": "a", "load": 0.1}"#.parse()?)?;
+/// assert!(matches!(alerts.recv(), Some(Ok(LiveRow::Left { row: Some(_), .. }))));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug)]
+pub struct LiveAggregate {
+    receiver: mpsc::Receiver<SentRow>,
+}
+
+impl LiveAggregate {
+    /// The next report, waiting for one as long as it takes. `None` once
+    /// it has ended, by an error or by the database being dropped, and
+    /// every report before has been read.
+    pub fn recv(&self) -> Option<crate::Result<LiveRow>> {
+        self.receiver.recv().ok()
+    }
+
+    /// The next report if one is waiting, without waiting.
+    pub fn try_recv(&self) -> Option<crate::Result<LiveRow>> {
+        self.receiver.try_recv().ok()
+    }
+
+    /// The next report, waiting at most `timeout`. `None` if none came,
+    /// or it has ended.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<crate::Result<LiveRow>> {
+        self.receiver.recv_timeout(timeout).ok()
+    }
+}
+
+/// Each report in turn, as `recv` hands them out.
+impl Iterator for LiveAggregate {
+    type Item = crate::Result<LiveRow>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.recv()
+    }
+}
+
+/// A row's group values, at their paths: `LiveRow`'s `group`.
+fn group_of(aggregate: &Aggregate, row: &Document) -> Document {
+    Selection::new(aggregate.group_by.iter().map(String::as_str)).project(row.clone())
+}
+
+/// A row's key: its group values, canonical, so `5` and `5.0`, one
+/// group, are one row (§107.2).
+fn row_key(aggregate: &Aggregate, row: &Document) -> Vec<u8> {
+    let values = (aggregate.group_by.iter())
+        .map(|path| canonical(row.get(path).unwrap_or(&Document::Null)))
+        .collect();
+    encode_document(&Document::Array(values))
+}
+
+/// Equal, a float to the bit: a mean that moved by its last bit has
+/// changed, and NaN is NaN. An object's fields in any order, as objects
+/// compare by their contents (§124): a group's object shown with its
+/// fields in another order, as another document came first, is the
+/// same.
+fn same(a: &Document, b: &Document) -> bool {
+    match (a, b) {
+        (Document::Object(x), Document::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
+        }
+        (Document::Array(x), Document::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(v, w)| same(v, w))
+        }
+        (Document::Float(x), Document::Float(y)) => x.to_bits() == y.to_bits(),
+        (x, y) => x == y,
+    }
+}
+
+/// The aggregate's rows as of `at`: every group's, before `having`, the
+/// row sort, skip and limit, and those they leave, the result.
+fn rows_at(
+    at: &Reading<'_>,
+    collection: &str,
+    filter: &Filter,
+    aggregate: &Aggregate,
+) -> crate::Result<(Vec<Document>, Vec<Document>)> {
+    let every = Aggregate {
+        rows: Filter::new(),
+        ..aggregate.clone()
+    };
+    let trace = Trace::default();
+    let (all, _plan) = aggregate_in(at.catalog, &at.store, collection, filter, &every, &trace)?;
+    let result = aggregate.rows.apply(all.clone());
+    Ok((all, result))
+}
+
+/// A live aggregate, as the writer keeps it.
+pub(crate) struct AggregateWatcher {
+    collection: String,
+    filter: Filter,
+    aggregate: Aggregate,
+    /// The result as of the last commit, each row with its key.
+    rows: Vec<(Vec<u8>, Document)>,
+    sender: mpsc::Sender<SentRow>,
+}
+
+impl AggregateWatcher {
+    /// A live aggregate of `filter` on `collection`, its first result as
+    /// of `at` sent already, as `Entered`.
+    pub(crate) fn start(
+        at: &Reading<'_>,
+        collection: &str,
+        filter: Filter,
+        aggregate: Aggregate,
+    ) -> crate::Result<(Self, LiveAggregate)> {
+        aggregate.check()?;
+        let (_all, result) = rows_at(at, collection, &filter, &aggregate)?;
+        let (sender, receiver) = mpsc::channel();
+        let mut rows = Vec::with_capacity(result.len());
+        for row in result {
+            rows.push((row_key(&aggregate, &row), row.clone()));
+            // The receiver is ours still: the send can't fail.
+            let group = group_of(&aggregate, &row);
+            let _ = sender.send(Ok(LiveRow::Entered { group, row }));
+        }
+        let watcher = AggregateWatcher {
+            collection: collection.to_string(),
+            filter,
+            aggregate,
+            rows,
+            sender,
+        };
+        Ok((watcher, LiveAggregate { receiver }))
+    }
+
+    /// Runs the aggregate again on `at` and reports how its result
+    /// changed: the rows that left it first, in their order before, then
+    /// those that came in or changed, in their order now. `false` once it
+    /// has ended.
+    fn rerun(&mut self, at: &Reading<'_>) -> bool {
+        let (all, result) = match rows_at(at, &self.collection, &self.filter, &self.aggregate) {
+            Ok(rows) => rows,
+            Err(e) => {
+                let _ = self.sender.send(Err(e));
+                return false;
+            }
+        };
+        let keyed = |rows: Vec<Document>| -> Vec<(Vec<u8>, Document)> {
+            (rows.into_iter())
+                .map(|row| (row_key(&self.aggregate, &row), row))
+                .collect()
+        };
+        let now = keyed(result);
+        let mut all = keyed(all);
+        let mut events = Vec::new();
+        let group = |row: &Document| group_of(&self.aggregate, row);
+        for (key, was) in &self.rows {
+            if !now.iter().any(|(k, _)| k == key) {
+                let row = (all.iter().position(|(k, _)| k == key)).map(|i| all.swap_remove(i).1);
+                // Its group as the row before showed it: there may be
+                // none now.
+                let group = group(was);
+                events.push(LiveRow::Left { group, row });
+            }
+        }
+        for (key, row) in &now {
+            let event = match self.rows.iter().find(|(k, _)| k == key) {
+                None => LiveRow::Entered {
+                    group: group(row),
+                    row: row.clone(),
+                },
+                Some((_, was)) if !same(was, row) => LiveRow::Changed {
+                    group: group(row),
+                    row: row.clone(),
+                },
+                Some(_) => continue,
+            };
+            events.push(event);
+        }
+        self.rows = now;
+        events
+            .into_iter()
+            .all(|event| self.sender.send(Ok(event)).is_ok())
+    }
+}
+
+/// Runs every live aggregate on a collection `changes` changed again, on
+/// `at`, the state the commit left (SPEC §139.1), and drops those that
+/// have ended.
+pub(crate) fn check_aggregates(
+    watchers: &mut Vec<AggregateWatcher>,
+    changes: &[Change],
+    at: &Reading<'_>,
+) {
+    watchers.retain_mut(|w| !changes.iter().any(|c| c.collection() == w.collection) || w.rerun(at));
 }

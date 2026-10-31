@@ -1,4 +1,4 @@
-use crate::aggregate::{Aggregate, Groups, Kind, Order};
+use crate::aggregate::{Aggregate, Groups, Kind, Order, Window};
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
@@ -7,7 +7,7 @@ use crate::document::{DocId, Document, encode_document, with_id};
 use crate::explain::{Alternative, EntryCount, Trace};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
-use crate::live::LiveQuery;
+use crate::live::{LiveAggregate, LiveQuery};
 use crate::query::{
     Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork,
     Update, caught,
@@ -189,6 +189,26 @@ impl<T> Collection<T> {
             Some(at) => self.db.read_at(at),
             None => self.db.read(),
         }
+    }
+
+    /// A live aggregate (SPEC §139): first an `Entered` for each row of
+    /// `aggregate` over what `filter` finds, then, for each commit that
+    /// changes the collection, the rows that came into the result, left
+    /// it, or changed. See [`LiveAggregate`].
+    ///
+    /// The aggregate runs again, whole, as each such commit commits,
+    /// under the writer's lock: give it a `window` over an indexed
+    /// date-time, or a filter that an index bounds, so that it reads a
+    /// few documents, not the collection. Everything `aggregate` takes
+    /// goes, the filter's and the rows' sort, skip and limit among it;
+    /// refused as `aggregate` refuses. It waits for a batch being
+    /// committed to finish, as `Database::subscribe` does.
+    pub fn watch_aggregate(
+        &self,
+        filter: Filter,
+        aggregate: &Aggregate,
+    ) -> crate::Result<LiveAggregate> {
+        self.db.watch_aggregate(&self.name, filter, aggregate)
     }
 
     /// The collection's name.
@@ -2232,7 +2252,7 @@ fn count_matches(
 /// (`aggregate_by_entries`), else from the documents `find_in` finds,
 /// each decoded on the paths the aggregate reads. With the plan it
 /// followed.
-fn aggregate_in(
+pub(crate) fn aggregate_in(
     catalog: &Catalog,
     store: &dyn PageStore,
     collection: &str,
@@ -2243,6 +2263,27 @@ fn aggregate_in(
     aggregate.check()?;
     let indexes = catalog.indexes(collection);
     follow_hint(collection, filter, indexes)?;
+    // A window is a condition once the newest is known (SPEC §139.2).
+    let windowed;
+    let filter = match &aggregate.window {
+        Some(_) if !filter.sort.is_empty() || filter.skip > 0 || filter.limit.is_some() => {
+            // Two windows, by count and by time: which first would be a
+            // rule to learn, and `apply`, given the documents the filter
+            // found, could keep only one of them.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an aggregate with a window over a filter with a sort, a skip or a limit: \
+                 window by time or by count, not both",
+            )
+            .into());
+        }
+        Some(window) => {
+            let newest = newest_in(catalog, store, collection, filter, window, trace)?;
+            windowed = filter.clone().and(window.condition(newest));
+            &windowed
+        }
+        None => filter,
+    };
     let mut groups = Groups::new(aggregate);
     // Counts alone, of every match: `count`'s.
     let counts_only = aggregate.columns.iter().all(|c| c.kind == Kind::Count);
@@ -2290,6 +2331,41 @@ fn aggregate_in(
     trace.groups(groups.len());
     let rows = groups.finish(|_| unreachable!("every value from its document"))?;
     Ok((rows, plan_for(filter, indexes)))
+}
+
+/// The latest date-time at a window's path among the documents that
+/// meet `filter`'s conditions (SPEC §139.2): the first of them sorted
+/// newest first, read through an index on the path where there is one.
+/// Its sort, skip and limit play no part; its hint steers the read.
+fn newest_in(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    window: &Window,
+    trace: &Trace,
+) -> crate::Result<Option<crate::DateTime>> {
+    let mut newest = (filter.conditions.iter().cloned())
+        .fold(Filter::new(), Filter::and)
+        // Date-times compare with date-times alone (§69.2).
+        .and(Condition::gte(&window.path, crate::DateTime::EARLIEST))
+        .sort_desc(&window.path)
+        .limit(1);
+    newest.hint = filter.hint.clone();
+    let select = Selection::new([window.path.as_str()]);
+    let found = find_in(
+        catalog,
+        store,
+        collection,
+        &newest,
+        false,
+        Some(&select),
+        trace,
+    )?;
+    match found.into_iter().next() {
+        Some(found) => Ok(window.newest([&found.decode(Some(&select))?])),
+        None => Ok(None),
+    }
 }
 
 /// What an aggregate decodes of a document (SPEC §107.3): the group

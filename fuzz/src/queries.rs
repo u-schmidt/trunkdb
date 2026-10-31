@@ -9,9 +9,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 use trunkdb::query::{Aggregate, Condition, Filter, Op, SortOrder, Update};
 use trunkdb::{
-    Change, Database, DocId, Document, Error, IndexOptions, Live, LiveQuery, Map, Upserted,
+    Change, Database, DocId, Document, Error, IndexOptions, Live, LiveAggregate, LiveQuery,
+    LiveRow, Map, Upserted,
 };
 
 /// Steps a program runs at most, and documents it keeps at most.
@@ -141,6 +143,14 @@ pub struct Ran {
     pub reported: u64,
     /// Conditions made a `Condition::custom` (SPEC §136).
     pub custom: u64,
+    /// Aggregates given a window (SPEC §139).
+    pub windows: u64,
+    /// Aggregates with a window refused beside a filter's sort, skip or
+    /// limit (SPEC §139.2).
+    pub windows_refused: u64,
+    /// Events live aggregates reported (SPEC §139), each as the model
+    /// says.
+    pub live_rows: u64,
     /// Events live queries reported (SPEC §138), each as the model says.
     pub live_events: u64,
 }
@@ -375,6 +385,9 @@ struct Run<'p> {
     /// Live queries (SPEC §138), made with the subscription: each with
     /// its filter and the ids it has reported matching.
     live: Vec<Watched>,
+    /// A live aggregate (SPEC §139), made with them: its filter, its
+    /// aggregate, and the rows it has reported in the result.
+    aggregates: Vec<WatchedAggregate>,
     ran: Ran,
     step: usize,
     /// `QUERIES_TRACE` set: each step said on stderr, for a replay.
@@ -387,6 +400,21 @@ struct Watched {
     filter: Filter,
     query: LiveQuery<Document>,
     matching: BTreeSet<DocId>,
+}
+
+/// A live aggregate and the result it has reported so far, each row
+/// with its group values as canonical text.
+struct WatchedAggregate {
+    filter: Filter,
+    aggregate: Aggregate,
+    live: LiveAggregate,
+    rows: Vec<(String, Document)>,
+}
+
+/// Whether `aggregate` has a window: its `Debug` says so, as the field
+/// isn't public.
+fn aggregate_has_window(aggregate: &Aggregate) -> bool {
+    format!("{aggregate:?}").contains("window: Some")
 }
 
 /// Runs the program `input` (SPEC §105.2), panicking where the database
@@ -407,6 +435,7 @@ pub fn run(input: &[u8]) -> Ran {
         runs: false,
         changes: None,
         live: Vec::new(),
+        aggregates: Vec::new(),
         ran: Ran::default(),
         step: 0,
         trace: std::env::var_os("QUERIES_TRACE").is_some(),
@@ -905,6 +934,49 @@ impl Run<'_> {
             true => AGGREGATED.to_vec(),
             false => index_fields,
         };
+        let aggregate = self.made_aggregate(&fields);
+        let filter = query.filter();
+        let matches = self.expected(&self.model, &filter);
+        let docs = self.docs();
+        let picks = query.skip > 0 || query.limit.is_some() || !query.sort.is_empty();
+        if aggregate_has_window(&aggregate) && picks {
+            // A window by time beside one by count (SPEC §139.2).
+            let refused = docs.aggregate(filter.clone(), &aggregate).unwrap_err();
+            assert!(
+                refused.to_string().contains("window"),
+                "{}: {refused}",
+                self.at()
+            );
+            self.ran.windows_refused += 1;
+            return;
+        }
+        let expected = aggregate.apply(matches).unwrap();
+        let found = docs.aggregate(filter.clone(), &aggregate).unwrap();
+        let agree =
+            found.len() == expected.len() && found.iter().zip(&expected).all(|(a, b)| same(a, b));
+        if !agree {
+            let text = |rows: &[Document]| rows.iter().map(canonical).collect::<Vec<_>>();
+            assert_eq!(
+                text(&found),
+                text(&expected),
+                "{}: aggregate {filter:?} {aggregate:?}",
+                self.at()
+            );
+        }
+        let run = docs.explain_aggregate(filter.clone(), &aggregate).unwrap();
+        assert_eq!(
+            run.stats.documents_returned as usize,
+            expected.len(),
+            "{}",
+            self.at()
+        );
+        self.ran.aggregated += run.stats.from_entries;
+    }
+
+    /// An aggregate of `fields` (SPEC §107): up to two group fields, one
+    /// to three columns, some with a condition, at times a row sort and
+    /// limit, and at times a window (§139).
+    fn made_aggregate(&mut self, fields: &[&'static str]) -> Aggregate {
         let mut aggregate = Aggregate::new();
         let mut grouped = Vec::new();
         for _ in 0..self.program.below(3) {
@@ -934,30 +1006,21 @@ impl Run<'_> {
         if self.program.one_in(4) {
             aggregate = aggregate.sort_desc("c0").limit(1 + self.program.below(3));
         }
-        let filter = query.filter();
-        let matches = self.expected(&self.model, &filter);
-        let expected = aggregate.apply(matches).unwrap();
-        let docs = self.docs();
-        let found = docs.aggregate(filter.clone(), &aggregate).unwrap();
-        let agree =
-            found.len() == expected.len() && found.iter().zip(&expected).all(|(a, b)| same(a, b));
-        if !agree {
-            let text = |rows: &[Document]| rows.iter().map(canonical).collect::<Vec<_>>();
-            assert_eq!(
-                text(&found),
-                text(&expected),
-                "{}: aggregate {filter:?} {aggregate:?}",
-                self.at()
-            );
+        // A window on a path of the pool's date-times (0 s, 1 ns, -5 s):
+        // widths at their gaps, and one past all of time.
+        if self.program.one_in(3) {
+            let path = fields[self.program.below(fields.len())];
+            let duration = [
+                Duration::ZERO,
+                Duration::from_nanos(1),
+                Duration::from_secs(5),
+                Duration::new(5, 1),
+                Duration::MAX,
+            ][self.program.below(5)];
+            aggregate = aggregate.window(path, duration);
+            self.ran.windows += 1;
         }
-        let run = docs.explain_aggregate(filter.clone(), &aggregate).unwrap();
-        assert_eq!(
-            run.stats.documents_returned as usize,
-            expected.len(),
-            "{}",
-            self.at()
-        );
-        self.ran.aggregated += run.stats.from_entries;
+        aggregate
     }
 
     // --- Index steps ---
@@ -1442,6 +1505,9 @@ impl Run<'_> {
         for old in std::mem::take(&mut self.live) {
             assert!(old.query.try_recv().is_none(), "{}", self.at());
         }
+        for old in std::mem::take(&mut self.aggregates) {
+            assert!(old.live.try_recv().is_none(), "{}", self.at());
+        }
         self.watch();
         self.check();
     }
@@ -1458,7 +1524,31 @@ impl Run<'_> {
                 matching: BTreeSet::new(),
             });
         }
+        // A live aggregate of the program's conditions, without a sort,
+        // skip or limit of the filter's, so a window may go beside them.
+        let filter = self.query().conditions_only();
+        let mut aggregate = self.made_aggregate(&AGGREGATED);
+        if self.program.one_in(3) {
+            aggregate = aggregate.having(self.condition_on("c0"));
+        }
+        let live = self
+            .docs()
+            .watch_aggregate(filter.clone(), &aggregate)
+            .unwrap();
+        self.aggregates.push(WatchedAggregate {
+            filter,
+            aggregate,
+            live,
+            rows: Vec::new(),
+        });
         self.live_is_model();
+    }
+
+    /// A condition on column `name` of an aggregate's rows: a `having`.
+    fn condition_on(&mut self, name: &str) -> Condition {
+        let op = OPS[self.program.below(OPS.len())].clone();
+        let value = self.value();
+        Condition::compare(name, op, value)
     }
 
     /// What each live query reported for the step, a commit at most:
@@ -1511,6 +1601,46 @@ impl Run<'_> {
                 watched.matching, expected,
                 "{at}: live query {:?}",
                 watched.filter
+            );
+        }
+        // Each live aggregate: `Entered` a row not in what it reported,
+        // `Left` and `Changed` one in it, `Changed` to other values.
+        // After them, what it reported is the model's result.
+        for watched in &mut self.aggregates {
+            while let Some(event) = watched.live.try_recv() {
+                let event = event.unwrap_or_else(|e| panic!("{at}: {e}"));
+                self.ran.live_rows += 1;
+                let group = group_key(event.group());
+                let at_row = watched.rows.iter().position(|(g, _)| *g == group);
+                match (event, at_row) {
+                    (LiveRow::Entered { row, .. }, None) => watched.rows.push((group, row)),
+                    (LiveRow::Left { .. }, Some(i)) => {
+                        watched.rows.remove(i);
+                    }
+                    (LiveRow::Changed { row, .. }, Some(i)) => {
+                        assert!(
+                            !same(&watched.rows[i].1, &row),
+                            "{at}: changed to the same {row:?}"
+                        );
+                        watched.rows[i].1 = row;
+                    }
+                    (event, at_row) => panic!("{at}: {event:?}, in the result: {at_row:?}"),
+                }
+            }
+            let matches: Vec<Document> = (self.model.values())
+                .filter(|doc| watched.filter.matches(doc))
+                .cloned()
+                .collect();
+            let expected = watched.aggregate.apply(matches).unwrap();
+            let reported: Vec<&Document> = watched.rows.iter().map(|(_, row)| row).collect();
+            let agree = reported.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|row| reported.iter().any(|r| same(r, row)));
+            assert!(
+                agree,
+                "{at}: live aggregate {:?} {:?}: reported {reported:?}, the model has {expected:?}",
+                watched.filter, watched.aggregate
             );
         }
     }
@@ -1975,6 +2105,25 @@ fn same(a: &Document, b: &Document) -> bool {
 
 /// A document as text with every object's fields in name order, for a
 /// failure's message.
+/// A row's group values as one key: the values a filter finds equal
+/// (SPEC §107.2) one key, so `5` and `5.0` and whole floats are ints.
+fn group_key(group: &Document) -> String {
+    fn folded(doc: &Document) -> Document {
+        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+        match doc {
+            Document::Float(f) if f.fract() == 0.0 && *f >= -TWO_POW_63 && *f < TWO_POW_63 => {
+                Document::Int(*f as i64)
+            }
+            Document::Object(map) => {
+                Document::Object(map.iter().map(|(k, v)| (k.clone(), folded(v))).collect())
+            }
+            Document::Array(items) => Document::Array(items.iter().map(folded).collect()),
+            other => other.clone(),
+        }
+    }
+    canonical(&folded(group))
+}
+
 fn canonical(doc: &Document) -> String {
     fn sorted(doc: &Document) -> Document {
         match doc {
