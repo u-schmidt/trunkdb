@@ -56,7 +56,7 @@ panics, and `thread::spawn` hands a thread's panic to `join` as an
 `Err`:
 
 - **Each call is caught** (`catch_unwind`), and the read or write that
-  made it fails with **`Error::ConditionPanicked`**, carrying the
+  made it fails with **`Error::ClosurePanicked`**, carrying the
   panic's message (a `&str` or `String` payload; "a panic without a
   message" for another). What the call found so far is dropped.
 - **A write writes nothing.** `update_many`, `update_fields`,
@@ -160,9 +160,8 @@ has no text. It is the one condition whose text doesn't read back
   next document, as after an I/O error.
 - `update_many`'s own closure, the one that changes each document,
   still runs under the writer's lock uncaught: a panic there poisons
-  it, as before this section. Its documentation says it runs under the
-  lock; it is a closure of the application's all the same, and wants
-  the same treatment.
+  it, as before this section. §137 catches it, and names the error
+  `Error::ClosurePanicked`, for both.
 
 ## 136.8 Tests
 - `tests/custom.rs`:

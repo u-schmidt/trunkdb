@@ -175,7 +175,9 @@ was is never past the file's end as the log starts, and a checkpoint that cut
 the WAL counts it empty even if its flush then failed [§128](spec/128-a-checkpoint-that-fails-after-cutting-the-wal.md). Only if that fails too is the
 batch's fate unknown; the database then refuses every call with
 `Error::Poisoned` until it's reopened, which recovers from the WAL
-[§19](spec/19-durability-take-two-a-page-image-wal.md) [§27](spec/27-a-thread-safe-cloneable-database-handle.md).
+[§19](spec/19-durability-take-two-a-page-image-wal.md) [§27](spec/27-a-thread-safe-cloneable-database-handle.md). A panic in the application's code inside a batch
+doesn't poison: it is caught, and the batch fails as any batch does
+[§136](spec/136-a-condition-of-the-applications-own.md) [§137](spec/137-a-panic-in-update-many-s-change.md).
 
 Costs: memory for the waiting pages (8 MB at the default), and a WAL
 that grows with every commit, which the next open after a crash reads
@@ -521,7 +523,8 @@ more than four.
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
   `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md),
   `explain_run` [§94](spec/94-explain-with-execution-statistics.md);
-  `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md);
+  `delete_many` and `update_many` with a closure [§37](spec/37-delete-many-and-dropping-a-collection.md) [§38](spec/38-update-many.md), whose
+  panic fails the call with `Error::ClosurePanicked` [§137](spec/137-a-panic-in-update-many-s-change.md);
   `update_fields` with operators, `Update::new().set(..).inc(..).unset(..)`
   on dotted paths [§68](spec/68-update-operators.md), and `min`, `max`, `rename`, and `push`,
   `add_to_set` and `pull` on arrays [§73](spec/73-more-update-operators.md);
@@ -546,7 +549,7 @@ more than four.
   column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md); a condition of the
   application's own, `Condition::custom(fields, test)`, a closure given
   the fields it names, whose panic fails the call with
-  `Error::ConditionPanicked` [§136](spec/136-a-condition-of-the-applications-own.md).
+  `Error::ClosurePanicked` [§136](spec/136-a-condition-of-the-applications-own.md).
 - **Reading a document:** `get(path)`, `as_i64`, `as_f64`, `as_str` and
   the other readers, each `None` for another type [§136](spec/136-a-condition-of-the-applications-own.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
@@ -573,6 +576,10 @@ more than four.
   says why it failed in types, not words: `Format` for a file or WAL
   this build can't read at all, `Io` of kind `WouldBlock` for a file
   another open holds, `Io` of kind `InvalidData` for damage [§92](spec/92-typed-format-errors.md).
+  Code of the application's that panics inside a call, a
+  `Condition::custom`, `update_many`'s change or a `T`'s conversions
+  while it writes, is caught: `ClosurePanicked`, the batch rolled back,
+  the writer's lock not poisoned [§136](spec/136-a-condition-of-the-applications-own.md) [§137](spec/137-a-panic-in-update-many-s-change.md).
 
 ## 11. Tools
 

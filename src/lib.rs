@@ -157,14 +157,16 @@ pub enum Error {
         "the database file may be inconsistent after a failed write; reopen the database to recover it from the write-ahead log"
     )]
     Poisoned,
-    /// The closure of a `Condition::custom` panicked (SPEC §136.2): code of
-    /// the application's, kept apart from trunkdb's. The call that ran it
-    /// did nothing — a read returned nothing, a write wrote nothing — and
-    /// the database goes on as before. `message` is what the panic said;
-    /// `std`'s panic hook has printed it too, as for any panic.
+    /// Code of the application's that trunkdb ran panicked, and was kept
+    /// apart from trunkdb's own: the closure of a `Condition::custom`
+    /// (SPEC §136.2), or `update_many`'s change and the conversions to and
+    /// from its `T` (§137). The call that ran it did nothing — a read
+    /// returned nothing, a write wrote nothing — and the database goes on
+    /// as before. `message` is what the panic said; `std`'s panic hook
+    /// has printed it too, as for any panic.
     #[non_exhaustive]
-    #[error("a custom condition panicked: {message}")]
-    ConditionPanicked {
+    #[error("a closure of the application's panicked: {message}")]
+    ClosurePanicked {
         /// What the panic said.
         message: String,
     },

@@ -9,7 +9,7 @@ use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::query::{
     Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork,
-    Update,
+    Update, caught,
 };
 use crate::select::{Answer, Selection};
 use crate::storage::{PageId, PageStore, RecordLocation};
@@ -568,10 +568,13 @@ where
         filter: Filter,
         mut change: impl FnMut(&mut T),
     ) -> crate::Result<usize> {
+        // `T`'s conversions are the application's code too (SPEC §137).
         self.as_document().update_matching(filter, |_id, doc| {
-            let mut value: T = from_document(doc)?;
-            change(&mut value);
-            Ok(crate::serde_bridge::to_document(&value)?)
+            caught(|| -> crate::Result<Document> {
+                let mut value: T = from_document(doc)?;
+                change(&mut value);
+                Ok(crate::serde_bridge::to_document(&value)?)
+            })?
         })
     }
 
@@ -581,7 +584,7 @@ where
     pub fn update_fields(&self, filter: Filter, update: &Update) -> crate::Result<usize> {
         self.as_document()
             .update_fields_then(filter, update, |doc| {
-                from_document::<T>(doc.clone()).map(drop)
+                caught(|| from_document::<T>(doc.clone()).map(drop))?
             })
     }
 
@@ -724,14 +727,16 @@ impl Collection<Document> {
     /// its own.
     ///
     /// `change` runs while the database is locked for writing: it must
-    /// not use this database itself, which would deadlock.
+    /// not use this database itself, which would deadlock. If it panics,
+    /// the call fails with `Error::ClosurePanicked`, nothing is written,
+    /// and the database goes on (SPEC §137).
     pub fn update_many(
         &self,
         filter: Filter,
         mut change: impl FnMut(&mut Document),
     ) -> crate::Result<usize> {
         self.update_matching(filter, |_id, mut doc| {
-            change(&mut doc);
+            caught(|| change(&mut doc))?;
             Ok(doc)
         })
     }

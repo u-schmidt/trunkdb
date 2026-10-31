@@ -303,8 +303,8 @@ fn panics_at(at: i64) -> Condition {
 
 fn panicked(result: trunkdb::Result<impl std::fmt::Debug>) -> String {
     match result {
-        Err(Error::ConditionPanicked { message, .. }) => message,
-        other => panic!("not ConditionPanicked: {other:?}"),
+        Err(Error::ClosurePanicked { message, .. }) => message,
+        other => panic!("not ClosurePanicked: {other:?}"),
     }
 }
 

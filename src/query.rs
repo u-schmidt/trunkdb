@@ -163,10 +163,21 @@ impl PartialEq for Custom {
     }
 }
 
-/// A closure of `Condition::custom` that panicked (SPEC §136.2), caught:
-/// `Error::ConditionPanicked` from a read or a write, the panic itself
-/// again from a check in memory.
+/// A closure of the application's that panicked, caught: of
+/// `Condition::custom` (SPEC §136.2), or `update_many`'s (§137).
+/// `Error::ClosurePanicked` from a read or a write, the panic itself again
+/// from a check in memory.
 pub(crate) struct Panicked(Box<dyn std::any::Any + Send>);
+
+/// `run`, code of the application's, with its panic caught (SPEC §137):
+/// `Error::ClosurePanicked`, which fails the batch it runs in as any
+/// error does, the writer's lock let go, not poisoned.
+pub(crate) fn caught<R>(run: impl FnOnce() -> R) -> crate::Result<R> {
+    // Unwind safe: after a panic the batch fails, and nothing it held is
+    // looked at again.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .map_err(|panic| Panicked(panic).into())
+}
 
 impl Panicked {
     /// What the panic said, as `std`'s hook prints it.
@@ -189,7 +200,7 @@ impl Panicked {
 
 impl From<Panicked> for crate::Error {
     fn from(panicked: Panicked) -> Self {
-        crate::Error::ConditionPanicked {
+        crate::Error::ClosurePanicked {
             message: panicked.message(),
         }
     }
@@ -365,7 +376,7 @@ impl Condition {
     /// It never bounds an index read: ANDed with conditions that do, it
     /// is called only on the documents they leave. It has no text form
     /// (SPEC §111). A panic in `test` fails the call that ran it with
-    /// `Error::ConditionPanicked`, a write with nothing written, and the
+    /// `Error::ClosurePanicked`, a write with nothing written, and the
     /// database goes on as before; a check in memory (`matches`) panics
     /// on.
     pub fn custom<F>(fields: impl IntoIterator<Item = impl Into<String>>, test: F) -> Self

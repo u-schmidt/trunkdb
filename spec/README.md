@@ -151,3 +151,4 @@ say what changed, and DESIGN.md says what is true now.
 134. [Aggregate columns, named last (`aggregate.rs`)](134-aggregate-columns-named-last.md)
 135. [A hook after each commit (`changes.rs`, `database.rs`, `catalog.rs`)](135-a-hook-after-each-commit.md)
 136. [A condition of the application's own (`query.rs`, `document.rs`, `collection.rs`)](136-a-condition-of-the-applications-own.md)
+137. [A panic in `update_many`'s change (`collection.rs`)](137-a-panic-in-update-many-s-change.md)

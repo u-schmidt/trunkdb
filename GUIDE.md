@@ -108,7 +108,7 @@ let found = users.find(Filter::new().eq("team", "core").and(at_example))?;
 
 The `(team, age)` index narrows the read; the closure runs on what it
 leaves. A closure alone scans the collection, and has no text form. If
-it panics, `find` returns `Error::ConditionPanicked`, and the database
+it panics, `find` returns `Error::ClosurePanicked`, and the database
 carries on.
 
 ## Atomic batches

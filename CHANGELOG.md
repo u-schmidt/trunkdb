@@ -730,7 +730,7 @@ limit, batches and a write-ahead log. Since then:
     The closure gets a document of the fields it names, never more. It
     never bounds an index read; ANDed with conditions that do, it runs
     on what they leave. A panic in it fails the call with the new
-    `Error::ConditionPanicked`: a write writes nothing, and the database
+    `Error::ClosurePanicked`: a write writes nothing, and the database
     goes on. A check in memory (`Filter::matches`) panics on. It has no
     text form: `Display` writes `custom(a, b)`, which the parser
     refuses. `Document` gets readers: `get(path)`, `is_null`,
@@ -738,3 +738,11 @@ limit, batches and a write-ahead log. Since then:
     `as_id`, `as_array`, `as_object`. `Condition` has a new variant,
     `Custom`; it is `#[non_exhaustive]`, so a `match` with a `_` arm
     still compiles.
+
+110. **A panic in `update_many`'s change** (§137), or in the `Serialize`
+    or `Deserialize` of a typed collection's `T` while `update_many` or
+    `update_fields` writes, no longer poisons the database. It ran
+    under the writer's lock, and every later write failed with
+    `Error::Poisoned` until the database was opened again. Now the call
+    fails with `Error::ClosurePanicked`, nothing is written, and the
+    database goes on. That error is item 109's, named for both.
