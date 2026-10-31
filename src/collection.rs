@@ -529,6 +529,7 @@ impl<T> Collection<T> {
             started.elapsed(),
         );
         explained.hinted = filter.hint.is_some();
+        explained.except = filter.except.clone();
         explained.alternatives = alternatives(
             at.catalog,
             &at.store,
@@ -5231,6 +5232,7 @@ mod tests {
             skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
             select: None,
+            except: Vec::new(),
             hint: None,
         }
     }
@@ -5605,6 +5607,7 @@ mod tests {
             skip: skips[rng.below(skips.len())],
             limit: limits[rng.below(limits.len())],
             select: None,
+            except: Vec::new(),
             hint: None,
         }
     }
@@ -6040,8 +6043,9 @@ mod tests {
     /// the documents `f` finds, each cut down to the selection — and reads
     /// no document more, the ones answered from their entries fewer.
     /// Half the time the selection is one index's fields, which its
-    /// entries may answer (§106.5). Returns how many results came from
-    /// entries.
+    /// entries may answer (§106.5). A third of the time some paths are
+    /// excepted too (§143), and half of those without the selection.
+    /// Returns how many results came from entries.
     fn selection_agrees(docs: &Collection<Document>, f: &Filter, rng: &mut XorShift) -> u64 {
         let whole = docs.find_with_ids(f.clone()).unwrap();
         let indexes = docs.indexes().unwrap();
@@ -6059,8 +6063,25 @@ mod tests {
                     .collect()
             }
         };
-        let s = f.clone().select(chosen.iter().map(String::as_str));
-        let selection = crate::select::Selection::new(chosen.iter().map(String::as_str));
+        // Drawn apart, so the corpora draw what they drew before §143.
+        let mut apart = XorShift((rng.0 ^ 0x9E37_79B9_7F4A_7C15).rotate_left(29) | 1);
+        let pool = selectable(docs, &whole);
+        let except: Vec<String> = match apart.below(3) {
+            0 if !pool.is_empty() => (0..1 + apart.below(2))
+                .map(|_| pool[apart.below(pool.len())].clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let selects = except.is_empty() || apart.below(2) == 0;
+        let (mut s, selection) = match selects {
+            true => (
+                f.clone().select(chosen.iter().map(String::as_str)),
+                crate::select::Selection::new(chosen.iter().map(String::as_str)),
+            ),
+            false => (f.clone(), crate::select::Selection::everything()),
+        };
+        s = s.except(except.iter().map(String::as_str));
+        let selection = selection.excepting(except.iter().map(String::as_str));
         let cut = |doc: Document| selection.project(doc).to_string();
         let expected: Vec<String> = whole.iter().map(|(_, doc)| cut(doc.clone())).collect();
         let text = |found: Vec<Document>| -> Vec<String> {
@@ -6129,7 +6150,8 @@ mod tests {
             docs.explain_run(f.clone()).unwrap(),
             docs.explain_run(s.clone()).unwrap(),
         );
-        assert_eq!(selected.select.as_deref(), Some(&chosen[..]));
+        assert_eq!(selected.select.as_deref(), selects.then_some(&chosen[..]));
+        assert_eq!(selected.except, except);
         assert_eq!(selected.stats.documents_returned, expected.len() as u64);
         assert_eq!(plain.stats.from_entries, 0);
         assert_eq!(
@@ -10223,6 +10245,169 @@ mod tests {
 
     /// SPEC §106.2: what a selection hands out, through `find`, `cursor`,
     /// `find_one`, a `View` and the typed path.
+    /// SPEC §143: `except` on every read: the rest in its stored order,
+    /// nested, alone and after a `select`, typed, from index entries where
+    /// a selection is answered there, live; counts and writes ignore it.
+    #[test]
+    fn an_except_hands_out_the_rest_on_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let notes = db.collection::<Document>("notes");
+        notes.ensure_index(["team", "title"]).unwrap();
+        for json in [
+            r#"{"title":"Plan","team":"core","body":"long","meta":{"raw":"x","by":"Ada"}}"#,
+            r#"{"title":"Notes","team":"core","meta":"none"}"#,
+            r#"{"title":"Web","team":"web","body":"text","meta":{"raw":"y"}}"#,
+        ] {
+            notes.insert(json.parse().unwrap()).unwrap();
+        }
+        let texts = |found: Vec<Document>| -> Vec<String> {
+            (found.into_iter())
+                .map(|doc| {
+                    let Document::Object(mut map) = doc else {
+                        panic!("{doc}")
+                    };
+                    assert!(
+                        matches!(map.iter().next(), Some((key, Document::Id(_))) if key == "_id")
+                    );
+                    map["_id"] = Document::String("ID".into());
+                    Document::Object(map).to_string()
+                })
+                .collect()
+        };
+        let lean = || Filter::new().sort_asc("title").except(["body", "meta.raw"]);
+        let expected = [
+            r#"{"_id":"ID","title":"Notes","team":"core","meta":"none"}"#,
+            r#"{"_id":"ID","title":"Plan","team":"core","meta":{"by":"Ada"}}"#,
+            r#"{"_id":"ID","title":"Web","team":"web","meta":{}}"#,
+        ];
+        assert_eq!(texts(notes.find(lean()).unwrap()), expected);
+        let streamed: Vec<Document> = notes.cursor(lean()).unwrap().map(Result::unwrap).collect();
+        assert_eq!(texts(streamed), expected);
+        let unsorted = || Filter::new().eq("team", "core").except(["body", "meta"]);
+        let streamed: Vec<Document> = notes
+            .cursor(unsorted())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut streamed = texts(streamed);
+        streamed.sort();
+        assert_eq!(
+            streamed,
+            [
+                r#"{"_id":"ID","title":"Notes","team":"core"}"#,
+                r#"{"_id":"ID","title":"Plan","team":"core"}"#
+            ]
+        );
+        let view = db.snapshot().unwrap().collection::<Document>("notes");
+        assert_eq!(texts(view.find(lean()).unwrap()), expected);
+        assert_eq!(
+            texts(notes.find_one(lean()).unwrap().into_iter().collect()),
+            expected[..1]
+        );
+        assert_eq!(
+            texts(notes.find(lean().except(["meta", "title"])).unwrap())[0],
+            r#"{"_id":"ID","team":"core"}"#
+        );
+        assert_eq!(
+            texts(notes.find(lean().except([""])).unwrap()),
+            [r#"{"_id":"ID"}"#; 3]
+        );
+
+        // After a select, and answered from entries where the select is.
+        let pairs = || {
+            Filter::new()
+                .eq("team", "core")
+                .sort_asc("title")
+                .select(["team", "title"])
+        };
+        let run = notes.explain_run(pairs().except(["team"])).unwrap();
+        assert_eq!(
+            (run.stats.from_entries, run.stats.documents_examined),
+            (2, 0)
+        );
+        assert_eq!(run.except, ["team"]);
+        assert_eq!(
+            texts(notes.find(pairs().except(["team"])).unwrap()),
+            [
+                r#"{"_id":"ID","title":"Notes"}"#,
+                r#"{"_id":"ID","title":"Plan"}"#
+            ]
+        );
+        let run = notes
+            .explain_run(Filter::new().eq("team", "core").except(["body"]))
+            .unwrap();
+        assert_eq!(
+            (run.stats.from_entries, run.stats.documents_examined),
+            (0, 2),
+            "no entry holds every field"
+        );
+        assert!(notes.explain_run(Filter::new()).unwrap().except.is_empty());
+
+        // Typed: a struct without the large field reads past it; one
+        // that needs it is told it's missing.
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Note {
+            title: String,
+            body: Option<String>,
+        }
+        let typed = db.collection::<Note>("notes");
+        let found = typed
+            .find(Filter::new().eq("title", "Plan").except(["body"]))
+            .unwrap();
+        assert_eq!(
+            found,
+            [Note {
+                title: "Plan".into(),
+                body: None
+            }]
+        );
+        let missing = typed.find(Filter::new().eq("title", "Plan").except(["title"]));
+        assert!(
+            matches!(missing, Err(crate::Error::Document(_))),
+            "{missing:?}"
+        );
+
+        // Live: what's handed out is cut, at the start and after.
+        let live = notes
+            .watch(Filter::new().eq("team", "web").except(["body", "meta"]))
+            .unwrap();
+        notes
+            .update_fields(
+                Filter::new().eq("team", "web"),
+                &Update::new().set("body", "more"),
+            )
+            .unwrap();
+        let docs: Vec<String> = (0..2)
+            .map(|_| match live.recv().unwrap().unwrap() {
+                crate::Live::Entered { doc, .. } | crate::Live::Changed { doc, .. } => {
+                    texts(vec![doc]).remove(0)
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(docs, [r#"{"_id":"ID","title":"Web","team":"web"}"#; 2]);
+
+        // Counts and writes see whole documents.
+        assert_eq!(
+            notes
+                .count(Filter::new().except(["team"]).eq("team", "core"))
+                .unwrap(),
+            2
+        );
+        notes
+            .update_many(Filter::new().eq("title", "Plan").except(["body"]), |doc| {
+                assert_eq!(doc.get("body").and_then(Document::as_str), Some("long"));
+            })
+            .unwrap();
+        assert_eq!(
+            notes
+                .delete_many(Filter::new().except(["title"]).eq("team", "web"))
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn a_selection_hands_out_what_it_names_on_every_read() {
         let dir = tempfile::tempdir().unwrap();

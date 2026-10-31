@@ -16,11 +16,12 @@ anyway: strings, `>` and `*` mean something to the shell.
 ## A query
 
 ```text
-[select <paths>] [where] [<condition>] [order by <path> [asc|desc], …] [limit <n>] [offset <n>] [use index <fields> | use no index]
+[select <paths> | select *] [except <paths>] [where] [<condition>] [order by <path> [asc|desc], …] [limit <n>] [offset <n>] [use index <fields> | use no index]
 ```
 
 Every part may be left out; nothing at all means every document.
 `where` is needed only after a `select`, to say where the paths end.
+`select * except body` hands out every field but `body`.
 Keywords can be in any case. `_id` is always handed out, selected or
 not; a selected field a document lacks is left out of its line.
 

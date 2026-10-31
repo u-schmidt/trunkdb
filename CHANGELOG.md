@@ -790,3 +790,11 @@ limit, batches and a write-ahead log. Since then:
     `pop_first(path)` and `pop_last(path)` take an element from an end
     of an array, a queue's next item; `push_all(path, values)` pushes
     each value in order, `$push` with `$each`.
+
+115. **`except`** (§143): `Filter::except(paths)` hands out every field
+    but those, BigQuery's `SELECT * EXCEPT`: for a large field a list
+    doesn't show. The rest keeps its order, `_id` stays, and the
+    excepted fields are skipped, not decoded. After a `select` it takes
+    out of what the selection hands out. In the text, `select * except
+    body`; `except` isn't a reserved word. `Explained::except` says
+    what was excepted.

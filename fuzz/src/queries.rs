@@ -153,6 +153,8 @@ pub struct Ran {
     pub live_rows: u64,
     /// Events live queries reported (SPEC §138), each as the model says.
     pub live_events: u64,
+    /// Reads with an `except` (SPEC §143).
+    pub excepted: u64,
 }
 
 pub const STEP_NAMES: [&str; 15] = [
@@ -210,6 +212,8 @@ struct Query {
     limit: Option<usize>,
     /// The paths selected (SPEC §106); `None`: whole documents.
     select: Option<Vec<&'static str>>,
+    /// The paths taken out of what it hands out (SPEC §143).
+    except: Vec<&'static str>,
 }
 
 impl Query {
@@ -223,16 +227,17 @@ impl Query {
         for (key, order) in &self.sort {
             filter = filter.then_by(*key, *order);
         }
-        match &self.select {
-            Some(paths) => filter.select(paths.iter().copied()),
-            None => filter,
+        if let Some(paths) = &self.select {
+            filter = filter.select(paths.iter().copied());
         }
+        filter.except(self.except.iter().copied())
     }
 
     /// The same query handing out whole documents.
     fn unselected(&self) -> Self {
         Query {
             select: None,
+            except: Vec::new(),
             ..self.clone()
         }
     }
@@ -455,6 +460,7 @@ pub fn run(input: &[u8]) -> Ran {
         skip: 0,
         limit: None,
         select: None,
+        except: Vec::new(),
     };
     for at in 0..run.snapshots.len() {
         run.read_snapshot(at, &everything);
@@ -786,12 +792,14 @@ impl Run<'_> {
             _ => Some(n + 1 + self.program.below(4)),
         };
         let select = self.selection(None);
+        let except = self.excepted();
         Query {
             conditions,
             sort,
             skip,
             limit,
             select,
+            except,
         }
     }
 
@@ -881,12 +889,14 @@ impl Run<'_> {
             _ => Some(1 + self.program.below(30)),
         };
         let select = self.selection(Some(fields));
+        let except = self.excepted();
         Query {
             conditions,
             sort,
             skip,
             limit,
             select,
+            except,
         }
     }
 
@@ -902,6 +912,18 @@ impl Run<'_> {
                     .map(|_| SELECTED[self.program.below(SELECTED.len())])
                     .collect(),
             ),
+        }
+    }
+
+    /// What a read takes out of what it hands out, a quarter of the time
+    /// (SPEC §143): one or two of `SELECTED`, with a selection or
+    /// without.
+    fn excepted(&mut self) -> Vec<&'static str> {
+        match self.program.below(4) {
+            0 => (0..1 + self.program.below(2))
+                .map(|_| SELECTED[self.program.below(SELECTED.len())])
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -1796,7 +1818,10 @@ impl Run<'_> {
         let explained = docs.explain_run(filter.clone()).unwrap();
         self.ran.plans.insert(plan_name(&explained.plan));
         self.ran.answered += explained.stats.from_entries;
-        if query.select.is_some() {
+        if !query.except.is_empty() {
+            self.ran.excepted += 1;
+        }
+        if query.select.is_some() || !query.except.is_empty() {
             // A selection reads the documents the same filter does, less
             // those answered from their entries (SPEC §106.5).
             let whole = docs.explain_run(query.unselected().filter()).unwrap();

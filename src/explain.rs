@@ -21,6 +21,9 @@ pub struct Explained {
     /// The paths the filter selects (SPEC §106), as given; `None`
     /// without a selection: whole documents.
     pub select: Option<Vec<String>>,
+    /// The paths the filter takes out of what it hands out (SPEC §143),
+    /// as given; empty without `except`.
+    pub except: Vec<String>,
     /// What it read and returned, and how long it took.
     pub stats: ExecutionStats,
     /// The plans the planner passed over, and what each would have read
@@ -213,6 +216,7 @@ impl Trace {
             reads,
             sort,
             select,
+            except: Vec::new(),
             alternatives: Vec::new(),
         }
     }

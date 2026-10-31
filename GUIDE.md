@@ -268,6 +268,18 @@ date-times can come from an entry. Numbers and nulls are read from the
 document, because the key keeps neither a number's type nor whether a
 null field is there.
 
+`except` is the other way round: every field but the ones it names,
+for a large field a list doesn't show (SPEC §143):
+
+```rust
+let list = notes.find(Filter::new().eq("team", "core").except(["body", "meta.raw"]))?;
+// in text: select * except body, meta.raw where team = "core"
+```
+
+What's left keeps its stored order, `_id` stays, and an object emptied
+by it stays as `{}`. After a `select`, it takes out of what the
+selection hands out.
+
 A typed collection can also be opened with a smaller type: serde
 ignores the fields it doesn't declare, so this hands back only names
 and teams:

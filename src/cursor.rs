@@ -61,7 +61,7 @@ enum Source<T> {
         /// means nothing in another one, where its slot may hold a
         /// different document (SPEC §20.2).
         candidates: std::vec::IntoIter<Pending>,
-        filter: Filter,
+        filter: Box<Filter>,
         /// The selection, and how the entries answer it (SPEC §106).
         selected: Option<Box<(Selection, Option<Answer>)>>,
         /// Matches still to pass over (`Filter::skip`, SPEC §72).
@@ -87,7 +87,7 @@ impl<T> Cursor<T> {
             source: Source::Streaming {
                 documents,
                 candidates: candidates.into_iter(),
-                filter,
+                filter: Box::new(filter),
                 selected,
                 skipping,
                 remaining,

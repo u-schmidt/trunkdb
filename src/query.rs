@@ -474,6 +474,9 @@ pub struct Filter {
     /// The paths a read hands out, besides `_id` (SPEC §106); `None`:
     /// whole documents.
     pub(crate) select: Option<Vec<String>>,
+    /// The paths taken out of what a read hands out (SPEC §143); empty:
+    /// none.
+    pub(crate) except: Vec<String>,
     /// Which index to read, where the planner's rules would choose
     /// another (SPEC §132); `None`: the rules choose.
     pub(crate) hint: Option<Hint>,
@@ -727,10 +730,46 @@ impl Filter {
         self
     }
 
-    /// The selection, parsed (SPEC §106.4); `None` without one, or where
-    /// it selects the whole document.
+    /// Every field a read would hand out but `paths` (SPEC §143): SQL's
+    /// `SELECT * EXCEPT (…)`, as BigQuery has it, MongoDB's exclusion
+    /// projection. For a large field a list doesn't show:
+    ///
+    /// ```
+    /// use trunkdb::query::Filter;
+    ///
+    /// let list = Filter::new().eq("team", "core").except(["body", "meta.raw"]);
+    /// // [{"_id": ..., "title": "Plan", "meta": {"author": "Ada"}}, ...]
+    /// # let _ = list;
+    /// ```
+    ///
+    /// - The paths are named as `select`'s: a path doesn't walk into
+    ///   arrays, a step ending in `[*]` names its array whole, and the
+    ///   empty path the whole document, so `except([""])` hands out `_id`
+    ///   alone.
+    /// - `_id` is handed out anyway: excepting it changes nothing.
+    /// - What's left keeps its order, the stored order without a
+    ///   `select`; an object emptied by it stays, as `{}`. A missing
+    ///   field is no change.
+    /// - With a `select`, it takes out of what the selection hands out:
+    ///   `select(["address"]).except(["address.zip"])`.
+    ///
+    /// A second call adds to the first. Like `select`, it changes only
+    /// what reads hand out, and saves decoding: the fields taken out are
+    /// skipped, not built. Without a `select`, no index entry answers a
+    /// read (§106.5): an entry doesn't hold every field.
+    pub fn except<S: Into<String>>(mut self, paths: impl IntoIterator<Item = S>) -> Self {
+        self.except.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// The selection, parsed (SPEC §106.4), with what `except` takes out
+    /// (§143); `None` where a read hands out the whole document.
     pub(crate) fn selection(&self) -> Option<Selection> {
-        let selection = Selection::new(self.select.as_ref()?.iter().map(String::as_str));
+        let selection = match &self.select {
+            Some(paths) => Selection::new(paths.iter().map(String::as_str)),
+            None => Selection::everything(),
+        };
+        let selection = selection.excepting(self.except.iter().map(String::as_str));
         (!selection.is_whole()).then_some(selection)
     }
 
@@ -4327,6 +4366,7 @@ mod tests {
             skip: 1,
             limit: Some(5),
             select: None,
+            except: Vec::new(),
             hint: None,
         };
         // `Filter` has no `PartialEq` (a `Float` NaN isn't equal to itself).
@@ -4729,6 +4769,7 @@ mod tests {
             skip: 0,
             limit: Some(2),
             select: None,
+            except: Vec::new(),
             hint: None,
         };
 

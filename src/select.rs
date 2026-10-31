@@ -11,6 +11,10 @@
 //! object with nothing selected under it is left out. A missing field is
 //! left out; a stored `null` is handed out. A step ending in `[*]`
 //! selects its array whole, and the empty path the whole document.
+//!
+//! `Filter::except`'s paths (§143) are a second tree, taken out of what
+//! the selection hands out: named the same way, never `_id`, and what's
+//! left keeps its order, an object emptied by them included.
 
 use crate::decode::{take_u8, take_u32};
 use crate::document::{
@@ -29,10 +33,14 @@ enum Node {
     Fields(Vec<(String, Node)>),
 }
 
-/// `Filter::select`'s paths as a tree (SPEC §106.4).
+/// `Filter::select`'s paths as a tree (SPEC §106.4), and
+/// `Filter::except`'s (§143).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Selection {
     root: Node,
+    /// What is taken out of `root`'s: `Fields` of none, nothing; `Whole`,
+    /// everything but `_id`.
+    except: Node,
 }
 
 impl Selection {
@@ -43,12 +51,53 @@ impl Selection {
         for path in paths {
             add(&mut root, path);
         }
-        Selection { root }
+        Selection {
+            root,
+            except: Node::Fields(Vec::new()),
+        }
     }
 
-    /// Whether it selects the whole document (the empty path).
+    /// The whole document, less `paths` (SPEC §143).
+    pub fn everything() -> Self {
+        Selection {
+            root: Node::Whole,
+            except: Node::Fields(Vec::new()),
+        }
+    }
+
+    /// `paths` taken out of what it hands out (SPEC §143), named as
+    /// `select`'s are: `_id` adds nothing, and the empty path takes out
+    /// everything else.
+    pub fn excepting<'p>(mut self, paths: impl IntoIterator<Item = &'p str>) -> Self {
+        for path in paths {
+            add(&mut self.except, path);
+        }
+        self
+    }
+
+    /// Whether it hands out the whole document: the empty path selected,
+    /// or nothing selected, and nothing excepted.
     pub fn is_whole(&self) -> bool {
-        self.root == Node::Whole
+        self.root == Node::Whole && self.except == Node::Fields(Vec::new())
+    }
+
+    /// `doc` with the excepted paths taken out, the rest in its order.
+    fn take_out(&self, doc: Document) -> Document {
+        match (&self.except, doc) {
+            (Node::Fields(fields), doc) if fields.is_empty() => doc,
+            (Node::Whole, Document::Object(mut map)) => {
+                let mut out = Map::with_capacity(1);
+                if let Some(id) = map.0.shift_remove(ID_FIELD) {
+                    out.insert(ID_FIELD.to_string(), id);
+                }
+                Document::Object(out)
+            }
+            (Node::Fields(fields), Document::Object(mut map)) => {
+                remove(&mut map, fields);
+                Document::Object(map)
+            }
+            (_, doc) => doc,
+        }
     }
 
     /// `doc` cut down to the selection: what `Filter::apply` hands out.
@@ -56,7 +105,7 @@ impl Selection {
     /// as it is, as a read decodes it whole.
     pub fn project(&self, doc: Document) -> Document {
         let Node::Fields(fields) = &self.root else {
-            return doc;
+            return self.take_out(doc);
         };
         let Document::Object(mut map) = doc else {
             return doc;
@@ -66,7 +115,7 @@ impl Selection {
             out.insert(ID_FIELD.to_string(), id);
         }
         take(&mut map, fields, &mut out);
-        Document::Object(out)
+        self.take_out(Document::Object(out))
     }
 
     /// The selection of a stored document, `id` as its `_id`, from its
@@ -76,24 +125,28 @@ impl Selection {
     /// document is. A stored `_id` (files before §59) is passed over, as
     /// `with_id` replaces it.
     pub fn decode(&self, encoded: &[u8], id: DocId) -> std::io::Result<Document> {
-        let Node::Fields(fields) = &self.root else {
-            return Ok(with_id(decode_document(encoded)?.0, id));
-        };
         if !encodes_object(encoded) {
             return Ok(with_id(decode_document(encoded)?.0, id));
         }
-        let mut out = Map::with_capacity(fields.len() + 1);
-        out.insert(ID_FIELD.to_string(), Document::Id(id));
         // `_id` alone still walks the document: damage reads as damage.
         let mut bytes = &encoded[1..];
-        decode_object(
-            &mut bytes,
-            fields,
-            Document::MAX_NESTING - 1,
-            true,
-            &mut out,
-        )?;
-        Ok(Document::Object(out))
+        let levels = Document::MAX_NESTING - 1;
+        let fields = match (&self.root, &self.except) {
+            (Node::Fields(fields), _) => fields,
+            // Everything but `_id`: nothing to take.
+            (Node::Whole, Node::Whole) => &Vec::new(),
+            // The whole document less some fields, skipped unbuilt.
+            (Node::Whole, Node::Fields(except)) => {
+                let mut out = Map::new();
+                out.insert(ID_FIELD.to_string(), Document::Id(id));
+                decode_except(&mut bytes, except, levels, true, &mut out)?;
+                return Ok(Document::Object(out));
+            }
+        };
+        let mut out = Map::with_capacity(fields.len() + 1);
+        out.insert(ID_FIELD.to_string(), Document::Id(id));
+        decode_object(&mut bytes, fields, levels, true, &mut out)?;
+        Ok(self.take_out(Document::Object(out)))
     }
 
     /// The paths of the values selected whole, in the order handed out:
@@ -177,6 +230,62 @@ fn take(map: &mut Map, fields: &[(String, Node)], out: &mut Map) {
             _ => {} // a path that stops before its end
         }
     }
+}
+
+/// The excepted `fields` taken out of `map`, the others keeping their
+/// order. A path stops where its value does, as a selection's does.
+fn remove(map: &mut Map, fields: &[(String, Node)]) {
+    for (name, node) in fields {
+        match node {
+            Node::Whole => {
+                map.0.shift_remove(name);
+            }
+            Node::Fields(inner) => {
+                if let Some(Document::Object(map)) = map.0.get_mut(name) {
+                    remove(map, inner);
+                }
+            }
+        }
+    }
+}
+
+/// An encoded object into `out`, less the excepted `fields`, skipped
+/// unbuilt with their checks; `bytes`, `levels` and `top` as for
+/// `decode_object`. A field excepted in part is opened where it is an
+/// object, and decoded whole where it isn't.
+fn decode_except(
+    bytes: &mut &[u8],
+    fields: &[(String, Node)],
+    levels: usize,
+    top: bool,
+    out: &mut Map,
+) -> std::io::Result<()> {
+    let count = take_u32(bytes, "an object's length")?;
+    for _ in 0..count {
+        let key = take_str(bytes, "a key")?;
+        if top && key == ID_FIELD {
+            skip_value(bytes, levels)?;
+            continue;
+        }
+        let value = match fields.iter().find(|(name, _)| name == key) {
+            None => decode_value(bytes, levels)?,
+            Some((_, Node::Whole)) => {
+                skip_value(bytes, levels)?;
+                continue;
+            }
+            // An object too deep to open is decoded: `decode_value`
+            // reports it.
+            Some((_, Node::Fields(inner))) if bytes.first() == Some(&TAG_OBJECT) && levels > 0 => {
+                take_u8(bytes, "a document's type tag")?;
+                let mut kept = Map::new();
+                decode_except(bytes, inner, levels - 1, false, &mut kept)?;
+                Document::Object(kept)
+            }
+            Some(_) => decode_value(bytes, levels)?,
+        };
+        out.insert(key.to_string(), value);
+    }
+    Ok(())
 }
 
 /// An encoded object's `fields` into `out`, in the selection's order,
@@ -309,7 +418,7 @@ impl Answer {
         out.insert(ID_FIELD.to_string(), Document::Id(key::doc_id(key)));
         let mut leaves = values.iter_mut();
         build(fields, &mut leaves, &mut out);
-        Some(Document::Object(out))
+        Some(self.selection.take_out(Document::Object(out)))
     }
 }
 
@@ -345,6 +454,70 @@ mod tests {
         Selection::new(paths.iter().copied())
             .project(doc(json))
             .to_string()
+    }
+
+    fn excepted(select: Option<&[&str]>, except: &[&str], json: &str) -> String {
+        let selection = match select {
+            Some(paths) => Selection::new(paths.iter().copied()),
+            None => Selection::everything(),
+        };
+        selection
+            .excepting(except.iter().copied())
+            .project(doc(json))
+            .to_string()
+    }
+
+    /// SPEC §143: what `except` takes out, and what it leaves.
+    #[test]
+    fn an_except_takes_out_what_it_names() {
+        let stored = r#"{"_id":"x","a":{"b":1,"c":2},"n":null,"s":"t","arr":[{"b":1}],"z":3}"#;
+        let all = |except: &[&str]| excepted(None, except, stored);
+        // The rest in its stored order.
+        assert_eq!(
+            all(&["a", "s"]),
+            r#"{"_id":"x","n":null,"arr":[{"b":1}],"z":3}"#
+        );
+        // Nested: the object stays, emptied too.
+        assert_eq!(
+            all(&["a.b"]),
+            r#"{"_id":"x","a":{"c":2},"n":null,"s":"t","arr":[{"b":1}],"z":3}"#
+        );
+        assert_eq!(
+            all(&["a.b", "a.c"]),
+            r#"{"_id":"x","a":{},"n":null,"s":"t","arr":[{"b":1}],"z":3}"#
+        );
+        // A path stops at an array, a scalar, a missing field: no change.
+        assert_eq!(
+            all(&["arr.b", "s.len", "q.r", "a.zz", "gone"]),
+            doc(stored).to_string()
+        );
+        // `[*]` names its array whole; `_id` stays; the empty path, all.
+        assert_eq!(
+            all(&["arr[*].b", "_id"]),
+            r#"{"_id":"x","a":{"b":1,"c":2},"n":null,"s":"t","z":3}"#
+        );
+        assert_eq!(all(&[""]), r#"{"_id":"x"}"#);
+        assert_eq!(all(&["[*].b"]), r#"{"_id":"x"}"#);
+        assert!(!Selection::everything().excepting(["a"]).is_whole());
+        assert!(
+            Selection::everything()
+                .excepting([] as [&str; 0])
+                .is_whole()
+        );
+        // With a selection: out of what it hands out, in its order.
+        assert_eq!(
+            excepted(Some(&["z", "a"]), &["a.c", "z"], stored),
+            r#"{"_id":"x","a":{"b":1}}"#
+        );
+        assert_eq!(excepted(Some(&["a.b"]), &["a"], stored), r#"{"_id":"x"}"#);
+        assert_eq!(
+            excepted(Some(&["a.b"]), &["a.b"], stored),
+            r#"{"_id":"x","a":{}}"#
+        );
+        assert_eq!(
+            excepted(Some(&[""]), &["a", "n", "arr", "z"], stored),
+            r#"{"_id":"x","s":"t"}"#
+        );
     }
 
     #[test]
@@ -410,6 +583,15 @@ mod tests {
         }
         let selections: [&[&str]; 6] =
             [&["a"], &["o.q.r"], &["n", "o.p"], &["missing"], &[], &["o"]];
+        // And excepts, without a selection (SPEC §143).
+        let excepts: [&[&str]; 6] = [
+            &["a"],
+            &["o.q.r"],
+            &["n", "o.p"],
+            &["missing"],
+            &[""],
+            &["o.q"],
+        ];
         for bytes in cases {
             let whole = decode_document(&bytes)
                 .map(|_| ())
@@ -421,18 +603,31 @@ mod tests {
                     .map_err(|e| e.to_string());
                 assert_eq!(selected, whole, "{paths:?} of {bytes:?}");
             }
+            for paths in excepts {
+                let left = Selection::everything()
+                    .excepting(paths.iter().copied())
+                    .decode(&bytes, id)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                assert_eq!(left, whole, "except {paths:?} of {bytes:?}");
+            }
         }
     }
 
     /// `decode` gives what `project` gives on the decoded document, for
-    /// every selection of a few paths over a nested document.
+    /// every selection of a few paths over a nested document: stored as
+    /// now, and with its `_id` in the cell's document, as files before
+    /// §59 have it, which the cell's id replaces.
     #[test]
     fn decoding_a_selection_is_projecting_the_whole() {
         let stored = doc(
             r#"{"a":{"b":1,"c":{"d":[1,2],"e":"x"}},"n":null,"s":"t","arr":[{"b":1}],
                 "_id":"stored","z":{"y":{"x":{}}}}"#,
         );
-        let encoded = crate::document::encode_stored(&stored);
+        let encodings = [
+            crate::document::encode_stored(&stored),
+            crate::document::encode_document(&stored),
+        ];
         let id = DocId([7; 16]);
         let paths = [
             "a", "a.b", "a.c", "a.c.d", "a.c.e", "a.x", "n", "s", "s.t", "arr", "arr.b",
@@ -442,14 +637,19 @@ mod tests {
         for a in paths {
             for b in paths {
                 for c in ["z", "a.c.e", "n"] {
-                    let selection = Selection::new([a, b, c]);
-                    let decoded = selection.decode(&encoded, id).unwrap();
-                    let expected = selection.project(whole.clone());
-                    assert_eq!(
-                        decoded.to_string(),
-                        expected.to_string(),
-                        "select {a}, {b}, {c}"
-                    );
+                    // SPEC §143: except the same, alone and after one.
+                    for (selection, encoded) in [
+                        Selection::new([a, b, c]),
+                        Selection::everything().excepting([a, b, c]),
+                        Selection::new([a, c]).excepting([b]),
+                    ]
+                    .into_iter()
+                    .flat_map(|s| encodings.iter().map(move |e| (s.clone(), e)))
+                    {
+                        let decoded = selection.decode(encoded, id).unwrap();
+                        let expected = selection.project(whole.clone());
+                        assert_eq!(decoded.to_string(), expected.to_string(), "{selection:?}");
+                    }
                 }
             }
         }

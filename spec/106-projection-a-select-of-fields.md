@@ -243,7 +243,7 @@ builder), decided in that section.
   here keys it by id, and leaving it out gains 16 bytes a document.
 - **Excluding fields** (`omit(["body"])`): useful against one large
   field, but a second meaning beside the first, and nothing asks for it
-  yet. It can come later as its own method.
+  yet. It can come later as its own method. §143 added it, `except`.
 - **Trimming arrays** (`items[*].sku` giving each element's `sku`):
   MongoDB's rules for it (non-objects dropped, objects kept empty) are a
   design of their own. `[*]` selects the array whole for now (106.2).

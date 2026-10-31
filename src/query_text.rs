@@ -182,21 +182,25 @@ impl<'t> Parser<'t> {
         }
     }
 
-    /// `[select paths] [where] [condition] [order by keys] [limit n]
-    /// [offset n]` (SPEC §111.1).
+    /// `[select (paths | *) [except paths]] [where] [condition] [order by
+    /// keys] [limit n] [offset n]` (SPEC §111.1, §143). `except` means
+    /// something only after `select`'s paths or `*`, where a field can't
+    /// be, so it isn't reserved.
     fn filter(&mut self) -> Parsed<Filter> {
         let mut filter = Filter::new();
-        if self.keyword("select") {
-            let mut paths = vec![self.path()?];
-            while self.eat(",") {
-                paths.push(self.path()?);
+        let selects = self.keyword("select");
+        if selects {
+            if !self.eat("*") {
+                filter.select = Some(self.paths()?);
             }
-            filter.select = Some(paths);
+            if self.keyword("except") {
+                filter.except = self.paths()?;
+            }
         }
         let condition = match self.keyword("where") {
             true => Some(self.condition()?),
             false if self.at_clause_end() => None,
-            false if filter.select.is_some() => {
+            false if selects => {
                 return self.expected("`where` before the condition");
             }
             false => Some(self.condition()?),
@@ -269,6 +273,15 @@ impl<'t> Parser<'t> {
     }
 
     /// Nothing but the clauses after a condition left: no condition.
+    /// Paths, one or more, between commas.
+    fn paths(&mut self) -> Parsed<Vec<String>> {
+        let mut paths = vec![self.path()?];
+        while self.eat(",") {
+            paths.push(self.path()?);
+        }
+        Ok(paths)
+    }
+
     fn at_clause_end(&mut self) -> bool {
         self.skip_space();
         let word = self.peek_word();
@@ -633,18 +646,24 @@ const ATOM: u8 = 4;
 impl fmt::Display for Filter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut gap = "";
-        if let Some(paths) = &self.select {
+        let selects = self.select.is_some() || !self.except.is_empty();
+        if selects {
             f.write_str("select ")?;
-            match paths.is_empty() {
+            match self.select.as_deref() {
+                None => f.write_str("*")?,
                 // Only `_id`, which `select` hands out anyway (§106).
-                true => f.write_str("_id")?,
-                false => write_list(f, paths, |f, path| write_path(f, path))?,
+                Some([]) => f.write_str("_id")?,
+                Some(paths) => write_list(f, paths, |f, path| write_path(f, path))?,
+            }
+            if !self.except.is_empty() {
+                f.write_str(" except ")?;
+                write_list(f, &self.except, |f, path| write_path(f, path))?;
             }
             gap = " ";
         }
         if !self.conditions.is_empty() {
             f.write_str(gap)?;
-            if self.select.is_some() {
+            if selects {
                 f.write_str("where ")?;
             }
             match self.conditions.as_slice() {
@@ -923,6 +942,52 @@ mod tests {
             format!("{filter:?}"),
             "{text}"
         );
+    }
+
+    /// SPEC §143: `select *` and `except` after it or after paths, a
+    /// field named `except` where a field can be, printed back as it
+    /// reads.
+    #[test]
+    fn except_reads_after_select() {
+        same("select * except body", Filter::new().except(["body"]));
+        same(
+            "SELECT * EXCEPT body, meta.raw WHERE a = 1",
+            Filter::new().except(["body", "meta.raw"]).eq("a", 1),
+        );
+        same(
+            "select address except address.zip order by n",
+            Filter::new()
+                .select(["address"])
+                .except(["address.zip"])
+                .sort_asc("n"),
+        );
+        same("select * where a = 1", Filter::new().eq("a", 1));
+        same("select except", Filter::new().select(["except"]));
+        same("except = 1", Filter::new().eq("except", 1));
+        same(
+            "select * except `except`, @",
+            Filter::new().except(["except", ""]),
+        );
+        for text in [
+            "select * except body",
+            "select * except body, meta.raw where a = 1",
+            "select address except address.zip order by n",
+            "select _id except a",
+            "select * except @",
+        ] {
+            assert_eq!(parse(text).to_string(), text);
+        }
+        // Not reserved: a field named `except` needs no backticks.
+        let named = Filter::new().except(["except"]);
+        assert_eq!(named.to_string(), "select * except except");
+        same("select * except except", named);
+        for bad in [
+            "select * except",
+            "select * a = 1",
+            "select * except a b = 1",
+        ] {
+            error(bad);
+        }
     }
 
     /// A hint last (SPEC §132.4): `use index` with a path or several in
@@ -1464,6 +1529,13 @@ mod tests {
         }
         if rng.below(3) == 0 {
             filter = filter.select(
+                (0..rng.below(3))
+                    .map(|_| random_path(rng))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if rng.below(3) == 0 {
+            filter = filter.except(
                 (0..rng.below(3))
                     .map(|_| random_path(rng))
                     .collect::<Vec<_>>(),

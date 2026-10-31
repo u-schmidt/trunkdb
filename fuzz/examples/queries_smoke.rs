@@ -74,6 +74,7 @@ fn main() {
                 total.windows += ran.windows;
                 total.windows_refused += ran.windows_refused;
                 total.live_rows += ran.live_rows;
+                total.excepted += ran.excepted;
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -106,6 +107,7 @@ fn main() {
         total.windows, total.windows_refused
     );
     println!("  live aggregate rows (§139): {}", total.live_rows);
+    println!("  reads with an except (§143): {}", total.excepted);
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

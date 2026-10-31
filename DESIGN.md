@@ -419,7 +419,9 @@ selected path, a match is built from its entry and its document never
 read, if each selected value is held as stored: a bool, a string that
 fits the key, an id, a date-time. A number is keyed as a float and a
 missing field as null, so those are read from the document. Writes work
-on whole documents, whatever is selected.
+on whole documents, whatever is selected. `except` takes paths out of
+what a read hands out, the rest in its order, skipped unbuilt as it is
+decoded [§143](spec/143-except-every-field-but-these.md).
 
 **Aggregates** (`aggregate`, with an `Aggregate`) put the documents a
 filter finds in groups by the values of some paths, and per group count,
@@ -571,7 +573,7 @@ more than four.
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`
   too [§60](spec/60-a-smaller-public-api.md); or from text, `text.parse::<Filter>()`, and back with
-  `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md);
+  `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md), `except` for those it leaves out [§143](spec/143-except-every-field-but-these.md);
   `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md), a
   column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md); a condition of the
   application's own, `Condition::custom(fields, test)`, a closure given

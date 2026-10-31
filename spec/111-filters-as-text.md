@@ -30,7 +30,9 @@ one built in code: nothing behind the parser changes.
 ```
 Every part may be left out; the empty text is `Filter::new()`.
 - **`select`** is `Filter::select` (§106). After it, `where` is needed
-  before a condition, to say where the paths end.
+  before a condition, to say where the paths end. Since §143, `select *`
+  is every field, and `except <paths>` after it or the paths is
+  `Filter::except`.
 - **`where`** may be left out without a `select`: a text box for a
   condition reads best without it.
 - A condition that is an `and` of several is several conditions, as
