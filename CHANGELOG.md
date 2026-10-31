@@ -722,3 +722,19 @@ limit, batches and a write-ahead log. Since then:
     dropped. The channel is `std`'s and unbounded: a writer never
     waits, so a subscriber may write. Nothing is recorded while no one
     subscribes.
+
+109. **A condition of the application's own** (§136).
+    `Condition::custom(fields, test)` takes the paths a closure reads
+    and the closure, `Fn(&Document) -> bool + Send + Sync`, for a test
+    no operator covers: a point within a fence, two fields compared.
+    The closure gets a document of the fields it names, never more. It
+    never bounds an index read; ANDed with conditions that do, it runs
+    on what they leave. A panic in it fails the call with the new
+    `Error::ConditionPanicked`: a write writes nothing, and the database
+    goes on. A check in memory (`Filter::matches`) panics on. It has no
+    text form: `Display` writes `custom(a, b)`, which the parser
+    refuses. `Document` gets readers: `get(path)`, `is_null`,
+    `as_bool`, `as_i64`, `as_f64`, `as_str`, `as_bytes`, `as_datetime`,
+    `as_id`, `as_array`, `as_object`. `Condition` has a new variant,
+    `Custom`; it is `#[non_exhaustive]`, so a `match` with a `_` arm
+    still compiles.

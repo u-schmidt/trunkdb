@@ -11,6 +11,7 @@ use crate::path::Path;
 pub use crate::query_text::ParseFilterError;
 use crate::select::Selection;
 pub use crate::update::Update;
+use std::sync::Arc;
 
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
 /// arm, so a new operator isn't a breaking change (SPEC §45.4).
@@ -102,6 +103,96 @@ pub enum Condition {
     /// It doesn't hold (NOT). Plain two-valued logic: `not(x == 5)` is
     /// true where `x` is missing, like `x != 5` (SPEC §32).
     Not(Box<Condition>),
+    /// A test of the application's own, a closure (SPEC §136): built by
+    /// `Condition::custom`.
+    Custom(Custom),
+}
+
+/// A condition of the application's own (SPEC §136): the paths it reads
+/// and the closure that tests them, from `Condition::custom`.
+///
+/// Cloned, it shares the closure. Equal only to itself and its clones:
+/// two closures can't be compared, even ones written the same.
+#[derive(Clone)]
+pub struct Custom {
+    fields: Vec<String>,
+    test: Arc<dyn Fn(&Document) -> bool + Send + Sync>,
+}
+
+impl Custom {
+    /// The paths it reads, as given.
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    /// The top-level fields the closure gets (SPEC §136.1): the first
+    /// step of each path. `None` if a path starts at the document itself
+    /// (empty, or `[*]` first), which hands it all of it.
+    pub(crate) fn names(&self) -> Option<Vec<&str>> {
+        let mut names: Vec<&str> = Vec::new();
+        for path in &self.fields {
+            let first = path.split(['.', '[']).next().unwrap_or_default();
+            if first.is_empty() {
+                return None;
+            }
+            if !names.contains(&first) {
+                names.push(first);
+            }
+        }
+        Some(names)
+    }
+}
+
+/// `custom(["start", "end"])`: the closure can't be shown.
+impl std::fmt::Debug for Custom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "custom({:?})", self.fields)
+    }
+}
+
+/// A `Filter` stays `UnwindSafe`, as it was before it could hold a
+/// closure (SPEC §136.3): not having it would be a break. These markers
+/// only warn; trunkdb looks at nothing a panicking closure left behind,
+/// and the closure's own state is the application's.
+impl std::panic::UnwindSafe for Custom {}
+impl std::panic::RefUnwindSafe for Custom {}
+
+impl PartialEq for Custom {
+    fn eq(&self, other: &Custom) -> bool {
+        Arc::ptr_eq(&self.test, &other.test) && self.fields == other.fields
+    }
+}
+
+/// A closure of `Condition::custom` that panicked (SPEC §136.2), caught:
+/// `Error::ConditionPanicked` from a read or a write, the panic itself
+/// again from a check in memory.
+pub(crate) struct Panicked(Box<dyn std::any::Any + Send>);
+
+impl Panicked {
+    /// What the panic said, as `std`'s hook prints it.
+    pub(crate) fn message(&self) -> String {
+        match self.0.downcast_ref::<&str>() {
+            Some(text) => text.to_string(),
+            None => match self.0.downcast_ref::<String>() {
+                Some(text) => text.clone(),
+                None => "a panic without a message".to_string(),
+            },
+        }
+    }
+
+    /// The panic, raised again: for a check in memory, where no state of
+    /// trunkdb's is at stake.
+    pub(crate) fn resume(self) -> ! {
+        std::panic::resume_unwind(self.0)
+    }
+}
+
+impl From<Panicked> for crate::Error {
+    fn from(panicked: Panicked) -> Self {
+        crate::Error::ConditionPanicked {
+            message: panicked.message(),
+        }
+    }
 }
 
 /// Building conditions, for `Filter::and` and `Filter::any_of` (SPEC
@@ -253,10 +344,46 @@ impl Condition {
         Condition::Any(conditions.into_iter().collect())
     }
 
+    /// A test of the application's own (SPEC §136): `test` decides,
+    /// given a document of the top-level fields `fields` start in, and
+    /// no others. For whatever no operator covers: a point within an
+    /// area, a comparison of two fields, a rule of the application's.
+    ///
+    /// ```
+    /// use trunkdb::Document;
+    /// use trunkdb::query::{Condition, Filter};
+    ///
+    /// let late = Condition::custom(["start", "end"], |doc| {
+    ///     let hours = |field| doc.get(field).and_then(Document::as_f64);
+    ///     matches!((hours("start"), hours("end")), (Some(start), Some(end)) if end - start > 8.0)
+    /// });
+    /// let shift: Document = r#"{"who": "kim", "start": 6, "end": 17.5}"#.parse()?;
+    /// assert!(Filter::new().and(late).matches(&shift));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// It never bounds an index read: ANDed with conditions that do, it
+    /// is called only on the documents they leave. It has no text form
+    /// (SPEC §111). A panic in `test` fails the call that ran it with
+    /// `Error::ConditionPanicked`, a write with nothing written, and the
+    /// database goes on as before; a check in memory (`matches`) panics
+    /// on.
+    pub fn custom<F>(fields: impl IntoIterator<Item = impl Into<String>>, test: F) -> Self
+    where
+        F: Fn(&Document) -> bool + Send + Sync + 'static,
+    {
+        Condition::Custom(Custom {
+            fields: fields.into_iter().map(Into::into).collect(),
+            test: Arc::new(test),
+        })
+    }
+
     /// Whether `doc` meets the condition, checked in memory as `find`
-    /// checks a document.
+    /// checks a document. A `custom` condition's panic goes on here.
     pub fn matches(&self, doc: &Document) -> bool {
-        Matcher::of(self).matches(doc)
+        Matcher::of(self)
+            .matches(doc)
+            .unwrap_or_else(|panicked| panicked.resume())
     }
 }
 
@@ -675,7 +802,9 @@ impl Filter {
     /// memory as `find` checks a document; sort, skip, limit and select play
     /// no part.
     pub fn matches(&self, doc: &Document) -> bool {
-        self.matcher().matches(doc)
+        self.matcher()
+            .matches(doc)
+            .unwrap_or_else(|panicked| panicked.resume())
     }
 
     /// The conditions with their paths parsed, to check document after
@@ -719,6 +848,7 @@ impl Filter {
                     conditions.iter().try_for_each(|c| of(c, names))
                 }
                 Condition::Not(condition) => of(condition, names),
+                Condition::Custom(custom) => custom.fields.iter().try_for_each(|f| add(f, names)),
             }
         }
         let mut names = Vec::new();
@@ -760,9 +890,12 @@ impl Filter {
                     conditions.iter().try_for_each(|c| of(c, name))
                 }
                 Condition::Not(condition) => of(condition, name),
-                Condition::Exists { .. } | Condition::Size { .. } | Condition::ElemMatch { .. } => {
-                    None
-                }
+                // A closure is called on a document, never on an entry
+                // (SPEC §136.4).
+                Condition::Exists { .. }
+                | Condition::Size { .. }
+                | Condition::ElemMatch { .. }
+                | Condition::Custom(_) => None,
             }
         }
         for condition in &self.conditions {
@@ -804,7 +937,9 @@ impl Filter {
         let matcher = self.matcher();
         let results: Vec<T> = items
             .into_iter()
-            .filter(|item| matcher.matches(doc_of(item)))
+            .filter(|item| {
+                (matcher.matches(doc_of(item))).unwrap_or_else(|panicked| panicked.resume())
+            })
             .collect();
         self.arrange(results, doc_of)
     }
@@ -1098,7 +1233,11 @@ fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bou
             })
         }
         Condition::ElemMatch { field, condition } => bounds_for(&within(field, condition), indexes),
-        Condition::Not(_) | Condition::Exists { .. } | Condition::Size { .. } => None,
+        // Nothing tells what a closure lets through (SPEC §136.4).
+        Condition::Not(_)
+        | Condition::Exists { .. }
+        | Condition::Size { .. }
+        | Condition::Custom(_) => None,
     }
 }
 
@@ -1146,6 +1285,8 @@ fn within(field: &str, condition: &Condition) -> Condition {
         Condition::All(conditions) => Condition::All(all(conditions)),
         Condition::Any(branches) => Condition::Any(all(branches)),
         Condition::Not(condition) => Condition::Not(Box::new(within(field, condition))),
+        // Its paths stay the element's: it bounds nothing anyway.
+        Condition::Custom(custom) => Condition::Custom(custom.clone()),
     }
 }
 
@@ -1581,7 +1722,10 @@ impl<'a> Covering<'a> {
     /// allocates next to nothing.
     pub fn decide(&self, key: &[u8], matcher: &Matcher, scratch: &mut Document) -> Option<bool> {
         self.fill(key, scratch)?;
-        Some(matcher.matches(scratch))
+        // `covered_by` keeps a closure out of a covering (SPEC §136.4).
+        // Were one to panic here anyway, the entry would be undecided:
+        // read and checked again, where its panic fails the call.
+        matcher.matches(scratch).ok()
     }
 
     /// `entry` into `doc`, an object, its slots reused.
@@ -1768,7 +1912,10 @@ impl<'f> EntryMatcher<'f> {
                 Condition::All(cs) => OnBytes::All(all(cs)?),
                 Condition::Any(cs) => OnBytes::Any(all(cs)?),
                 Condition::Not(c) => OnBytes::Not(Box::new(of(c, fields)?)),
-                Condition::Exists { .. } | Condition::Size { .. } | Condition::ElemMatch { .. } => {
+                Condition::Exists { .. }
+                | Condition::Size { .. }
+                | Condition::ElemMatch { .. }
+                | Condition::Custom(_) => {
                     return None;
                 }
             })
@@ -1984,6 +2131,11 @@ pub(crate) enum Matcher<'f> {
     All(Vec<Matcher<'f>>),
     Any(Vec<Matcher<'f>>),
     Not(Box<Matcher<'f>>),
+    /// `names`: `Custom::names`, the fields the closure gets.
+    Custom {
+        custom: &'f Custom,
+        names: Option<Vec<&'f str>>,
+    },
 }
 
 impl<'f> Matcher<'f> {
@@ -2015,11 +2167,18 @@ impl<'f> Matcher<'f> {
                 Matcher::Any(conditions.iter().map(Matcher::of).collect())
             }
             Condition::Not(condition) => Matcher::Not(Box::new(Matcher::of(condition))),
+            Condition::Custom(custom) => Matcher::Custom {
+                custom,
+                names: custom.names(),
+            },
         }
     }
 
-    pub fn matches(&self, doc: &Document) -> bool {
-        match self {
+    /// Whether `doc` matches. `Err` if a `custom` condition's closure
+    /// panicked (SPEC §136.2): the read or write that asked fails, and
+    /// what it found so far is dropped.
+    pub fn matches(&self, doc: &Document) -> Result<bool, Panicked> {
+        Ok(match self {
             Matcher::Compare {
                 path,
                 op,
@@ -2053,16 +2212,63 @@ impl<'f> Matcher<'f> {
                 any_matches(op, size, &lengths)
             }
             Matcher::ElemMatch { path, condition } => {
-                path.values(doc).into_iter().any(|value| match value {
-                    Document::Array(elements) => elements.iter().any(|e| condition.matches(e)),
-                    _ => false,
-                })
+                for value in path.values(doc) {
+                    if let Document::Array(elements) = value {
+                        for element in elements {
+                            if condition.matches(element)? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+                false
             }
-            Matcher::All(matchers) => matchers.iter().all(|m| m.matches(doc)),
-            Matcher::Any(matchers) => matchers.iter().any(|m| m.matches(doc)),
-            Matcher::Not(matcher) => !matcher.matches(doc),
-        }
+            Matcher::All(matchers) => {
+                for matcher in matchers {
+                    if !matcher.matches(doc)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Matcher::Any(matchers) => {
+                for matcher in matchers {
+                    if matcher.matches(doc)? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            Matcher::Not(matcher) => !matcher.matches(doc)?,
+            Matcher::Custom { custom, names } => return call(custom, names.as_deref(), doc),
+        })
     }
+}
+
+/// `custom`'s closure on `doc` cut down to `names` (SPEC §136.1), its
+/// panic caught (§136.2). A document read was decoded on the fields the
+/// whole filter names, which may be more: the cut keeps the closure from
+/// seeing a field it didn't name, wherever it runs. Not cut where it
+/// holds no others.
+fn call(custom: &Custom, names: Option<&[&str]>, doc: &Document) -> Result<bool, Panicked> {
+    let cut;
+    let doc = match (names, doc) {
+        (Some(names), Document::Object(map))
+            if !map.keys().all(|key| names.contains(&key.as_str())) =>
+        {
+            cut = Document::Object(
+                map.iter()
+                    .filter(|(key, _)| names.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            );
+            &cut
+        }
+        _ => doc,
+    };
+    // Unwind safe: after a panic the call fails, and nothing it held is
+    // looked at again.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (custom.test)(doc))).map_err(Panicked)
 }
 
 /// `op` against `value` for any of `values` — `Ne` for none being equal.
@@ -2367,6 +2573,7 @@ mod tests {
                 Condition::All(conditions) => conditions.iter().all(|c| matches(c, doc)),
                 Condition::Any(conditions) => conditions.iter().any(|c| matches(c, doc)),
                 Condition::Not(condition) => !matches(condition, doc),
+                Condition::Custom(custom) => (custom.test)(doc),
             }
         }
 
@@ -2510,7 +2717,11 @@ mod tests {
             for _ in 0..5 {
                 let doc = random_doc(&mut rng, 4);
                 let expected = before_102::matches(&condition, &doc);
-                assert_eq!(matcher.matches(&doc), expected, "{condition:?} on {doc}");
+                assert_eq!(
+                    matcher.matches(&doc).ok(),
+                    Some(expected),
+                    "{condition:?} on {doc}"
+                );
                 assert_eq!(condition.matches(&doc), expected, "{condition:?} on {doc}");
                 held += usize::from(expected);
                 checked += 1;
@@ -3386,7 +3597,11 @@ mod tests {
                     asked += 1;
                     if let Some(answer) = on_bytes.matches(&key) {
                         decided += 1;
-                        assert_eq!(answer, matcher.matches(&doc), "{filter:?} on {doc}");
+                        assert_eq!(
+                            Some(answer),
+                            matcher.matches(&doc).ok(),
+                            "{filter:?} on {doc}"
+                        );
                     }
                 }
             }
@@ -3471,7 +3686,10 @@ mod tests {
                 if let (Some(&first), Some(&last)) = (ends.first(), ends.last()) {
                     intervals += 1;
                     for (key, doc) in &entries[first..=last] {
-                        assert!(matcher.matches(doc), "{filter:?}: {doc} in {key:?}");
+                        assert!(
+                            matcher.matches(doc).is_ok_and(|m| m),
+                            "{filter:?}: {doc} in {key:?}"
+                        );
                     }
                 }
             }

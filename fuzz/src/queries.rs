@@ -137,6 +137,8 @@ pub struct Ran {
     pub refused_duplicates: u64,
     /// Documents reported changed by `Database::subscribe` (SPEC §135).
     pub reported: u64,
+    /// Conditions made a `Condition::custom` (SPEC §136).
+    pub custom: u64,
 }
 
 pub const STEP_NAMES: [&str; 15] = [
@@ -315,6 +317,33 @@ fn pool() -> Vec<Document> {
         )]),
         Document::Binary(vec![1, 2]),
     ]
+}
+
+/// Whether `condition` is or holds a `Condition::custom`.
+fn holds_custom(condition: &Condition) -> bool {
+    match condition {
+        Condition::Custom(_) => true,
+        Condition::All(all) | Condition::Any(all) => all.iter().any(holds_custom),
+        Condition::Not(inner)
+        | Condition::ElemMatch {
+            condition: inner, ..
+        } => holds_custom(inner),
+        _ => false,
+    }
+}
+
+/// The paths `condition` reads, for a closure that checks it.
+fn paths(condition: &Condition, into: &mut Vec<String>) {
+    match condition {
+        Condition::Compare { field, .. }
+        | Condition::Exists { field, .. }
+        | Condition::Size { field, .. }
+        | Condition::ElemMatch { field, .. } => into.push(field.clone()),
+        Condition::All(all) | Condition::Any(all) => all.iter().for_each(|c| paths(c, into)),
+        Condition::Not(inner) => paths(inner, into),
+        Condition::Custom(custom) => into.extend(custom.fields().iter().cloned()),
+        _ => unreachable!("a condition the program doesn't make"),
+    }
 }
 
 /// The state of a run: the database, its model, what the program made.
@@ -605,7 +634,36 @@ impl Run<'_> {
 
     fn condition(&mut self, depth: usize) -> Condition {
         if depth == 0 || self.program.below(3) != 0 {
-            return match self.program.below(11) {
+            let leaf = self.leaf();
+            return self.maybe_custom(leaf);
+        }
+        let children: Vec<Condition> = (0..self.program.below(4))
+            .map(|_| self.condition(depth - 1))
+            .collect();
+        match self.program.below(3) {
+            0 => Condition::all(children),
+            1 => Condition::any(children),
+            _ => !self.condition(depth - 1),
+        }
+    }
+
+    /// One time in six, `condition` made a closure that checks it
+    /// (SPEC §136), naming the paths it reads: in every plan it must
+    /// answer as the condition does, so the model, which checks the
+    /// closure as it checks the condition, says what it finds.
+    fn maybe_custom(&mut self, condition: Condition) -> Condition {
+        if !self.program.one_in(6) {
+            return condition;
+        }
+        self.ran.custom += 1;
+        let mut fields = Vec::new();
+        paths(&condition, &mut fields);
+        Condition::custom(fields, move |doc| condition.matches(doc))
+    }
+
+    fn leaf(&mut self) -> Condition {
+        {
+            match self.program.below(11) {
                 0 => Condition::exists(PATHS[self.program.below(PATHS.len())]),
                 1 => Condition::missing(PATHS[self.program.below(PATHS.len())]),
                 2 => {
@@ -648,15 +706,7 @@ impl Run<'_> {
                     let value = self.value_for(path);
                     Condition::compare(path, op, value)
                 }
-            };
-        }
-        let children: Vec<Condition> = (0..self.program.below(4))
-            .map(|_| self.condition(depth - 1))
-            .collect();
-        match self.program.below(3) {
-            0 => Condition::all(children),
-            1 => Condition::any(children),
-            _ => !self.condition(depth - 1),
+            }
         }
     }
 
@@ -1534,11 +1584,7 @@ impl Run<'_> {
         }
         // The typed read takes the query as its text reads it back
         // (SPEC §111): the same text, and the same answers.
-        let text = filter.to_string();
-        let from_text: Filter = text
-            .parse()
-            .unwrap_or_else(|e| panic!("{}: {text}: {e}", self.at()));
-        assert_eq!(from_text.to_string(), text, "{}", self.at());
+        let from_text = self.read_back(query, filter);
         let answers = Answers {
             find: docs.find(filter.clone()).unwrap(),
             typed: typed
@@ -1621,6 +1667,23 @@ impl Run<'_> {
         );
     }
 
+    /// `filter`, of `query`, as its text reads it back (SPEC §111), which
+    /// prints the same text. A closure has no text to read back
+    /// (§136.5): the parser refuses one, and `filter` itself is taken.
+    fn read_back(&self, query: &Query, filter: &Filter) -> Filter {
+        let text = filter.to_string();
+        if query.conditions.iter().any(holds_custom) {
+            let refused = text.parse::<Filter>().expect_err("a closure has no text");
+            assert!(refused.to_string().contains("custom(…)"), "{}", self.at());
+            return filter.clone();
+        }
+        let from_text: Filter = text
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: {text}: {e}", self.at()));
+        assert_eq!(from_text.to_string(), text, "{}", self.at());
+        from_text
+    }
+
     /// The same read under a hint (SPEC §132): no index, the primary
     /// one, or any of `INDEXES`, made or not. A hint chooses how, never
     /// which: the same answers — or, where it can't be followed,
@@ -1634,10 +1697,7 @@ impl Run<'_> {
         };
         let hinted = hint(query.filter());
         let text = hinted.to_string();
-        let from_text: Filter = text
-            .parse()
-            .unwrap_or_else(|e| panic!("{}: {text}: {e}", self.at()));
-        assert_eq!(from_text.to_string(), text, "{}", self.at());
+        let from_text = self.read_back(query, &hinted);
         let docs = self.docs();
         let typed = self.db().collection::<IdOnly>(COLLECTION);
         let explained = match docs.explain_run(hinted.clone()) {

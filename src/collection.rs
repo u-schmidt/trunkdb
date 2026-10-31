@@ -1024,7 +1024,7 @@ impl Collection<Document> {
             let names = filter.fields_with(false);
             let trace = Trace::default();
             let matcher = filter.matcher();
-            let matches: Vec<DocId> = read_candidates(
+            let candidates = read_candidates(
                 catalog,
                 store,
                 &self.name,
@@ -1033,11 +1033,13 @@ impl Collection<Document> {
                 Wants::default(),
                 &trace,
             )?
-            .0
-            .into_iter()
-            .filter(|(source, fields)| source.decided() || matcher.matches(fields))
-            .map(|(source, _fields)| source.id())
-            .collect();
+            .0;
+            let mut matches: Vec<DocId> = Vec::new();
+            for (source, fields) in candidates {
+                if source.decided() || matcher.matches(&fields)? {
+                    matches.push(source.id());
+                }
+            }
             let (op, outcome) = match matches[..] {
                 [] => (
                     WriteOp::Insert(self.name.clone(), id_if_new, doc),
@@ -1312,10 +1314,12 @@ fn find_in(
         Wants { sort, select },
         trace,
     )?;
-    let mut matches: Vec<Candidate> = candidates
-        .into_iter()
-        .filter(|(source, fields)| source.decided() || matcher.matches(fields))
-        .collect();
+    let mut matches: Vec<Candidate> = Vec::new();
+    for (source, fields) in candidates {
+        if source.decided() || matcher.matches(&fields)? {
+            matches.push((source, fields));
+        }
+    }
     trace.matched(matches.len());
     if sort {
         // So equal sort values end up in id order, as they do when read
@@ -1721,7 +1725,7 @@ fn walk_in_index_order(
             }
             None => read(&loc)?,
         };
-        if !source.decided() && !matcher.matches(&doc) {
+        if !source.decided() && !matcher.matches(&doc)? {
             return Ok(false);
         }
         trace.matched(1);
@@ -1857,7 +1861,7 @@ fn walk_in_index_order(
         for (_key, loc) in primary {
             let (id, doc) = read(&loc)?;
             let value = crate::query::value_or_null(&doc, &first.field);
-            if crate::query::is_unordered(value) && matcher.matches(&doc) {
+            if crate::query::is_unordered(value) && matcher.matches(&doc)? {
                 trace.matched(1);
                 unordered.push((id, doc));
                 // Without keys after the first, id order is their order.
@@ -2152,7 +2156,8 @@ fn count_matches(
         None => {
             let names = filter.fields_with(false);
             let matcher = filter.matcher();
-            read_candidates(
+            let mut count = 0;
+            let candidates = read_candidates(
                 catalog,
                 store,
                 collection,
@@ -2161,10 +2166,11 @@ fn count_matches(
                 Wants::default(),
                 trace,
             )?
-            .0
-            .iter()
-            .filter(|(source, fields)| source.decided() || matcher.matches(fields))
-            .count()
+            .0;
+            for (source, fields) in &candidates {
+                count += usize::from(source.decided() || matcher.matches(fields)?);
+            }
+            count
         }
     };
     let count = count.saturating_sub(filter.skip);
@@ -2229,7 +2235,7 @@ fn aggregate_in(
     for found in found {
         let id = found.id();
         let doc = found.decode(Some(&selection))?;
-        groups.add_document(&doc, Order::id(id), None);
+        groups.add_document(&doc, Order::id(id), None)?;
     }
     trace.groups(groups.len());
     let rows = groups.finish(|_| unreachable!("every value from its document"))?;
@@ -2492,11 +2498,11 @@ fn aggregate_by_entries(
         // entry decided.
         trace.examined();
         let doc = records.stored(loc)?.decode()?;
-        if decided.is_none() && !matcher.matches(&doc) {
+        if decided.is_none() && !matcher.matches(&doc)? {
             continue;
         }
         trace.matched(1);
-        groups.add_document(&doc, Order::id(id), None);
+        groups.add_document(&doc, Order::id(id), None)?;
     }
     Ok(Some(plan))
 }
@@ -2549,13 +2555,13 @@ fn count_in(
     store: &dyn PageStore,
     collection: &str,
     filter: &Filter,
-) -> std::io::Result<Option<usize>> {
+) -> crate::Result<Option<usize>> {
     let Some(meta) = catalog.get(collection) else {
         return Ok(Some(0));
     };
     if filter.conditions.is_empty() {
         let primary = BTreeIndex::new(meta.index_root);
-        return primary.count(store, KeyRange::everything()).map(Some);
+        return Ok(primary.count(store, KeyRange::everything()).map(Some)?);
     }
     if filter.ids().is_some() {
         return Ok(None);
@@ -2597,7 +2603,7 @@ fn count_in(
             Some(decided) => decided,
             None => {
                 let fields = records.stored(loc)?.fields(names.as_deref())?;
-                matcher.matches(&fields)
+                matcher.matches(&fields)?
             }
         };
         count += usize::from(matches);

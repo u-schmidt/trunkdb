@@ -80,6 +80,116 @@ impl Document {
     }
 }
 
+/// Reading a value without a `match` (SPEC §136.3), as
+/// `serde_json::Value` is read: each `as_` method gives `None` for a value
+/// of another type.
+///
+/// ```
+/// use trunkdb::Document;
+///
+/// let doc: Document = r#"{"pos": {"lat": 52.5, "lon": 13}, "tags": ["a"]}"#.parse()?;
+/// assert_eq!(doc.get("pos.lat").and_then(Document::as_f64), Some(52.5));
+/// // A whole number reads as a float too, as filters compare them.
+/// assert_eq!(doc.get("pos.lon").and_then(Document::as_f64), Some(13.0));
+/// assert_eq!(doc.get("pos.lon").and_then(Document::as_i64), Some(13));
+/// assert_eq!(doc.get("pos.alt"), None);
+/// assert_eq!(doc.get("tags").and_then(Document::as_array).map(<[_]>::len), Some(1));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+impl Document {
+    /// The value at `path` (SPEC §31): field names, with a `.` between
+    /// the steps into objects, `""` for the document itself. `None` where
+    /// a step is missing or isn't an object. A path with `[*]` reaches any
+    /// number of values, not one, and gives `None`: read the array with
+    /// `as_array`.
+    pub fn get(&self, path: &str) -> Option<&Document> {
+        if path.contains("[*]") {
+            return None;
+        }
+        crate::path::Path::new(path).field_value(self)
+    }
+
+    /// Whether it is `Null`.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Document::Null)
+    }
+
+    /// A `Bool`'s value.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Document::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// An `Int`'s value. A `Float` gives `None`, even a whole one.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Document::Int(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// A `Float`'s value, or an `Int`'s as a float, as filters compare
+    /// the two (SPEC §34.1). Beyond 2^53 an `Int` is rounded to the
+    /// nearest float.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Document::Float(value) => Some(*value),
+            Document::Int(value) => Some(*value as f64),
+            _ => None,
+        }
+    }
+
+    /// A `String`'s text.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Document::String(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// A `Binary`'s bytes.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Document::Binary(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// A `DateTime`'s point in time.
+    pub fn as_datetime(&self) -> Option<DateTime> {
+        match self {
+            Document::DateTime(at) => Some(*at),
+            _ => None,
+        }
+    }
+
+    /// An `Id`'s id.
+    pub fn as_id(&self) -> Option<DocId> {
+        match self {
+            Document::Id(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// An `Array`'s elements.
+    pub fn as_array(&self) -> Option<&[Document]> {
+        match self {
+            Document::Array(elements) => Some(elements),
+            _ => None,
+        }
+    }
+
+    /// An `Object`'s fields.
+    pub fn as_object(&self) -> Option<&Map> {
+        match self {
+            Document::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+}
+
 /// A document as tagged JSON text (SPEC §71): compact, or indented with
 /// `{:#}`. Plain JSON, except for what JSON has no type for: an id is
 /// `{"$id": "<uuid>"}`, a date-time `{"$date": "<RFC 3339>"}`, binary
@@ -553,6 +663,80 @@ pub(crate) fn decode_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC §136.3: each reader gives its type's value, and `None` for
+    /// every other type.
+    #[test]
+    fn each_reader_reads_its_own_type_only() {
+        let at = DateTime::from_unix(1_790_000_000, 5).unwrap();
+        let id = DocId([7; 16]);
+        let values = [
+            Document::Null,
+            Document::Bool(true),
+            Document::Int(-3),
+            Document::Float(2.5),
+            Document::String("s".into()),
+            Document::Binary(vec![1, 2]),
+            Document::Array(vec![Document::Int(1)]),
+            Document::Object(Map::from_iter([("k".to_string(), Document::Null)])),
+            Document::Id(id),
+            Document::DateTime(at),
+        ];
+        for value in &values {
+            let kind = |of: &Document| std::mem::discriminant(of) == std::mem::discriminant(value);
+            assert_eq!(value.is_null(), kind(&Document::Null));
+            assert_eq!(value.as_bool().is_some(), kind(&values[1]), "{value}");
+            assert_eq!(value.as_i64().is_some(), kind(&values[2]), "{value}");
+            // An `Int` reads as a float too (§34.1).
+            assert_eq!(
+                value.as_f64().is_some(),
+                kind(&values[2]) || kind(&values[3]),
+                "{value}"
+            );
+            assert_eq!(value.as_str().is_some(), kind(&values[4]), "{value}");
+            assert_eq!(value.as_bytes().is_some(), kind(&values[5]), "{value}");
+            assert_eq!(value.as_array().is_some(), kind(&values[6]), "{value}");
+            assert_eq!(value.as_object().is_some(), kind(&values[7]), "{value}");
+            assert_eq!(value.as_id().is_some(), kind(&values[8]), "{value}");
+            assert_eq!(value.as_datetime().is_some(), kind(&values[9]), "{value}");
+        }
+        assert_eq!(values[1].as_bool(), Some(true));
+        assert_eq!(values[2].as_i64(), Some(-3));
+        assert_eq!(values[2].as_f64(), Some(-3.0));
+        assert_eq!(values[3].as_f64(), Some(2.5));
+        assert_eq!(Document::Float(4.0).as_i64(), None, "a whole float");
+        assert_eq!(values[4].as_str(), Some("s"));
+        assert_eq!(values[5].as_bytes(), Some(&[1u8, 2][..]));
+        assert_eq!(values[6].as_array(), Some(&[Document::Int(1)][..]));
+        assert_eq!(values[8].as_id(), Some(id));
+        assert_eq!(values[9].as_datetime(), Some(at));
+    }
+
+    /// SPEC §136.3: `get` follows a path into objects, as a condition
+    /// reads it; `""` is the document; `[*]` reaches no single value.
+    #[test]
+    fn get_follows_a_path() {
+        let doc: Document = r#"{"a": {"b": {"c": 1}}, "d": [{"e": 2}], "f": null}"#
+            .parse()
+            .unwrap();
+        assert_eq!(doc.get("a.b.c"), Some(&Document::Int(1)));
+        assert_eq!(
+            doc.get("a.b").and_then(Document::as_object).map(Map::len),
+            Some(1)
+        );
+        assert_eq!(doc.get(""), Some(&doc));
+        assert_eq!(doc.get("f"), Some(&Document::Null), "there, and null");
+        assert_eq!(doc.get("g"), None, "not there");
+        assert_eq!(doc.get("a.x.c"), None);
+        assert_eq!(doc.get("a.b.c.d"), None, "through a number");
+        assert_eq!(doc.get("d.e"), None, "through an array");
+        assert_eq!(doc.get("d[*].e"), None);
+        assert_eq!(doc.get("d[*]"), None);
+        assert_eq!(Document::Int(1).get("a"), None);
+        // Not even a field of that name, as a filter wouldn't read it.
+        let named: Document = r#"{"d[*]": 1}"#.parse().unwrap();
+        assert_eq!(named.get("d[*]"), None);
+    }
 
     fn roundtrip(doc: Document) {
         let bytes = encode_document(&doc);

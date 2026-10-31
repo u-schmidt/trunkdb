@@ -91,6 +91,26 @@ assert_eq!(page.to_string(), r#"team = "core" order by name limit 20 offset 40"#
 `select` are there too; a mistake comes
 back as `ParseFilterError`, with its line and column.
 
+## A condition of your own
+
+For a test no operator covers, a closure: name the fields it reads, and
+it gets a document of just those (SPEC §136):
+
+```rust
+use trunkdb::{Document, query::Condition};
+
+let at_example = Condition::custom(["email"], |user| {
+    let email = user.get("email").and_then(Document::as_str);
+    email.is_some_and(|email| email.ends_with("@example.com"))
+});
+let found = users.find(Filter::new().eq("team", "core").and(at_example))?;
+```
+
+The `(team, age)` index narrows the read; the closure runs on what it
+leaves. A closure alone scans the collection, and has no text form. If
+it panics, `find` returns `Error::ConditionPanicked`, and the database
+carries on.
+
 ## Atomic batches
 
 A batch spans collections and commits all of its writes or none:

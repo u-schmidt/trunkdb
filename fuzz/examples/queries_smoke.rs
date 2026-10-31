@@ -69,6 +69,7 @@ fn main() {
                 total.unique_indexes += ran.unique_indexes;
                 total.refused_duplicates += ran.refused_duplicates;
                 total.reported += ran.reported;
+                total.custom += ran.custom;
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -94,6 +95,7 @@ fn main() {
         total.refused_duplicates
     );
     println!("  reported changed (§135): {}", total.reported);
+    println!("  custom conditions (§136): {}", total.custom);
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

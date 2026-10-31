@@ -8,7 +8,9 @@
 use crate::document::{DocId, Document, ID_FIELD, encode_document};
 use crate::map::Map;
 use crate::path::Path;
-use crate::query::{Condition, Filter, Matcher, SortOrder, canonical, is_unordered, sort_order};
+use crate::query::{
+    Condition, Filter, Matcher, Panicked, SortOrder, canonical, is_unordered, sort_order,
+};
 use crate::storage::RecordLocation;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -270,7 +272,8 @@ impl Aggregate {
                 },
                 _ => Order::after(seq as u64),
             };
-            groups.add_document(&doc, order, None);
+            // In memory, a `custom` condition's panic goes on (SPEC §136.2).
+            (groups.add_document(&doc, order, None)).unwrap_or_else(|panicked| panicked.resume());
         }
         groups.finish(|_| unreachable!("every value is the document's"))
     }
@@ -682,7 +685,13 @@ impl<'a> Groups<'a> {
 
     /// A match, from its document (or the fields of it the aggregate
     /// reads): every value as stored.
-    pub fn add_document(&mut self, doc: &Document, order: Order, at: Option<RecordLocation>) {
+    /// `Err` if a column's `custom` condition panicked (SPEC §136.2).
+    pub fn add_document(
+        &mut self,
+        doc: &Document,
+        order: Order,
+        at: Option<RecordLocation>,
+    ) -> Result<(), Panicked> {
         let group: Vec<Document> = (self.group_paths.iter())
             .map(|path| path.value_or_null(doc).clone())
             .collect();
@@ -691,10 +700,15 @@ impl<'a> Groups<'a> {
             .collect();
         // Which columns take this document in: those without a
         // condition, and those whose condition it meets (SPEC §126.2).
-        let takes: Vec<bool> = (self.conditions.iter())
-            .map(|condition| condition.as_ref().is_none_or(|m| m.matches(doc)))
-            .collect();
+        let mut takes: Vec<bool> = Vec::with_capacity(self.conditions.len());
+        for condition in &self.conditions {
+            takes.push(match condition {
+                Some(matcher) => matcher.matches(doc)?,
+                None => true,
+            });
+        }
         self.add(group, &values, &takes, true, order, at);
+        Ok(())
     }
 
     /// A match from its index entry (SPEC §107.5): `group` and `values`

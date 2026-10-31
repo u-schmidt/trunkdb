@@ -322,6 +322,12 @@ impl<'t> Parser<'t> {
             self.expect(")")?;
             return Ok(Condition::Exists { field });
         }
+        // What `Display` writes of a `Condition::custom` (SPEC §136.5).
+        if self.at_function("custom") {
+            return self.error(
+                "`custom(…)` is a closure in code, which has no text: build the filter in code",
+            );
+        }
         if self.at_function("size") {
             self.keyword("size");
             self.expect("(")?;
@@ -772,6 +778,13 @@ fn write_condition(f: &mut Formatter<'_>, condition: &Condition, least: u8) -> f
         Condition::Not(inner) => {
             f.write_str("not ")?;
             write_condition(f, inner, NOT)?;
+        }
+        // The one condition that doesn't read back (SPEC §136.5): the
+        // parser refuses `custom(`, saying a closure has no text.
+        Condition::Custom(custom) => {
+            f.write_str("custom(")?;
+            write_list(f, custom.fields(), |f, path| write_path(f, path))?;
+            f.write_char(')')?;
         }
     }
     if binds < least {

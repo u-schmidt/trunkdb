@@ -543,7 +543,12 @@ more than four.
   too [§60](spec/60-a-smaller-public-api.md); or from text, `text.parse::<Filter>()`, and back with
   `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md);
   `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md), a
-  column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md).
+  column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md); a condition of the
+  application's own, `Condition::custom(fields, test)`, a closure given
+  the fields it names, whose panic fails the call with
+  `Error::ConditionPanicked` [§136](spec/136-a-condition-of-the-applications-own.md).
+- **Reading a document:** `get(path)`, `as_i64`, `as_f64`, `as_str` and
+  the other readers, each `None` for another type [§136](spec/136-a-condition-of-the-applications-own.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
 - **Limits** sit on the types they limit: `Document::MAX_NESTING`, and
   on `Database` the rest; its documentation lists them all.

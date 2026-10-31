@@ -21,7 +21,8 @@ measurements.
 ## Features
 
 - Typed documents through serde, or untyped ones (`Document`).
-- Filters in code or as text, with sort, skip and limit; projection and
+- Filters in code or as text, with sort, skip and limit, and conditions
+  of your own as closures; projection and
   aggregates by group, with a condition per column. Arrays, objects and binary compare by their
   contents with `=` and `!=`.
 - Secondary indexes: unique, compound, on nested paths and array
