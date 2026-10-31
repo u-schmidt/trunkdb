@@ -111,6 +111,12 @@ leaves. A closure alone scans the collection, and has no text form. If
 it panics, `find` returns `Error::ClosurePanicked`, and the database
 carries on.
 
+The closure must not read or write the database: it can run while a
+write holds the database's lock, and would wait for itself. Give it
+what it needs beforehand (`move` the fences in). To read or write in
+response to a match, use `watch` (below): its events arrive on your
+own thread, where anything goes.
+
 ## Atomic batches
 
 A batch spans collections and commits all of its writes or none:

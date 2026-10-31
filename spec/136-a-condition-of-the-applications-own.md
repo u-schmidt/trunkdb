@@ -158,6 +158,15 @@ has no text. It is the one condition whose text doesn't read back
   nothing to catch.
 - A `Cursor` that met a panic hands out the error and goes on with the
   next document, as after an I/O error.
+- **The closure mustn't use the database.** It may run inside a
+  write, or as a live query is checked (§138.2), under the writer's
+  lock: a write from it waits for that lock for ever. A read from it
+  takes a second read lock on the same thread, which can wait for ever
+  behind a `compact` waiting for the first to end. What it needs beside its
+  document it captures beforehand. To react to a match by reading or
+  writing, a live query hands the document to the application's own
+  thread, where it may (§135.5). Nothing enforces it: the closure is
+  `'static` and may hold a `Database`.
 - `update_many`'s own closure, the one that changes each document,
   still runs under the writer's lock uncaught: a panic there poisons
   it, as before this section. §137 catches it, and names the error

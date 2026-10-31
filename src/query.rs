@@ -379,6 +379,15 @@ impl Condition {
     /// `Error::ClosurePanicked`, a write with nothing written, and the
     /// database goes on as before; a check in memory (`matches`) panics
     /// on.
+    ///
+    /// `test` mustn't use the database. It may run inside a write, or as
+    /// a live query is checked, with the writer's lock held: a write
+    /// from it waits for that lock for ever. A read from it can wait for
+    /// ever too, behind a `compact` waiting for the read that called it.
+    /// What it needs beside the document it gets it takes in beforehand,
+    /// as `move` captures. To react to what matches by reading or
+    /// writing, `Collection::watch` hands the documents to a thread of
+    /// the application's, where it may (SPEC §136.7).
     pub fn custom<F>(fields: impl IntoIterator<Item = impl Into<String>>, test: F) -> Self
     where
         F: Fn(&Document) -> bool + Send + Sync + 'static,

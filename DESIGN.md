@@ -573,8 +573,8 @@ more than four.
   `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md), a
   column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md); a condition of the
   application's own, `Condition::custom(fields, test)`, a closure given
-  the fields it names, whose panic fails the call with
-  `Error::ClosurePanicked` [§136](spec/136-a-condition-of-the-applications-own.md).
+  the fields it names, which mustn't use the database, and whose panic
+  fails the call with `Error::ClosurePanicked` [§136](spec/136-a-condition-of-the-applications-own.md).
 - **Reading a document:** `get(path)`, `as_i64`, `as_f64`, `as_str` and
   the other readers, each `None` for another type [§136](spec/136-a-condition-of-the-applications-own.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.
