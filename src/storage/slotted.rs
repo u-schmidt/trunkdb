@@ -49,7 +49,8 @@ impl SlottedPage {
     /// Interprets an existing page buffer (as read from a `PageStore`) as a
     /// slotted page. Fails if the type byte is unknown or not a slotted page
     /// type, if the slot directory runs into the cells, or if a cell lies
-    /// outside the page. Overlapping cells are not detected (SPEC §54).
+    /// outside the page. Overlapping cells are not detected here (SPEC §54.2);
+    /// `Database::check` finds them (§141).
     ///
     /// A page the cache marked as checked isn't checked again (SPEC §66).
     pub fn from_bytes(buf: impl Into<Page>) -> std::io::Result<Self> {
@@ -403,6 +404,29 @@ impl SlottedPage {
     pub fn iter_cells(&self) -> impl Iterator<Item = (u16, &[u8])> {
         (0..self.slot_count()).filter_map(move |slot| self.get_cell(slot).map(|c| (slot, c)))
     }
+
+    /// Two live slots whose cells share bytes, if any: one document's or
+    /// entry's bytes read as part of another's (SPEC §54.2, §141). The
+    /// cells are sorted by offset and each compared with the one before:
+    /// until two overlap, that one ends furthest. An allocation and
+    /// O(n log n), for `check` alone, never on a read.
+    pub(crate) fn overlapping_cells(&self) -> Option<(u16, u16)> {
+        let mut cells: Vec<(u16, u16, u16)> = (0..self.slot_count())
+            .map(|slot| {
+                let (offset, length) = self.read_slot(slot);
+                (offset, length, slot)
+            })
+            .filter(|&(_, length, _)| length != 0)
+            .collect();
+        cells.sort_unstable();
+        cells.windows(2).find_map(|pair| {
+            let [(offset, length, slot), (next, _, other)] = *pair else {
+                unreachable!("windows of two")
+            };
+            (offset as usize + length as usize > next as usize)
+                .then(|| (slot.min(other), slot.max(other)))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +561,33 @@ mod tests {
         assert_eq!(page.next_page(), 0);
         page.set_next_page(42);
         assert_eq!(page.next_page(), 42);
+    }
+
+    /// SPEC §141: cells that share a byte are found, whichever slots
+    /// they are in; cells that only touch, and tombstones, are not.
+    #[test]
+    fn overlapping_cells_are_found_and_touching_ones_are_not() {
+        let mut page = SlottedPage::new(PageType::Data);
+        for cell in [&b"aaaa"[..], b"bbbb", b"cccc", b"dddd"] {
+            page.insert_cell(cell).unwrap();
+        }
+        page.delete_cell(1);
+        assert_eq!(page.overlapping_cells(), None, "packed cells touch");
+
+        // Cells are placed from the page's end down: `d` lowest, then
+        // `c`, the bytes slot 1 held, and `a`.
+        let (c, d) = (page.read_slot(2), page.read_slot(3));
+        let with = |slot: u16, (offset, length): (u16, u16)| {
+            let mut page = page.clone();
+            page.write_slot(slot, offset, length);
+            page.overlapping_cells()
+        };
+        assert_eq!(with(3, c), Some((2, 3)), "the same bytes");
+        assert_eq!(with(3, (d.0, 5)), Some((2, 3)), "one byte into the next");
+        assert_eq!(with(0, (c.0, 12)), Some((0, 2)), "one cell over two");
+        assert_eq!(with(1, (d.0 + 1, 2)), Some((1, 3)), "inside another cell");
+        assert_eq!(with(3, (c.0 + 5, 2)), None, "where a deleted cell was");
+        assert_eq!(with(1, (c.0 + 1, 0)), None, "a tombstone inside a cell");
     }
 
     #[test]

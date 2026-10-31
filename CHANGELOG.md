@@ -777,3 +777,9 @@ limit, batches and a write-ahead log. Since then:
     `#[non_exhaustive]` `Error`. Files stay format 12 and exports as in
     0.26.0, which opens what 0.27.0 writes; no new fixture, as nothing
     changes how files are written (§120.9).
+
+113. **`check` finding cells that share bytes** (§141): two cells of a
+    page whose bytes overlap, one document's or entry's read as part
+    of another's, are now a problem `Database::check` and `trunkdb
+    check` report, by page, owner and slots. A page's own check on
+    reading still leaves them out (§54.2). No measurable cost.

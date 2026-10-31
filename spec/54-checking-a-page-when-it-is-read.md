@@ -38,8 +38,8 @@ another. Finding them means sorting the live cells by offset on every
 read: an allocation and O(n log n) on the path that §52's profile showed
 to be allocation-bound, for damage that a checksum already catches when
 it comes from the disk. Rejected for `from_bytes`. It would fit in
-`Database::check` (§39), which can afford to be slow; listed as open in
-ROADMAP.md. The doc comment on `from_bytes` says so.
+`Database::check` (§39), which can afford to be slow, and §141 put it
+there. The doc comment on `from_bytes` says so.
 
 ## 54.3 What it costs
 `from_bytes` runs on every B-tree page of every read, so the benchmark

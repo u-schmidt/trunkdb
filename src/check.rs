@@ -10,7 +10,7 @@ use crate::database::{Database, ReadGuard};
 use crate::document::{DocId, Document};
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::release::Release;
-use crate::storage::{PAGE_SIZE, PageId, RecordLocation, SnapshotStore};
+use crate::storage::{PAGE_SIZE, PageId, PageStore, RecordLocation, SlottedPage, SnapshotStore};
 use std::collections::BTreeSet;
 
 /// What the file is, from its header.
@@ -84,6 +84,7 @@ impl Database {
     /// - every page belongs to exactly one thing — the header, the
     ///   catalog, the free list, or one collection's data, overflow or
     ///   index pages — none to two, none to nothing (a leak);
+    /// - no two cells of a page share bytes (SPEC §141);
     /// - every document is readable and stored under its own id;
     /// - every index holds exactly one entry per document with an
     ///   indexed value, in order, and a unique index no two equal values.
@@ -108,6 +109,7 @@ impl Database {
         let mut check = Check {
             owners: vec![NOBODY; page_count as usize],
             names: Vec::new(),
+            slotted: Vec::new(),
             page_count,
             problems: Vec::new(),
             incomplete: false,
@@ -128,7 +130,7 @@ impl Database {
         }
         let header = check.owner("the header".to_string());
         check.claim(0, header);
-        let catalog_pages = check.owner("the catalog".to_string());
+        let catalog_pages = check.slotted_owner("the catalog".to_string());
         match Catalog::pages(store) {
             Ok(pages) => pages
                 .into_iter()
@@ -151,6 +153,8 @@ impl Database {
             }
         }
 
+        cells_apart(&mut check, store);
+
         if check.incomplete {
             // Whatever couldn't be read may own pages: each would look
             // leaked.
@@ -171,6 +175,34 @@ impl Database {
     }
 }
 
+/// Every slotted page owned, read once more to find two cells sharing
+/// bytes (SPEC §141): what a page's own check leaves out, since it would
+/// sort the cells on every read (§54.2). In page order, one page at a
+/// time. A page is claimed only once it was read, so a damaged one has
+/// no owner here.
+fn cells_apart(check: &mut Check, store: &SnapshotStore) {
+    for page in 0..check.page_count {
+        let owner = check.owners[page as usize];
+        if owner == NOBODY || !check.slotted[owner as usize] {
+            continue;
+        }
+        let read = store.read_page(page).and_then(SlottedPage::from_bytes);
+        match read {
+            Ok(slotted) => {
+                if let Some((a, b)) = slotted.overlapping_cells() {
+                    let problem = format!(
+                        "page {page} ({}): slots {a} and {b} share bytes",
+                        check.names[owner as usize]
+                    );
+                    check.problem(problem);
+                }
+            }
+            // Read once already as it was claimed, from this snapshot.
+            Err(e) => check.unreadable(format!("page {page}: {e}")),
+        }
+    }
+}
+
 /// Who owns a page, as `Check::owner` numbered them.
 type Owner = u32;
 
@@ -183,6 +215,9 @@ struct Check {
     owners: Vec<Owner>,
     /// The owners' names, by number.
     names: Vec<String>,
+    /// Whether an owner's pages hold slots, by number: those whose cells
+    /// `cells_apart` compares.
+    slotted: Vec<bool>,
     page_count: u64,
     problems: Vec<String>,
     /// Something couldn't be read, so the pages it owns are unknown.
@@ -202,7 +237,18 @@ impl Check {
 
     /// A new owner of pages, by its name in problems.
     fn owner(&mut self, name: String) -> Owner {
+        self.owner_as(name, false)
+    }
+
+    /// A new owner of slotted pages: the catalog's, a collection's data
+    /// pages, an index's.
+    fn slotted_owner(&mut self, name: String) -> Owner {
+        self.owner_as(name, true)
+    }
+
+    fn owner_as(&mut self, name: String, slotted: bool) -> Owner {
         self.names.push(name);
+        self.slotted.push(slotted);
         (self.names.len() - 1) as Owner
     }
 
@@ -256,11 +302,11 @@ fn check_collection(
 ) -> std::io::Result<usize> {
     let meta = *catalog.get(name).expect("a listed collection");
     let primary = BTreeIndex::new(meta.index_root);
-    let primary_pages = check.owner(format!("{name:?}'s primary index"));
+    let primary_pages = check.slotted_owner(format!("{name:?}'s primary index"));
     for page in primary.pages(store)? {
         check.claim(page, primary_pages);
     }
-    let data_pages = check.owner(format!("{name:?}'s documents"));
+    let data_pages = check.slotted_owner(format!("{name:?}'s documents"));
     let chain_pages = check.owner(format!("{name:?}'s large documents"));
     let indexes = catalog.indexes(name);
     // How many entries the documents call for, index by index.
@@ -367,7 +413,7 @@ fn check_index(
 ) -> std::io::Result<()> {
     let what = format!("{name:?}'s index on {:?}", index.name());
     let tree = BTreeIndex::new(index.root);
-    let owner = check.owner(what.clone());
+    let owner = check.slotted_owner(what.clone());
     for page in tree.pages(store)? {
         check.claim(page, owner);
     }
@@ -606,7 +652,7 @@ impl Order {
 mod tests {
     use super::*;
     use crate::query::Filter;
-    use crate::storage::{PageStore, PageType};
+    use crate::storage::PageType;
 
     fn object(pairs: &[(&str, Document)]) -> Document {
         Document::Object(
@@ -931,6 +977,68 @@ mod tests {
         assert_eq!(problems.len(), 2, "{problems:#?}");
         assert_found(&db, "is unique, but documents");
         assert_found(&db, &format!("lacks document {other}"));
+    }
+
+    /// SPEC §141: a cell made one byte longer, into the next, on a data
+    /// page, a primary index's leaf, a secondary index's and the
+    /// catalog's page, each in a file of its own: each found, by page,
+    /// owner and slots. Each page still passes its own check on reading
+    /// (§54). On the data page nothing else notices: the document reads
+    /// as before.
+    #[test]
+    fn cells_sharing_bytes_are_found() {
+        for owner in [
+            "\"people\"'s documents",
+            "\"people\"'s primary index",
+            "\"people\"'s index on \"age\"",
+            "the catalog",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = sample(&dir);
+            let (page, slots) = db
+                .transact(|catalog, store| {
+                    let meta = *catalog.get("people").unwrap();
+                    let page = match owner {
+                        "the catalog" => 1,
+                        "\"people\"'s index on \"age\"" => catalog.indexes("people")[0].root,
+                        "\"people\"'s primary index" => meta.index_root,
+                        _ => {
+                            let tree = BTreeIndex::new(meta.index_root);
+                            let mut walk = tree.walk(store, KeyRange::everything(), false);
+                            walk.step().unwrap()?.1.page
+                        }
+                    };
+                    let mut page_bytes = store.read_page(page)?;
+                    let bytes = page_bytes.make_mut();
+                    let field = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+                    // Live cells by offset: (offset, length, slot).
+                    let mut cells: Vec<(u16, u16, usize)> = (0..field(9) as usize)
+                        .map(|slot| (field(13 + slot * 4), field(15 + slot * 4), slot))
+                        .filter(|&(_, length, _)| length != 0)
+                        .collect();
+                    cells.sort();
+                    let (low, high) = cells
+                        .windows(2)
+                        .map(|pair| (pair[0], pair[1]))
+                        .find(|(low, high)| low.0 + low.1 == high.0)
+                        .expect("two cells side by side");
+                    let at = 15 + low.2 * 4;
+                    bytes[at..at + 2].copy_from_slice(&(low.1 + 1).to_le_bytes());
+                    SlottedPage::check_layout(bytes)?;
+                    store.write_page(page, page_bytes)?;
+                    Ok((page, (low.2.min(high.2), low.2.max(high.2))))
+                })
+                .unwrap();
+            let shared = format!(
+                "page {page} ({owner}): slots {} and {} share bytes",
+                slots.0, slots.1
+            );
+            if owner == "\"people\"'s documents" {
+                assert_eq!(problems(&db), [shared]);
+            } else {
+                assert_found(&db, &shared);
+            }
+        }
     }
 
     #[test]

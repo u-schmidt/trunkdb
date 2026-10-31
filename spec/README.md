@@ -155,3 +155,4 @@ say what changed, and DESIGN.md says what is true now.
 138. [Live queries (`live.rs`, `database.rs`, `collection.rs`)](138-live-queries.md)
 139. [Live aggregates, and a window (`live.rs`, `aggregate.rs`, `collection.rs`, `database.rs`, `datetime.rs`)](139-live-aggregates-and-a-window.md)
 140. [Changes as they happen: what §135–§139 share](140-changes-as-they-happen.md)
+141. [`check` finding cells that share bytes (`check.rs`, `storage/slotted.rs`)](141-check-finding-cells-that-share-bytes.md)

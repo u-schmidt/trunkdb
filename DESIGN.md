@@ -614,7 +614,8 @@ more than four.
 - **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
-  without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md). It reads
+  without their document and the other way round [§39](spec/39-the-trunkdb-command-and-database-check.md) [§40](spec/40-page-checksums.md), two cells of a
+  page sharing bytes, which a read doesn't look for [§141](spec/141-check-finding-cells-that-share-bytes.md). It reads
   documents one at a time and checks an index entry by entry against
   the documents its entries name, so its memory doesn't grow with the
   file: four bytes a page, for its owner [§109](spec/109-check-in-memory-that-does-not-grow-with-the-file.md).
