@@ -176,7 +176,7 @@ limit is described.
 The time-series workload (§5.1) asks when a position enters or leaves
 a geofence; the application works it out itself today. Readings sent
 every few seconds, such as a server's load, ask the same of a mean
-over a window. Four steps, each useful alone, in this order:
+over a window. Five steps, each useful alone, in this order:
 - Done in §135: **a hook after each commit.** `Database::subscribe`
   hands out a `Changes`, a receiver over `std`'s `mpsc`: one `Commit`
   per batch, in commit order, sent once it is durable and published,
@@ -184,18 +184,86 @@ over a window. Four steps, each useful alone, in this order:
   effect (`Inserted`, `Updated`, `Deleted`); `drop_collection` one
   `Dropped`. Ids only; unbounded, so a writer never waits; nothing
   recorded without a subscriber.
-- Conditions on places: a point within a circle or a polygon, as
-  MongoDB's `$geoWithin`, needed apart from the rest. With it an index
-  on points, if a scan of the fences is too slow; with a few fences it
-  isn't. Geometry runs deep (sphere or plane, the antimeridian,
-  polygons with holes), and SQLite and PostgreSQL keep it in extensions
-  (R*Tree, PostGIS). The alternative: a condition of the application's
-  own, a closure on the document (`Condition::custom`), so trunkdb
-  knows nothing of places and the application brings its geometry
-  crate; it serves `find`, the hook and live queries alike, and any
-  other test no operator covers. It never bounds an index and has no
-  text form (§111), which a few fences don't miss. Decided once the
-  hook is in use.
+- A condition of the application's own, next: a closure on the
+  document, `Condition::custom`, for any test no operator covers. A
+  point within a fence, with the application's geometry crate, so
+  trunkdb knows nothing of places; a comparison of two fields
+  (`end > start`); a rule of the application's (an IBAN, a version
+  string), a regex until a pattern language is there. It serves
+  `find`, the hook's reader and live queries alike. Planned:
+  ```rust
+  let fence = fences.get("depot");   // the application's own geometry
+  Filter::new()
+      .and(Condition::eq("device", "van-7"))
+      .and(Condition::custom(["pos"], move |doc| {
+          match (doc.get("pos.lat").and_then(Document::as_f64),
+                 doc.get("pos.lon").and_then(Document::as_f64)) {
+              (Some(lat), Some(lon)) => fence.contains(lat, lon),
+              _ => false,
+          }
+      }))
+  ```
+  - **The fields it reads, named:** a list of paths, as every
+    condition names its own. The closure gets a document of just their
+    top-level fields, never more, wherever it runs: so the read decodes
+    only those (§99), and a field forgotten in the list is missing in
+    the first test, not in one read of a hundred. `explain` and the
+    text form show them.
+  - **`Fn(&Document) -> bool + Send + Sync + 'static`**, kept in an
+    `Arc`: a `Filter` is `Clone` and moves between threads, and a live
+    query runs on the thread that commits. A clone copies the pointer.
+    What the closure uses it owns (`move`) or shares through an `Arc`.
+  - **Reading a document in it:** `Document` has no readers of its own
+    yet, only a `match`. Added, as `serde_json::Value` has them:
+    `get(path)`, a path as a condition's (§31), `None` where nothing
+    is; `as_bool`, `as_i64`, `as_f64` (an `Int` too, as filters compare
+    them, §34.1), `as_str`, `as_datetime`, `as_id`, `as_array`,
+    `as_object`, `None` for another type. Of use beyond the closure,
+    wherever a program reads an untyped document.
+  - **An opaque `Custom`** in the variant, `Condition::Custom(Custom)`,
+    so how the closure is kept can change without a break.
+  - **`Debug`, `PartialEq`, `Clone` kept:** `Debug` shows
+    `custom(["start", "end"])` without the closure, which can't be
+    printed; equal only to itself and its clones (`Arc::ptr_eq`), as
+    closures can't be compared; `Clone` the `Arc`.
+  - **A panic in the closure leaves trunkdb as it was:** code of the
+    application's, run inside trunkdb, is kept apart from it, as a web
+    server keeps a handler that panics, and `thread::spawn` hands a
+    thread's panic to `join` as an `Err`. Each call is caught
+    (`catch_unwind`), and the call that ran it returns
+    `Error::ConditionPanicked`, with the panic's message: a read, and a
+    write with its batch dropped, nothing written. A read for a write
+    (`update_many`, `delete_many`, `update_fields`) runs under the
+    writer's lock, which a panic let through would poison:
+    `Error::Poisoned` for every write until the database is opened
+    again. Caught, the lock is let go as after any failed batch. A live
+    query whose closure panics (a later step) ends with the error to
+    its subscriber; the commit it was checking stands, and the other
+    subscriptions go on. Built with `panic = "abort"`, a program ends
+    at a panic, which nothing catches.
+  - **No index:** it never bounds a read, and `covered_by` refuses it,
+    so the documents are read. ANDed with conditions that do bound
+    one, it is checked only on what they leave. An index on a coarse
+    key the application writes beside a position (a geohash cell, say)
+    and `is_in` of the cells a fence covers, then the closure, is what
+    a spatial index does inside, with nothing new.
+  - **No text form (§111):** `Display` writes `custom(start, end)`,
+    which the parser refuses, saying a closure has no text: the one
+    condition whose text doesn't read back.
+  - Rejected: the whole document for the closure, which decodes every
+    field of every document read; a panic raised again in the
+    program, which a writer would see for a live query of another's; a
+    panic taken as `false`, which hides the bug, and under a `not`
+    deletes in `delete_many` what the closure never passed; a trait
+    of the application's to implement instead of a closure, the same
+    with more to write; a closure on a typed `T`, deserialized for
+    every document checked, which a typed collection may want later.
+- Conditions on places built in: a point within a circle or a polygon,
+  as MongoDB's `$geoWithin`, with an index on points. Geometry runs
+  deep (sphere or plane, the antimeridian, polygons with holes), and
+  SQLite and PostgreSQL keep it in extensions (R*Tree, PostGIS); the
+  file would need pages of a new kind. Only if `Condition::custom`,
+  with a coarse key indexed, is too slow for a program that uses it.
 - Live queries: a `Filter` kept as a subscription, which reports the
   documents that came to match it and those that no longer do. With a
   position kept in one document of state, updated with each ping,
