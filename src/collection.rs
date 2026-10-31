@@ -2,11 +2,12 @@ use crate::aggregate::{Aggregate, Groups, Kind, Order};
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
-use crate::database::{Committed, Database, ReadGuard};
+use crate::database::{Committed, Database, ReadGuard, Reading};
 use crate::document::{DocId, Document, encode_document, with_id};
 use crate::explain::{Alternative, EntryCount, Trace};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
+use crate::live::LiveQuery;
 use crate::query::{
     Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork,
     Update, caught,
@@ -546,6 +547,16 @@ where
         }
     }
 
+    /// A live query of `filter` (SPEC §138), its documents converted to
+    /// `T` as they are received: see [`LiveQuery`]. As the untyped
+    /// `watch`; a document that doesn't convert is an `Err` item, and
+    /// the query goes on.
+    pub fn watch(&self, filter: Filter) -> crate::Result<LiveQuery<T>> {
+        self.db.watch(&self.name, filter, |doc| {
+            Ok(crate::serde_bridge::from_document(doc)?)
+        })
+    }
+
     /// Replaces document `id` with `doc`, which keeps its id. `false` if
     /// there's no document `id`, as for the untyped `update`.
     pub fn update(&self, id: &DocId, doc: T) -> crate::Result<bool> {
@@ -682,6 +693,20 @@ impl Collection<Document> {
         Ok(id)
     }
 
+    /// A live query of `filter` (SPEC §138): first an `Entered` for each
+    /// document that matches now, then what each commit after changes,
+    /// documents that came to match, no longer match, or were written
+    /// and still match. See [`LiveQuery`].
+    ///
+    /// `filter`'s conditions decide, its `select` cuts what is handed
+    /// out, and a hint steers the first read only. A sort, a skip or a
+    /// limit is refused with `Error::NotLive`: a window of the first
+    /// matches moves with every write. It waits for a batch being
+    /// committed to finish, as `Database::subscribe` does.
+    pub fn watch(&self, filter: Filter) -> crate::Result<LiveQuery<Document>> {
+        self.db.watch(&self.name, filter, Ok)
+    }
+
     /// The document `id`; `None` if there's none.
     pub fn get(&self, id: &DocId) -> crate::Result<Option<Document>> {
         match self.stored(id)? {
@@ -694,16 +719,7 @@ impl Collection<Document> {
     /// `Document` or a `T` (SPEC §99).
     fn stored(&self, id: &DocId) -> crate::Result<Option<Stored>> {
         let state = self.read()?;
-        let at = state.snapshot();
-        let Some(meta) = at.catalog.get(&self.name) else {
-            return Ok(None); // collection doesn't exist yet, so neither does the document
-        };
-
-        let index = BTreeIndex::new(meta.index_root);
-        let Some(loc) = index.lookup(&at.store, &key::primary(*id))? else {
-            return Ok(None);
-        };
-        Ok(Some(data::Records::new(&at.store).stored(loc)?))
+        stored_at(&state.snapshot(), &self.name, id)
     }
 
     /// `false` if there's no document `id` — for a single op that's an
@@ -860,7 +876,10 @@ impl Collection<Document> {
 
     /// Every match with the id of its cell: what `find` and a sorted
     /// `cursor` read.
-    fn matches_with_ids(&self, filter: &Filter) -> crate::Result<Vec<(DocId, Document)>> {
+    pub(crate) fn matches_with_ids(
+        &self,
+        filter: &Filter,
+    ) -> crate::Result<Vec<(DocId, Document)>> {
         let select = filter.selection();
         self.matches_found(filter, true, select.as_ref())?
             .into_iter()
@@ -1270,6 +1289,32 @@ fn follow_hint(collection: &str, filter: &Filter, indexes: &[IndexMeta]) -> crat
         index,
         reason: reason.to_string(),
     })
+}
+
+/// Document `id` of `collection` as it is stored in `at`; `None` if
+/// there's none.
+fn stored_at(at: &Reading<'_>, collection: &str, id: &DocId) -> crate::Result<Option<Stored>> {
+    let Some(meta) = at.catalog.get(collection) else {
+        return Ok(None); // collection doesn't exist yet, so neither does the document
+    };
+    let index = BTreeIndex::new(meta.index_root);
+    let Some(loc) = index.lookup(&at.store, &key::primary(*id))? else {
+        return Ok(None);
+    };
+    Ok(Some(data::Records::new(&at.store).stored(loc)?))
+}
+
+/// Document `id` of `collection` as of `at`, whole: what a live query
+/// checks (SPEC §138.2).
+pub(crate) fn document_at(
+    at: &Reading<'_>,
+    collection: &str,
+    id: &DocId,
+) -> crate::Result<Option<Document>> {
+    match stored_at(at, collection, id)? {
+        Some(stored) => Ok(Some(stored.decode()?)),
+        None => Ok(None),
+    }
 }
 
 /// Every match with its id, against a catalog and store the caller

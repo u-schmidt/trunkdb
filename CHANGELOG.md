@@ -746,3 +746,13 @@ limit, batches and a write-ahead log. Since then:
     `Error::Poisoned` until the database was opened again. Now the call
     fails with `Error::ClosurePanicked`, nothing is written, and the
     database goes on. That error is item 109's, named for both.
+
+111. **Live queries** (§138): `Collection::watch(filter)` keeps a filter
+    as a subscription. A `LiveQuery` first reports every document that
+    matches as `Entered`, then, for each commit, the documents that
+    came to match (`Entered`), no longer match (`Left`) or were written
+    and still match (`Changed`), each with its id and the document as
+    that commit left it. Each commit is checked as it commits, so a
+    fence entered and left between two reads is reported both times.
+    A sort, a skip or a limit is refused with the new
+    `Error::NotLive`. New types: `Live`, `LiveQuery`.

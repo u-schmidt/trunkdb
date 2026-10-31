@@ -77,6 +77,7 @@ pub mod fuzzing;
 mod id;
 mod index;
 mod json;
+mod live;
 pub mod map;
 mod path;
 pub mod query;
@@ -103,6 +104,7 @@ pub use datetime::{DateTime, ParseDateTimeError};
 pub use document::{DocId, Document, ParseIdError};
 pub use export::{ImportOptions, Summary};
 pub use json::ParseDocumentError;
+pub use live::{Live, LiveQuery};
 pub use map::Map;
 pub use release::{RELEASE, Release};
 pub use serde_bridge::DocumentError;
@@ -169,6 +171,15 @@ pub enum Error {
     ClosurePanicked {
         /// What the panic said.
         message: String,
+    },
+    /// `Collection::watch` was given a filter that can't be live (SPEC
+    /// §138.4): one with a sort, a skip or a limit, whose window of the
+    /// first matches moves with every write. Nothing was registered.
+    #[non_exhaustive]
+    #[error("a live query can't have {reason}")]
+    NotLive {
+        /// What the filter has: "a sort", "a skip" or "a limit".
+        reason: &'static str,
     },
     /// A batch tried to insert a document whose id its collection already
     /// has. The whole batch was rolled back.

@@ -3,9 +3,12 @@ use crate::catalog::Catalog;
 use crate::changes::{self, Changes};
 use crate::collection::{Collection, apply_write_op};
 use crate::data;
+use crate::document::Document;
 use crate::durability::{self, Durability, WalDurability};
 use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
+use crate::live::{self, LiveQuery};
+use crate::query::Filter;
 use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
 use std::path::{Path, PathBuf};
@@ -100,6 +103,10 @@ pub(crate) struct Writer {
     /// `Changes` handed out. A sender whose `Changes` is gone is dropped
     /// at the next report. While there is none, batches record nothing.
     subscribers: Vec<mpsc::Sender<changes::Commit>>,
+    /// The live queries (SPEC §138), checked after each commit against
+    /// the documents it changed. While there is one, batches record
+    /// their changes, as for a subscriber.
+    watchers: Vec<live::Watcher>,
     /// Test-only: called once, by the next batch, when it is logged and
     /// flushed and not yet published — to see what goes on beside it.
     #[cfg(test)]
@@ -128,7 +135,7 @@ impl Committed {
 
     /// The snapshot, to read from `pages`: its catalog, and the pages as
     /// of its commit.
-    fn reading<'a>(&'a self, pages: &'a Pages) -> Reading<'a> {
+    pub(crate) fn reading<'a>(&'a self, pages: &'a Pages) -> Reading<'a> {
         Reading {
             catalog: self.catalog(),
             store: pages.at(self.0.commit),
@@ -537,6 +544,7 @@ impl Database {
                     ),
                     past: Vec::new(),
                     subscribers: Vec::new(),
+                    watchers: Vec::new(),
                     #[cfg(test)]
                     after_log: None,
                 }),
@@ -620,6 +628,43 @@ impl Database {
         let (sender, receiver) = mpsc::channel();
         writer.subscribers.push(sender);
         Ok(Changes::new(receiver))
+    }
+
+    /// `Collection::watch` (SPEC §138): under the writer's lock, so no
+    /// commit falls between the first read and the first commit checked.
+    pub(crate) fn watch<T>(
+        &self,
+        collection: &str,
+        filter: Filter,
+        convert: fn(Document) -> crate::Result<T>,
+    ) -> crate::Result<LiveQuery<T>> {
+        if let Some(reason) = live::refused(&filter) {
+            return Err(crate::Error::NotLive { reason });
+        }
+        let mut writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| crate::Error::Poisoned)?;
+        if self.inner.poisoned.load(Ordering::Relaxed) {
+            return Err(crate::Error::Poisoned);
+        }
+        let now =
+            Collection::<Document>::new(self.clone(), collection).matches_with_ids(&filter)?;
+        let (sender, receiver) = mpsc::channel();
+        let mut matching = std::collections::BTreeSet::new();
+        for (id, doc) in now {
+            matching.insert(id);
+            // The receiver is ours still: the send can't fail.
+            let _ = sender.send(Ok(live::Live::Entered { id, doc }));
+        }
+        writer.watchers.push(live::Watcher::new(
+            collection.to_string(),
+            filter,
+            matching,
+            sender,
+        ));
+        Ok(LiveQuery::new(receiver, convert))
     }
 
     /// Starts a typed, atomic multi-op write — see `Batch`.
@@ -782,7 +827,7 @@ impl Database {
         // the batch fails (SPEC §19.5, §78). No commit can come between
         // this and ours: we hold the writer's lock.
         let mut catalog = self.current().catalog().clone();
-        if !writer.subscribers.is_empty() {
+        if !writer.subscribers.is_empty() || !writer.watchers.is_empty() {
             catalog.record_changes();
         }
 
@@ -876,7 +921,19 @@ impl Database {
         // under the writer's lock, so in the order of the commits (SPEC
         // §135). A send never waits.
         if let Some(changes) = changes {
-            writer.report(changes.finish());
+            let changes = changes.finish();
+            // The live queries first, against the state this commit left
+            // (SPEC §138.2): the snapshot just published, the writer's
+            // lock still held, so no commit comes between.
+            if !writer.watchers.is_empty() && !changes.is_empty() {
+                let current = self.current();
+                live::check(
+                    &mut writer.watchers,
+                    &changes,
+                    &current.reading(&self.inner.pages),
+                );
+            }
+            writer.report(changes);
         }
 
         // A compaction's image is written back at once, however small:
@@ -1827,6 +1884,31 @@ mod tests {
         assert_eq!(subscribers(&db), 1, "not noticed before a report");
         db.write_batch(vec![insert("posts", 1, 1)]).unwrap();
         assert_eq!(subscribers(&db), 0);
+        assert!(!records(&db));
+    }
+
+    #[test]
+    fn a_live_query_records_changes_until_it_is_dropped() {
+        let (_dir, _path, db) = open_temp();
+        let records = |db: &Database| {
+            db.transact(|catalog, _| Ok(catalog.records_changes()))
+                .unwrap()
+        };
+        let watchers = |db: &Database| db.inner.writer.lock().unwrap().watchers.len();
+        assert!(!records(&db));
+        let live = Collection::<Document>::new(db.clone(), "posts")
+            .watch(Filter::new())
+            .unwrap();
+        assert!(records(&db), "a watcher alone records");
+        assert!(!db.current().catalog().records_changes());
+        db.write_batch(vec![insert("posts", 1, 1)]).unwrap();
+        assert!(live.try_recv().is_some());
+        drop(live);
+        // Noticed at the next change to its collection, not before.
+        db.write_batch(vec![insert("other", 2, 2)]).unwrap();
+        assert_eq!(watchers(&db), 1);
+        db.write_batch(vec![insert("posts", 3, 3)]).unwrap();
+        assert_eq!(watchers(&db), 0);
         assert!(!records(&db));
     }
 

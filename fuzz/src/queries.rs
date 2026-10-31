@@ -10,7 +10,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use trunkdb::query::{Aggregate, Condition, Filter, Op, SortOrder, Update};
-use trunkdb::{Change, Database, DocId, Document, Error, IndexOptions, Map, Upserted};
+use trunkdb::{
+    Change, Database, DocId, Document, Error, IndexOptions, Live, LiveQuery, Map, Upserted,
+};
 
 /// Steps a program runs at most, and documents it keeps at most.
 const MAX_STEPS: usize = 64;
@@ -139,6 +141,8 @@ pub struct Ran {
     pub reported: u64,
     /// Conditions made a `Condition::custom` (SPEC §136).
     pub custom: u64,
+    /// Events live queries reported (SPEC §138), each as the model says.
+    pub live_events: u64,
 }
 
 pub const STEP_NAMES: [&str; 15] = [
@@ -368,11 +372,21 @@ struct Run<'p> {
     /// A subscription to the database's commits (SPEC §135), made after
     /// the prelude and again at every reopen.
     changes: Option<trunkdb::Changes>,
+    /// Live queries (SPEC §138), made with the subscription: each with
+    /// its filter and the ids it has reported matching.
+    live: Vec<Watched>,
     ran: Ran,
     step: usize,
     /// `QUERIES_TRACE` set: each step said on stderr, for a replay.
     trace: bool,
     program: Program<'p>,
+}
+
+/// A live query and what it has said so far.
+struct Watched {
+    filter: Filter,
+    query: LiveQuery<Document>,
+    matching: BTreeSet<DocId>,
 }
 
 /// Runs the program `input` (SPEC §105.2), panicking where the database
@@ -392,6 +406,7 @@ pub fn run(input: &[u8]) -> Ran {
         long: 1,
         runs: false,
         changes: None,
+        live: Vec::new(),
         ran: Ran::default(),
         step: 0,
         trace: std::env::var_os("QUERIES_TRACE").is_some(),
@@ -399,6 +414,7 @@ pub fn run(input: &[u8]) -> Ran {
     };
     run.prelude();
     run.changes = Some(run.db().subscribe().unwrap());
+    run.watch();
     while !run.program.done() && run.step < MAX_STEPS {
         run.step();
         run.step += 1;
@@ -492,6 +508,7 @@ impl Run<'_> {
             }
         }
         self.changes_are_reported(kind, before);
+        self.live_is_model();
         // Rule 1 in full on one write step in four, and after a
         // compaction or a reopen; on the others, the count and a few
         // documents (SPEC §105.4: reading every document every step was
@@ -1421,7 +1438,81 @@ impl Run<'_> {
         // The old subscription ended with the database it was on.
         assert_eq!(self.changes.take().and_then(|old| old.try_recv()), None);
         self.changes = Some(self.db().subscribe().unwrap());
+        // The old live queries ended with it too.
+        for old in std::mem::take(&mut self.live) {
+            assert!(old.query.try_recv().is_none(), "{}", self.at());
+        }
+        self.watch();
         self.check();
+    }
+
+    /// One or two live queries of the program's conditions (SPEC §138):
+    /// first an `Entered` for every document the model has matching.
+    fn watch(&mut self) {
+        for _ in 0..1 + self.program.below(2) {
+            let filter = self.query().conditions_only();
+            let query = self.docs().watch(filter.clone()).unwrap();
+            self.live.push(Watched {
+                filter,
+                query,
+                matching: BTreeSet::new(),
+            });
+        }
+        self.live_is_model();
+    }
+
+    /// What each live query reported for the step, a commit at most:
+    /// every event names a document as the model has it now, `Entered`
+    /// one it didn't report matching and that matches, `Left` one it did
+    /// that no longer does or is gone, `Changed` one it did that still
+    /// does. After them, it reports matching exactly what matches in the
+    /// model.
+    fn live_is_model(&mut self) {
+        let at = self.at();
+        for watched in &mut self.live {
+            while let Some(event) = watched.query.try_recv() {
+                let event = event.unwrap_or_else(|e| panic!("{at}: {e}"));
+                self.ran.live_events += 1;
+                let id = event.id();
+                let now = self.model.get(&id);
+                let is_now = |doc: &Document| {
+                    assert!(
+                        now.is_some_and(|model| same(model, doc)),
+                        "{at}: {id} reported as {doc:?}, the model has {now:?}"
+                    );
+                    watched.filter.matches(doc)
+                };
+                match event {
+                    Live::Entered { doc, .. } => {
+                        assert!(is_now(&doc), "{at}: {id} entered, not matching");
+                        assert!(watched.matching.insert(id), "{at}: {id} entered twice");
+                    }
+                    Live::Left { doc, .. } => {
+                        match doc {
+                            Some(doc) => assert!(!is_now(&doc), "{at}: {id} left, matching"),
+                            None => assert!(now.is_none(), "{at}: {id} left as gone, isn't"),
+                        }
+                        assert!(watched.matching.remove(&id), "{at}: {id} left, never in");
+                    }
+                    Live::Changed { doc, .. } => {
+                        assert!(is_now(&doc), "{at}: {id} changed, not matching");
+                        assert!(watched.matching.contains(&id), "{at}: {id} changed, not in");
+                    }
+                    other => panic!("{at}: {other:?}"),
+                }
+            }
+            let expected: BTreeSet<DocId> = self
+                .model
+                .iter()
+                .filter(|(_, doc)| watched.filter.matches(doc))
+                .map(|(id, _)| *id)
+                .collect();
+            assert_eq!(
+                watched.matching, expected,
+                "{at}: live query {:?}",
+                watched.filter
+            );
+        }
     }
 
     /// What the subscription received for the step (SPEC §135): at most

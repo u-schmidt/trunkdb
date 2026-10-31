@@ -70,6 +70,7 @@ fn main() {
                 total.refused_duplicates += ran.refused_duplicates;
                 total.reported += ran.reported;
                 total.custom += ran.custom;
+                total.live_events += ran.live_events;
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -96,6 +97,7 @@ fn main() {
     );
     println!("  reported changed (§135): {}", total.reported);
     println!("  custom conditions (§136): {}", total.custom);
+    println!("  live query events (§138): {}", total.live_events);
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

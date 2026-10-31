@@ -45,7 +45,7 @@ All of it is done:
 | 0.24.0 | `trunkdb fields <file> <collection> [filter]`: every path a collection's documents have, written as a filter writes it, in how many documents, and as which kinds of value, most first; a filter sums up only what it finds, `limit` a sample; read-only, at most 10,000 paths; an Agent Skill, `skills/trunkdb/`, for AI agents using the command. **Batched writes:** the default checkpoint threshold 4,000 pages instead of 1,000, the WAL limit following to 65.5 MB; with 1,000 documents a commit, 59 commits of 100 checkpointed, now 10; on 100,000 documents inserts about 1.35× faster, updates 1.35×, deletes 1.6×, single commits and reads unchanged; recovery after a crash with a full WAL 79 ms; a compaction's commit writes it back at once whatever its size, as §108 had it. **Fixed:** an OR of `eq`s of one field whose branches came wrapped alone in an AND or OR printed as an OR but read back as `in`, so its text didn't read back the same (a fix to §115). **`=` and `!=` on arrays, objects and binary:** compared by their contents, as `add_to_set` and `pull` compare them (objects in any field order, `[1]` equal to `[1.0]`), where `=` never held and `!=` always did, even against the very value; `in`, `not in` and `has (@ = …)` with them; `<` and the rest still never hold; an index entry with such a value in a compound key read from its document; groups of equal ones merged; unique indexes unchanged, still not checking them. **The release that wrote a file:** the header names the release that created the file and the one that last wrote it, `FileInfo::created_by` and `written_by`, `Release` and `trunkdb::RELEASE`, in `trunkdb info` too; unknown for older files and where an older build wrote since; still format 12. **Smaller fixtures:** 60 tasks instead of 300, the 0.23.0 fixture written again by 0.23.0's code, 9 KB compressed instead of 32; a fixture only for a release that changes how files are written. **Fixed:** `trunkdb info` panicked when its reader went (`| head`); it ends quietly, as `find` does | §120.9, §121–§125 |
 | 0.25.0 | **A condition on an aggregate column:** `filter` after a column, SQL's `FILTER (WHERE …)`, the column taking in only the group's documents that meet it, the groups and other columns every match; any column, two ANDed, one before any column refused; decided from index entries where the index holds its fields, a leaf of counts at a time where its ends decide it; the column methods' docs saying their string is the column's name. **Fixed:** a database opened through a symlink found a WAL beside the link instead of the file's, so after a crash it missed committed batches, and a write through it could have the file's old WAL replayed over newer pages later; the link is now followed to the file before the WAL is named, a loop of links refused; `trunkdb export` through a link protects the file's WAL; a hard link documented as unsupported. **Fixed:** a checkpoint whose flush failed after it had cut the WAL left the WAL's length as before, so a failed log after it was taken back by growing the WAL with zeros, and the next open refused it; the length is 0 once the cut succeeds, and an undo never grows the WAL past its end before the failed log (a fix to §81). **Fixed:** a page whose slot directory ran past its end, the cells said to start further on and its checksum matching, panicked as it was checked, reading past the page; refused as damage before a slot is read, a seed for `open_raw` with it. **Fixed:** on Unix, a compaction opened `<database>.compact` emptying what was there, following a link: whatever file a link under that name pointed to was emptied, even where the compaction gained nothing; the file is now always a new one, as on Windows, under the first name free (a fix to §108). **Fixed:** `avg` rounded the exact total to a float before dividing it, so finite numbers whose total passed `f64::MAX` had an infinite mean, and other means could be a unit off; the exact total is now divided, then rounded once, never `-0.0` (a fix to §107) | §126–§131 |
 | 0.26.0 | **A hint in the query:** `Filter::use_index(fields)` reads that index where the rules would read another, `Filter::no_index()` scans, `"_id"` the primary index; the rules choose the rest among it alone; a hint that can't be followed, no such index or nothing to read it by, is `Error::Hint` from every read, never a quiet fall back; `explain_run` says `hinted`; `use index …` and `use no index` last in a filter's text and `trunkdb find`; a panic on `false` under a hint, found by the `queries` fuzz target, fixed before release ; **the plans `explain_run` passed over:** `Explained::alternatives`, the filter hinted to each index, `_id` and a scan, each with the entries it would read, `Exactly` or `MoreThan`, whether it reads a document per entry, and whether that's fewer; ranges counted whole a leaf at a time up to 1,000 leaves, walks in sort order as far as the run read; `instead:` lines in `trunkdb find --explain`; **aggregate columns named last** (breaking): `count().named("n")`, `sum("tries").named("total")`, a column's `filter` before its name, an `UnnamedColumn` until it has one, so a column without a name or a `filter` before any column doesn't compile | §132–§134 |
-| next | **A hook after each commit:** `Database::subscribe`, a `Changes` receiving a `Commit` for every batch committed after it, in commit order, once it is durable and new reads see it, never for a failed batch; each document once with the batch's net effect, `Inserted`, `Updated` or `Deleted`, `drop_collection` one `Dropped`; ids only; an unbounded `std` channel, so a writer never waits and a subscriber may write; nothing recorded without a subscriber; **a condition of the application's own:** `Condition::custom(fields, test)`, a closure `Fn(&Document) -> bool + Send + Sync` given a document of the fields it names, never more; it never bounds an index read nor is decided on an entry; a panic in it fails the call with `Error::ClosurePanicked`, a write with nothing written, the writer's lock not poisoned; no text form, the parser refusing `custom(…)`; readers on `Document`: `get(path)`, `as_bool`, `as_i64`, `as_f64`, `as_str` and the others; **a panic in `update_many`'s change** or in its `T`'s conversions, under the writer's lock, fails the call with `Error::ClosurePanicked`, nothing written, the lock not poisoned | §135–§137 |
+| next | **A hook after each commit:** `Database::subscribe`, a `Changes` receiving a `Commit` for every batch committed after it, in commit order, once it is durable and new reads see it, never for a failed batch; each document once with the batch's net effect, `Inserted`, `Updated` or `Deleted`, `drop_collection` one `Dropped`; ids only; an unbounded `std` channel, so a writer never waits and a subscriber may write; nothing recorded without a subscriber; **a condition of the application's own:** `Condition::custom(fields, test)`, a closure `Fn(&Document) -> bool + Send + Sync` given a document of the fields it names, never more; it never bounds an index read nor is decided on an entry; a panic in it fails the call with `Error::ClosurePanicked`, a write with nothing written, the writer's lock not poisoned; no text form, the parser refusing `custom(…)`; readers on `Document`: `get(path)`, `as_bool`, `as_i64`, `as_f64`, `as_str` and the others; **a panic in `update_many`'s change** or in its `T`'s conversions, under the writer's lock, fails the call with `Error::ClosurePanicked`, nothing written, the lock not poisoned; **live queries:** `Collection::watch(filter)`, a `LiveQuery<T>` reporting first what matches, then for each commit the documents `Entered`, `Left` or `Changed`, with their id and the document as that commit left it; checked inside the commit against the documents it changed, so no transition is lost; a sort, a skip or a limit refused with `Error::NotLive`; a panic in a `custom` condition ending that query alone | §135–§138 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -201,81 +201,18 @@ over a window. Five steps, each useful alone, in this order:
   SQLite and PostgreSQL keep it in extensions (R*Tree, PostGIS); the
   file would need pages of a new kind. Only if `Condition::custom`,
   with a coarse key indexed, is too slow for a program that uses it.
-- Live queries, next: a `Filter` kept as a subscription, which reports
-  the documents that came to match it, those that no longer do, and
-  those written that still do (also called continuous queries).
-  With a position kept in one document of state, updated with each
-  ping, entering a fence is that document coming to match, leaving it
-  the document no longer matching: no state of its own. Planned:
-  ```rust
-  let live = vans.watch(Filter::new().eq("device", "van-7").and(in_depot))?;
-  for event in live {
-      match event? {
-          Live::Entered(van) => { /* came to match */ }
-          Live::Left(van) => { /* no longer matches; None if deleted */ }
-          Live::Changed(van) => { /* written, still matches */ }
-          _ => {}
-      }
-  }
-  ```
-  - **`Collection::watch(filter) -> Result<LiveQuery<T>>`**, on a typed
-    collection as on one of `Document`. `LiveQuery` reads as `Changes`
-    does (§135.1): `recv`, `try_recv`, `recv_timeout`, an `Iterator`,
-    each of a `Result<Live<T>>`; dropped, the query ends. One channel
-    for each live query: a hundred fences are a hundred of them.
-  - **The state first, then the changes:** `watch` takes the writer's
-    lock, reads what matches now and hands each as `Entered` before
-    anything else, so a van already in the depot at the start is
-    reported so. No commit falls between the read and the first change
-    checked.
-  - **Checked inside the commit:** after a batch is durable and
-    published, still under the writer's lock, each live query on a
-    collection the batch changed checks the documents it changed (the
-    ids §135's `ChangeLog` records, kept whenever a live query is
-    open). So every transition is seen, in commit order, each against
-    the state its own commit left. Checked later, on the reader's
-    thread, a newer commit may have moved the van on already: an entry
-    and a leaving between two reads would both be lost. At a ping every
-    second or two the check costs nothing worth counting, so no
-    incremental view maintenance (DBSP, TimescaleDB's continuous
-    aggregates) is needed.
-  - **Matched before: a set of ids** each live query keeps, of what
-    matches now. A changed document that matches and isn't in it has
-    `Entered`, one in it that no longer matches has `Left`, one in it
-    that still matches has `Changed`. One id for each document that
-    matches: few for a fence. Reading the document's version before the
-    commit instead would cost a read for each change.
-  - **Documents, not ids:** the commit holds the document as its own
-    batch left it, the position that entered the fence and not a later
-    one, which §135's ids can't give. `Left` holds the document, or
-    `None` if it was deleted. A typed `T` is converted on the reader's
-    thread as it receives, not under the writer's lock. `select`
-    (§106) applies to what is handed out.
-  - **`Changed`, though a fence needs only the other two:** what a
-    live list on a screen needs ("the vans in the depot, and their
-    speed"), and it costs nothing more. As `Updated` in §135, written,
-    not necessarily changed.
-  - **Not live: `sort`, `skip`, `limit`.** A live window of the first
-    ten moves with every write; `watch` refuses them with an error.
-    A hint (`use_index`, §132) steers the first read only.
-  - **A panic in a `Condition::custom`** while a commit is checked:
-    that live query receives `Error::ClosurePanicked` and ends, as its
-    set can no longer be trusted. The commit stands, and the other
-    subscriptions go on (§136.2).
-  - **`drop_collection`:** each document in the set `Left`, without a
-    document; the query goes on, for a collection made again under the
-    name.
-  - **Unbounded, as `Changes`:** a writer never waits for a reader,
-    and a reader may write.
-  - Left to the application: hysteresis at a fence's edge (GPS noise
-    flips a position in and out), and order: pings a tracker sends
-    late, after being offline, are applied in the order of their time,
-    not of their arrival, or a fence is entered after it was left.
-  - Rejected: checking on the reader's thread from §135's reports
-    (transitions lost between two reads); ids only (a read for each,
-    of a state a newer commit may have changed); a callback (§135.5);
-    a first state handed apart, as `(Vec<T>, LiveQuery)`, where
-    `Entered` says the same in one way; a live `sort` and `limit`.
+- Done in §138: **live queries.** `Collection::watch(filter)` hands out
+  a `LiveQuery<T>`: first an `Entered` for every document that matches,
+  then for each commit `Entered`, `Left` and `Changed`, each with the
+  id and the document as that commit left it (`Left`'s `None` if
+  deleted), cut to the filter's `select`. Checked inside each commit,
+  under the writer's lock, against the documents it changed, so no
+  transition is lost to a late reader; a set of matching ids says what
+  matched before. A sort, a skip or a limit is refused with
+  `Error::NotLive`. A panic in a `Condition::custom` ends that query
+  alone with `Error::ClosurePanicked`; `drop_collection` is a `Left`
+  for each match. Hysteresis at a fence's edge and late pings stay
+  with the application.
 - Live aggregates: an `Aggregate` (§107) kept as a subscription, as a
   `Filter` above: "the mean load of the last five minutes", reported as
   it changes, while a process reports the load every few seconds. A

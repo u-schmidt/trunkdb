@@ -204,6 +204,15 @@ each document once with the batch's net effect. A failed batch drops
 its record with its catalog. The channel is unbounded, so a writer
 never waits for a subscriber, and a subscriber may write.
 
+**Live queries, checked as it commits** [§138](spec/138-live-queries.md): the writer keeps each
+`Collection::watch` with its filter and the set of ids that match. A
+batch records its changes while one is open, as for a subscriber, and
+right after step 4, before the reports, each document it changed in a
+watched collection is read from the snapshot just published and
+checked against each filter there. Against the set, that is
+`Entered`, `Left` or `Changed`, sent to the live query's own unbounded
+channel. A panic in a `custom` condition ends that query alone.
+
 ## 6. Documents and data pages
 
 **The value type** is `Document`: `Null`, `Bool`, `Int`, `Float`,
@@ -540,6 +549,10 @@ more than four.
 - **Changes:** `db.subscribe()`, a `Changes` receiving a `Commit` for
   each batch committed after it, its documents `Inserted`, `Updated`
   or `Deleted` and its collections `Dropped` [§135](spec/135-a-hook-after-each-commit.md).
+- **Live queries:** `collection.watch(filter)`, a `LiveQuery<T>`
+  reporting what matches, then each document that `Entered`, `Left` or
+  `Changed`; a sort, a skip or a limit refused with `Error::NotLive`
+  [§138](spec/138-live-queries.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`

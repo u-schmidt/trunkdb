@@ -168,6 +168,43 @@ let watcher = std::thread::spawn(move || {
   report. Where an event must not be lost, write it as a document in
   the same batch as the change, and work those off.
 
+## Watching a filter
+
+`watch` keeps a filter as a live query: it tells you which documents
+come to match it and which no longer do (SPEC §138). With each van's
+position in one document, entering the depot is its document coming to
+match:
+
+```rust
+use trunkdb::Live;
+
+let in_depot = vans.watch(Filter::new().eq("zone", "depot"))?;
+std::thread::spawn(move || {
+    for event in in_depot {                 // waits for each event
+        match event {
+            Ok(Live::Entered { id, doc, .. }) => println!("{id} arrived: {doc:?}"),
+            Ok(Live::Left { id, .. }) => println!("{id} left"),
+            Ok(Live::Changed { id, .. }) => println!("{id} moved within"),
+            Ok(_) => {}
+            Err(e) => eprintln!("{e}"),     // the query has ended, or a T didn't convert
+        }
+    }
+});
+```
+
+- **What matches now comes first,** each as `Entered`, then the changes.
+- **Every commit is checked as it commits,** against the state it
+  left: a van that came and went before you read is reported twice,
+  `Entered` and `Left`, each with the document as it was then.
+- **`Left` holds `None`** for a document deleted, or its collection
+  dropped.
+- **Any condition goes,** a `Condition::custom` with your geometry
+  among them; `select` cuts what is handed out. A sort, a skip or a
+  limit is refused.
+- **Yours to handle:** GPS noise flipping a position in and out at a
+  fence's edge, and pings that arrive late after a tracker was offline
+  (apply them in the order of their time).
+
 ## Reads that agree with each other
 
 Each call reads the database as it is at that moment, so a write on
