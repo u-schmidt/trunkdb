@@ -74,41 +74,21 @@ persisted one can come later (§75); a date-time type, file format 11
 (§69); every document an object, format 12 (§95); snapshot reads in
 memory only, with nothing in the file (§77); `find_with_ids` removed and
 `cursor` handing out `T` (§74); the internals private, and `Error`,
-`Document` and the reports `#[non_exhaustive]` (§60). The WAL's format
-matters less: it's empty after a clean close, so a change needs only a
-checkpoint before upgrading.
+`Document` and the reports `#[non_exhaustive]` (§60); `indexmap` out of
+the API, behind trunkdb's own `Map` (§116); variants with public fields
+`#[non_exhaustive]` (§117); one pass over the whole public API (§118);
+aggregate columns named last, `count().named("n")` (§134); old files as
+fixtures, opened by every test run (§120); unique indexes in the
+`queries` target (§119); every public item documented, the
+`missing_docs` lint on, and the MSRV policy in the README. The WAL's
+format matters less: it's empty after a clean close, so a change needs
+only a checkpoint before upgrading.
 
 **Must: expensive to change once applications use it**
-- Done in §116: **`indexmap` out of the API.** `Document::Object`
-  holds a `trunkdb::Map`, trunkdb's own type with the `IndexMap` inside
-  it, so an `indexmap` 3 changes nothing a program sees.
-- Done in §117: **variants with public fields `#[non_exhaustive]`**,
-  `Condition`'s and `QueryPlan`'s, so a field can be added to one
-  without breaking a `match`; `All`, `Any`, `Not` and the unit
-  variants left as they are.
-- Done in §118: **one pass over the whole public API**, listed from
-  rustdoc's JSON: options and reports no longer `Copy` or `Eq`, two
-  helpers made private, `Document` no longer a serde `Deserializer`,
-  the `fuzzing` feature declared outside the API. Another pass, the
-  same way, once the API settles, for what came since.
-- Done in §134: **aggregate columns, the name last.** `count("n")` was
-  read as what is counted, as SQL, LINQ, Spark and Polars write
-  `count(x)`. Now `count().named("n")`, `sum("tries").named("total")`,
-  a column's `filter` before its name; a column is an `UnnamedColumn`
-  until it has one, so a column without a name, or a `filter` before
-  any column, doesn't compile.
-
-**Should: cheap, and checked instead of kept by care**
-- Done in §120: **old files as fixtures**, a small database written by
-  each release from 0.23.0 that changes how files are written (§120.9),
-  kept in `tests/fixtures/`, and a test that
-  opens every one, reads it as written and writes to it. It catches a
-  change to how values are stored that no other test does.
-- Done: **every public item documented**, and the `missing_docs` lint
-  on in `src/lib.rs`, so CI fails on a new item without docs. The MSRV
-  policy is written down, in the README.
-- Done in §119: **unique indexes in the `queries` target**, which
-  found an update that could store a duplicate.
+- **Another pass over the public API,** as §118's, listed from
+  rustdoc's JSON, once it settles, for what came since: the hook, the
+  live queries and aggregates, the window, `Condition::custom` and
+  `Document`'s readers among it.
 
 **Optional: where trunkdb is published**
 - **On crates.io**, with its docs on docs.rs, or GitHub alone, as now:
@@ -173,86 +153,25 @@ limit is described.
 
 **Changes as they happen**
 
-The time-series workload (§5.1) asks when a position enters or leaves
-a geofence; the application works it out itself today. Readings sent
-every few seconds, such as a server's load, ask the same of a mean
-over a window. Five steps, each useful alone, in this order:
-- Done in §135: **a hook after each commit.** `Database::subscribe`
-  hands out a `Changes`, a receiver over `std`'s `mpsc`: one `Commit`
-  per batch, in commit order, sent once it is durable and published,
-  never for one that failed. Each document once, with the batch's net
-  effect (`Inserted`, `Updated`, `Deleted`); `drop_collection` one
-  `Dropped`. Ids only; unbounded, so a writer never waits; nothing
-  recorded without a subscriber.
-- Done in §136: **a condition of the application's own.**
-  `Condition::custom(fields, test)`, a closure `Fn(&Document) -> bool +
-  Send + Sync`, for any test no operator covers: a point within a
-  fence, with the application's geometry crate, two fields compared, a
-  rule of its own. It gets a document of the fields it names, never
-  more. It never bounds an index read nor is decided on an entry; ANDed
-  with conditions that do, it runs on what they leave. A panic in it
-  fails the call with `Error::ClosurePanicked`, a write with nothing
-  written and the writer's lock not poisoned. No text form: the parser
-  refuses `custom(…)`. `Document` got readers: `get(path)`, `as_f64`,
-  `as_str` and the others.
+Built in §135–§139, as one group: the hook after each commit,
+`Condition::custom`, live queries, live aggregates and a window.
+[§140](spec/140-changes-as-they-happen.md) says what they share. Open, if asked for:
 - Conditions on places built in: a point within a circle or a polygon,
   as MongoDB's `$geoWithin`, with an index on points. Geometry runs
   deep (sphere or plane, the antimeridian, polygons with holes), and
   SQLite and PostgreSQL keep it in extensions (R*Tree, PostGIS); the
   file would need pages of a new kind. Only if `Condition::custom`,
-  with a coarse key indexed, is too slow for a program that uses it.
-- Done in §138: **live queries.** `Collection::watch(filter)` hands out
-  a `LiveQuery<T>`: first an `Entered` for every document that matches,
-  then for each commit `Entered`, `Left` and `Changed`, each with the
-  id and the document as that commit left it (`Left`'s `None` if
-  deleted), cut to the filter's `select`. Checked inside each commit,
-  under the writer's lock, against the documents it changed, so no
-  transition is lost to a late reader; a set of matching ids says what
-  matched before. A sort, a skip or a limit is refused with
-  `Error::NotLive`. A panic in a `Condition::custom` ends that query
-  alone with `Error::ClosurePanicked`; `drop_collection` is a `Left`
-  for each match. Hysteresis at a fence's edge and late pings stay
-  with the application.
-- Done in §139: **live aggregates, and a window.**
-  `Collection::watch_aggregate(filter, &aggregate)` hands out a
-  `LiveAggregate`: every row first as `Entered`, then for each commit
-  to the collection the rows `Entered`, `Left` (with the row as it is
-  now, `None` if its group is gone) or `Changed` (only where a value
-  changed), each with its `group`. The aggregate runs again whole,
-  inside the commit, so no crossing of a `having` is lost; the
-  filter's and the rows' sort, skip and limit go. `Aggregate::window
-  (path, duration)` keeps the documents within `duration` of the
-  newest date-time among the matches, counted back from it, not from
-  the clock, one newest for the whole aggregate; for `aggregate` and
-  `apply` too, through an index on `path`. Refused beside a filter's
-  sort, skip or limit, a window by count. Later, if asked for: a
-  window for each group, by count or by time, "the last ten readings
-  of each server" (SQL's `ROW_NUMBER() OVER (PARTITION BY …)`).
-
-What the hook, live queries and live aggregates share:
-- **Kept in memory, never in the file.** A subscription is registered
-  by the program, as an event handler is, and ends when it is dropped
-  or the program does; the program registers it again at its start.
-  What reacts to a change is the application's code, which a file
-  can't hold, so a stored query would have no one listening after a
-  restart anyway.
-- **The state first, then the changes.** A live query or aggregate
-  reports at its registration what matches now, then only what comes
-  to match and what no longer does, as Realm's do: a position already
-  in a fence at the start is reported so. The state that decides it,
-  the position in its document, is in the file, so the answer is
-  rebuilt after a restart, not remembered.
-- **Nothing missed while the program is down:** the file is locked to
-  one writing process (§21), so with the program gone nothing changes.
-  The one gap is a crash between a commit and its report. Where a
-  report must not be lost (a message sent once), the application
-  writes the event as a document in the same batch as the change that
-  caused it, and works those off apart (the transactional outbox, as
-  .NET's MassTransit and NServiceBus have it): both or neither.
-- **Through a channel, not a callback.** A report handed to a channel
-  is read on the application's own thread, which may then read and
-  write freely. A callback run inside the commit that writes to the
-  database would wait for the writer it runs in.
+  with a coarse key indexed, or the fences in the application's own
+  memory (§140.6), is too slow for a program that uses it.
+- A window for each group, by count or by time, "the last ten readings
+  of each server", SQL's `ROW_NUMBER() OVER (PARTITION BY …)`: where
+  groups report at rates far apart (§139.6).
+- A window counted back from the clock, with a timer to run the
+  aggregate again as readings age out: a second source of events
+  (§139.2).
+- A live `sort` and `limit` for a live query, "the ten fastest vans"
+  (§138.6); a live aggregate does it already.
+- Typed rows for a live aggregate, with a typed `aggregate` (§139.6).
 
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).

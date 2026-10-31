@@ -194,7 +194,8 @@ old file's index keys). The file and the WAL stay as they are, and the
 next open that writes recovers from the WAL. Every write fails with
 `Error::ReadOnly` [§88](spec/88-a-read-only-open.md).
 
-**Reported after it commits** [§135](spec/135-a-hook-after-each-commit.md): while a
+**Reported after it commits** [§135](spec/135-a-hook-after-each-commit.md), with what the hook, live
+queries and live aggregates share in [§140](spec/140-changes-as-they-happen.md): while a
 `Database::subscribe` is open, a batch records in its own catalog what
 it does to each document, as `apply_write_op` applies it, and
 `drop_collection` the collection it drops. Taken out before step 4, the
