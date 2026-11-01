@@ -459,8 +459,9 @@ let per_sku = db.collection::<Document>("orders").aggregate(
 - **Each element counts:** tags `["a", "a"]` are two in group `"a"`.
 - **Unwind again** for an array inside: `.unwind("items")
   .unwind("items.parts")`.
-- It reads the documents: an index doesn't keep a value repeated in one
-  array twice.
+- It reads the documents: a multikey index's entries aren't the
+  elements an unwind makes (a value repeated is one entry, an object
+  element none).
 
 Where an index holds the fields an aggregate reads, its entries answer
 `count`, `avg`, `min`, `max` and `count_distinct` without reading the

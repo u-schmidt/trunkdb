@@ -56,7 +56,8 @@ among the fields it decodes; the two shortcuts of §107.5 are left:
   an index on the array whole holds no arrays (§34), and hands over a
   `null` the unwind leaves out.
 
-Reading per element from a multikey index is a step of its own (147.5).
+Reading per element from a multikey index isn't exact as the index
+stands (147.5).
 
 ## 147.3 Memory
 Each document is cloned once per element, the clone holding only the
@@ -75,13 +76,32 @@ nothing more is kept than the groups were keeping.
 - **Unwinding in `find`:** documents handed out per element would be a
   read that isn't what is stored; it is an aggregate's step.
 
-## 147.5 Next: from a multikey index
-"Tasks per tag" on an index over `tags[*]` could be counted without
-reading documents, as §107.5 does for plain fields. As the index keeps
-a value once per document, only what doesn't depend on repeats could
-come from it: `count_distinct`, `min`, `max`, groups that are all a
-document has. `count` and `sum` would read the documents whose arrays
-repeat a value, which an entry can't tell. Planned.
+## 147.5 Not from a multikey index, for now
+"Tasks per tag" on an index over `tags[*]` would be counted without
+reading documents, as §107.5 does for plain fields, if the entries were
+the elements an unwind makes. They aren't, and an entry can't tell
+where they differ (`index_keys`, §42.2):
+
+- **A value that isn't an array,** `"tags": "b"`, has no entries;
+  unwound, it is one element.
+- **Elements no index holds** (§34): objects, arrays, NaN, binary have
+  no entries; unwound, each is a group of its own.
+- **A value repeated in one array** is one entry; unwound, it counts
+  each time.
+
+So not even `count_distinct`, `min` and `max` per element are exact
+from the entries: a group, or a document's place in one, could be
+missing. First written here as planned for those three, and taken back
+when `index_keys` was read for it.
+
+**What would make it exact,** if a collection makes per-element
+aggregates slow: a marker entry in a multikey index for each document
+whose array its entries don't stand for whole, one of the three cases.
+The entries path would read the marked documents and take the rest
+from their entries, each entry then one element, so a plain `count`
+per tag would be exact too. A new kind of entry: file format 13, every
+multikey index rebuilt at the first open (ROADMAP, "An index rebuilt at
+open"). Deferred until asked for.
 
 ## 147.6 Tests
 - `aggregate.rs`:

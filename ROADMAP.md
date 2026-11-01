@@ -129,11 +129,6 @@ another pass over the public API:
 
 - **Parameters in a filter's text,** named, `status = :status`, values
   passed apart (§111.8), with the PyO3 bindings at the latest.
-- **An unwind read from a multikey index** (§147.5): "tasks per tag"
-  on `tags[*]` without the documents, for what doesn't depend on a
-  value repeated in one array, which the index keeps once:
-  `count_distinct`, `min`, `max`; `count` and `sum` reading the
-  documents whose arrays repeat a value.
 - **A window for each group,** by count or by time, "the last ten
   readings of each server", SQL's `ROW_NUMBER() OVER (PARTITION BY …)`,
   for live aggregates too: where groups report at rates far apart
@@ -235,6 +230,13 @@ Built in §135–§139, as one group: the hook after each commit,
   without the gate on the read path (§80.8).
 
 **API**
+- An unwind read from a multikey index (§147.5), "tasks per tag" on
+  `tags[*]` without the documents: not exact as the index stands, which
+  holds no entry for a value that isn't an array or an element of a
+  kind no index holds, and one for a value repeated. With a marker entry
+  for each document whose entries don't stand for its array whole, file
+  format 13 and multikey indexes rebuilt at the first open, every
+  column would be: if a collection makes per-element aggregates slow.
 - A document as `serde_json::Value`, beside its text form (§71), if a
   tool needs it: behind a feature named `serde_json-1`, so `serde_json`
   stays out of the default public API (§71.4).
