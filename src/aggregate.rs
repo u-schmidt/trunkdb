@@ -66,6 +66,9 @@ use std::time::Duration;
 ///   document, by id, or `by` a field and then by id; `null` where that
 ///   document has none (SPEC §146).
 ///
+/// With `unwind`, each document found is one per element of an array
+/// first, and the groups and columns see the elements (SPEC §147).
+///
 /// Rows come in the order of their group values, ascending, unless
 /// `sort_asc` and the like say otherwise. `having` picks rows before the
 /// sort, `skip` and `limit` after it.
@@ -78,6 +81,9 @@ pub struct Aggregate {
     pub(crate) rows: Filter,
     /// `window`: only the documents this close to the newest (SPEC §139).
     pub(crate) window: Option<Window>,
+    /// `unwind`: the arrays each document is made one per element of,
+    /// in order (SPEC §147).
+    pub(crate) unwind: Vec<String>,
 }
 
 /// `Aggregate::window`: the documents whose `path` is within `duration`
@@ -257,6 +263,39 @@ impl Aggregate {
         self
     }
 
+    /// Makes each document the filter finds one per element of the array
+    /// at `path`, the element at `path` in place of the array (SPEC
+    /// §147), MongoDB's `$unwind`: the groups, the columns and their
+    /// conditions see the elements, and a document counts once per
+    /// element.
+    ///
+    /// ```
+    /// use trunkdb::query::Aggregate;
+    ///
+    /// // Per sku, over every order's items: `items.sku` and `items.qty`
+    /// // of one element together.
+    /// let per_sku = Aggregate::new()
+    ///     .unwind("items")
+    ///     .group_by("items.sku")
+    ///     .sum("items.qty").named("sold")
+    ///     .count().named("lines");
+    /// # let _ = per_sku;
+    /// ```
+    ///
+    /// - An empty array, `null` or a missing field: the document is left
+    ///   out. A value that isn't an array is one element, itself.
+    /// - Equal elements count each, `["a", "a"]` twice.
+    /// - Called again, each document made is unwound by the next path: a
+    ///   path inside the one before (`items`, then `items.parts`) goes
+    ///   into each element.
+    /// - The filter picks documents before they are unwound, its sort,
+    ///   skip and limit too, and a window keeps documents: its path may
+    ///   not be inside an unwound one.
+    pub fn unwind(mut self, path: impl Into<String>) -> Self {
+        self.unwind.push(path.into());
+        self
+    }
+
     /// Groups by the value at `path` too: call it again for several
     /// fields. A dotted path is nested in the row as stored.
     pub fn group_by(mut self, path: impl Into<String>) -> Self {
@@ -412,6 +451,21 @@ impl Aggregate {
                 ));
             }
         }
+        for path in &self.unwind {
+            if path.is_empty() || path.contains("[*]") || path == ID_FIELD {
+                return refuse(format!(
+                    "`unwind` must name a field of arrays, without `[*]`: `{path}`"
+                ));
+            }
+            if let Some(window) = &self.window
+                && inside(&window.path, path)
+            {
+                return refuse(format!(
+                    "a window keeps documents, not elements: `{}` is inside unwound `{path}`",
+                    window.path
+                ));
+            }
+        }
         let firsts: Vec<&str> = self.group_by.iter().map(|p| first_step(p)).collect();
         let paths = self
             .group_by
@@ -471,12 +525,14 @@ impl Aggregate {
             .collect()
     }
 
-    /// Whether some column is read from documents only: a `sum`
-    /// (§107.5), and `first` and `last`, which order the documents by
-    /// their ids or a field of theirs (SPEC §146). `count_distinct` takes
-    /// what entries hand out, exact, as `min` and `max` do.
+    /// Whether it is read from documents only: a `sum` (§107.5), and
+    /// `first` and `last`, which order the documents by their ids or a
+    /// field of theirs (SPEC §146); an `unwind`, whose elements an entry
+    /// doesn't hand out (§147). `count_distinct` takes what entries hand
+    /// out, exact, as `min` and `max` do.
     pub(crate) fn needs_documents(&self) -> bool {
-        (self.columns.iter()).any(|c| matches!(c.kind, Kind::Sum | Kind::First | Kind::Last))
+        !self.unwind.is_empty()
+            || (self.columns.iter()).any(|c| matches!(c.kind, Kind::Sum | Kind::First | Kind::Last))
     }
 
     /// Whether some column has a condition.
@@ -485,7 +541,7 @@ impl Aggregate {
     }
 
     /// Every path it reads: the group fields', then the columns', then
-    /// what orders `first` and `last`.
+    /// what orders `first` and `last`, then the arrays unwound, whole.
     pub(crate) fn paths(&self) -> Vec<&str> {
         let columns = (self.columns.iter())
             .filter_map(|c| c.path.as_deref())
@@ -494,8 +550,42 @@ impl Aggregate {
             .iter()
             .map(String::as_str)
             .chain(columns)
+            .chain(self.unwind.iter().map(String::as_str))
             .collect()
     }
+}
+
+/// Whether `path` is `outer` or inside it: `items.qty` in `items`.
+fn inside(path: &str, outer: &str) -> bool {
+    path == outer
+        || (path.len() > outer.len()
+            && path.starts_with(outer)
+            && path.as_bytes()[outer.len()] == b'.')
+}
+
+/// `doc` made one per element of each array at `paths` in turn, the
+/// element in its place (SPEC §147): none for an empty array, `null` or
+/// a missing field, `doc` itself for a value that isn't an array.
+fn unwound(doc: &Document, paths: &[Path<'_>], names: &[String]) -> Vec<Document> {
+    let mut docs = vec![doc.clone()];
+    for (path, name) in paths.iter().zip(names) {
+        let mut next = Vec::with_capacity(docs.len());
+        for doc in docs {
+            match path.field_value(&doc) {
+                None | Some(Document::Null) => {}
+                Some(Document::Array(items)) => {
+                    for item in items.clone() {
+                        let mut one = doc.clone();
+                        put(&mut one, name, item);
+                        next.push(one);
+                    }
+                }
+                Some(_) => next.push(doc),
+            }
+        }
+        docs = next;
+    }
+    docs
 }
 
 fn first_step(path: &str) -> &str {
@@ -503,17 +593,23 @@ fn first_step(path: &str) -> &str {
 }
 
 /// Where a match comes in "first by id": by its id, or, without one,
-/// after every id in the order given.
+/// after every id in the order given; then, unwound, by its element's
+/// place in the array (SPEC §147).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Order(bool, DocId, u64);
+pub(crate) struct Order(bool, DocId, u64, u64);
 
 impl Order {
     pub fn id(id: DocId) -> Self {
-        Order(false, id, 0)
+        Order(false, id, 0, 0)
     }
 
     fn after(seq: u64) -> Self {
-        Order(true, DocId::NIL, seq)
+        Order(true, DocId::NIL, seq, 0)
+    }
+
+    /// The `n`th document unwound from this one's.
+    fn element(self, n: usize) -> Self {
+        Order(self.0, self.1, self.2, n as u64)
     }
 }
 
@@ -804,6 +900,8 @@ pub(crate) struct Groups<'a> {
     column_paths: Vec<Option<Path<'a>>>,
     /// What orders each `first` and `last` (SPEC §146).
     by_paths: Vec<Option<Path<'a>>>,
+    /// The arrays unwound (SPEC §147).
+    unwind_paths: Vec<Path<'a>>,
     /// Each column's condition, compiled once (SPEC §126.3).
     conditions: Vec<Option<Matcher<'a>>>,
     /// Each group's place in `list`, in the order of its values.
@@ -824,6 +922,7 @@ impl<'a> Groups<'a> {
             by_paths: (aggregate.columns.iter())
                 .map(|c| c.by.as_deref().map(Path::new))
                 .collect(),
+            unwind_paths: aggregate.unwind.iter().map(|p| Path::new(p)).collect(),
             conditions: (aggregate.columns.iter())
                 .map(|c| c.condition.as_ref().map(Matcher::of))
                 .collect(),
@@ -846,6 +945,23 @@ impl<'a> Groups<'a> {
     /// reads): every value as stored.
     /// `Err` if a column's `custom` condition panicked (SPEC §136.2).
     pub fn add_document(
+        &mut self,
+        doc: &Document,
+        order: Order,
+        at: Option<RecordLocation>,
+    ) -> Result<(), Panicked> {
+        if self.unwind_paths.is_empty() {
+            return self.add_one(doc, order, at);
+        }
+        let docs = unwound(doc, &self.unwind_paths, &self.aggregate.unwind);
+        for (n, doc) in docs.iter().enumerate() {
+            self.add_one(doc, order.element(n), at)?;
+        }
+        Ok(())
+    }
+
+    /// One document, or one element's, once unwound.
+    fn add_one(
         &mut self,
         doc: &Document,
         order: Order,
@@ -1781,6 +1897,91 @@ mod tests {
         );
     }
 
+    /// SPEC §147: one document per element, the element in its place;
+    /// fields of one element together; each element counted.
+    #[test]
+    fn unwind_makes_a_document_per_element() {
+        let orders = docs(&[
+            r#"{"items":[{"sku":"a","qty":2},{"sku":"b","qty":1},{"sku":"a","qty":3}]}"#,
+            r#"{"items":[{"sku":"b","qty":5}]}"#,
+            r#"{"items":[]}"#,
+            r#"{"items":null}"#,
+            r#"{}"#,
+            r#"{"items":{"sku":"c","qty":7}}"#,
+        ]);
+        let per_sku = Aggregate::new()
+            .unwind("items")
+            .group_by("items.sku")
+            .sum("items.qty")
+            .named("sold")
+            .count()
+            .named("lines");
+        assert_eq!(
+            rows(&per_sku, orders.clone()),
+            [
+                r#"{"items":{"sku":"a"},"sold":5,"lines":2}"#,
+                r#"{"items":{"sku":"b"},"sold":6,"lines":2}"#,
+                r#"{"items":{"sku":"c"},"sold":7,"lines":1}"#,
+            ]
+        );
+        // Without groups: every element, one row; a column's condition on
+        // the element.
+        let lines = Aggregate::new()
+            .unwind("items")
+            .count()
+            .named("n")
+            .count()
+            .filter(Condition::gt("items.qty", 2))
+            .named("big");
+        assert_eq!(rows(&lines, orders), [r#"{"n":5,"big":3}"#]);
+        // Equal elements each count, plain values too.
+        let tags = docs(&[r#"{"tags":["x","x","y"]}"#, r#"{"tags":"y"}"#]);
+        let per_tag = Aggregate::new()
+            .unwind("tags")
+            .group_by("tags")
+            .count()
+            .named("n");
+        assert_eq!(
+            rows(&per_tag, tags),
+            [r#"{"tags":"x","n":2}"#, r#"{"tags":"y","n":2}"#]
+        );
+    }
+
+    /// SPEC §147: a path inside the one unwound before goes into each
+    /// element; unrelated ones make every pair; first and last by the
+    /// element's place in its array.
+    #[test]
+    fn unwinds_follow_one_another() {
+        let all = docs(&[r#"{"items":[{"parts":["p","q"]},{"parts":["q"]}],"tags":["t","u"]}"#]);
+        let parts = Aggregate::new()
+            .unwind("items")
+            .unwind("items.parts")
+            .group_by("items.parts")
+            .count()
+            .named("n");
+        assert_eq!(
+            rows(&parts, all.clone()),
+            [
+                r#"{"items":{"parts":"p"},"n":1}"#,
+                r#"{"items":{"parts":"q"},"n":2}"#
+            ]
+        );
+        let pairs = Aggregate::new()
+            .unwind("items")
+            .unwind("tags")
+            .count()
+            .named("n");
+        assert_eq!(rows(&pairs, all), [r#"{"n":4}"#]);
+        let ends = Aggregate::new()
+            .unwind("tags")
+            .first("tags")
+            .named("f")
+            .last("tags")
+            .named("l");
+        let two = docs(&[r#"{"tags":["a","b"]}"#, r#"{"tags":["c","d"]}"#]);
+        assert_eq!(rows(&ends, two), [r#"{"f":"a","l":"d"}"#]);
+    }
+
     #[test]
     fn a_wrong_aggregate_is_refused() {
         let refused = |aggregate: Aggregate| {
@@ -1808,6 +2009,21 @@ mod tests {
         assert!(refused(Aggregate::new().count().by("at").named("n")).contains("`by` orders"));
         assert!(refused(Aggregate::new().max("v").by("at").named("m")).contains("`by` orders"));
         assert!(refused(Aggregate::new().last("v").by("at[*]").named("l")).contains("[*]"));
+        assert!(refused(Aggregate::new().unwind("")).contains("`unwind` must"));
+        assert!(refused(Aggregate::new().unwind("a[*]")).contains("`unwind` must"));
+        assert!(refused(Aggregate::new().unwind("_id")).contains("`unwind` must"));
+        let late = std::time::Duration::from_secs(1);
+        assert!(
+            refused(Aggregate::new().unwind("r").window("r.at", late)).contains("keeps documents")
+        );
+        assert!(
+            refused(Aggregate::new().unwind("r").window("r", late)).contains("keeps documents")
+        );
+        Aggregate::new()
+            .unwind("r")
+            .window("rat", late)
+            .apply(Vec::new())
+            .unwrap();
         assert!(
             refused(Aggregate::new().group_by("a").group_by("a.b")).contains("one in the other")
         );

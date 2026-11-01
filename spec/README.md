@@ -161,3 +161,4 @@ say what changed, and DESIGN.md says what is true now.
 144. [Operators in a batch and an upsert (`batch.rs`, `collection.rs`, `update.rs`)](144-operators-in-a-batch-and-an-upsert.md)
 145. [A live sort and limit (`live.rs`, `collection.rs`)](145-a-live-sort-and-limit.md)
 146. [`count_distinct`, `first` and `last` (`aggregate.rs`, `collection.rs`)](146-count-distinct-first-and-last.md)
+147. [Unwind (`aggregate.rs`, `collection.rs`)](147-unwind.md)

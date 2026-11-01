@@ -73,6 +73,7 @@ fn main() {
                 total.live_events += ran.live_events;
                 total.live_sorted += ran.live_sorted;
                 total.distinct_and_ends += ran.distinct_and_ends;
+                total.unwound += ran.unwound;
                 total.live_sorted_events += ran.live_sorted_events;
                 total.windows += ran.windows;
                 total.windows_refused += ran.windows_refused;
@@ -131,6 +132,7 @@ fn main() {
         "  count_distinct, first and last columns (§146): {}",
         total.distinct_and_ends
     );
+    println!("  aggregates unwinding (§147): {}", total.unwound);
     println!(
         "  upsert_fields (§144): {}, {} inserting",
         total.upserted_fields, total.upsert_fields_inserted

@@ -824,3 +824,12 @@ limit, batches and a write-ahead log. Since then:
     or last document, by id, or `by(field)` and then by id:
     `.last("pos").by("at")` is each van's position at its newest `at`,
     pings sent late included. `by` on any other column is refused.
+119. **Unwind** (§147): `Aggregate::unwind(path)` makes each document
+    the filter finds one per element of the array at `path`, the
+    element in its place, MongoDB's `$unwind`: sales per sku with
+    `unwind("items").group_by("items.sku").sum("items.qty")`, fields of
+    one element together. An empty array, `null` or a missing field
+    leaves the document out; a value that isn't an array is one
+    element; equal elements each count. Unwinds follow one another,
+    into an element's own arrays. Read from documents; live aggregates
+    and `apply` unwind alike.

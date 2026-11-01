@@ -247,7 +247,8 @@ An `Explained` (§94) for the aggregate's read:
   application code on the rows.
 - **Grouping by array elements** (`$unwind`): what a multikey index
   does for conditions (§42), but its rows count a document once per
-  element; a design of its own, if asked for.
+  element; a design of its own, if asked for. It came in §147,
+  `Aggregate::unwind`.
 - **`count_distinct`, `first`, `last`, `push`, percentiles:** when a
   workload asks. The first three came in §146. `count` of a path, SQL's `COUNT(col)`, is `count`
   with `having` or a `sum` of a 0/1 field; left out for now.

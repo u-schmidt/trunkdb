@@ -155,6 +155,8 @@ pub struct Ran {
     pub live_events: u64,
     /// `count_distinct`, `first` and `last` columns made (SPEC §146).
     pub distinct_and_ends: u64,
+    /// Aggregates that unwind (SPEC §147).
+    pub unwound: u64,
     /// Live queries with a sort (SPEC §145), and their events.
     pub live_sorted: u64,
     pub live_sorted_events: u64,
@@ -1020,17 +1022,34 @@ impl Run<'_> {
     /// limit, and at times a window (§139).
     fn made_aggregate(&mut self, fields: &[&'static str]) -> Aggregate {
         let mut aggregate = Aggregate::new();
-        let mut grouped = Vec::new();
+        // Unwound `tags` (SPEC §147), one aggregate in six, where it is
+        // among the fields: then a path of `tags` is `tags.k` one time in
+        // two, a field of the element, as a value or an object holds it.
+        let unwinds = fields.contains(&"tags") && self.program.one_in(6);
+        if unwinds {
+            aggregate = aggregate.unwind("tags");
+            self.ran.unwound += 1;
+        }
+        let pick = |program: &mut Program| {
+            let field = fields[program.below(fields.len())];
+            match unwinds && field == "tags" && program.one_in(2) {
+                true => "tags.k",
+                false => field,
+            }
+        };
+        let mut grouped: Vec<&str> = Vec::new();
         for _ in 0..self.program.below(3) {
-            let field = fields[self.program.below(fields.len())];
-            if !grouped.contains(&field) {
+            let field = pick(&mut self.program);
+            // `tags` and `tags.k` both would be one inside the other.
+            let first = |f: &str| f.split('.').next().unwrap_or_default().to_string();
+            if !grouped.iter().any(|g| first(g) == first(field)) {
                 grouped.push(field);
                 aggregate = aggregate.group_by(field);
             }
         }
         for c in 0..1 + self.program.below(3) {
             let name = format!("c{c}");
-            let path = fields[self.program.below(fields.len())];
+            let path = pick(&mut self.program);
             // The new kinds one column in ten: they read documents, and
             // every aggregate with one is one less from entries (§107.5).
             let kind = match self.program.one_in(10) {
@@ -1072,8 +1091,10 @@ impl Run<'_> {
         }
         // A window on a path of the pool's date-times (0 s, 1 ns, -5 s):
         // widths at their gaps, and one past all of time.
-        if self.program.one_in(3) {
-            let path = fields[self.program.below(fields.len())];
+        let window = self.program.one_in(3);
+        let path = fields[self.program.below(fields.len())];
+        // A window keeps documents: not on a path unwound.
+        if window && !(unwinds && path == "tags") {
             let duration = [
                 Duration::ZERO,
                 Duration::from_nanos(1),

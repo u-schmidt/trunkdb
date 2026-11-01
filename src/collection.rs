@@ -2436,7 +2436,8 @@ pub(crate) fn aggregate_in(
     let mut groups = Groups::new(aggregate);
     // Counts alone, of every match: `count`'s.
     let counts_only = aggregate.columns.iter().all(|c| c.kind == Kind::Count);
-    if aggregate.group_by.is_empty() && counts_only && !aggregate.has_conditions() {
+    let whole = aggregate.unwind.is_empty() && !aggregate.has_conditions();
+    if aggregate.group_by.is_empty() && counts_only && whole {
         let n = count_matches(catalog, store, collection, filter, trace)?;
         trace.matched(n);
         if n > 0 {
@@ -11287,6 +11288,74 @@ mod tests {
             assert_eq!(rows, a.apply(notes.find(Filter::new()).unwrap()).unwrap());
             let r = notes.explain_aggregate(Filter::new(), &a).unwrap();
             assert_eq!(r.stats.from_entries > 0, entries, "{a:?}");
+        }
+    }
+
+    /// SPEC §147: an unwind reads its documents, a multikey index on the
+    /// array there, and counts elements, not documents: neither from
+    /// entries nor by the count of every match.
+    #[test]
+    fn an_unwind_reads_documents_and_counts_elements() {
+        use crate::query::Aggregate;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let tasks = db.collection::<Document>("tasks");
+        tasks.ensure_index("tags[*]").unwrap();
+        // And one on the array whole. Its entries hand an array over to
+        // its document, which is unwound; but not a `null`, which an
+        // unwind leaves out.
+        tasks.ensure_index("tags").unwrap();
+        for tags in [r#"["a","b"]"#, r#"["a"]"#, "[]", r#""b""#, "null"] {
+            tasks
+                .insert(format!(r#"{{"tags": {tags}}}"#).parse().unwrap())
+                .unwrap();
+        }
+        for (a, expected) in [
+            (
+                Aggregate::new().unwind("tags").count().named("n"),
+                r#"[{"n":4}]"#,
+            ),
+            (
+                Aggregate::new()
+                    .unwind("tags")
+                    .group_by("tags")
+                    .count()
+                    .named("n"),
+                r#"[{"tags":"a","n":2},{"tags":"b","n":2}]"#,
+            ),
+        ] {
+            for f in [Filter::new(), Filter::new().eq("tags[*]", "a")] {
+                let rows = tasks.aggregate(f.clone(), &a).unwrap();
+                assert_eq!(rows, a.apply(tasks.find(f.clone()).unwrap()).unwrap());
+                let run = tasks.explain_aggregate(f, &a).unwrap();
+                assert_eq!(run.stats.from_entries, 0);
+            }
+            let text = Document::Array(tasks.aggregate(Filter::new(), &a).unwrap()).to_string();
+            assert_eq!(text, expected);
+        }
+        // No arrays at all: an index on the field holds every document,
+        // and would count the `null` an unwind leaves out.
+        let plain = db.collection::<Document>("plain");
+        plain.ensure_index("tags").unwrap();
+        for tags in [r#""a""#, r#""b""#, "null"] {
+            plain
+                .insert(format!(r#"{{"tags": {tags}}}"#).parse().unwrap())
+                .unwrap();
+        }
+        for a in [
+            Aggregate::new().unwind("tags").count().named("n"),
+            Aggregate::new()
+                .unwind("tags")
+                .group_by("tags")
+                .count()
+                .named("n"),
+        ] {
+            let rows = plain.aggregate(Filter::new(), &a).unwrap();
+            assert_eq!(rows, a.apply(plain.find(Filter::new()).unwrap()).unwrap());
+            let n: i64 = (rows.iter())
+                .map(|row| row.get("n").and_then(Document::as_i64).unwrap())
+                .sum();
+            assert_eq!(n, 2, "{a:?}");
         }
     }
 

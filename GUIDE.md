@@ -430,6 +430,34 @@ let vans = db.collection::<Document>("pings").aggregate(
 - **`count_distinct` counts as `=` compares:** `5` and `5.0` once, `null`
   and missing not at all.
 
+### Per element of an array
+
+`unwind` makes each document one per element of an array before it is
+grouped, MongoDB's `$unwind` (SPEC §147): sales per sku over the items
+of every order.
+
+```rust
+let per_sku = db.collection::<Document>("orders").aggregate(
+    Filter::new().gte("placed", since),     // picks orders, before unwinding
+    &Aggregate::new()
+        .unwind("items")                    // `items` is one element now
+        .group_by("items.sku")
+        .sum("items.qty").named("sold")     // that element's qty
+        .count().named("lines"),
+)?;
+// [{"items": {"sku": "a-1"}, "sold": 40, "lines": 12}, ...]
+```
+
+- **Fields of one element go together:** `items.sku` and `items.qty`
+  are the same item's.
+- **An empty array, `null` or a missing field** leaves the order out; a
+  value that isn't an array is one element.
+- **Each element counts:** tags `["a", "a"]` are two in group `"a"`.
+- **Unwind again** for an array inside: `.unwind("items")
+  .unwind("items.parts")`.
+- It reads the documents: an index doesn't keep a value repeated in one
+  array twice.
+
 Where an index holds the fields an aggregate reads, its entries answer
 `count`, `avg`, `min`, `max` and `count_distinct` without reading the
 documents: "tasks

@@ -431,7 +431,9 @@ decoded [§143](spec/143-except-every-field-but-these.md).
 filter finds in groups by the values of some paths, and per group count,
 sum, average, or find the smallest and largest value
 [§107](spec/107-aggregates.md); count the different values, or take the first or last
-document's, by id or `by` a field [§146](spec/146-count-distinct-first-and-last.md). A missing field groups with null, values a
+document's, by id or `by` a field [§146](spec/146-count-distinct-first-and-last.md). `unwind(path)` makes each
+document one per element of an array first, the groups and columns
+seeing the elements, read from documents [§147](spec/147-unwind.md). A missing field groups with null, values a
 filter finds equal are one group, and sums are exact (a fixed-point
 integer as wide as every float), so the plan doesn't change the answer.
 A mean is that exact total divided, then rounded once [§131](spec/131-a-mean-rounded-once.md).
@@ -585,7 +587,7 @@ more than four.
   `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md), `except` for those it leaves out [§143](spec/143-except-every-field-but-these.md);
   `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md), a
   column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md), `count_distinct`, `first` and
-  `last`, the last two `by` a field [§146](spec/146-count-distinct-first-and-last.md); a condition of the
+  `last`, the last two `by` a field [§146](spec/146-count-distinct-first-and-last.md), `unwind` [§147](spec/147-unwind.md); a condition of the
   application's own, `Condition::custom(fields, test)`, a closure given
   the fields it names, which mustn't use the database, and whose panic
   fails the call with `Error::ClosurePanicked` [§136](spec/136-a-condition-of-the-applications-own.md).

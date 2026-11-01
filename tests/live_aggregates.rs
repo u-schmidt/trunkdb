@@ -581,3 +581,44 @@ fn iterating_ends_when_the_database_is_dropped() {
     drop(db);
     assert_eq!(live.count(), 2);
 }
+
+/// SPEC §147: a live aggregate unwinds as it runs again: an element
+/// added to a document's array changes its group's row.
+#[test]
+fn a_live_aggregate_unwinds() {
+    let (_dir, db) = open();
+    let tasks = db.collection::<Document>("tasks");
+    let id = tasks.insert(r#"{"tags": ["a"]}"#.parse().unwrap()).unwrap();
+    let per_tag = Aggregate::new()
+        .unwind("tags")
+        .group_by("tags")
+        .count()
+        .named("n");
+    let live = tasks.watch_aggregate(Filter::new(), &per_tag).unwrap();
+    let first: Vec<String> = std::iter::from_fn(|| live.try_recv())
+        .map(|e| format!("{:?}", e.unwrap()))
+        .collect();
+    assert_eq!(first.len(), 1);
+    tasks
+        .update(&id, r#"{"tags": ["a", "a", "b"]}"#.parse().unwrap())
+        .unwrap();
+    let events: Vec<LiveRow> = std::iter::from_fn(|| live.try_recv())
+        .map(Result::unwrap)
+        .collect();
+    let shown: Vec<String> = events
+        .iter()
+        .map(|e| match e {
+            LiveRow::Entered { row, .. } => format!("entered {row}"),
+            LiveRow::Changed { row, .. } => format!("changed {row}"),
+            LiveRow::Left { group, .. } => format!("left {group}"),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            r#"changed {"tags":"a","n":2}"#,
+            r#"entered {"tags":"b","n":1}"#
+        ]
+    );
+}
