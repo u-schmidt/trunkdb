@@ -158,3 +158,4 @@ say what changed, and DESIGN.md says what is true now.
 141. [`check` finding cells that share bytes (`check.rs`, `storage/slotted.rs`)](141-check-finding-cells-that-share-bytes.md)
 142. [`mul`, `pop` and `push_all` (`update.rs`)](142-mul-pop-and-push-all.md)
 143. [`except`: every field but these (`select.rs`, `query.rs`, `query_text.rs`, `explain.rs`)](143-except-every-field-but-these.md)
+144. [Operators in a batch and an upsert (`batch.rs`, `collection.rs`, `update.rs`)](144-operators-in-a-batch-and-an-upsert.md)

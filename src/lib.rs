@@ -92,7 +92,7 @@ mod storage;
 mod txn;
 mod update;
 
-pub use batch::{Batch, IntoDocument};
+pub use batch::{Batch, FromDocument, IntoDocument};
 pub use catalog::{IndexInfo, IndexOptions};
 pub use changes::{Change, Changes, Commit};
 pub use check::{CheckReport, FileInfo};

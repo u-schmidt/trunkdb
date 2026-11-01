@@ -75,7 +75,8 @@ Rejected:
 
 ## 68.3 Limits
 - **No operators in a `Batch`** or in `upsert`: `update_fields` is its
-  own batch, like `update_many`.
+  own batch, like `update_many`. They came in §144: `Batch::update_fields`
+  by id, and `upsert_fields`.
 - **A misspelled path adds a field** instead of failing, as in
   MongoDB. On the typed path the new field is ignored by serde, so the
   update seems to do nothing.

@@ -75,6 +75,18 @@ fn main() {
                 total.windows_refused += ran.windows_refused;
                 total.live_rows += ran.live_rows;
                 total.excepted += ran.excepted;
+                total.upserted_fields += ran.upserted_fields;
+                total.upsert_fields_inserted += ran.upsert_fields_inserted;
+                total.batch_fields += ran.batch_fields;
+                total.batch_fields_committed += ran.batch_fields_committed;
+                total.batch_fields_skipped += ran.batch_fields_skipped;
+                for (total, ran) in total
+                    .batch_fields_failed
+                    .iter_mut()
+                    .zip(ran.batch_fields_failed)
+                {
+                    *total += ran;
+                }
             }
             Err(_) => {
                 let file = keep(seed, n, &input);
@@ -108,6 +120,21 @@ fn main() {
     );
     println!("  live aggregate rows (§139): {}", total.live_rows);
     println!("  reads with an except (§143): {}", total.excepted);
+    println!(
+        "  upsert_fields (§144): {}, {} inserting",
+        total.upserted_fields, total.upsert_fields_inserted
+    );
+    println!(
+        "  update_fields ops in batches (§144): {}, in {} batches committed",
+        total.batch_fields, total.batch_fields_committed
+    );
+    println!(
+        "    failing on a missing id {}, an operator {}, a duplicate {}; after an earlier op {}",
+        total.batch_fields_failed[0],
+        total.batch_fields_failed[1],
+        total.batch_fields_failed[2],
+        total.batch_fields_skipped
+    );
     println!("plans:");
     for plan in &total.plans {
         println!("  {plan}");

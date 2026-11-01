@@ -659,6 +659,16 @@ where
         let document = crate::serde_bridge::to_document(&doc)?;
         self.as_document().upsert(filter, document)
     }
+
+    /// See the untyped `upsert_fields`. The document written, inserted or
+    /// updated, must convert to `T`, or nothing is: a `T` with a field the
+    /// filter and the operators don't give fails as an insert.
+    pub fn upsert_fields(&self, filter: Filter, update: &Update) -> crate::Result<Upserted> {
+        self.as_document()
+            .upsert_fields_then(filter, update, |doc| {
+                caught(|| from_document::<T>(doc.clone()).map(drop))?
+            })
+    }
 }
 
 /// The id an insert stores `doc` under (SPEC §59): the id in its `_id`
@@ -816,12 +826,7 @@ impl Collection<Document> {
         update: &Update,
         mut accept: impl FnMut(&Document) -> crate::Result<()>,
     ) -> crate::Result<usize> {
-        update.check().map_err(|message| {
-            crate::Error::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                message,
-            ))
-        })?;
+        update.check().map_err(invalid_input)?;
         self.update_matching(filter, |id, mut doc| {
             update
                 .apply(&mut doc)
@@ -1065,46 +1070,171 @@ impl Collection<Document> {
     pub fn upsert(&self, filter: Filter, doc: Document) -> crate::Result<Upserted> {
         let id_if_new = id_for_insert(&self.db, &doc);
         self.db.transact(|catalog, store| {
-            follow_hint(&self.name, &filter, catalog.indexes(&self.name))?;
-            let names = filter.fields_with(false);
-            let trace = Trace::default();
-            let matcher = filter.matcher();
-            let candidates = read_candidates(
-                catalog,
-                store,
-                &self.name,
-                &filter,
-                names.as_deref(),
-                Wants::default(),
-                &trace,
-            )?
-            .0;
-            let mut matches: Vec<DocId> = Vec::new();
-            for (source, fields) in candidates {
-                if source.decided() || matcher.matches(&fields)? {
-                    matches.push(source.id());
-                }
-            }
-            let (op, outcome) = match matches[..] {
-                [] => (
+            let (op, outcome) = match self.only_match(catalog, store, &filter)? {
+                None => (
                     WriteOp::Insert(self.name.clone(), id_if_new, doc),
                     Upserted::Inserted(id_if_new),
                 ),
-                [id] => (
+                Some(id) => (
                     WriteOp::Update(self.name.clone(), id, doc),
                     Upserted::Updated(id),
                 ),
-                _ => {
-                    return Err(crate::Error::MultipleMatches {
-                        collection: self.name.clone(),
-                        count: matches.len(),
-                    });
-                }
             };
             apply_write_op(catalog, store, &op)?;
             Ok(outcome)
         })
     }
+
+    /// `upsert` by `update`'s operators (SPEC §144.2): the one document
+    /// matching `filter`'s conditions gets them, as `update_fields` would
+    /// make them; where none matches, a new one is inserted, made of the
+    /// filter's `eq`s and then the operators, `set_on_insert` included.
+    /// `Error::MultipleMatches` if several match.
+    ///
+    /// ```no_run
+    /// # fn main() -> trunkdb::Result<()> {
+    /// use trunkdb::{Database, DateTime, Document, query::{Filter, Update}};
+    ///
+    /// let db = Database::open("app.trunkdb")?;
+    /// let visits = db.collection::<Document>("visits");
+    /// // { page: "/home", hits: 1, first: … } the first time, hits + 1 after.
+    /// visits.upsert_fields(
+    ///     Filter::new().eq("page", "/home"),
+    ///     &Update::new().inc("hits", 1).set_on_insert("first", DateTime::now()),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The new document's fields come from each `eq` at the top of the
+    /// filter or in an AND, on a path an update could name; an `eq` on
+    /// `_id` gives its id. ORs, NOTs and other comparisons are left out:
+    /// they don't say one value. A filter that gives a field two values,
+    /// or a value to a field and to one inside it, is refused before
+    /// anything is read (`ErrorKind::InvalidInput`), as an update that
+    /// `update_fields` would refuse is. A match the operators leave as it
+    /// was isn't written, and is still `Upserted::Updated`.
+    pub fn upsert_fields(&self, filter: Filter, update: &Update) -> crate::Result<Upserted> {
+        self.upsert_fields_then(filter, update, |_doc| Ok(()))
+    }
+
+    /// `upsert_fields`, with `accept` to refuse the document written: the
+    /// typed path's check that it still converts to `T`.
+    fn upsert_fields_then(
+        &self,
+        filter: Filter,
+        update: &Update,
+        mut accept: impl FnMut(&Document) -> crate::Result<()>,
+    ) -> crate::Result<Upserted> {
+        update.check().map_err(invalid_input)?;
+        let (named, seed) = crate::update::seed(&filter.conditions).map_err(invalid_input)?;
+        let id_if_new = named.unwrap_or_else(|| self.db.id_gen().generate());
+        self.db.transact(
+            |catalog, store| match self.only_match(catalog, store, &filter)? {
+                Some(id) => {
+                    update_by_id(catalog, store, &self.name, id, update, &mut accept)?;
+                    Ok(Upserted::Updated(id))
+                }
+                None => {
+                    let mut doc = seed;
+                    update
+                        .apply_inserting(&mut doc)
+                        .map_err(|message| crate::Error::Update {
+                            collection: self.name.clone(),
+                            id: id_if_new,
+                            message,
+                        })?;
+                    let doc = with_id(doc, id_if_new);
+                    accept(&doc)?;
+                    apply_write_op(
+                        catalog,
+                        store,
+                        &WriteOp::Insert(self.name.clone(), id_if_new, doc),
+                    )?;
+                    Ok(Upserted::Inserted(id_if_new))
+                }
+            },
+        )
+    }
+
+    /// The id of the one document matching `filter`'s conditions, `None`
+    /// if none does; `Error::MultipleMatches` if several do: what an
+    /// upsert writes to (SPEC §29.3).
+    fn only_match(
+        &self,
+        catalog: &Catalog,
+        store: &dyn PageStore,
+        filter: &Filter,
+    ) -> crate::Result<Option<DocId>> {
+        follow_hint(&self.name, filter, catalog.indexes(&self.name))?;
+        let names = filter.fields_with(false);
+        let trace = Trace::default();
+        let matcher = filter.matcher();
+        let candidates = read_candidates(
+            catalog,
+            store,
+            &self.name,
+            filter,
+            names.as_deref(),
+            Wants::default(),
+            &trace,
+        )?
+        .0;
+        let mut matches: Vec<DocId> = Vec::new();
+        for (source, fields) in candidates {
+            if source.decided() || matcher.matches(&fields)? {
+                matches.push(source.id());
+            }
+        }
+        match matches[..] {
+            [] => Ok(None),
+            [id] => Ok(Some(id)),
+            _ => Err(crate::Error::MultipleMatches {
+                collection: self.name.clone(),
+                count: matches.len(),
+            }),
+        }
+    }
+}
+
+/// An `InvalidInput` error saying `message`: an update or filter refused
+/// as written, before anything is read.
+pub(crate) fn invalid_input(message: String) -> crate::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into()
+}
+
+/// Makes `update` to document `id` of `collection` and writes it, unless
+/// that left it as it was, judged by its encoding (SPEC §68.2): for
+/// `upsert_fields` and a batch's `update_fields` (§144). `accept` may
+/// refuse the changed document; `Error::NotFound` if there's none.
+pub(crate) fn update_by_id(
+    catalog: &mut Catalog,
+    store: &mut dyn PageStore,
+    collection: &str,
+    id: DocId,
+    update: &Update,
+    accept: &mut dyn FnMut(&Document) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let (_, loc) = locate(catalog, store, collection, &id)?;
+    let old = with_id(data::get_record(store, loc)?.1, id);
+    let mut new = old.clone();
+    update
+        .apply(&mut new)
+        .map_err(|message| crate::Error::Update {
+            collection: collection.to_string(),
+            id,
+            message,
+        })?;
+    let new = with_id(new, id);
+    accept(&new)?;
+    if encode_document(&new) == encode_document(&old) {
+        return Ok(()); // nothing to write
+    }
+    apply_write_op(
+        catalog,
+        store,
+        &WriteOp::Update(collection.to_string(), id, new),
+    )
 }
 
 // Each match with its id, for tests that need the id of a document they
@@ -10239,6 +10369,167 @@ mod tests {
         for key in 0..5 {
             assert_eq!(users.count(name_is(&format!("user {key}"))).unwrap(), 1);
         }
+    }
+
+    /// SPEC §144.2: `upsert_fields` inserts from the filter's `eq`s and
+    /// the operators, `set_on_insert` included, then updates the one
+    /// match; a match left as it was isn't written; the index follows;
+    /// what can't be made, or matches twice, writes nothing.
+    #[test]
+    fn upsert_fields_inserts_from_the_filter_then_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let visits = db.collection::<Document>("visits");
+        visits.ensure_index("hits").unwrap();
+        let doc = |json: &str| json.parse::<Document>().unwrap();
+        let home = Filter::new().eq("page", "/home").eq("at.site", "a");
+        let visit = Update::new().inc("hits", 1).set_on_insert("first", 7);
+
+        let Upserted::Inserted(id) = visits.upsert_fields(home.clone(), &visit).unwrap() else {
+            panic!("nothing matched yet");
+        };
+        assert_eq!(
+            visits.get(&id).unwrap(),
+            Some(with_id(
+                doc(r#"{"page":"/home","at":{"site":"a"},"hits":1,"first":7}"#),
+                id
+            ))
+        );
+        let again = Update::new().inc("hits", 1).set_on_insert("first", 8);
+        assert_eq!(
+            visits.upsert_fields(home.clone(), &again).unwrap(),
+            Upserted::Updated(id)
+        );
+        assert_eq!(
+            visits.get(&id).unwrap(),
+            Some(with_id(
+                doc(r#"{"page":"/home","at":{"site":"a"},"hits":2,"first":7}"#),
+                id
+            )),
+            "`set_on_insert` leaves a match as it is"
+        );
+        assert_eq!(
+            visits.count(Filter::new().eq("hits", 2)).unwrap(),
+            1,
+            "the index follows"
+        );
+
+        let named = DocId([9; 16]);
+        assert_eq!(
+            visits
+                .upsert_fields(Filter::new().id(named).eq("page", "/about"), &visit)
+                .unwrap(),
+            Upserted::Inserted(named),
+            "an `eq` on `_id` gives the id"
+        );
+
+        let changes = db.subscribe().unwrap();
+        let same = Update::new().set("hits", 2);
+        assert_eq!(
+            visits.upsert_fields(home.clone(), &same).unwrap(),
+            Upserted::Updated(id)
+        );
+        assert!(
+            changes.try_recv().is_none(),
+            "a match left as it was isn't written"
+        );
+
+        let before = visits.find(Filter::new()).unwrap();
+        let refused = |result: crate::Result<Upserted>| match result {
+            Err(crate::Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}")
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        };
+        refused(visits.upsert_fields(Filter::new().eq("page", "a").eq("page", "b"), &visit));
+        refused(visits.upsert_fields(Filter::new().eq("at", 1).eq("at.site", "a"), &visit));
+        refused(visits.upsert_fields(home.clone(), &Update::new().set("_id", 1)));
+        let err = visits
+            .upsert_fields(Filter::new().exists("page"), &visit)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::MultipleMatches { count: 2, .. }),
+            "{err}"
+        );
+        let err = visits
+            .upsert_fields(home.clone(), &Update::new().push("page", 1))
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Update { id: at, .. } if *at == id),
+            "{err}"
+        );
+        let err = visits
+            .upsert_fields(Filter::new().eq("page", 5), &Update::new().set("page.x", 1))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Update { .. }),
+            "an insert's operators fail too: {err}"
+        );
+        assert_eq!(
+            visits.find(Filter::new()).unwrap(),
+            before,
+            "nothing written"
+        );
+        assert!(changes.try_recv().is_none());
+    }
+
+    /// SPEC §144.2: the typed document written must convert to `T`; and
+    /// the lookup and the write are one step, so racing threads count
+    /// every visit into one document.
+    #[test]
+    fn typed_upsert_fields_converts_and_counts_once() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Visit {
+            page: String,
+            hits: i64,
+            first: i64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let visits = db.collection::<Visit>("visits");
+        visits.ensure_index("page").unwrap();
+        let visit = Update::new().inc("hits", 1).set_on_insert("first", 1);
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for n in 0..25 {
+                        let page = format!("/{}", n % 2);
+                        visits
+                            .upsert_fields(Filter::new().eq("page", page), &visit)
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let mut found = visits.find(Filter::new()).unwrap();
+        found.sort_by(|a, b| a.page.cmp(&b.page));
+        let visit_of = |page: &str, hits| Visit {
+            page: page.into(),
+            hits,
+            first: 1,
+        };
+        assert_eq!(found, [visit_of("/0", 52), visit_of("/1", 48)]);
+
+        let err = visits
+            .upsert_fields(
+                Filter::new().eq("page", "/2"),
+                &Update::new().inc("hits", 1),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Document(_)),
+            "no `first`: {err}"
+        );
+        let err = visits
+            .upsert_fields(
+                Filter::new().eq("page", "/0"),
+                &Update::new().set("hits", "many"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Document(_)), "{err}");
+        assert_eq!(visits.count(Filter::new()).unwrap(), 2);
+        assert_eq!(visits.count(Filter::new().eq("hits", 52)).unwrap(), 1);
     }
 
     // --- Projection (SPEC §106) ---

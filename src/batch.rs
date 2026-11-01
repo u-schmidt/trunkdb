@@ -1,8 +1,10 @@
-use crate::collection::Collection;
+use crate::collection::{Collection, apply_write_op, update_by_id};
 use crate::database::Database;
 use crate::document::{DocId, Document};
+use crate::query::Update;
 use crate::txn::WriteOp;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// What a batch stores (SPEC §60): any serde type, as `Collection<T>`
 /// converts it, or a `Document` as it is, for a `Collection<Document>`.
@@ -12,11 +14,51 @@ pub trait IntoDocument: sealed::Sealed {
     fn into_document(self) -> crate::Result<Document>;
 }
 
+/// What a batch's `update_fields` reads back (SPEC §144.1): any serde
+/// type, which the changed document must still convert to, or a
+/// `Document`, which takes any. Sealed: only these two.
+pub trait FromDocument: sealed::SealedFrom {
+    #[doc(hidden)]
+    fn accept(doc: &Document) -> crate::Result<()>;
+}
+
 mod sealed {
     /// Outside code can't name this, so it can't implement `IntoDocument`.
     pub trait Sealed {}
     impl<T: serde::Serialize> Sealed for T {}
     impl Sealed for crate::Document {}
+
+    /// The same for `FromDocument`.
+    pub trait SealedFrom {}
+    impl<T: serde::de::DeserializeOwned> SealedFrom for T {}
+    impl SealedFrom for crate::Document {}
+}
+
+/// As for `IntoDocument`: `Document` isn't `Deserialize`.
+impl<T: DeserializeOwned> FromDocument for T {
+    fn accept(doc: &Document) -> crate::Result<()> {
+        // `T`'s conversions are the application's code (SPEC §137).
+        crate::query::caught(|| crate::serde_bridge::from_document::<T>(doc.clone()).map(drop))?
+            .map_err(Into::into)
+    }
+}
+
+impl FromDocument for Document {
+    fn accept(_doc: &Document) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+/// One op of a batch: a write as it is, or operators to make to the
+/// document as the ops before it leave it.
+enum Op {
+    Write(WriteOp),
+    Fields {
+        collection: String,
+        id: DocId,
+        update: Update,
+        accept: fn(&Document) -> crate::Result<()>,
+    },
 }
 
 /// The two can't overlap: `Document` isn't `Serialize`, and being local to
@@ -53,7 +95,7 @@ impl IntoDocument for Document {
 #[must_use = "a batch writes nothing until `commit`"]
 pub struct Batch {
     db: Database,
-    ops: Vec<WriteOp>,
+    ops: Vec<Op>,
 }
 
 impl Batch {
@@ -76,7 +118,8 @@ impl Batch {
         let name = self.name_of(collection);
         let document = doc.into_document()?;
         let id = crate::collection::id_for_insert(&self.db, &document);
-        self.ops.push(WriteOp::Insert(name, id, document));
+        self.ops
+            .push(Op::Write(WriteOp::Insert(name, id, document)));
         Ok(id)
     }
 
@@ -90,7 +133,49 @@ impl Batch {
     ) -> crate::Result<()> {
         let name = self.name_of(collection);
         let document = doc.into_document()?;
-        self.ops.push(WriteOp::Update(name, *id, document));
+        self.ops
+            .push(Op::Write(WriteOp::Update(name, *id, document)));
+        Ok(())
+    }
+
+    /// Adds `update`'s operators to document `id` (SPEC §144.1), made at
+    /// `commit` to the document as the ops before leave it, as
+    /// `Collection::update_fields` makes them. An update it would refuse
+    /// as written is refused here, leaving the batch as it was.
+    ///
+    /// At `commit`, a missing id fails the whole batch, as for `update`;
+    /// so does an operator that can't be made (`Error::Update`), and, on a
+    /// typed collection, a changed document that no longer converts to
+    /// `T`. A document the operators leave as it was isn't written.
+    ///
+    /// ```no_run
+    /// # fn main() -> trunkdb::Result<()> {
+    /// use trunkdb::{Database, DocId, Document, query::Update};
+    ///
+    /// let db = Database::open("app.trunkdb")?;
+    /// let accounts = db.collection::<Document>("accounts");
+    /// # let (from, to) = (DocId::NIL, DocId::NIL);
+    /// let mut batch = db.batch();
+    /// batch.update_fields(&accounts, &from, &Update::new().inc("balance", -25))?;
+    /// batch.update_fields(&accounts, &to, &Update::new().inc("balance", 25))?;
+    /// batch.commit()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_fields<T: FromDocument>(
+        &mut self,
+        collection: &Collection<T>,
+        id: &DocId,
+        update: &Update,
+    ) -> crate::Result<()> {
+        let name = self.name_of(collection);
+        update.check().map_err(crate::collection::invalid_input)?;
+        self.ops.push(Op::Fields {
+            collection: name,
+            id: *id,
+            update: update.clone(),
+            accept: T::accept,
+        });
         Ok(())
     }
 
@@ -98,7 +183,7 @@ impl Batch {
     /// for `update`.
     pub fn delete<T>(&mut self, collection: &Collection<T>, id: &DocId) {
         let name = self.name_of(collection);
-        self.ops.push(WriteOp::Delete(name, *id));
+        self.ops.push(Op::Write(WriteOp::Delete(name, *id)));
     }
 
     /// How many ops the batch holds.
@@ -113,7 +198,27 @@ impl Batch {
 
     /// Applies every op as one atomic, durable unit (SPEC §19.3).
     pub fn commit(self) -> crate::Result<()> {
-        self.db.write_batch(self.ops)
+        if self.ops.is_empty() {
+            return self.db.write_batch(Vec::new()); // reports a poisoned database
+        }
+        self.db.transact(|catalog, store| {
+            for op in &self.ops {
+                match op {
+                    Op::Write(write) => apply_write_op(catalog, store, write)?,
+                    // The document as the ops before left it: read here,
+                    // under the writer's lock.
+                    Op::Fields {
+                        collection,
+                        id,
+                        update,
+                        accept,
+                    } => update_by_id(catalog, store, collection, *id, update, &mut |doc| {
+                        accept(doc)
+                    })?,
+                }
+            }
+            Ok(())
+        })
     }
 
     /// The collection's name — after checking the handle belongs to this
@@ -131,7 +236,7 @@ impl Batch {
 
 #[cfg(test)]
 mod tests {
-    use crate::query::{Condition, Filter, Op};
+    use crate::query::{Condition, Filter, Op, Update};
     use crate::testing::{Text, text};
     use crate::{Database, DocId, Document, Error};
     use serde::{Deserialize, Serialize};
@@ -317,6 +422,119 @@ mod tests {
         assert_eq!(
             counters.find(Filter::default()).unwrap(),
             [Counter { count: 1 }]
+        );
+    }
+
+    /// SPEC §144.1: operators in a batch, on what the ops before them
+    /// left: a document inserted, replaced or changed earlier in it.
+    #[test]
+    fn update_fields_works_on_what_the_batch_has_so_far() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let entries = db.collection::<Entry>("entries");
+        entries.ensure_index("price").unwrap();
+        let (a, b) = (
+            entries.insert(entry("a", 100)).unwrap(),
+            entries.insert(entry("b", 0)).unwrap(),
+        );
+        let by = |n: i64| Update::new().inc("price", n);
+
+        let mut batch = db.batch();
+        batch.update_fields(&entries, &a, &by(-25)).unwrap();
+        batch.update_fields(&entries, &b, &by(25)).unwrap();
+        let c = batch.insert(&entries, entry("c", 1)).unwrap();
+        batch.update_fields(&entries, &c, &by(1)).unwrap();
+        batch
+            .update_fields(&entries, &c, &Update::new().mul("price", 10))
+            .unwrap();
+        batch.update(&entries, &b, entry("b", 50)).unwrap();
+        batch.update_fields(&entries, &b, &by(5)).unwrap();
+        assert_eq!(batch.len(), 7);
+        batch.commit().unwrap();
+        assert_eq!(entries.get(&a).unwrap(), Some(entry("a", 75)));
+        assert_eq!(entries.get(&b).unwrap(), Some(entry("b", 55)));
+        assert_eq!(entries.get(&c).unwrap(), Some(entry("c", 20)));
+        assert_eq!(
+            entries.count(Filter::new().gte("price", 55)).unwrap(),
+            2,
+            "the index follows"
+        );
+    }
+
+    /// SPEC §144.1: a missing id, an operator that can't be made, or a
+    /// typed document that no longer converts fails the whole batch; an
+    /// update refused as written is refused when added; one that changes
+    /// nothing isn't written.
+    #[test]
+    fn update_fields_in_a_batch_fails_it_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let entries = db.collection::<Entry>("entries");
+        let notes = db.collection::<Document>("notes");
+        let a = entries.insert(entry("a", 1)).unwrap();
+        let note = notes.insert("{\"text\": \"x\"}".parse().unwrap()).unwrap();
+        let inc = Update::new().inc("price", 1);
+        let missing = DocId([7; 16]);
+
+        let mut gone = db.batch();
+        gone.update_fields(&entries, &a, &inc).unwrap();
+        gone.update_fields(&entries, &missing, &inc).unwrap();
+        let Err(Error::NotFound { id, .. }) = gone.commit() else {
+            panic!("expected NotFound");
+        };
+        assert_eq!(id, missing);
+
+        let mut deleted = db.batch();
+        deleted.delete(&entries, &a);
+        deleted.update_fields(&entries, &a, &inc).unwrap();
+        assert!(matches!(deleted.commit(), Err(Error::NotFound { .. })));
+
+        let mut failing = db.batch();
+        let logged = failing.insert(&notes, "{}".parse().unwrap()).unwrap();
+        failing.update_fields(&entries, &a, &inc).unwrap();
+        failing
+            .update_fields(&notes, &note, &Update::new().inc("text", 1))
+            .unwrap();
+        let Err(Error::Update { collection, id, .. }) = failing.commit() else {
+            panic!("expected Error::Update");
+        };
+        assert_eq!((collection.as_str(), id), ("notes", note));
+        assert_eq!(notes.get(&logged).unwrap(), None);
+
+        let mut typed = db.batch();
+        typed
+            .update_fields(&entries, &a, &Update::new().set("price", "high"))
+            .unwrap();
+        assert!(matches!(typed.commit(), Err(Error::Document(_))));
+        // The untyped path takes it: nothing to convert to.
+        let mut untyped = db.batch();
+        let raw = db.collection::<Document>("entries");
+        untyped
+            .update_fields(&raw, &a, &Update::new().set("level", "high"))
+            .unwrap();
+        untyped.commit().unwrap();
+        assert_eq!(
+            entries.get(&a).unwrap(),
+            Some(entry("a", 1)),
+            "nothing else landed"
+        );
+
+        let mut refused = db.batch();
+        let Err(Error::Io(e)) = refused.update_fields(&entries, &a, &Update::new().unset("_id"))
+        else {
+            panic!("expected InvalidInput");
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(refused.is_empty(), "the refused op wasn't added");
+
+        let changes = db.subscribe().unwrap();
+        let mut same = db.batch();
+        same.update_fields(&entries, &a, &Update::new().set("price", 1))
+            .unwrap();
+        same.commit().unwrap();
+        assert!(
+            changes.try_recv().is_none(),
+            "nothing changed, nothing written"
         );
     }
 

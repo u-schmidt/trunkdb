@@ -550,7 +550,9 @@ more than four.
   `update_fields` with operators, `Update::new().set(..).inc(..).unset(..)`
   on dotted paths [§68](spec/68-update-operators.md), and `min`, `max`, `rename`, and `push`,
   `add_to_set` and `pull` on arrays [§73](spec/73-more-update-operators.md), `mul`, `pop_first`, `pop_last`
-  and `push_all` [§142](spec/142-mul-pop-and-push-all.md);
+  and `push_all` [§142](spec/142-mul-pop-and-push-all.md); the operators in a `Batch` by id, and
+  `upsert_fields`, which inserts from the filter's `eq`s where nothing
+  matches, with `set_on_insert` [§144](spec/144-operators-in-a-batch-and-an-upsert.md);
   `ensure_index` and `ensure_index_with` (`IndexOptions::new().unique()`,
   `.sparse()`), `indexes()` listing each index's fields and options
   [§28](spec/28-secondary-indexes.md) [§33](spec/33-unique-indexes.md) [§44](spec/44-sparse-indexes.md) [§60](spec/60-a-smaller-public-api.md).

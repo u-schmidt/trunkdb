@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 
 ```rust
 use serde::{Deserialize, Serialize};
-use trunkdb::{Database, DocId, IndexOptions, query::{Filter, Update}};
+use trunkdb::{Database, DateTime, DocId, Document, IndexOptions, query::{Filter, Update}};
 
 #[derive(Serialize, Deserialize)]
 struct User {
@@ -50,6 +50,10 @@ let third_page = users.find(Filter::new().sort_asc("name").skip(40).limit(20))?;
 let renamed = users.update_fields(Filter::new().eq("team", "core"), &Update::new().set("team", "platform").inc("age", 1))?;
 let tagged = users.update_fields(Filter::new().id(id), &Update::new().add_to_set("tags", "admin").pull("tags", "guest"))?;
 let queued = users.update_fields(Filter::new().id(id), &Update::new().mul("age", 2).push_all("tags", ["new", "beta"]).pop_first("tags"))?;
+
+// One document per key: made from the filter's `eq`s the first time, counted after.
+let visits = db.collection::<Document>("visits");
+visits.upsert_fields(Filter::new().eq("page", "/home"), &Update::new().inc("hits", 1).set_on_insert("first", DateTime::now()))?;
 ```
 
 ## The id without serde's rename
@@ -134,6 +138,16 @@ let mut batch = db.batch();
 let grace = batch.insert(&users, User { id: None, name: "Grace".into(), email: "grace@example.com".into(), team: "core".into(), age: 45, nick: None, tags: vec![] })?;
 batch.insert(&events, Event { user: grace, what: "joined".into() })?; // the id is known before the commit
 batch.commit()?; // both, or neither: after a crash too
+```
+
+Operators go in a batch too, on one document by id, made at the commit
+to the document as the ops before leave it (SPEC §144):
+
+```rust
+let mut batch = db.batch();
+batch.update_fields(&users, &grace, &Update::new().inc("age", 1))?;
+batch.update_fields(&users, &id, &Update::new().add_to_set("tags", "mentor"))?;
+batch.commit()?;
 ```
 
 ## Hearing about changes

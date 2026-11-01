@@ -1,6 +1,6 @@
-use crate::document::{Document, ID_FIELD};
+use crate::document::{DocId, Document, ID_FIELD};
 use crate::map::Map;
-use crate::query::equal_values;
+use crate::query::{Condition, Op, equal_values};
 use std::cmp::Ordering;
 
 /// Changes to make to every document a filter finds, named by field
@@ -27,6 +27,8 @@ pub struct Update {
 #[derive(Debug, Clone)]
 enum Change {
     Set(String, Document),
+    /// A `set` only where `upsert_fields` inserts (SPEC §144.3).
+    SetOnInsert(String, Document),
     Unset(String),
     Inc(String, Document),
     Mul(String, Document),
@@ -46,6 +48,7 @@ impl Change {
     fn paths(&self) -> Vec<&str> {
         match self {
             Change::Set(path, _)
+            | Change::SetOnInsert(path, _)
             | Change::Unset(path)
             | Change::Inc(path, _)
             | Change::Mul(path, _)
@@ -71,6 +74,15 @@ impl Update {
     /// fails the update.
     pub fn set(mut self, path: impl Into<String>, value: impl Into<Document>) -> Self {
         self.changes.push(Change::Set(path.into(), value.into()));
+        self
+    }
+
+    /// A `set` made only where `upsert_fields` inserts the document,
+    /// MongoDB's `$setOnInsert` (SPEC §144.3): a `created` that later
+    /// upserts leave as it is. Anywhere else, no change.
+    pub fn set_on_insert(mut self, path: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.changes
+            .push(Change::SetOnInsert(path.into(), value.into()));
         self
     }
 
@@ -240,9 +252,24 @@ impl Update {
     /// Makes the changes to `doc`, in order. On an error, `doc` may be
     /// half changed; the caller drops it with the whole batch.
     pub(crate) fn apply(&self, doc: &mut Document) -> Result<(), String> {
+        self.apply_as(doc, false)
+    }
+
+    /// `apply` to the document `upsert_fields` inserts, `set_on_insert`
+    /// included (SPEC §144.2).
+    pub(crate) fn apply_inserting(&self, doc: &mut Document) -> Result<(), String> {
+        self.apply_as(doc, true)
+    }
+
+    fn apply_as(&self, doc: &mut Document, inserting: bool) -> Result<(), String> {
         for change in &self.changes {
             match change {
                 Change::Set(path, value) => *slot(doc, path)?.0 = value.clone(),
+                Change::SetOnInsert(path, value) => {
+                    if inserting {
+                        *slot(doc, path)?.0 = value.clone();
+                    }
+                }
                 Change::Unset(path) => {
                     take(doc, path);
                 }
@@ -289,6 +316,78 @@ impl Update {
         }
         Ok(())
     }
+}
+
+/// The document `upsert_fields` starts from where nothing matches
+/// (SPEC §144.2): each `eq` of the filter, at the top or in an AND, on a
+/// path an update could name, and the id an `eq` on `_id` names. ORs,
+/// NOTs and other comparisons say no one value, and are left out. A
+/// path given two values that aren't equal, or one inside another's
+/// value, can't be made: an error, before anything is read.
+pub(crate) fn seed(conditions: &[Condition]) -> Result<(Option<DocId>, Document), String> {
+    fn walk<'a>(
+        conditions: &'a [Condition],
+        id: &mut Option<DocId>,
+        doc: &mut Document,
+        paths: &mut Vec<&'a str>,
+    ) -> Result<(), String> {
+        for condition in conditions {
+            match condition {
+                Condition::All(inner) => walk(inner, id, doc, paths)?,
+                // An `_id` that isn't an id names none; nor is it a path
+                // an update could name, so it isn't seeded below either.
+                Condition::Compare {
+                    field,
+                    op: Op::Eq,
+                    value: Document::Id(named),
+                } if field == ID_FIELD => {
+                    if let Some(before) = *id
+                        && before != *named
+                    {
+                        return Err(format!(
+                            "the filter names two ids, {before:?} and {named:?}"
+                        ));
+                    }
+                    *id = Some(*named);
+                }
+                Condition::Compare {
+                    field,
+                    op: Op::Eq,
+                    value,
+                } if check_path(field).is_ok() => {
+                    let inside = |outer: &str, inner: &str| {
+                        inner
+                            .strip_prefix(outer)
+                            .is_some_and(|rest| rest.starts_with('.'))
+                    };
+                    if let Some(other) = paths
+                        .iter()
+                        .find(|other| inside(other, field) || inside(field, other))
+                    {
+                        return Err(format!(
+                            "{field:?} and {other:?}: the filter gives a value to a field and to one inside it, so no document to insert"
+                        ));
+                    }
+                    paths.push(field);
+                    match slot(doc, field)? {
+                        (at, true) => *at = value.clone(),
+                        (at, false) if equal_values(at, value) => {}
+                        (_, false) => {
+                            return Err(format!(
+                                "{field:?}: the filter gives it two values, so no document to insert"
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    let mut id = None;
+    let mut doc = Document::Object(Map::new());
+    walk(conditions, &mut id, &mut doc, &mut Vec::new())?;
+    Ok((id, doc))
 }
 
 /// A path an update may name: one field, not `_id` or inside it.
@@ -1010,6 +1109,81 @@ mod tests {
                 .pull("t", Document::Array(vec![]))
                 .check()
                 .is_ok()
+        );
+    }
+    #[test]
+    fn set_on_insert_sets_only_where_inserting() {
+        let update = Update::new().set_on_insert("first", 1).inc("hits", 1);
+        assert_eq!(
+            applied(update.clone(), r#"{"hits": 4}"#),
+            Ok(doc(r#"{"hits": 5}"#))
+        );
+        let mut new = doc(r#"{"page": "/"}"#);
+        update.apply_inserting(&mut new).unwrap();
+        assert_eq!(new, doc(r#"{"page": "/", "first": 1, "hits": 1}"#));
+        // Checked as a `set` is, and through a string it fails as one.
+        assert!(Update::new().set_on_insert("_id", 1).check().is_err());
+        assert!(Update::new().set_on_insert("a[0]", 1).check().is_err());
+        let mut text = doc(r#"{"a": "x"}"#);
+        assert!(
+            Update::new()
+                .set_on_insert("a.b", 1)
+                .apply_inserting(&mut text)
+                .is_err()
+        );
+    }
+
+    /// SPEC §144.2: the document an upsert inserts starts from the
+    /// filter's `eq`s, at the top and in ANDs, and its `_id`.
+    #[test]
+    fn the_seed_takes_the_filters_eqs() {
+        use crate::query::Filter;
+        let id = DocId([3; 16]);
+        let seeded = |filter: Filter| seed(&filter.conditions);
+        assert_eq!(
+            seeded(
+                Filter::new()
+                    .eq("page", "/home")
+                    .eq("at.site", "a")
+                    .id(id)
+                    .gt("hits", 3)
+                    .ne("x", 1)
+                    .eq("tags[*]", "t")
+                    .any_of([Condition::eq("o", 1), Condition::eq("o", 2)])
+                    .and(Condition::Not(Box::new(Condition::eq("n", 1))))
+            ),
+            Ok((Some(id), doc(r#"{"page": "/home", "at": {"site": "a"}}"#)))
+        );
+        assert_eq!(
+            seeded(Filter::new().and(Condition::all([
+                Condition::eq("a", 1),
+                Condition::all([Condition::eq("b", Document::Null)])
+            ]))),
+            Ok((None, doc(r#"{"a": 1, "b": null}"#)))
+        );
+        assert_eq!(
+            seeded(Filter::new().eq("_id", "not an id")),
+            Ok((None, doc("{}"))),
+            "an `_id` that isn't an id names none"
+        );
+        assert_eq!(
+            seeded(Filter::new().eq("a", 1).eq("a", 1.0)),
+            Ok((None, doc(r#"{"a": 1}"#))),
+            "two equal values are one"
+        );
+        for (filter, says) in [
+            (Filter::new().eq("a", 1).eq("a", 2), "two values"),
+            (Filter::new().eq("a", 1).eq("a.b", 2), "one inside it"),
+            (Filter::new().eq("a.b", 2).eq("a", 1), "one inside it"),
+            (Filter::new().id(id).id(DocId([4; 16])), "two ids"),
+        ] {
+            let error = seeded(filter).unwrap_err();
+            assert!(error.contains(says), "{error}");
+        }
+        assert_eq!(
+            seeded(Filter::new().eq("ab", 1).eq("a", 2)),
+            Ok((None, doc(r#"{"ab": 1, "a": 2}"#))),
+            "a name that starts another's isn't inside it"
         );
     }
 }

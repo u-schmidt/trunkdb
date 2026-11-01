@@ -798,3 +798,12 @@ limit, batches and a write-ahead log. Since then:
     out of what the selection hands out. In the text, `select * except
     body`; `except` isn't a reserved word. `Explained::except` says
     what was excepted.
+116. **Operators in a batch and an upsert** (§144):
+    `Batch::update_fields(&collection, &id, &update)` makes the
+    operators to one document at the commit, as the ops before leave
+    it: a transfer between two accounts without reading either.
+    `Collection::upsert_fields(filter, &update)` updates the one match,
+    or inserts a document made of the filter's `eq`s and the operators,
+    MongoDB's `upsert: true`: a counter per key. `Update::set_on_insert`
+    gives a field only where it inserts. A batch now commits op by op
+    under the writer's lock, no longer through the `TransactionManager`.

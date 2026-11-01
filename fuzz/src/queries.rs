@@ -155,6 +155,18 @@ pub struct Ran {
     pub live_events: u64,
     /// Reads with an `except` (SPEC §143).
     pub excepted: u64,
+    /// `upsert_fields` calls (SPEC §144.2), and how many inserted.
+    pub upserted_fields: u64,
+    pub upsert_fields_inserted: u64,
+    /// A batch's `update_fields` ops (SPEC §144.1), and the batches with
+    /// them that committed.
+    pub batch_fields: u64,
+    pub batch_fields_committed: u64,
+    /// Of the batches with them and no earlier op failing, those failing
+    /// on a missing id, an operator, and a duplicate.
+    pub batch_fields_failed: [u64; 3],
+    /// Batches whose ops failed before operators could be added.
+    pub batch_fields_skipped: u64,
 }
 
 pub const STEP_NAMES: [&str; 15] = [
@@ -1154,11 +1166,25 @@ impl Run<'_> {
         // each is checked against the state the ops before it left
         // (§33.2), so the model goes op by op as well.
         let mut fails: Option<Refusal> = None;
-        for _ in 0..1 + self.program.below(32) {
-            let id = self.some_id();
+        // One batch in three ends with operators (SPEC §144.1), after a
+        // few ops, so that most of them get as far as their operators.
+        let with_fields = self.program.one_in(3);
+        let ops = match with_fields {
+            true => 1 + self.program.below(4),
+            false => 1 + self.program.below(32),
+        };
+        for _ in 0..ops {
             // Half inserts, so that collections grow as much as they
             // shrink, with deletes and the rest of the steps.
-            let refusal = match self.program.below(4) {
+            let kind = self.program.below(4);
+            // Before operators, ops the model says succeed, mostly: an
+            // insert of a new id, the others on one the batch holds.
+            let id = match (with_fields, kind, after.len()) {
+                (true, 0 | 1, _) => self.new_id(),
+                (true, _, n) if n > 0 => *after.keys().nth(self.program.below(n)).unwrap(),
+                _ => self.some_id(),
+            };
+            let refusal = match kind {
                 0 | 1 if after.len() < MAX_DOCS => {
                     let doc = Self::with_id(self.document(), id);
                     let refusal = match after.contains_key(&id) {
@@ -1189,7 +1215,71 @@ impl Run<'_> {
             }
             fails = fails.or(refusal);
         }
+        // Operators last (SPEC §144.1): the model doesn't apply them, so
+        // no op after them depends on what they leave. A refusal before
+        // them still comes first; one of theirs may be an operator that
+        // can't be made, or a duplicate, before a missing id.
+        let earlier = fails.is_some();
+        let mut fields = Vec::new();
+        if with_fields && earlier {
+            self.ran.batch_fields_skipped += 1;
+        }
+        if with_fields && !earlier {
+            for _ in 0..1 + self.program.below(3) {
+                // Mostly a document the batch holds by then, so that most
+                // of these batches can commit.
+                let id = match after.len() {
+                    0 => self.some_id(),
+                    _ if self.program.one_in(8) => self.some_id(),
+                    n => *after.keys().nth(self.program.below(n)).unwrap(),
+                };
+                let update = self.random_update();
+                match batch.update_fields(&docs, &id, &update) {
+                    Ok(()) => {
+                        self.ran.batch_fields += 1;
+                        fields.push(id);
+                        if !after.contains_key(&id) {
+                            fails = fails.or(Some(Refusal::NotFound));
+                        }
+                    }
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                    Err(e) => panic!("{}: update_fields {update:?} added: {e:?}", self.at()),
+                }
+            }
+        }
         let result = batch.commit();
+        if !earlier && !fields.is_empty() {
+            match &result {
+                Ok(()) => {
+                    assert!(fails.is_none(), "{}: the model says {fails:?}", self.at());
+                    self.ran.batch_fields_committed += 1;
+                    self.model = after;
+                    for id in fields {
+                        let stored = self.docs().get(&id).unwrap().expect("updated");
+                        self.model.insert(id, stored);
+                    }
+                    self.no_duplicates("a batch's update_fields");
+                }
+                Err(Error::NotFound { id, .. }) => {
+                    assert!(
+                        fields.contains(id) && !after.contains_key(id),
+                        "{}: {result:?}",
+                        self.at()
+                    );
+                    self.ran.batch_fields_failed[0] += 1;
+                }
+                Err(Error::Update { id, .. }) => {
+                    assert!(fields.contains(id), "{}: {result:?}", self.at());
+                    self.ran.batch_fields_failed[1] += 1;
+                }
+                Err(Error::DuplicateValue { id, .. }) if fields.contains(id) => {
+                    self.ran.refused_duplicates += 1;
+                    self.ran.batch_fields_failed[2] += 1;
+                }
+                Err(e) => panic!("{}: a batch with operators: {e:?}", self.at()),
+            }
+            return;
+        }
         let as_said = match (&fails, &result) {
             (None, Ok(())) => {
                 self.model = after;
@@ -1254,14 +1344,15 @@ impl Run<'_> {
         }
     }
 
-    fn update_fields(&mut self) {
-        let filter = self.query().few(20).total().filter();
+    /// One to three operators on the fields documents hold (SPEC §68,
+    /// §73, §142), `set_on_insert` too (§144.3).
+    fn random_update(&mut self) -> Update {
         let mut update = Update::new();
         let fields = ["a", "b", "c", "o.p", "tags", "z"];
         for _ in 0..1 + self.program.below(3) {
             let path = fields[self.program.below(fields.len())];
             let value = self.value();
-            update = match self.program.below(13) {
+            update = match self.program.below(14) {
                 0 => update.set(path, value),
                 1 => update.unset(path),
                 2 => update.inc(path, Document::Int(self.program.below(3) as i64)),
@@ -1274,9 +1365,16 @@ impl Run<'_> {
                 9 => update.push_all(path, [value.clone(), value]),
                 10 => update.pop_first(path),
                 11 => update.pop_last(path),
+                12 => update.set_on_insert(path, value),
                 _ => update.rename(path, fields[self.program.below(fields.len())]),
             };
         }
+        update
+    }
+
+    fn update_fields(&mut self) {
+        let filter = self.query().few(20).total().filter();
+        let update = self.random_update();
         let touched: Vec<DocId> = (self.expected(&self.model, &filter).iter())
             .map(id_of)
             .collect();
@@ -1302,14 +1400,7 @@ impl Run<'_> {
                 // Nor does it know which update would make a duplicate,
                 // so whatever was let through mustn't hold one (SPEC
                 // §119).
-                for (id, doc) in &self.model {
-                    let colliding = self.collisions(&self.model, *id, doc);
-                    assert!(
-                        colliding.is_empty(),
-                        "{}: update_fields {filter:?} {update:?} left {id} a duplicate of {colliding:?}",
-                        self.at()
-                    );
-                }
+                self.no_duplicates(&format!("update_fields {filter:?} {update:?}"));
             }
             // Refused: a document it changes, colliding with one stored.
             Err(Error::DuplicateValue { id, existing, .. }) => {
@@ -1326,7 +1417,82 @@ impl Run<'_> {
         }
     }
 
+    /// After operators the model doesn't apply: whatever was let through
+    /// mustn't hold a duplicate in a unique index (SPEC §119).
+    fn no_duplicates(&self, what: &str) {
+        for (id, doc) in &self.model {
+            let colliding = self.collisions(&self.model, *id, doc);
+            assert!(
+                colliding.is_empty(),
+                "{}: {what} left {id} a duplicate of {colliding:?}",
+                self.at()
+            );
+        }
+    }
+
+    /// SPEC §144.2: the one match updated, or a document inserted, read
+    /// back as stored; several matches refused; what can't be made
+    /// refused, writing nothing.
+    fn upsert_fields(&mut self) {
+        let query = self.query();
+        let filter = query.filter();
+        let update = self.random_update();
+        let conditions = query.conditions_only();
+        let matches: Vec<DocId> = (self.expected(&self.model, &conditions).iter())
+            .map(id_of)
+            .collect();
+        if matches.is_empty() && !self.room() {
+            return;
+        }
+        let result = self.docs().upsert_fields(filter.clone(), &update);
+        self.ran.upserted_fields += 1;
+        if self.trace {
+            eprintln!("  upsert_fields {filter:?} {update:?}, matching {matches:?}: {result:?}");
+        }
+        let into = match (&matches[..], &result) {
+            // Refused as written, the update or the filter's `eq`s.
+            (_, Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::InvalidInput => None,
+            (_, Err(Error::MultipleMatches { count, .. })) if matches.len() > 1 => {
+                assert_eq!(*count, matches.len(), "{}", self.at());
+                None
+            }
+            ([one], Err(Error::Update { id, .. })) if id == one => None,
+            ([], Err(Error::Update { id, .. })) if !self.model.contains_key(id) => None,
+            ([one], Err(Error::DuplicateValue { id, existing, .. }))
+                if id == one && self.model.contains_key(existing) =>
+            {
+                self.ran.refused_duplicates += 1;
+                None
+            }
+            ([], Err(Error::DuplicateValue { id, existing, .. }))
+                if !self.model.contains_key(id) && self.model.contains_key(existing) =>
+            {
+                self.ran.refused_duplicates += 1;
+                None
+            }
+            // The filter's `_id` names a document that doesn't match.
+            ([], Err(Error::DuplicateId { id, .. })) if self.model.contains_key(id) => None,
+            ([one], Ok(Upserted::Updated(id))) if id == one => Some(*id),
+            ([], Ok(Upserted::Inserted(id))) if !self.model.contains_key(id) => {
+                self.ran.upsert_fields_inserted += 1;
+                Some(*id)
+            }
+            _ => panic!(
+                "{}: upsert_fields {filter:?} {update:?}, matching {matches:?}: {result:?}",
+                self.at()
+            ),
+        };
+        if let Some(id) = into {
+            let stored = self.docs().get(&id).unwrap().expect("upserted");
+            self.model.insert(id, stored);
+            self.no_duplicates(&format!("upsert_fields {filter:?} {update:?}"));
+        }
+    }
+
     fn upsert(&mut self) {
+        if self.program.one_in(3) {
+            return self.upsert_fields();
+        }
         let query = self.query();
         let filter = query.filter();
         let id = self.new_id();
