@@ -654,19 +654,13 @@ impl Database {
         if self.inner.poisoned.load(Ordering::Relaxed) {
             return Err(crate::Error::Poisoned);
         }
-        let now =
-            Collection::<Document>::new(self.clone(), collection).matches_with_ids(&filter)?;
+        let now = Collection::<Document>::new(self.clone(), collection)
+            .matches_with_ids(&live::first_read(&filter))?;
         let (sender, receiver) = mpsc::channel();
-        let mut matching = std::collections::BTreeSet::new();
-        for (id, doc) in now {
-            matching.insert(id);
-            // The receiver is ours still: the send can't fail.
-            let _ = sender.send(Ok(live::Live::Entered { id, doc }));
-        }
-        writer.watchers.push(live::Watcher::new(
+        writer.watchers.push(live::Watcher::start(
             collection.to_string(),
             filter,
-            matching,
+            now,
             sender,
         ));
         Ok(LiveQuery::new(receiver, convert))

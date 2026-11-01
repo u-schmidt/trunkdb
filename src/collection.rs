@@ -730,10 +730,12 @@ impl Collection<Document> {
     /// and still match. See [`LiveQuery`].
     ///
     /// `filter`'s conditions decide, its `select` cuts what is handed
-    /// out, and a hint steers the first read only. A sort, a skip or a
-    /// limit is refused with `Error::NotLive`: a window of the first
-    /// matches moves with every write. It waits for a batch being
-    /// committed to finish, as `Database::subscribe` does.
+    /// out, and a hint steers the first read only. With a sort, and a
+    /// limit or none, it is a list in that order (SPEC §145), "the ten
+    /// fastest vans", and each event says where in it: see [`Live`](crate::Live). A
+    /// skip, or a limit without a sort, is refused with
+    /// `Error::NotLive`. It waits for a batch being committed to finish,
+    /// as `Database::subscribe` does.
     pub fn watch(&self, filter: Filter) -> crate::Result<LiveQuery<Document>> {
         self.db.watch(&self.name, filter, Ok)
     }
@@ -1466,6 +1468,22 @@ pub(crate) fn document_at(
         Some(stored) => Ok(Some(stored.decode()?)),
         None => Ok(None),
     }
+}
+
+/// Every match of `filter` on `collection` as of `at`, with its id,
+/// whole: what a sorted live query reads again (SPEC §145.2).
+pub(crate) fn find_at(
+    at: &Reading<'_>,
+    collection: &str,
+    filter: &Filter,
+) -> crate::Result<Vec<(DocId, Document)>> {
+    let trace = Trace::default();
+    find_in(
+        at.catalog, &at.store, collection, filter, true, None, &trace,
+    )?
+    .into_iter()
+    .map(|found| Ok((found.id(), found.decode(None)?)))
+    .collect()
 }
 
 /// Every match with its id, against a catalog and store the caller

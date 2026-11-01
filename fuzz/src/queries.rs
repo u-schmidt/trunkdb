@@ -153,6 +153,9 @@ pub struct Ran {
     pub live_rows: u64,
     /// Events live queries reported (SPEC §138), each as the model says.
     pub live_events: u64,
+    /// Live queries with a sort (SPEC §145), and their events.
+    pub live_sorted: u64,
+    pub live_sorted_events: u64,
     /// Reads with an `except` (SPEC §143).
     pub excepted: u64,
     /// `upsert_fields` calls (SPEC §144.2), and how many inserted.
@@ -417,6 +420,9 @@ struct Watched {
     filter: Filter,
     query: LiveQuery<Document>,
     matching: BTreeSet<DocId>,
+    /// With a sort (SPEC §145): the list kept by applying each event's
+    /// places in turn.
+    list: Option<Vec<DocId>>,
 }
 
 /// A live aggregate and the result it has reported so far, each row
@@ -1457,7 +1463,10 @@ impl Run<'_> {
                 None
             }
             ([one], Err(Error::Update { id, .. })) if id == one => None,
-            ([], Err(Error::Update { id, .. })) if !self.model.contains_key(id) => None,
+            // The operators fail on what would be inserted, first: under
+            // a new id, or under the filter's `_id`, one that doesn't
+            // match, which the insert would refuse after (SPEC §144.2).
+            ([], Err(Error::Update { .. })) => None,
             ([one], Err(Error::DuplicateValue { id, existing, .. }))
                 if id == one && self.model.contains_key(existing) =>
             {
@@ -1706,14 +1715,26 @@ impl Run<'_> {
 
     /// One or two live queries of the program's conditions (SPEC §138):
     /// first an `Entered` for every document the model has matching.
+    /// Where the program's query sorts, one time in two with its sort
+    /// and limit, a list (SPEC §145).
     fn watch(&mut self) {
         for _ in 0..1 + self.program.below(2) {
-            let filter = self.query().conditions_only();
+            let query = self.query();
+            let sorted = !query.sort.is_empty() && self.program.one_in(2);
+            let mut filter = query.conditions_only();
+            if sorted {
+                for (key, order) in &query.sort {
+                    filter = filter.then_by(*key, *order);
+                }
+                filter = filter.limit(query.limit);
+                self.ran.live_sorted += 1;
+            }
             let query = self.docs().watch(filter.clone()).unwrap();
             self.live.push(Watched {
                 filter,
                 query,
                 matching: BTreeSet::new(),
+                list: sorted.then(Vec::new),
             });
         }
         // A live aggregate of the program's conditions, without a sort,
@@ -1743,6 +1764,79 @@ impl Run<'_> {
         Condition::compare(name, op, value)
     }
 
+    /// What a sorted live query reported for the step (SPEC §145): each
+    /// event names a document as the model has it now, at places in the
+    /// list as the events before left it; `Left` one that is gone, no
+    /// longer matches, or was pushed out. After them, the list is what
+    /// `find` answers on the model.
+    fn sorted_is_model(
+        at: &str,
+        model: &BTreeMap<DocId, Document>,
+        (filter, query): (&Filter, &LiveQuery<Document>),
+        list: &mut Vec<DocId>,
+        ran: &mut Ran,
+    ) {
+        while let Some(event) = query.try_recv() {
+            let event = event.unwrap_or_else(|e| panic!("{at}: {e}"));
+            ran.live_sorted_events += 1;
+            let id = event.id();
+            let now = model.get(&id);
+            let is_now = |doc: &Document| {
+                assert!(
+                    now.is_some_and(|model| same(model, doc)),
+                    "{at}: {id} reported as {doc:?}, the model has {now:?}"
+                );
+            };
+            match event {
+                Live::Entered { doc, at: to, .. } => {
+                    is_now(&doc);
+                    assert!(filter.matches(&doc), "{at}: {id} entered, not matching");
+                    let to = to.unwrap_or_else(|| panic!("{at}: {id} entered at no place"));
+                    assert!(
+                        to <= list.len(),
+                        "{at}: {id} entered at {to} of {}",
+                        list.len()
+                    );
+                    assert!(!list.contains(&id), "{at}: {id} entered twice");
+                    list.insert(to, id);
+                }
+                Live::Left { doc, from, .. } => {
+                    match doc {
+                        Some(doc) => is_now(&doc),
+                        None => assert!(now.is_none(), "{at}: {id} left as gone, isn't"),
+                    }
+                    let from = from.unwrap_or_else(|| panic!("{at}: {id} left from no place"));
+                    assert_eq!(list.get(from), Some(&id), "{at}: {id} left from {from}");
+                    list.remove(from);
+                }
+                Live::Changed {
+                    doc, from, at: to, ..
+                } => {
+                    is_now(&doc);
+                    assert!(filter.matches(&doc), "{at}: {id} changed, not matching");
+                    let (from, to) = from
+                        .zip(to)
+                        .unwrap_or_else(|| panic!("{at}: {id} no places"));
+                    assert_eq!(list.get(from), Some(&id), "{at}: {id} changed from {from}");
+                    list.remove(from);
+                    assert!(
+                        to <= list.len(),
+                        "{at}: {id} changed to {to} of {}",
+                        list.len()
+                    );
+                    list.insert(to, id);
+                }
+                other => panic!("{at}: {other:?}"),
+            }
+        }
+        let expected: Vec<DocId> = filter
+            .apply(model.values().cloned())
+            .iter()
+            .map(id_of)
+            .collect();
+        assert_eq!(*list, expected, "{at}: sorted live query {filter:?}");
+    }
+
     /// What each live query reported for the step, a commit at most:
     /// every event names a document as the model has it now, `Entered`
     /// one it didn't report matching and that matches, `Left` one it did
@@ -1752,6 +1846,16 @@ impl Run<'_> {
     fn live_is_model(&mut self) {
         let at = self.at();
         for watched in &mut self.live {
+            if let Some(list) = &mut watched.list {
+                Self::sorted_is_model(
+                    &at,
+                    &self.model,
+                    (&watched.filter, &watched.query),
+                    list,
+                    &mut self.ran,
+                );
+                continue;
+            }
             while let Some(event) = watched.query.try_recv() {
                 let event = event.unwrap_or_else(|e| panic!("{at}: {e}"));
                 self.ran.live_events += 1;

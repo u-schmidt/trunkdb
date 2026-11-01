@@ -220,11 +220,42 @@ std::thread::spawn(move || {
 - **`Left` holds `None`** for a document deleted, or its collection
   dropped.
 - **Any condition goes,** a `Condition::custom` with your geometry
-  among them; `select` cuts what is handed out. A sort, a skip or a
-  limit is refused.
+  among them; `select` cuts what is handed out. A skip, or a limit
+  without a sort, is refused.
 - **Yours to handle:** GPS noise flipping a position in and out at a
   fence's edge, and pings that arrive late after a tracker was offline
   (apply them in the order of their time).
+
+### A list in order
+
+With a sort, and a limit or none, a live query is a list: "the ten
+fastest vans", kept as they change (SPEC §145). Each event says where
+in the list, and applied one after another they give what `find`
+answers:
+
+```rust
+let fastest = vans.watch(Filter::new().sort_desc("speed").limit(10))?;
+let mut list: Vec<DocId> = Vec::new();
+for event in fastest {
+    match event? {
+        Live::Entered { id, at: Some(at), .. } => list.insert(at, id),
+        Live::Left { from: Some(from), .. } => { list.remove(from); }
+        Live::Changed { id, from: Some(from), at: Some(at), .. } => {
+            list.remove(from);
+            list.insert(at, id);
+        }
+        _ => {}
+    }
+}
+```
+
+- **`Left` is also pushed out:** a faster van came in, and the tenth
+  still drives. Its document comes with it.
+- **A van that slows down past the tenth** brings in the eleventh,
+  which nothing wrote: trunkdb reads the filter again for it. An index
+  on the sort field keeps that a walk of ten entries.
+- **Vans nobody wrote are never reported;** their places shift as
+  others are taken out or put in before them.
 
 ## Reads that agree with each other
 

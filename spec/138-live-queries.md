@@ -97,7 +97,7 @@ out again in one batch is nothing, as nothing matches after it.
   `update` doesn't.
 
 **Not live: `sort`, `skip`, `limit`.** A window of the first matches
-moves with every write. `watch` refuses them with
+moves with every write. (A sort and a limit came in §145.) `watch` refuses them with
 **`Error::NotLive`**, saying which; nothing is registered. A hint
 (`use_index`, §132) steers the first read only, and one that can't be
 followed fails the `watch` as it fails a `find`.
@@ -131,7 +131,8 @@ under the name. A document inserted there under a dropped one's id is
   `Entered` says the same, in one way.
 - **A live `sort` and `limit`**, "the ten fastest vans": a window
   that moves with every write, with a document leaving it when another
-  comes in. Asked for, it is a step of its own.
+  comes in. Asked for, it is a step of its own. It came in §145, a skip
+  still refused.
 - **A panic taken as no match:** the document would `Left` on a bug.
 
 ## 138.7 Limits

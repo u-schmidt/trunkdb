@@ -212,7 +212,11 @@ right after step 4, before the reports, each document it changed in a
 watched collection is read from the snapshot just published and
 checked against each filter there. Against the set, that is
 `Entered`, `Left` or `Changed`, sent to the live query's own unbounded
-channel. A panic in a `custom` condition ends that query alone.
+channel. A panic in a `custom` condition ends that query alone. With a
+sort [§145](spec/145-a-live-sort-and-limit.md), it keeps the first `limit` matches in order
+instead of the set, settles once the whole commit is seen, and reads
+the filter again only where a full list lost a member to a document
+the commit didn't write; each event has its place in the list.
 Beside them the writer keeps each `watch_aggregate` with the rows of
 its result, and after the live queries runs it again, whole, on the
 same snapshot, for each commit that changed its collection; rows known
@@ -567,8 +571,9 @@ more than four.
   or `Deleted` and its collections `Dropped` [§135](spec/135-a-hook-after-each-commit.md).
 - **Live queries:** `collection.watch(filter)`, a `LiveQuery<T>`
   reporting what matches, then each document that `Entered`, `Left` or
-  `Changed`; a sort, a skip or a limit refused with `Error::NotLive`
-  [§138](spec/138-live-queries.md); `collection.watch_aggregate(filter,
+  `Changed` [§138](spec/138-live-queries.md); with a sort and a limit, a list in order, each
+  event with its place, a skip refused with `Error::NotLive`
+  [§145](spec/145-a-live-sort-and-limit.md); `collection.watch_aggregate(filter,
   &aggregate)`, a `LiveAggregate` reporting its rows `Entered`, `Left`
   or `Changed`, and `Aggregate::window` [§139](spec/139-live-aggregates-and-a-window.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike

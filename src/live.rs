@@ -2,7 +2,9 @@
 //! subscription, and reports the documents that come to match it, those
 //! that no longer do, and those written that still do. `Watcher` is the
 //! writer's side, checked inside each commit against the documents the
-//! commit changed; `LiveQuery` the application's. Live aggregates
+//! commit changed; `LiveQuery` the application's. With a sort, and a
+//! limit or none, a watcher keeps a window of the first matches in
+//! order (SPEC §145). Live aggregates
 //! (SPEC §139) are kept beside them: `AggregateWatcher`, run again whole
 //! after each commit to their collection, and `LiveAggregate`.
 
@@ -12,9 +14,10 @@ use crate::collection::aggregate_in;
 use crate::database::Reading;
 use crate::document::{DocId, Document, encode_document};
 use crate::explain::Trace;
-use crate::query::{Filter, Panicked, canonical};
+use crate::query::{Filter, Panicked, Sort, canonical, sort_order, value_or_null};
 use crate::select::Selection;
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -22,6 +25,13 @@ use std::time::Duration;
 /// its filter, one that no longer does, or one written that still does.
 /// Each holds the document as the commit that caused it left it, cut to
 /// the filter's `select`.
+///
+/// With a sort (SPEC §145) the live query is a list in the sort's order,
+/// at most `limit` long, and each event says where in it: `Left`'s
+/// `from`, `Entered`'s `at`, `Changed`'s both. They are places in the
+/// list as the events before left it, so a list kept by applying each
+/// event in turn (take out at `from`, put in at `at`) is the query's.
+/// Without a sort they are `None`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Live<T> {
@@ -33,8 +43,11 @@ pub enum Live<T> {
         id: DocId,
         /// The document as it is now.
         doc: T,
+        /// With a sort, its place in the list: put in there.
+        at: Option<usize>,
     },
-    /// The document matched before this commit, and no longer does.
+    /// The document matched before this commit, and no longer does; or,
+    /// with a limit, it still does, and others came before it.
     #[non_exhaustive]
     Left {
         /// Its id.
@@ -42,6 +55,8 @@ pub enum Live<T> {
         /// The document as it is now; `None` if it was deleted, or its
         /// collection dropped.
         doc: Option<T>,
+        /// With a sort, the place in the list it had: taken out there.
+        from: Option<usize>,
     },
     /// The document matched before this commit and still does, and the
     /// commit wrote it. Its contents may be the same as before.
@@ -51,6 +66,10 @@ pub enum Live<T> {
         id: DocId,
         /// The document as it is now.
         doc: T,
+        /// With a sort, the place in the list it had: taken out there.
+        from: Option<usize>,
+        /// With a sort, its place now: put in there, once taken out.
+        at: Option<usize>,
     },
 }
 
@@ -64,17 +83,21 @@ impl<T> Live<T> {
 
     fn try_map<U, E>(self, convert: impl Fn(T) -> Result<U, E>) -> Result<Live<U>, E> {
         Ok(match self {
-            Live::Entered { id, doc } => Live::Entered {
+            Live::Entered { id, doc, at } => Live::Entered {
                 id,
                 doc: convert(doc)?,
+                at,
             },
-            Live::Left { id, doc } => Live::Left {
+            Live::Left { id, doc, from } => Live::Left {
                 id,
                 doc: doc.map(convert).transpose()?,
+                from,
             },
-            Live::Changed { id, doc } => Live::Changed {
+            Live::Changed { id, doc, from, at } => Live::Changed {
                 id,
                 doc: convert(doc)?,
+                from,
+                at,
             },
         })
     }
@@ -174,17 +197,84 @@ impl<T> Iterator for LiveQuery<T> {
     }
 }
 
-/// `filter`'s refusal, if it can't be live (SPEC §138.4): an order and a
-/// window move with every write.
+/// `filter`'s refusal, if it can't be live (SPEC §138.4, §145): a skip
+/// moves with every write before the list, and a limit without a sort
+/// has no order to keep.
 pub(crate) fn refused(filter: &Filter) -> Option<&'static str> {
-    if !filter.sort.is_empty() {
-        Some("a sort")
-    } else if filter.skip > 0 {
+    if filter.skip > 0 {
         Some("a skip")
-    } else if filter.limit.is_some() {
-        Some("a limit")
+    } else if filter.limit.is_some() && filter.sort.is_empty() {
+        Some("a limit without a sort")
     } else {
         None
+    }
+}
+
+/// The filter `watch` reads its first state with: with a sort, whole
+/// documents, for their sort values; the `select` cuts them as they are
+/// sent.
+pub(crate) fn first_read(filter: &Filter) -> Filter {
+    match filter.sort.is_empty() {
+        true => filter.clone(),
+        false => Filter {
+            select: None,
+            except: Vec::new(),
+            ..filter.clone()
+        },
+    }
+}
+
+/// A document's place in a sorted live query (SPEC §145): its sort
+/// values, then its id, as `find` orders equal ones.
+#[derive(Debug, Clone)]
+struct Member {
+    key: Vec<Document>,
+    id: DocId,
+}
+
+impl Member {
+    fn of(sort: &[Sort], id: DocId, doc: &Document) -> Self {
+        // A decoded document holds its `_id`, as `find` sorts it.
+        let key = (sort.iter())
+            .map(|key| value_or_null(doc, &key.field).clone())
+            .collect();
+        Member { key, id }
+    }
+}
+
+/// `find`'s order: by the sort keys, then by id, so a total one.
+fn order(sort: &[Sort], a: &Member, b: &Member) -> Ordering {
+    (sort.iter().zip(a.key.iter().zip(&b.key)))
+        .map(|(key, (a, b))| sort_order(a, b, key.order))
+        .find(|ord| ord.is_ne())
+        .unwrap_or_else(|| a.id.cmp(&b.id))
+}
+
+/// What a watcher keeps between commits.
+enum Kept {
+    /// Without a sort: the ids of the documents that match as of the
+    /// last commit (SPEC §138.3).
+    Matching(BTreeSet<DocId>),
+    /// With a sort (SPEC §145).
+    Window(Window),
+}
+
+/// A sorted live query's list as of the last commit, and the changes of
+/// the commit being checked, settled once it is all seen.
+struct Window {
+    /// The first `limit` matches, or every one without a limit, in order.
+    members: Vec<Member>,
+    limit: Option<usize>,
+    /// This commit's documents of the collection, as it left them.
+    pending: Vec<(DocId, Option<Document>)>,
+}
+
+impl Window {
+    /// Whether matches may be left out: the list is as long as the
+    /// limit. Where it isn't, every match is in it.
+    fn full(&self) -> bool {
+        self.limit
+            .is_some_and(|limit| limit > 0 && self.members.len() >= limit)
     }
 }
 
@@ -193,28 +283,60 @@ pub(crate) struct Watcher {
     collection: String,
     filter: Filter,
     select: Option<Selection>,
-    /// The ids of the documents that match as of the last commit.
-    matching: BTreeSet<DocId>,
+    kept: Kept,
     sender: mpsc::Sender<Sent>,
 }
 
 impl Watcher {
-    /// A live query on `collection`, whose `matching` documents were sent
-    /// already, as `Entered`.
-    pub(crate) fn new(
+    /// A live query on `collection`, starting from what matches `now`,
+    /// as `first_read` read it, in `find`'s order: each sent as
+    /// `Entered`.
+    pub(crate) fn start(
         collection: String,
         filter: Filter,
-        matching: BTreeSet<DocId>,
+        now: Vec<(DocId, Document)>,
         sender: mpsc::Sender<Sent>,
     ) -> Self {
         let select = filter.selection();
-        Watcher {
+        let (kept, entered): (Kept, Vec<Live<Document>>) = match filter.sort.is_empty() {
+            true => {
+                let matching = now.iter().map(|(id, _)| *id).collect();
+                let entered = (now.into_iter())
+                    .map(|(id, doc)| Live::Entered { id, doc, at: None })
+                    .collect();
+                (Kept::Matching(matching), entered)
+            }
+            false => {
+                let members = (now.iter())
+                    .map(|(id, doc)| Member::of(&filter.sort, *id, doc))
+                    .collect();
+                let entered = (now.into_iter().enumerate())
+                    .map(|(at, (id, doc))| Live::Entered {
+                        id,
+                        doc,
+                        at: Some(at),
+                    })
+                    .collect();
+                let window = Window {
+                    members,
+                    limit: filter.limit,
+                    pending: Vec::new(),
+                };
+                (Kept::Window(window), entered)
+            }
+        };
+        let watcher = Watcher {
             collection,
             filter,
             select,
-            matching,
+            kept,
             sender,
+        };
+        for live in entered {
+            // The receiver is ours still: the send can't fail.
+            let _ = watcher.send(live);
         }
+        watcher
     }
 
     /// `false` once it has ended: its `LiveQuery` dropped, or an error
@@ -230,9 +352,17 @@ impl Watcher {
     }
 
     /// One change of a commit to its collection, `now` the document as
-    /// the commit left it. `false` once it has ended.
+    /// the commit left it. `false` once it has ended. A sorted one only
+    /// takes note, and `settle` reports.
     fn changed(&mut self, id: DocId, now: Option<&Document>) -> Result<bool, Panicked> {
-        let was = self.matching.contains(&id);
+        let matching = match &mut self.kept {
+            Kept::Matching(matching) => matching,
+            Kept::Window(window) => {
+                window.pending.push((id, now.cloned()));
+                return Ok(true);
+            }
+        };
+        let was = matching.contains(&id);
         let is = match now {
             Some(doc) => self.filter.matcher().matches(doc)?,
             None => false,
@@ -240,34 +370,206 @@ impl Watcher {
         let live = match (was, is) {
             (false, false) => return Ok(true),
             (false, true) => {
-                self.matching.insert(id);
+                matching.insert(id);
                 Live::Entered {
                     id,
                     doc: now.cloned().expect("it matches, so it is there"),
+                    at: None,
                 }
             }
             (true, false) => {
-                self.matching.remove(&id);
+                matching.remove(&id);
                 Live::Left {
                     id,
                     doc: now.cloned(),
+                    from: None,
                 }
             }
             (true, true) => Live::Changed {
                 id,
                 doc: now.cloned().expect("it matches, so it is there"),
+                from: None,
+                at: None,
             },
         };
         Ok(self.send(live))
     }
 
-    /// Its collection dropped: each document that matched has left.
+    /// Its collection dropped: each document that matched has left. A drop
+    /// commits alone, so nothing is pending.
     fn dropped(&mut self) -> bool {
-        let matching = std::mem::take(&mut self.matching);
-        matching
-            .into_iter()
-            .all(|id| self.send(Live::Left { id, doc: None }))
+        let left: Vec<Live<Document>> = match &mut self.kept {
+            Kept::Matching(matching) => (std::mem::take(matching).into_iter())
+                .map(|id| Live::Left {
+                    id,
+                    doc: None,
+                    from: None,
+                })
+                .collect(),
+            Kept::Window(window) => (std::mem::take(&mut window.members).into_iter())
+                .map(|member| Live::Left {
+                    id: member.id,
+                    doc: None,
+                    from: Some(0),
+                })
+                .collect(),
+        };
+        left.into_iter().all(|live| self.send(live))
     }
+
+    /// A sorted one, once the whole commit is seen (SPEC §145.2): its list
+    /// made anew, and the steps from the old one sent. `false` once it has
+    /// ended.
+    fn settle(&mut self, at: &Reading<'_>) -> bool {
+        let Kept::Window(window) = &mut self.kept else {
+            return true;
+        };
+        if window.pending.is_empty() {
+            return true;
+        }
+        let pending: BTreeMap<DocId, Option<Document>> =
+            std::mem::take(&mut window.pending).into_iter().collect();
+        match self.reorder(at, &pending) {
+            Ok(events) => events.into_iter().all(|live| self.send(live)),
+            Err(e) => {
+                // A panic, or a document that couldn't be read: the list
+                // can't be trusted from here.
+                let _ = self.sender.send(Err(e));
+                false
+            }
+        }
+    }
+
+    /// The list after this commit, `pending` the documents it wrote, and
+    /// the events that take the old list to it: those that left first,
+    /// then those written or come in, in their new order.
+    fn reorder(
+        &mut self,
+        at: &Reading<'_>,
+        pending: &BTreeMap<DocId, Option<Document>>,
+    ) -> crate::Result<Vec<Live<Document>>> {
+        let Kept::Window(window) = &mut self.kept else {
+            unreachable!("only a sorted live query settles");
+        };
+        let sort = &self.filter.sort;
+        let matcher = self.filter.matcher();
+        // What is known to match now: the list's documents not written,
+        // as they were, and the written ones that match.
+        let mut known: Vec<(Member, Option<Document>)> = (window.members.iter())
+            .filter(|member| !pending.contains_key(&member.id))
+            .map(|member| (member.clone(), None))
+            .collect();
+        for (id, now) in pending {
+            if let Some(doc) = now
+                && matcher.matches(doc)?
+            {
+                known.push((Member::of(sort, *id, doc), Some(doc.clone())));
+            }
+        }
+        known.sort_by(|(a, _), (b, _)| order(sort, a, b));
+        let new = match (window.limit, window.members.last()) {
+            (Some(limit), Some(last)) if window.full() => {
+                // A match left out of a full list comes after its last,
+                // unwritten: what is known up to there is the list's
+                // start. Short of the limit, the rest is read again.
+                let certain: Vec<_> = (known.into_iter())
+                    .take_while(|(member, _)| order(sort, member, last).is_le())
+                    .collect();
+                match certain.len() >= limit {
+                    true => certain.into_iter().take(limit).collect(),
+                    false => read_again(at, &self.collection, &self.filter)?,
+                }
+            }
+            (Some(limit), _) => known.into_iter().take(limit).collect(),
+            (None, _) => known,
+        };
+
+        let staying: BTreeSet<DocId> = new.iter().map(|(member, _)| member.id).collect();
+        let list = &mut window.members;
+        let was: BTreeSet<DocId> = list.iter().map(|member| member.id).collect();
+        let mut events = Vec::new();
+        let mut i = 0;
+        while i < list.len() {
+            let id = list[i].id;
+            if staying.contains(&id) {
+                i += 1;
+                continue;
+            }
+            list.remove(i);
+            let doc = match pending.get(&id) {
+                Some(now) => now.clone(),
+                // Unwritten, and others came before it.
+                None => crate::collection::document_at(at, &self.collection, &id)?,
+            };
+            events.push(Live::Left {
+                id,
+                doc,
+                from: Some(i),
+            });
+        }
+        // `list` stays in order by what each member holds, a written one
+        // its old place until it is moved: each step a place in it.
+        for (member, doc) in new {
+            let id = member.id;
+            let place = |list: &[Member]| {
+                list.partition_point(|other| order(sort, other, &member) == Ordering::Less)
+            };
+            if was.contains(&id) {
+                if !pending.contains_key(&id) {
+                    continue;
+                }
+                let from = (list.iter())
+                    .position(|other| other.id == id)
+                    .expect("it stayed");
+                list.remove(from);
+                let to = place(list);
+                list.insert(to, member);
+                let doc = doc.expect("written, so read");
+                events.push(Live::Changed {
+                    id,
+                    doc,
+                    from: Some(from),
+                    at: Some(to),
+                });
+            } else {
+                let to = place(list);
+                list.insert(to, member);
+                let doc = doc.expect("come in, so read");
+                events.push(Live::Entered {
+                    id,
+                    doc,
+                    at: Some(to),
+                });
+            }
+        }
+        debug_assert!(
+            list.windows(2).all(|w| order(sort, &w[0], &w[1]).is_lt()),
+            "the steps leave the list in order"
+        );
+        Ok(events)
+    }
+}
+
+/// The first `limit` matches of `filter` on `collection` as of `at`,
+/// read again: where a full list lost one to a document no commit wrote.
+/// Neither its `select` nor its hint: the sort values are wanted, and
+/// the hint steered the first read only.
+fn read_again(
+    at: &Reading<'_>,
+    collection: &str,
+    filter: &Filter,
+) -> crate::Result<Vec<(Member, Option<Document>)>> {
+    let filter = Filter {
+        conditions: filter.conditions.clone(),
+        sort: filter.sort.clone(),
+        limit: filter.limit,
+        ..Filter::new()
+    };
+    // In `find`'s order, which is `order`'s.
+    let found = crate::collection::find_at(at, collection, &filter)?;
+    Ok((found.into_iter())
+        .map(|(id, doc)| (Member::of(&filter.sort, id, &doc), Some(doc)))
+        .collect())
 }
 
 /// Checks every watcher against a commit's `changes`, `at` the state the
@@ -325,6 +627,8 @@ pub(crate) fn check(watchers: &mut Vec<Watcher>, changes: &[Change], at: &Readin
             }
         });
     }
+    // A sorted one reports once it has seen the whole commit (§145.2).
+    watchers.retain_mut(|w| w.settle(at));
 }
 
 /// What a live aggregate reports (SPEC §139): a row that came to be in

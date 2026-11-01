@@ -173,12 +173,14 @@ pub enum Error {
         message: String,
     },
     /// `Collection::watch` was given a filter that can't be live (SPEC
-    /// §138.4): one with a sort, a skip or a limit, whose window of the
-    /// first matches moves with every write. Nothing was registered.
+    /// §138.4, §145): one with a skip, whose list moves with every write
+    /// before it, or a limit without a sort, which has no order to keep.
+    /// Nothing was registered.
     #[non_exhaustive]
     #[error("a live query can't have {reason}")]
     NotLive {
-        /// What the filter has: "a sort", "a skip" or "a limit".
+        /// What the filter has: "a skip" or "a limit without a sort"
+        /// (SPEC §145).
         reason: &'static str,
     },
     /// A batch tried to insert a document whose id its collection already

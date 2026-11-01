@@ -807,3 +807,12 @@ limit, batches and a write-ahead log. Since then:
     MongoDB's `upsert: true`: a counter per key. `Update::set_on_insert`
     gives a field only where it inserts. A batch now commits op by op
     under the writer's lock, no longer through the `TransactionManager`.
+117. **A live sort and limit** (§145): `watch` takes a filter with a
+    sort, and a limit or none, "the ten fastest vans": a list in
+    `find`'s order, kept as each commit changes it. `Live::Entered`
+    gains `at`, `Left` `from`, `Changed` both, each its place in the
+    list as the events before left it, `None` without a sort; `Left`
+    also means pushed out by one that came before. Where a full list
+    loses a member to a document no commit wrote, the filter is read
+    again. A skip, and a limit without a sort, are still refused with
+    `Error::NotLive`, whose `reason` now says so.

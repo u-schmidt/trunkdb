@@ -71,6 +71,8 @@ fn main() {
                 total.reported += ran.reported;
                 total.custom += ran.custom;
                 total.live_events += ran.live_events;
+                total.live_sorted += ran.live_sorted;
+                total.live_sorted_events += ran.live_sorted_events;
                 total.windows += ran.windows;
                 total.windows_refused += ran.windows_refused;
                 total.live_rows += ran.live_rows;
@@ -114,6 +116,10 @@ fn main() {
     println!("  reported changed (§135): {}", total.reported);
     println!("  custom conditions (§136): {}", total.custom);
     println!("  live query events (§138): {}", total.live_events);
+    println!(
+        "  sorted live queries (§145): {}, {} events",
+        total.live_sorted, total.live_sorted_events
+    );
     println!(
         "  windows (§139): {}, {} refused beside a sort, skip or limit",
         total.windows, total.windows_refused
