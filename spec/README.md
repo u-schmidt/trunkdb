@@ -163,3 +163,4 @@ say what changed, and DESIGN.md says what is true now.
 146. [`count_distinct`, `first` and `last` (`aggregate.rs`, `collection.rs`)](146-count-distinct-first-and-last.md)
 147. [Unwind (`aggregate.rs`, `collection.rs`)](147-unwind.md)
 148. [Rows of the application's own (`collection.rs`, `live.rs`, `snapshot.rs`)](148-rows-of-the-applications-own.md)
+149. [WAL records of what changed, measured first (`durability/wal.rs`, `storage/file.rs`)](149-wal-records-of-what-changed-measured-first.md) — a draft, not built

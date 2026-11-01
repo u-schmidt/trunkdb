@@ -139,6 +139,17 @@ another pass over the public API:
 - **A sort by `_id` after an OR of `Eq`s,** or after a compound index
   fixed only in part: a merge of id-ordered ranges, where §103 walks
   one (§103.7); paging by id through `status in (…)`.
+- **A sort by a key of the application's own,** with a limit: a
+  closure given the fields it names, as `Condition::custom` is (§136),
+  returning a number to sort by, or none to leave the document out;
+  the best N kept in a heap as the matches go by, so memory stays at
+  N. "The ten restaurants nearest to this point", distance computed by
+  the application, no geometry built in; with a range on an indexed
+  `lat` around the point, only the band is measured. The same for the
+  nearest vectors, exact, by a scan of thousands to tens of thousands
+  (millions want a vector store, Not planned), and for any score of
+  the application's. To settle in its section: each key handed back
+  with its document, a live form beside §145's, no text form.
 - **A pattern language:** regex or `LIKE`-style wildcards (§25.4).
 - **A date without a time, and a time without a date,** as variants of
   their own; until then, noon UTC of the day serves (§69.1).
@@ -207,12 +218,15 @@ Built in §135–§139, as one group: the hook after each commit,
   rebuilt: an external sort, if real files ask for it (§108.8).
 - Batched writes, inserts about 0.7× SQLite's since §123 raised the
   checkpoint threshold: the CPU work is level (inserts without flushes
-  run at SQLite's speed), the rest is the disk. What would pay, in order
-  (§123.5): WAL records of a page's changed bytes after its first whole
-  image in a checkpoint interval, 10 MB a commit of 1,000 documents now
-  (WAL version 4); a checkpoint without the WAL's own flush, a
-  generation number in its header and records; `check_layout` skipped
-  for a node checked when it entered the cache.
+  run at SQLite's speed), the rest is the disk. §149 measured WAL
+  records of a page's changed bytes after its first whole image before
+  building them: 4.2× fewer WAL bytes on inserts, but only about 15%
+  faster, as the CPU is most of a commit (designed there, WAL version
+  4; whether to build it is open, §149.8). First, likely: the CPU part
+  profiled again, `check_layout` skipped for a node checked when it
+  entered the cache, the copy on first change, allocations; then a
+  checkpoint without the WAL's own flush, a generation number in its
+  header and records.
 
 **Concurrency**
 - Readers that run in parallel past four: four do 3.2 times the work
@@ -280,5 +294,11 @@ in §6.
 - **Encryption:** left to the disk or the operating system.
 - **Schema validation:** the application's own types are the schema,
   checked as documents convert to and from them.
+- **Vector search:** done well, an index for nearest neighbours over
+  millions of vectors would be a feature as large as the rest of
+  trunkdb, if not its main one, and stores built for it exist (pgvector
+  and others). trunkdb is not a vector store; a field of floats is
+  stored as any other field. A sort by a key of the application's own
+  (Planned) finds the nearest few thousand exactly, by a scan.
 
 Aggregates were on this list until §106.7, and came in §107.
