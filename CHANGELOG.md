@@ -833,3 +833,12 @@ limit, batches and a write-ahead log. Since then:
     element; equal elements each count. Unwinds follow one another,
     into an element's own arrays. Read from documents; live aggregates
     and `apply` unwind alike.
+120. **Rows of the application's own** (§148):
+    `Collection::aggregate_as::<R>` and `View::aggregate_as::<R>`
+    convert each row to a struct, a row that doesn't failing the call
+    with `Error::Document`; `watch_aggregate_as::<R>` gives a
+    `LiveAggregate<R>`, whose `LiveRow<R>` holds `R` rows, converted on
+    the reader's thread, a row that doesn't convert an `Err` for that
+    event while the live aggregate goes on. `LiveRow` and
+    `LiveAggregate` default to `Document`, so code naming them is
+    unchanged.

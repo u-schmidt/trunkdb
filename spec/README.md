@@ -162,3 +162,4 @@ say what changed, and DESIGN.md says what is true now.
 145. [A live sort and limit (`live.rs`, `collection.rs`)](145-a-live-sort-and-limit.md)
 146. [`count_distinct`, `first` and `last` (`aggregate.rs`, `collection.rs`)](146-count-distinct-first-and-last.md)
 147. [Unwind (`aggregate.rs`, `collection.rs`)](147-unwind.md)
+148. [Rows of the application's own (`collection.rs`, `live.rs`, `snapshot.rs`)](148-rows-of-the-applications-own.md)

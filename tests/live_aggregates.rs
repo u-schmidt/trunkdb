@@ -622,3 +622,156 @@ fn a_live_aggregate_unwinds() {
         ]
     );
 }
+
+// Rows of the application's own (SPEC §148).
+
+#[derive(serde::Deserialize, Debug, PartialEq)]
+struct Mean {
+    server: String,
+    mean: Option<f64>,
+    n: i64,
+}
+
+fn mean_of(server: &str, mean: Option<f64>, n: i64) -> Mean {
+    Mean {
+        server: server.into(),
+        mean,
+        n,
+    }
+}
+
+fn typed() -> Aggregate {
+    Aggregate::new()
+        .group_by("server")
+        .avg("load")
+        .named("mean")
+        .count()
+        .named("n")
+}
+
+#[test]
+fn aggregate_as_converts_each_row() {
+    let (_dir, db) = open();
+    let readings = readings(&db);
+    readings.insert(reading("a", 0.5, 1)).unwrap();
+    readings.insert(reading("a", 1.0, 2)).unwrap();
+    readings
+        .insert(r#"{"server": "b", "load": "high"}"#.parse().unwrap())
+        .unwrap();
+    // `null` where no number was averaged: an `Option`.
+    let rows: Vec<Mean> = readings.aggregate_as(Filter::new(), &typed()).unwrap();
+    assert_eq!(rows, [mean_of("a", Some(0.75), 2), mean_of("b", None, 1)]);
+
+    // A group field nested as its path, on a snapshot too.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct Site {
+        name: String,
+    }
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct PerSite {
+        site: Site,
+        n: i64,
+    }
+    readings
+        .insert(r#"{"site": {"name": "x"}}"#.parse().unwrap())
+        .unwrap();
+    let per_site = Aggregate::new()
+        .group_by("site.name")
+        .count()
+        .named("n")
+        .having(Condition::eq("site.name", "x"));
+    let snapshot = db.snapshot().unwrap();
+    let view = snapshot.collection::<Document>("readings");
+    let rows: Vec<PerSite> = view.aggregate_as(Filter::new(), &per_site).unwrap();
+    assert_eq!(
+        rows,
+        [PerSite {
+            site: Site { name: "x".into() },
+            n: 1
+        }]
+    );
+
+    // A row that doesn't convert fails the call.
+    #[derive(serde::Deserialize, Debug)]
+    #[allow(dead_code)]
+    struct Strict {
+        server: String,
+        mean: f64,
+    }
+    let refused = readings.aggregate_as::<Strict>(Filter::new(), &typed());
+    assert!(matches!(refused, Err(Error::Document(_))), "{refused:?}");
+}
+
+#[test]
+fn a_live_aggregate_hands_out_rows_of_its_own() {
+    let (_dir, db) = open();
+    let readings = readings(&db);
+    readings.insert(reading("a", 0.5, 1)).unwrap();
+    let live: LiveAggregate<Mean> = readings
+        .watch_aggregate_as(Filter::new(), &typed())
+        .unwrap();
+    let row = |event: LiveRow<Mean>| match event {
+        LiveRow::Entered { row, .. } => ("entered", Some(row)),
+        LiveRow::Changed { row, .. } => ("changed", Some(row)),
+        LiveRow::Left { row, .. } => ("left", row),
+        _ => unreachable!(),
+    };
+    let next = || row(live.try_recv().unwrap().unwrap());
+    assert_eq!(next(), ("entered", Some(mean_of("a", Some(0.5), 1))));
+    let id = readings.insert(reading("a", 1.5, 2)).unwrap();
+    assert_eq!(next(), ("changed", Some(mean_of("a", Some(1.0), 2))));
+    // `group` stays a document.
+    let b = readings.insert(reading("b", 0.1, 3)).unwrap();
+    let event = live.try_recv().unwrap().unwrap();
+    assert_eq!(event.group().get("server"), Some(&Document::from("b")));
+    assert_eq!(row(event), ("entered", Some(mean_of("b", Some(0.1), 1))));
+    readings.delete(&b).unwrap();
+    assert_eq!(next(), ("left", None));
+    readings.delete(&id).unwrap();
+    assert_eq!(next(), ("changed", Some(mean_of("a", Some(0.5), 1))));
+    assert!(live.try_recv().is_none());
+
+    // Left by the `having`: the row as it is now, converted.
+    let busy = typed().having(Condition::gt("mean", 0.4));
+    let alerts = readings
+        .watch_aggregate_as::<Mean>(Filter::new(), &busy)
+        .unwrap();
+    assert!(matches!(
+        alerts.try_recv(),
+        Some(Ok(LiveRow::Entered { .. }))
+    ));
+    readings.insert(reading("a", 0.1, 5)).unwrap();
+    let Some(Ok(LiveRow::Left { row, .. })) = alerts.try_recv() else {
+        panic!("left")
+    };
+    assert_eq!(row, Some(mean_of("a", Some(0.3), 2)));
+
+    // A row that doesn't convert: an `Err` for it, and the live aggregate
+    // goes on.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    struct Strict {
+        server: String,
+        mean: f64,
+    }
+    let strict = readings
+        .watch_aggregate_as::<Strict>(Filter::new(), &typed())
+        .unwrap();
+    assert!(matches!(strict.try_recv(), Some(Ok(_))));
+    // Both commits before either is read: the second waits behind the
+    // first's error.
+    readings
+        .insert(r#"{"server": "c", "load": "high"}"#.parse().unwrap())
+        .unwrap();
+    readings.insert(reading("c", 0.2, 4)).unwrap();
+    assert!(matches!(strict.try_recv(), Some(Err(Error::Document(_)))));
+    let Some(Ok(LiveRow::Changed { row, .. })) = strict.try_recv() else {
+        panic!("it went on")
+    };
+    assert_eq!(
+        row,
+        Strict {
+            server: "c".into(),
+            mean: 0.2
+        }
+    );
+}

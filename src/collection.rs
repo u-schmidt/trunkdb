@@ -208,7 +208,44 @@ impl<T> Collection<T> {
         filter: Filter,
         aggregate: &Aggregate,
     ) -> crate::Result<LiveAggregate> {
-        self.db.watch_aggregate(&self.name, filter, aggregate)
+        self.db.watch_aggregate(&self.name, filter, aggregate, Ok)
+    }
+
+    /// `watch_aggregate`, its rows converted to an `R` of the
+    /// application's own as they are received (SPEC §148): a struct with
+    /// a field for each group field and column, by name, the group
+    /// fields nested as their paths are. A row that doesn't convert is
+    /// an `Err` item, and the live aggregate goes on; `group` stays a
+    /// `Document`.
+    ///
+    /// ```
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = trunkdb::Database::open(dir.path().join("app.trunkdb"))?;
+    /// use trunkdb::{Document, LiveRow, query::{Aggregate, Filter}};
+    ///
+    /// #[derive(serde::Deserialize, Debug, PartialEq)]
+    /// struct Load {
+    ///     server: String,
+    ///     mean: f64,
+    /// }
+    ///
+    /// let readings = db.collection::<Document>("readings");
+    /// let per_server = Aggregate::new().group_by("server").avg("load").named("mean");
+    /// let live = readings.watch_aggregate_as::<Load>(Filter::new(), &per_server)?;
+    /// readings.insert(r#"{"server": "a", "load": 0.5}"#.parse()?)?;
+    /// let Some(Ok(LiveRow::Entered { row, .. })) = live.recv() else { panic!() };
+    /// assert_eq!(row, Load { server: "a".into(), mean: 0.5 });
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn watch_aggregate_as<R: DeserializeOwned>(
+        &self,
+        filter: Filter,
+        aggregate: &Aggregate,
+    ) -> crate::Result<LiveAggregate<R>> {
+        self.db
+            .watch_aggregate(&self.name, filter, aggregate, |row| {
+                Ok(crate::serde_bridge::from_document(row)?)
+            })
     }
 
     /// The collection's name.
@@ -447,7 +484,8 @@ impl<T> Collection<T> {
     /// The documents `find(filter)` would return, put in groups and
     /// summed up as `aggregate` says — SQL's `GROUP BY` (SPEC §107). One
     /// row per group, a document of the group's values and each column;
-    /// see `Aggregate`. `Document::into_value` makes a row a struct.
+    /// see `Aggregate`. `aggregate_as` makes each row a struct of the
+    /// application's own (SPEC §148).
     ///
     /// Each match is decoded only on the fields the aggregate reads.
     /// Where an index's entries decide the filter and hold every field
@@ -466,6 +504,40 @@ impl<T> Collection<T> {
             at.catalog, &at.store, &self.name, &filter, aggregate, &trace,
         )?;
         Ok(rows)
+    }
+
+    /// `aggregate`, each row converted to an `R` of the application's
+    /// own (SPEC §148): a struct with a field for each group field and
+    /// column, by name, the group fields nested as their paths are, an
+    /// `Option` where a value may be `null`. A row that doesn't convert
+    /// fails the call with `Error::Document`, as a typed `find` does.
+    ///
+    /// ```
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = trunkdb::Database::open(dir.path().join("app.trunkdb"))?;
+    /// use trunkdb::{Document, query::{Aggregate, Filter}};
+    ///
+    /// #[derive(serde::Deserialize, Debug, PartialEq)]
+    /// struct PerStatus {
+    ///     status: String,
+    ///     n: i64,
+    /// }
+    ///
+    /// let tasks = db.collection::<Document>("tasks");
+    /// tasks.insert(r#"{"status": "open"}"#.parse()?)?;
+    /// let per_status = Aggregate::new().group_by("status").count().named("n");
+    /// let rows: Vec<PerStatus> = tasks.aggregate_as(Filter::new(), &per_status)?;
+    /// assert_eq!(rows, [PerStatus { status: "open".into(), n: 1 }]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn aggregate_as<R: DeserializeOwned>(
+        &self,
+        filter: Filter,
+        aggregate: &Aggregate,
+    ) -> crate::Result<Vec<R>> {
+        (self.aggregate(filter, aggregate)?.into_iter())
+            .map(|row| Ok(crate::serde_bridge::from_document(row)?))
+            .collect()
     }
 
     /// Runs `aggregate` as `aggregate` does and says how (SPEC §107.6),

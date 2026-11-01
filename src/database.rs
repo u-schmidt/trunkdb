@@ -668,12 +668,13 @@ impl Database {
 
     /// `Collection::watch_aggregate` (SPEC §139): under the writer's
     /// lock, as `watch`.
-    pub(crate) fn watch_aggregate(
+    pub(crate) fn watch_aggregate<R>(
         &self,
         collection: &str,
         filter: Filter,
         aggregate: &Aggregate,
-    ) -> crate::Result<LiveAggregate> {
+        convert: fn(Document) -> crate::Result<R>,
+    ) -> crate::Result<LiveAggregate<R>> {
         let mut writer = self
             .inner
             .writer
@@ -683,14 +684,14 @@ impl Database {
             return Err(crate::Error::Poisoned);
         }
         let current = self.current();
-        let (watcher, live) = live::AggregateWatcher::start(
+        let (watcher, receiver) = live::AggregateWatcher::start(
             &current.reading(&self.inner.pages),
             collection,
             filter,
             aggregate.clone(),
         )?;
         writer.aggregates.push(watcher);
-        Ok(live)
+        Ok(LiveAggregate::new(receiver, convert))
     }
 
     /// Starts a typed, atomic multi-op write — see `Batch`.

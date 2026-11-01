@@ -149,7 +149,8 @@ and without `group_by` the one row `Changed` to its values for none.
   (139.2).
 - **`Live` reused for rows:** it carries a `DocId`, which a row hasn't.
 - **Typed rows:** `aggregate` hands out `Document`s; a typed row may
-  come with a typed `aggregate`.
+  come with a typed `aggregate`. Both came in §148,
+  `aggregate_as` and `watch_aggregate_as`.
 
 Later, if asked for: **a window for each group,** by count or by time,
 "the last ten readings of each server", which neither the filter's

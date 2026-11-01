@@ -636,9 +636,12 @@ pub(crate) fn check(watchers: &mut Vec<Watcher>, changes: &[Change], at: &Readin
 /// is known by its group values, as `group_by` names them, which each
 /// event holds as `group`; without `group_by` there is one row, always
 /// there, and its `group` is `{}`.
+///
+/// The row is a `Document`, or an `R` of the application's from
+/// `watch_aggregate_as` (SPEC §148); `group` is a `Document` either way.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
-pub enum LiveRow {
+pub enum LiveRow<R = Document> {
     /// The row is in the result, and wasn't before this commit; or it
     /// was when `watch_aggregate` was called, reported first.
     #[non_exhaustive]
@@ -646,7 +649,7 @@ pub enum LiveRow {
         /// Its group values, at their paths as in the row.
         group: Document,
         /// The row as it is now.
-        row: Document,
+        row: R,
     },
     /// The row was in the result before this commit, and no longer is.
     #[non_exhaustive]
@@ -656,7 +659,7 @@ pub enum LiveRow {
         /// The row as it is now, where its group still has documents but
         /// the row fails the `having`, or the row sort's `skip` or `limit`
         /// leave it out; `None` where no document of the group is left.
-        row: Option<Document>,
+        row: Option<R>,
     },
     /// The row was in the result before this commit and still is, with
     /// other values.
@@ -665,11 +668,11 @@ pub enum LiveRow {
         /// Its group values, at their paths as in the row.
         group: Document,
         /// The row as it is now.
-        row: Document,
+        row: R,
     },
 }
 
-impl LiveRow {
+impl<R> LiveRow<R> {
     /// The group values of the row reported on: `{}` without
     /// `group_by`.
     pub fn group(&self) -> &Document {
@@ -679,10 +682,27 @@ impl LiveRow {
             | LiveRow::Changed { group, .. } => group,
         }
     }
+
+    fn try_map<U, E>(self, convert: impl Fn(R) -> Result<U, E>) -> Result<LiveRow<U>, E> {
+        Ok(match self {
+            LiveRow::Entered { group, row } => LiveRow::Entered {
+                group,
+                row: convert(row)?,
+            },
+            LiveRow::Left { group, row } => LiveRow::Left {
+                group,
+                row: row.map(convert).transpose()?,
+            },
+            LiveRow::Changed { group, row } => LiveRow::Changed {
+                group,
+                row: convert(row)?,
+            },
+        })
+    }
 }
 
 /// What an aggregate watcher sends: an event, or the error that ended it.
-type SentRow = Result<LiveRow, crate::Error>;
+pub(crate) type SentRow = Result<LiveRow, crate::Error>;
 
 /// A live aggregate, from `Collection::watch_aggregate` (SPEC §139):
 /// first an `Entered` for every row of the aggregate's result, then, for
@@ -696,7 +716,10 @@ type SentRow = Result<LiveRow, crate::Error>;
 ///
 /// An item is `Err` once, as it ends: a `Condition::custom` that
 /// panicked as the aggregate ran (`Error::ClosurePanicked`), or a
-/// document that couldn't be read.
+/// document that couldn't be read. With rows of the application's own,
+/// `R` from `watch_aggregate_as` (SPEC §148), each is converted as it is
+/// received, on the reader's thread; one that doesn't convert is an
+/// `Err` for it, and the live aggregate goes on.
 ///
 /// ```
 /// # let dir = tempfile::tempdir().unwrap();
@@ -716,34 +739,56 @@ type SentRow = Result<LiveRow, crate::Error>;
 /// assert!(matches!(alerts.recv(), Some(Ok(LiveRow::Left { row: Some(_), .. }))));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug)]
-pub struct LiveAggregate {
+pub struct LiveAggregate<R = Document> {
     receiver: mpsc::Receiver<SentRow>,
+    /// `Ok` for a `Document`, `from_document` for an `R`: on the
+    /// reader's thread, not under the writer's lock.
+    convert: fn(Document) -> crate::Result<R>,
 }
 
-impl LiveAggregate {
+impl<R> std::fmt::Debug for LiveAggregate<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveAggregate").finish_non_exhaustive()
+    }
+}
+
+impl<R> LiveAggregate<R> {
+    pub(crate) fn new(
+        receiver: mpsc::Receiver<SentRow>,
+        convert: fn(Document) -> crate::Result<R>,
+    ) -> Self {
+        LiveAggregate { receiver, convert }
+    }
+
+    fn converted(&self, sent: SentRow) -> crate::Result<LiveRow<R>> {
+        sent?.try_map(self.convert)
+    }
+
     /// The next report, waiting for one as long as it takes. `None` once
     /// it has ended, by an error or by the database being dropped, and
     /// every report before has been read.
-    pub fn recv(&self) -> Option<crate::Result<LiveRow>> {
-        self.receiver.recv().ok()
+    pub fn recv(&self) -> Option<crate::Result<LiveRow<R>>> {
+        let sent = self.receiver.recv().ok()?;
+        Some(self.converted(sent))
     }
 
     /// The next report if one is waiting, without waiting.
-    pub fn try_recv(&self) -> Option<crate::Result<LiveRow>> {
-        self.receiver.try_recv().ok()
+    pub fn try_recv(&self) -> Option<crate::Result<LiveRow<R>>> {
+        let sent = self.receiver.try_recv().ok()?;
+        Some(self.converted(sent))
     }
 
     /// The next report, waiting at most `timeout`. `None` if none came,
     /// or it has ended.
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<crate::Result<LiveRow>> {
-        self.receiver.recv_timeout(timeout).ok()
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<crate::Result<LiveRow<R>>> {
+        let sent = self.receiver.recv_timeout(timeout).ok()?;
+        Some(self.converted(sent))
     }
 }
 
 /// Each report in turn, as `recv` hands them out.
-impl Iterator for LiveAggregate {
-    type Item = crate::Result<LiveRow>;
+impl<R> Iterator for LiveAggregate<R> {
+    type Item = crate::Result<LiveRow<R>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.recv()
@@ -818,7 +863,7 @@ impl AggregateWatcher {
         collection: &str,
         filter: Filter,
         aggregate: Aggregate,
-    ) -> crate::Result<(Self, LiveAggregate)> {
+    ) -> crate::Result<(Self, mpsc::Receiver<SentRow>)> {
         aggregate.check()?;
         let (_all, result) = rows_at(at, collection, &filter, &aggregate)?;
         let (sender, receiver) = mpsc::channel();
@@ -836,7 +881,7 @@ impl AggregateWatcher {
             rows,
             sender,
         };
-        Ok((watcher, LiveAggregate { receiver }))
+        Ok((watcher, receiver))
     }
 
     /// Runs the aggregate again on `at` and reports how its result

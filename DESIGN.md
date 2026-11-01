@@ -579,7 +579,9 @@ more than four.
   event with its place, a skip refused with `Error::NotLive`
   [§145](spec/145-a-live-sort-and-limit.md); `collection.watch_aggregate(filter,
   &aggregate)`, a `LiveAggregate` reporting its rows `Entered`, `Left`
-  or `Changed`, and `Aggregate::window` [§139](spec/139-live-aggregates-and-a-window.md).
+  or `Changed`, and `Aggregate::window` [§139](spec/139-live-aggregates-and-a-window.md); rows of the
+  application's own, `aggregate_as::<R>` and `watch_aggregate_as::<R>`
+  [§148](spec/148-rows-of-the-applications-own.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`

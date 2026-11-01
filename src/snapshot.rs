@@ -223,6 +223,16 @@ impl<T> View<T> {
         self.collection.aggregate(filter, aggregate)
     }
 
+    /// The groups, each row an `R` of the application's own — see
+    /// [`Collection::aggregate_as`].
+    pub fn aggregate_as<R: DeserializeOwned>(
+        &self,
+        filter: Filter,
+        aggregate: &Aggregate,
+    ) -> crate::Result<Vec<R>> {
+        self.collection.aggregate_as(filter, aggregate)
+    }
+
     /// Runs `aggregate` and says how — see
     /// [`Collection::explain_aggregate`].
     pub fn explain_aggregate(

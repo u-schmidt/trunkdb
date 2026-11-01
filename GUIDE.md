@@ -372,6 +372,10 @@ let per_status = db.collection::<Document>("tasks").aggregate(
 - The filter picks the documents, sort and limit included, as for
   `find`; the rows have the group's values and each column, no `_id`.
 - A missing field groups with `null`; `5` and `5.0` are one group.
+- **Rows as your own struct:** `aggregate_as::<PerStatus>(filter,
+  &aggregate)`, a field per group field and column, by name; an
+  `Option` where a value may be `null` (SPEC §148).
+  `watch_aggregate_as` does the same for a live aggregate.
 - `sum` and `avg` add only numbers, exactly, in any order; a mean is
   rounded once, so it is finite wherever the numbers are; `min` and
   `max` pass over nulls.
@@ -507,6 +511,9 @@ std::thread::spawn(move || {
   or out of the result, or `Changed` where a value really changed.
 - **`Left` has the row as it is now,** under the limit, or `None` once
   the group has no readings left; `group` says which it was.
+- **Rows of your own:** `watch_aggregate_as::<Load>` hands out each
+  `row` as a `Load`, converted as you receive it; one that doesn't
+  convert is an `Err`, and the events after it still come.
 - **"The last ten readings"** is a filter, `sort_desc("at").limit(10)`,
   not a window; the two together are refused.
 - **It runs whole at every commit to the collection:** with a window
