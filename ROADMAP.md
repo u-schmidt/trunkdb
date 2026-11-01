@@ -109,7 +109,7 @@ only a checkpoint before upgrading.
 - New types — a date without a time, a time without a date, a decimal:
   `Document` is `#[non_exhaustive]`, and a file holding one is refused
   by an older build, as above.
-- Everything under **Open** below: new operators, parameters (`:`
+- Everything **Planned** or **Deferred** below: new operators, parameters (`:`
   reads nowhere now), `serde_json` behind a feature, repairing what
   `check` finds, the planner, performance, the PyO3 bindings. None changes a file today's build
   writes or what a program or query means today.
@@ -119,28 +119,57 @@ applications, and whether the format has anything that hurts over
 months of real data.
 
 ## Open
-Unordered within each group; each line says where the need or the
-limit is described.
+In three groups: what is planned, what is deferred until a reason
+comes, and what is not planned. Unordered within each group; each line
+says where the need or the limit is described.
+
+### Planned
+Besides the Must of [A settled API and format](#a-settled-api-and-format),
+another pass over the public API:
+
+- **A live `sort` and `limit` for a live query,** "the ten fastest
+  vans" (§138.6); a live aggregate does it already.
+- **Typed rows for a live aggregate,** with a typed `aggregate`
+  (§139.6).
+- **Parameters in a filter's text,** named, `status = :status`, values
+  passed apart (§111.8), with the PyO3 bindings at the latest.
+- **`count_distinct`, `first` and `last` in an aggregate** (§107.8):
+  `last` of a position grouped by van is each van's last position.
+- **A window for each group,** by count or by time, "the last ten
+  readings of each server", SQL's `ROW_NUMBER() OVER (PARTITION BY …)`,
+  for live aggregates too: where groups report at rates far apart
+  (§139.6). After `first` and `last`, which give the last one of each.
+- **An OR mixing ids and other conditions,** served by lookups and
+  index ranges together, "these ids, or what changed since"; now one
+  branch without ids means no lookups, and the OR is a scan (§61.4).
+- **A sort by `_id` after an OR of `Eq`s,** or after a compound index
+  fixed only in part: a merge of id-ordered ranges, where §103 walks
+  one (§103.7); paging by id through `status in (…)`.
+- **A pattern language:** regex or `LIKE`-style wildcards (§25.4).
+- **A date without a time, and a time without a date,** as variants of
+  their own; until then, noon UTC of the day serves (§69.1).
+- **PyO3 bindings,** for Python apps.
+- **Longer fuzzing runs,** with AddressSanitizer too, and short ones in
+  CI on nightly (§55.6).
+
+### Deferred
+Each waits for what its line names: a program that needs it, or a
+measurement that shows the cost. "When asked" means a program that
+uses trunkdb asking for it.
 
 **Data types**
-- A date without a time, and a time without a date, as variants of
-  their own; until then, noon UTC of the day serves (§69.1).
 - `chrono`, `time` and `jiff` recognized on the way in, behind a
   feature each, as date-times rather than the strings they serialize to
   (§69.5); conversions between their types and `trunkdb::DateTime`.
 
 **Queries**
-- A pattern language: regex or `LIKE`-style wildcards (§25.4).
 - Rules are enough while every plan is bounded by one pass over one
   collection; where they are blind to the data, a hint (§132) and the
-  plans `explain_run` passed over (§133) cover it. With joins, or
-  lookups into another collection, that bound is gone and the choice
-  of a rule-based planner wants a second look. The alternatives for
+  plans `explain_run` passed over (§133) cover it. With lookups into
+  another collection, that bound is gone and the choice of a rule-based
+  planner wants a second look. The alternatives for
   `explain_aggregate`'s reads from entries wait until asked for
   (§133.5).
-- A sort by `_id` after an OR of `Eq`s, or after a compound index fixed
-  only in part: a merge of id-ordered ranges, where §103 walks one
-  (§103.7).
 - Leaves decided whole for filters that accept several intervals of
   keys (`ne`, an OR, a NOT), each leaf checked against the intervals'
   bounds; they decide entry by entry, on bytes, since §104 (§104.6).
@@ -156,7 +185,7 @@ limit is described.
 
 Built in §135–§139, as one group: the hook after each commit,
 `Condition::custom`, live queries, live aggregates and a window.
-[§140](spec/140-changes-as-they-happen.md) says what they share. Open, if asked for:
+[§140](spec/140-changes-as-they-happen.md) says what they share.
 - Conditions on places built in: a point within a circle or a polygon,
   as MongoDB's `$geoWithin`, with an index on points. Geometry runs
   deep (sphere or plane, the antimeridian, polygons with holes), and
@@ -164,15 +193,9 @@ Built in §135–§139, as one group: the hook after each commit,
   file would need pages of a new kind. Only if `Condition::custom`,
   with a coarse key indexed, or the fences in the application's own
   memory (§140.6), is too slow for a program that uses it.
-- A window for each group, by count or by time, "the last ten readings
-  of each server", SQL's `ROW_NUMBER() OVER (PARTITION BY …)`: where
-  groups report at rates far apart (§139.6).
 - A window counted back from the clock, with a timer to run the
   aggregate again as readings age out: a second source of events
   (§139.2).
-- A live `sort` and `limit` for a live query, "the ten fastest vans"
-  (§138.6); a live aggregate does it already.
-- Typed rows for a live aggregate, with a typed `aggregate` (§139.6).
 
 **Storage and durability**
 - Scan resistance for the page cache (§50.7).
@@ -216,9 +239,9 @@ Built in §135–§139, as one group: the hook after each commit,
 - A document as `serde_json::Value`, beside its text form (§71), if a
   tool needs it: behind a feature named `serde_json-1`, so `serde_json`
   stays out of the default public API (§71.4).
-- Aggregates beyond §107, when asked (§107.8): grouping by array
-  elements (MongoDB's `$unwind`); `count_distinct`, `first`, `last`,
-  `push`, percentiles; `sum` from index entries, which wants an
+- Aggregates beyond §107 and the planned `count_distinct`, `first`
+  and `last`, when asked (§107.8): grouping by array elements
+  (MongoDB's `$unwind`); `push`, percentiles; `sum` from index entries, which wants an
   `Int`/`Float` bit and a missing mark in every key, file format 13
   (§106.8); `min` and `max` that seek a group's ends instead of walking
   its entries; rows handed out as they are made rather than collected.
@@ -234,22 +257,29 @@ Built in §135–§139, as one group: the hook after each commit,
 - Arrays trimmed to a field of their elements in a projection, when
   asked (§106.8): `items[*].sku`, which now selects `items` whole.
 - `pull` by a condition on the element, when asked for (§73.3).
-- An OR mixing ids and other conditions, served by lookups and index
-  ranges together; now one branch without ids means no lookups (§61.4).
 
 **Tooling and reach**
 - Repairing what `check` finds, beyond export and import (§39.5).
-- Longer fuzzing runs, with AddressSanitizer too, and short ones in CI
-  on nightly (§55.6).
-- Parameters in a filter's text, named, `status = :status`, values
-  passed apart (§111.8), with the PyO3 bindings at the latest;
-  aggregates and updates as text (§111.11). Aggregates in SQL's
+- Aggregates and updates as text (§111.11). Aggregates in SQL's
   order, `group by team select count() as tasks, avg(hours) as
   mean_hours having tasks > 1`, the form most who'd want it know,
   documented with what goes in and what comes out; a column's
   condition in it, `count() filter (where …) as n` (§126.11).
-- PyO3 bindings, for Python apps.
 
-Not planned: a cost-based query planner, joins, multiple writers,
-encryption, schema validation (§6). Aggregates were on this list until
-§106.7, and came in §107.
+### Not planned
+Decided against, each for the reason given; the scope was first drawn
+in §6.
+
+- **A cost-based query planner:** fixed rules, a hint where they are
+  blind to the data (§132), and `explain_run`'s alternatives (§133)
+  cover plans bounded by one pass over one collection.
+- **Joins:** a document holds what belongs together, and a reference
+  (a `DocId` field, §62) is looked up by the application.
+- **Multiple writers:** batches are serialized (§27); readers run
+  beside the writer on snapshots (§77), and one process owns the file
+  (§21).
+- **Encryption:** left to the disk or the operating system.
+- **Schema validation:** the application's own types are the schema,
+  checked as documents convert to and from them.
+
+Aggregates were on this list until §106.7, and came in §107.
