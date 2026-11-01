@@ -816,3 +816,11 @@ limit, batches and a write-ahead log. Since then:
     loses a member to a document no commit wrote, the filter is read
     again. A skip, and a limit without a sort, are still refused with
     `Error::NotLive`, whose `reason` now says so.
+118. **`count_distinct`, `first` and `last`** (§146): three more
+    aggregate columns. `count_distinct(path)` counts the different
+    values as a filter's `=` tells them apart, `null` and missing not
+    counted, from index entries where an index holds the path.
+    `first(path)` and `last(path)` take the value of the group's first
+    or last document, by id, or `by(field)` and then by id:
+    `.last("pos").by("at")` is each van's position at its newest `at`,
+    pings sent late included. `by` on any other column is refused.

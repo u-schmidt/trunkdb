@@ -160,3 +160,4 @@ say what changed, and DESIGN.md says what is true now.
 143. [`except`: every field but these (`select.rs`, `query.rs`, `query_text.rs`, `explain.rs`)](143-except-every-field-but-these.md)
 144. [Operators in a batch and an upsert (`batch.rs`, `collection.rs`, `update.rs`)](144-operators-in-a-batch-and-an-upsert.md)
 145. [A live sort and limit (`live.rs`, `collection.rs`)](145-a-live-sort-and-limit.md)
+146. [`count_distinct`, `first` and `last` (`aggregate.rs`, `collection.rs`)](146-count-distinct-first-and-last.md)

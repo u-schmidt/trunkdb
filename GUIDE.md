@@ -406,11 +406,37 @@ let per_team = db.collection::<Document>("tasks").aggregate(
   row: `0` for a `count` or `sum`, `null` for the others.
 - Two `filter`s on one column are ANDed.
 
+Three more columns tell what a group holds rather than add it up
+(SPEC §146): `count_distinct` counts its different values, and `first`
+and `last` take the value of its first or last document:
+
+```rust
+let vans = db.collection::<Document>("pings").aggregate(
+    Filter::new(),
+    &Aggregate::new()
+        .group_by("van")
+        .last("pos").by("at").named("where") // the position of the newest `at`
+        .count_distinct("driver").named("drivers"),
+)?;
+// [{"van": "v1", "where": {"lat": 52.5, "lon": 13.4}, "drivers": 2}, ...]
+```
+
+- **First and last are by id** unless `by` names a field: by id is the
+  order documents were written in, which pings sent late, after a
+  tracker was offline, don't follow. `by("at")` does.
+- **The last document's value, even a missing one:** `null` if it has
+  none. `.filter(Condition::exists("pos"))` before `named` takes the
+  last that has one.
+- **`count_distinct` counts as `=` compares:** `5` and `5.0` once, `null`
+  and missing not at all.
+
 Where an index holds the fields an aggregate reads, its entries answer
-`count`, `avg`, `min` and `max` without reading the documents: "tasks
+`count`, `avg`, `min`, `max` and `count_distinct` without reading the
+documents: "tasks
 per status" on `(status, created)` counts the index's leaves. `sum`
 reads its numbers from the documents, as the key doesn't keep whether
-a number is an `Int` or a `Float`. A column's condition is decided from
+a number is an `Int` or a `Float`; `first` and `last` read theirs too.
+A column's condition is decided from
 the entries too, where the index holds the fields it names.
 `explain_aggregate` says how it ran.
 

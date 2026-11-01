@@ -14,7 +14,7 @@ use crate::query::{
 };
 use crate::storage::RecordLocation;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 /// What `Collection::aggregate` computes from the documents its filter
@@ -59,6 +59,12 @@ use std::time::Duration;
 ///   missing passed over, values no comparison orders only where there
 ///   is nothing else; of equal ones, the first document's by id. `null`
 ///   if there is no value.
+/// - **`count_distinct`:** how many different values, as a filter's `=`
+///   tells them apart (`5` and `5.0` one, arrays and objects by their
+///   contents); `null` and missing not counted (SPEC §146).
+/// - **`first`, `last`:** the value of the group's first or last
+///   document, by id, or `by` a field and then by id; `null` where that
+///   document has none (SPEC §146).
 ///
 /// Rows come in the order of their group values, ascending, unless
 /// `sort_asc` and the like say otherwise. `having` picks rows before the
@@ -111,6 +117,9 @@ pub(crate) struct Column {
     /// Which of the group's documents the column takes in (SPEC §126);
     /// `None`: every one.
     pub condition: Option<Condition>,
+    /// For `first` and `last`, the field that orders the documents
+    /// before their ids (SPEC §146); `None`: by id alone.
+    pub by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,11 +129,16 @@ pub(crate) enum Kind {
     Min,
     Max,
     Avg,
+    CountDistinct,
+    First,
+    Last,
 }
 
 /// A column of an [`Aggregate`] that has no name yet (SPEC §134):
-/// `count()`, `sum(path)`, `min(path)`, `max(path)` or `avg(path)`,
-/// then `filter` if only some of the group's documents count, and
+/// `count()`, `sum(path)`, `min(path)`, `max(path)`, `avg(path)`,
+/// `count_distinct(path)`, `first(path)` or `last(path)`, then `filter`
+/// if only some of the group's documents count, `by` for `first` and
+/// `last`, and
 /// `named` last, which adds it and hands the `Aggregate` back. SQL
 /// writes it in the same order: `count(*) FILTER (WHERE …) AS n`.
 ///
@@ -162,9 +176,21 @@ pub struct UnnamedColumn {
     kind: Kind,
     path: Option<String>,
     condition: Option<Condition>,
+    by: Option<String>,
 }
 
 impl UnnamedColumn {
+    /// Orders the group's documents by the value at `path` for `first`
+    /// and `last` (SPEC §146), in the order a sort uses, documents equal
+    /// there by id: `.last("pos").by("at")` is the position of the
+    /// latest `at`, where pings came in late and their ids aren't in
+    /// time order. A missing value orders as `null`, first. Refused on
+    /// any other column, as the aggregate runs.
+    pub fn by(mut self, path: impl Into<String>) -> Self {
+        self.by = Some(path.into());
+        self
+    }
+
     /// Lets this column take in only the documents that meet
     /// `condition` (SPEC §126). It filters this one column, not the
     /// aggregate: the other columns, and the groups, still see every
@@ -188,6 +214,7 @@ impl UnnamedColumn {
             kind: self.kind,
             path: self.path,
             condition: self.condition,
+            by: self.by,
         });
         aggregate
     }
@@ -265,12 +292,34 @@ impl Aggregate {
         self.column(Kind::Avg, Some(path.into()))
     }
 
+    /// A column counting the different values at `path`, to be
+    /// `named`, as SQL's `count(distinct path)`: values a filter finds
+    /// equal count once, `null` and missing not at all.
+    pub fn count_distinct(self, path: impl Into<String>) -> UnnamedColumn {
+        self.column(Kind::CountDistinct, Some(path.into()))
+    }
+
+    /// A column of the value at `path` in the group's first document, by
+    /// id, the order documents were made in, unless `by` orders them;
+    /// `null` if that document has none. To be `named`.
+    pub fn first(self, path: impl Into<String>) -> UnnamedColumn {
+        self.column(Kind::First, Some(path.into()))
+    }
+
+    /// A column of the value at `path` in the group's last document, by
+    /// id unless `by` orders them: `.last("pos").by("at")`, each van's
+    /// latest position. `null` if that document has none. To be `named`.
+    pub fn last(self, path: impl Into<String>) -> UnnamedColumn {
+        self.column(Kind::Last, Some(path.into()))
+    }
+
     fn column(self, kind: Kind, path: Option<String>) -> UnnamedColumn {
         UnnamedColumn {
             aggregate: self,
             kind,
             path,
             condition: None,
+            by: None,
         }
     }
 
@@ -367,7 +416,8 @@ impl Aggregate {
         let paths = self
             .group_by
             .iter()
-            .chain(self.columns.iter().filter_map(|c| c.path.as_ref()));
+            .chain(self.columns.iter().filter_map(|c| c.path.as_ref()))
+            .chain(self.columns.iter().filter_map(|c| c.by.as_ref()));
         for path in paths {
             if path.is_empty() || path.contains("[*]") {
                 return refuse(format!(
@@ -395,6 +445,9 @@ impl Aggregate {
             if firsts.contains(&name) {
                 return refuse(format!("a column named `{name}`, as a group field is"));
             }
+            if column.by.is_some() && !matches!(column.kind, Kind::First | Kind::Last) {
+                return refuse(format!("`by` orders only `first` and `last`, not `{name}`"));
+            }
         }
         let known =
             |field: &str| firsts.contains(&field) || self.columns.iter().any(|c| c.name == field);
@@ -418,14 +471,25 @@ impl Aggregate {
             .collect()
     }
 
+    /// Whether some column is read from documents only: a `sum`
+    /// (§107.5), and `first` and `last`, which order the documents by
+    /// their ids or a field of theirs (SPEC §146). `count_distinct` takes
+    /// what entries hand out, exact, as `min` and `max` do.
+    pub(crate) fn needs_documents(&self) -> bool {
+        (self.columns.iter()).any(|c| matches!(c.kind, Kind::Sum | Kind::First | Kind::Last))
+    }
+
     /// Whether some column has a condition.
     pub(crate) fn has_conditions(&self) -> bool {
         self.columns.iter().any(|c| c.condition.is_some())
     }
 
-    /// Every path it reads: the group fields', then the columns'.
+    /// Every path it reads: the group fields', then the columns', then
+    /// what orders `first` and `last`.
     pub(crate) fn paths(&self) -> Vec<&str> {
-        let columns = self.columns.iter().filter_map(|c| c.path.as_deref());
+        let columns = (self.columns.iter())
+            .filter_map(|c| c.path.as_deref())
+            .chain(self.columns.iter().filter_map(|c| c.by.as_deref()));
         self.group_by
             .iter()
             .map(String::as_str)
@@ -709,6 +773,20 @@ enum State {
     Avg(ExactSum),
     Min(Option<Seen>),
     Max(Option<Seen>),
+    /// Each different value's canonical encoding (SPEC §146).
+    Distinct(BTreeSet<Vec<u8>>),
+    /// `first` or `last` so far: what orders it, and its value.
+    Edge(Option<Edge>),
+}
+
+/// The document `first` or `last` holds so far (SPEC §146).
+#[derive(Debug, Clone)]
+struct Edge {
+    /// Its value at `by`; `Null` without one.
+    by: Document,
+    order: Order,
+    /// Its value at the column's path; `None` if missing.
+    value: Option<Document>,
 }
 
 #[derive(Debug)]
@@ -724,6 +802,8 @@ pub(crate) struct Groups<'a> {
     aggregate: &'a Aggregate,
     group_paths: Vec<Path<'a>>,
     column_paths: Vec<Option<Path<'a>>>,
+    /// What orders each `first` and `last` (SPEC §146).
+    by_paths: Vec<Option<Path<'a>>>,
     /// Each column's condition, compiled once (SPEC §126.3).
     conditions: Vec<Option<Matcher<'a>>>,
     /// Each group's place in `list`, in the order of its values.
@@ -740,6 +820,9 @@ impl<'a> Groups<'a> {
             group_paths: aggregate.group_by.iter().map(|p| Path::new(p)).collect(),
             column_paths: (aggregate.columns.iter())
                 .map(|c| c.path.as_deref().map(Path::new))
+                .collect(),
+            by_paths: (aggregate.columns.iter())
+                .map(|c| c.by.as_deref().map(Path::new))
                 .collect(),
             conditions: (aggregate.columns.iter())
                 .map(|c| c.condition.as_ref().map(Matcher::of))
@@ -774,6 +857,9 @@ impl<'a> Groups<'a> {
         let values: Vec<Option<Document>> = (self.column_paths.iter())
             .map(|path| path.as_ref().and_then(|p| p.field_value(doc)).cloned())
             .collect();
+        let by: Vec<Option<Document>> = (self.by_paths.iter())
+            .map(|path| path.as_ref().map(|p| p.value_or_null(doc).clone()))
+            .collect();
         // Which columns take this document in: those without a
         // condition, and those whose condition it meets (SPEC §126.2).
         let mut takes: Vec<bool> = Vec::with_capacity(self.conditions.len());
@@ -784,6 +870,9 @@ impl<'a> Groups<'a> {
             });
         }
         self.add(group, &values, &takes, true, order, at);
+        if let Some(i) = self.last {
+            self.add_edges(i, &values, &by, &takes, order);
+        }
         Ok(())
     }
 
@@ -863,6 +952,50 @@ impl<'a> Groups<'a> {
                 at: Some(at),
             });
             update(state, column.kind, seen);
+        }
+    }
+
+    /// A document's `first` and `last` (SPEC §146), into group `i`: kept
+    /// where it comes before the one held, or after it.
+    fn add_edges(
+        &mut self,
+        i: usize,
+        values: &[Option<Document>],
+        by: &[Option<Document>],
+        takes: &[bool],
+        order: Order,
+    ) {
+        let columns = &self.aggregate.columns;
+        for ((((state, column), value), by), take) in (self.list[i].columns.iter_mut())
+            .zip(columns)
+            .zip(values)
+            .zip(by)
+            .zip(takes)
+        {
+            let State::Edge(held) = state else {
+                continue;
+            };
+            if !take {
+                continue;
+            }
+            let edge = Edge {
+                by: by.clone().unwrap_or(Document::Null),
+                order,
+                value: value.clone(),
+            };
+            let ord = |a: &Edge, b: &Edge| {
+                sort_order(&a.by, &b.by, SortOrder::Asc).then(a.order.cmp(&b.order))
+            };
+            let replace = match held {
+                None => true,
+                Some(held) => match column.kind {
+                    Kind::First => ord(&edge, held).is_lt(),
+                    _ => ord(&edge, held).is_gt(),
+                },
+            };
+            if replace {
+                *held = Some(edge);
+            }
         }
     }
 
@@ -1020,6 +1153,8 @@ impl<'a> Groups<'a> {
                         Some(seen) => as_stored(seen, path.as_ref().expect("a path"))?,
                         None => Document::Null,
                     },
+                    State::Distinct(values) => Document::Int(values.len() as i64),
+                    State::Edge(edge) => edge.and_then(|e| e.value).unwrap_or(Document::Null),
                 };
                 put(&mut row, &column.name, value);
             }
@@ -1036,6 +1171,8 @@ fn initial(kind: Kind) -> State {
         Kind::Avg => State::Avg(ExactSum::default()),
         Kind::Min => State::Min(None),
         Kind::Max => State::Max(None),
+        Kind::CountDistinct => State::Distinct(BTreeSet::new()),
+        Kind::First | Kind::Last => State::Edge(None),
     }
 }
 
@@ -1048,6 +1185,13 @@ fn update(state: &mut State, kind: Kind, seen: Option<Seen>) {
                 sum.add(&seen.value);
             }
         }
+        State::Distinct(values) => {
+            if let Some(seen) = seen.filter(|seen| seen.value != Document::Null) {
+                values.insert(encode_document(&canonical(&seen.value)));
+            }
+        }
+        // Kept by `add_edges`, which sees what orders them.
+        State::Edge(_) => {}
         State::Min(best) | State::Max(best) => {
             let Some(seen) = seen.filter(|seen| seen.value != Document::Null) else {
                 return;
@@ -1545,6 +1689,98 @@ mod tests {
     }
 
     /// SPEC §107.2: what is refused before anything is read.
+    /// SPEC §146: different values as a filter's `=` tells them apart,
+    /// `null` and missing not counted, per group and per condition.
+    #[test]
+    fn count_distinct_counts_values_a_filter_tells_apart() {
+        let all = docs(&[
+            r#"{"g":"x","v":1}"#,
+            r#"{"g":"x","v":1.0}"#,
+            r#"{"g":"x","v":2}"#,
+            r#"{"g":"x","v":"a"}"#,
+            r#"{"g":"x","v":null}"#,
+            r#"{"g":"x"}"#,
+            r#"{"g":"x","v":[1]}"#,
+            r#"{"g":"x","v":[1.0]}"#,
+            r#"{"g":"x","v":{"a":1,"b":2}}"#,
+            r#"{"g":"x","v":{"b":2,"a":1}}"#,
+            r#"{"g":"y","v":"a"}"#,
+            r#"{"g":"y","v":"A"}"#,
+        ]);
+        let distinct = Aggregate::new()
+            .group_by("g")
+            .count_distinct("v")
+            .named("d")
+            .count_distinct("v")
+            .filter(Condition::gt("v", 1))
+            .named("big");
+        assert_eq!(
+            rows(&distinct, all),
+            [r#"{"g":"x","d":5,"big":1}"#, r#"{"g":"y","d":2,"big":0}"#]
+        );
+        let nothing = Aggregate::new().count_distinct("v").named("d");
+        assert_eq!(rows(&nothing, Vec::new()), [r#"{"d":0}"#]);
+    }
+
+    /// SPEC §146: `first` and `last` by id, a missing value `null`, a
+    /// condition passing such documents over.
+    #[test]
+    fn first_and_last_take_the_ends_by_id() {
+        let all = docs(&[
+            r#"{"van":"a","pos":1}"#,
+            r#"{"van":"b","pos":10}"#,
+            r#"{"van":"a","pos":2}"#,
+            r#"{"van":"a"}"#,
+        ]);
+        let ends = Aggregate::new()
+            .group_by("van")
+            .first("pos")
+            .named("first")
+            .last("pos")
+            .named("last")
+            .last("pos")
+            .filter(Condition::exists("pos"))
+            .named("last_known");
+        assert_eq!(
+            rows(&ends, all),
+            [
+                r#"{"van":"a","first":1,"last":null,"last_known":2}"#,
+                r#"{"van":"b","first":10,"last":10,"last_known":10}"#,
+            ]
+        );
+        let nothing = Aggregate::new().first("pos").named("f");
+        assert_eq!(rows(&nothing, Vec::new()), [r#"{"f":null}"#]);
+    }
+
+    /// SPEC §146: `by` orders before the ids; equal there, by id; a
+    /// missing value orders as `null`, first.
+    #[test]
+    fn first_and_last_by_a_field_then_by_id() {
+        let all = docs(&[
+            r#"{"van":"a","at":3,"pos":"late"}"#,
+            r#"{"van":"a","at":5,"pos":"newest"}"#,
+            r#"{"van":"a","at":1,"pos":"oldest"}"#,
+            r#"{"van":"a","pos":"no time"}"#,
+            r#"{"van":"b","at":7,"pos":"one"}"#,
+            r#"{"van":"b","at":7,"pos":"two"}"#,
+        ]);
+        let ends = Aggregate::new()
+            .group_by("van")
+            .first("pos")
+            .by("at")
+            .named("first")
+            .last("pos")
+            .by("at")
+            .named("last");
+        assert_eq!(
+            rows(&ends, all),
+            [
+                r#"{"van":"a","first":"no time","last":"newest"}"#,
+                r#"{"van":"b","first":"one","last":"two"}"#,
+            ]
+        );
+    }
+
     #[test]
     fn a_wrong_aggregate_is_refused() {
         let refused = |aggregate: Aggregate| {
@@ -1569,6 +1805,9 @@ mod tests {
         assert!(refused(Aggregate::new().count().named("a.b")).contains("plain name"));
         assert!(refused(Aggregate::new().group_by("tags[*]")).contains("[*]"));
         assert!(refused(Aggregate::new().sum("").named("s")).contains("name a field"));
+        assert!(refused(Aggregate::new().count().by("at").named("n")).contains("`by` orders"));
+        assert!(refused(Aggregate::new().max("v").by("at").named("m")).contains("`by` orders"));
+        assert!(refused(Aggregate::new().last("v").by("at[*]").named("l")).contains("[*]"));
         assert!(
             refused(Aggregate::new().group_by("a").group_by("a.b")).contains("one in the other")
         );

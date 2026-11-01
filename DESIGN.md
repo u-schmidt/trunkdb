@@ -430,12 +430,14 @@ decoded [§143](spec/143-except-every-field-but-these.md).
 **Aggregates** (`aggregate`, with an `Aggregate`) put the documents a
 filter finds in groups by the values of some paths, and per group count,
 sum, average, or find the smallest and largest value
-[§107](spec/107-aggregates.md). A missing field groups with null, values a
+[§107](spec/107-aggregates.md); count the different values, or take the first or last
+document's, by id or `by` a field [§146](spec/146-count-distinct-first-and-last.md). A missing field groups with null, values a
 filter finds equal are one group, and sums are exact (a fixed-point
 integer as wide as every float), so the plan doesn't change the answer.
 A mean is that exact total divided, then rounded once [§131](spec/131-a-mean-rounded-once.md).
 Where an index holds every path the aggregate reads, its entries are
-aggregated without their documents for `count`, `avg`, `min` and `max`,
+aggregated without their documents for `count`, `avg`, `min`, `max`
+and `count_distinct`,
 a document read only for a value the key doesn't hold as stored (a
 group's or an extreme's number); a walk counts whole leaves of a group.
 Without conditions, an index is walked only if it holds every document.
@@ -582,7 +584,8 @@ more than four.
   too [§60](spec/60-a-smaller-public-api.md); or from text, `text.parse::<Filter>()`, and back with
   `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md), `except` for those it leaves out [§143](spec/143-except-every-field-but-these.md);
   `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md), a
-  column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md); a condition of the
+  column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md), `count_distinct`, `first` and
+  `last`, the last two `by` a field [§146](spec/146-count-distinct-first-and-last.md); a condition of the
   application's own, `Condition::custom(fields, test)`, a closure given
   the fields it names, which mustn't use the database, and whose panic
   fails the call with `Error::ClosurePanicked` [§136](spec/136-a-condition-of-the-applications-own.md).

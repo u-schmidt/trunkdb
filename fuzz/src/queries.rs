@@ -153,6 +153,8 @@ pub struct Ran {
     pub live_rows: u64,
     /// Events live queries reported (SPEC §138), each as the model says.
     pub live_events: u64,
+    /// `count_distinct`, `first` and `last` columns made (SPEC §146).
+    pub distinct_and_ends: u64,
     /// Live queries with a sort (SPEC §145), and their events.
     pub live_sorted: u64,
     pub live_sorted_events: u64,
@@ -1029,12 +1031,34 @@ impl Run<'_> {
         for c in 0..1 + self.program.below(3) {
             let name = format!("c{c}");
             let path = fields[self.program.below(fields.len())];
-            let mut column = match self.program.below(5) {
+            // The new kinds one column in ten: they read documents, and
+            // every aggregate with one is one less from entries (§107.5).
+            let kind = match self.program.one_in(10) {
+                true => 5 + self.program.below(3),
+                false => self.program.below(5),
+            };
+            let mut column = match kind {
                 0 => aggregate.count(),
                 1 => aggregate.sum(path),
                 2 => aggregate.min(path),
                 3 => aggregate.max(path),
-                _ => aggregate.avg(path),
+                4 => aggregate.avg(path),
+                // SPEC §146, `first` and `last` by a field one time in two.
+                5 => {
+                    self.ran.distinct_and_ends += 1;
+                    aggregate.count_distinct(path)
+                }
+                kind => {
+                    self.ran.distinct_and_ends += 1;
+                    let column = match kind {
+                        6 => aggregate.first(path),
+                        _ => aggregate.last(path),
+                    };
+                    match self.program.one_in(2) {
+                        true => column.by(fields[self.program.below(fields.len())]),
+                        false => column,
+                    }
+                }
             };
             // A condition on the column (SPEC §126), as a filter's
             // conditions are made.

@@ -249,7 +249,7 @@ An `Explained` (§94) for the aggregate's read:
   does for conditions (§42), but its rows count a document once per
   element; a design of its own, if asked for.
 - **`count_distinct`, `first`, `last`, `push`, percentiles:** when a
-  workload asks. `count` of a path, SQL's `COUNT(col)`, is `count`
+  workload asks. The first three came in §146. `count` of a path, SQL's `COUNT(col)`, is `count`
   with `having` or a `sum` of a 0/1 field; left out for now.
 - **Type bits in keys** for `sum` from entries: an `Int`/`Float` bit
   and a missing mark in every key, file format 13 and every index

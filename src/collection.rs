@@ -2552,7 +2552,7 @@ fn aggregate_by_entries(
 ) -> crate::Result<Option<QueryPlan>> {
     let aggregate = groups.aggregate();
     let picks = filter.skip > 0 || filter.limit.is_some() || !filter.sort.is_empty();
-    if picks || filter.ids().is_some() || aggregate.columns.iter().any(|c| c.kind == Kind::Sum) {
+    if picks || filter.ids().is_some() || aggregate.needs_documents() {
         return Ok(None);
     }
     let paths = aggregate.paths();
@@ -11187,10 +11187,11 @@ mod tests {
             for c in 0..1 + rng.below(3) {
                 let path = fields[rng.below(3)];
                 let name = format!("c{c}");
-                aggregate = match rng.below(4) {
+                aggregate = match rng.below(5) {
                     0 => aggregate.count(),
                     1 => aggregate.min(path),
                     2 => aggregate.max(path),
+                    3 => aggregate.count_distinct(path),
                     _ => aggregate.avg(path),
                 }
                 .named(name);
@@ -11213,6 +11214,80 @@ mod tests {
             from_entries * 4 > matched,
             "{from_entries} of {matched} from entries"
         );
+    }
+
+    /// SPEC §146: `first` and `last` read their documents, where an index
+    /// holds every path; `count_distinct` is served by the entries, a long
+    /// string cut in its key read from its document, so two that differ
+    /// only past the cut count twice.
+    #[test]
+    fn distinct_counts_and_ends_read_their_documents() {
+        use crate::query::Aggregate;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let notes = db.collection::<Document>("notes");
+        notes.ensure_index(["g", "v", "at"]).unwrap();
+        let long = "z".repeat(600);
+        let mut batch = db.batch();
+        for n in 0..40i64 {
+            batch
+                .insert(
+                    &notes,
+                    object(vec![
+                        ("g", Document::String(["a", "b"][n as usize % 2].into())),
+                        ("v", Document::String(format!("{long}{}", n % 5))),
+                        ("at", Document::Int(n % 7)),
+                    ]),
+                )
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        let counts = Aggregate::new().group_by("g").count().named("n");
+        let r = notes.explain_aggregate(Filter::new(), &counts).unwrap();
+        assert!(r.stats.from_entries > 0, "the index serves a count");
+        // `at` is read only for `by`: the last by id, n = 38 in group
+        // "a", isn't the last by `at`, 6, which n = 6, 20 and 34 share.
+        let a = Aggregate::new()
+            .group_by("g")
+            .count_distinct("v")
+            .named("d")
+            .last("v")
+            .named("last")
+            .last("v")
+            .by("at")
+            .named("latest");
+        let rows = notes.aggregate(Filter::new(), &a).unwrap();
+        assert_eq!(rows, a.apply(notes.find(Filter::new()).unwrap()).unwrap());
+        let ends = |row: &Document, column: &str| {
+            let v = row.get(column).and_then(Document::as_str).unwrap();
+            (v.len(), v.chars().last().unwrap())
+        };
+        assert_eq!(rows[0].get("d"), Some(&Document::Int(5)));
+        assert_eq!(rows[1].get("d"), Some(&Document::Int(5)));
+        assert_eq!(ends(&rows[0], "last"), (601, '3'));
+        assert_eq!(ends(&rows[0], "latest"), (601, '4'));
+        let r = notes.explain_aggregate(Filter::new(), &a).unwrap();
+        assert_eq!(r.stats.from_entries, 0);
+        // `first` and `last` alone read their documents; `count_distinct`
+        // is from the entries where they hold the value whole, and every
+        // `v` is cut there, so read from its document.
+        for (a, entries) in [
+            (Aggregate::new().group_by("g").first("at").named("f"), false),
+            (Aggregate::new().group_by("g").last("at").named("l"), false),
+            (Aggregate::new().count_distinct("at").named("d"), true),
+            (
+                Aggregate::new()
+                    .group_by("g")
+                    .count_distinct("v")
+                    .named("d"),
+                false,
+            ),
+        ] {
+            let rows = notes.aggregate(Filter::new(), &a).unwrap();
+            assert_eq!(rows, a.apply(notes.find(Filter::new()).unwrap()).unwrap());
+            let r = notes.explain_aggregate(Filter::new(), &a).unwrap();
+            assert_eq!(r.stats.from_entries > 0, entries, "{a:?}");
+        }
     }
 
     /// SPEC §126.4: a column's condition decided from the entries, and
