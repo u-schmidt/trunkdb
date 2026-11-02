@@ -1745,6 +1745,9 @@ fn excludes_null(index: &IndexMeta, conditions: &[Condition]) -> bool {
 /// further. Nothing on its first field, no bounds.
 fn compound_bounds<'a>(index: &'a IndexMeta, conditions: &[Condition]) -> Option<Bounds<'a>> {
     let (prefix, equal, mut by) = equal_prefix(index, conditions, index.fields.len());
+    if let Some(bounds) = in_bounds(index, conditions, equal, &prefix, &by) {
+        return Some(bounds);
+    }
     let range = index
         .fields
         .get(equal)
@@ -1769,6 +1772,85 @@ fn compound_bounds<'a>(index: &'a IndexMeta, conditions: &[Condition]) -> Option
     })
 }
 
+/// An `in` on `index`'s field `at`, the one after the `Eq`s that fix
+/// the fields before it (`prefix`, by `by`), as one range per value
+/// (SPEC §160): `status in ("open", "late") and due < 50` on `(status,
+/// due)` as the keys of "open" before 50 and those of "late", as `=`
+/// would read each, where the OR alone bounds only `status`. The `Eq`s
+/// on the fields after it, and a range on the one after those, narrow
+/// every value's range alike. Bounds by value, as `=`'s are: each range
+/// holds one value of the field. `None` where it would bound one field
+/// alone, an `in` on the first field and nothing after it, which the
+/// OR's own bounds read as well (`bounds_for`), or where a value has no
+/// key.
+fn in_bounds<'a>(
+    index: &'a IndexMeta,
+    conditions: &[Condition],
+    at: usize,
+    prefix: &[u8],
+    by: &[Condition],
+) -> Option<Bounds<'a>> {
+    let field = index.fields.get(at)?;
+    let values = conditions
+        .iter()
+        .find_map(|c| in_values(c, field, index.fields.len()))?;
+    let (after, more, after_by) = equal_prefix_from(index, conditions, at + 1, index.fields.len());
+    let next =
+        (index.fields.get(at + 1 + more)).and_then(|next| field_range(index, conditions, next));
+    let fields = at + 1 + more + next.is_some() as usize;
+    if fields < 2 {
+        return None;
+    }
+    let ranges = values
+        .into_iter()
+        .map(|(encoded, eq)| {
+            let key = [prefix, &encoded, &after].concat();
+            let mut by = by.to_vec();
+            by.push(eq.clone());
+            by.extend(after_by.iter().cloned());
+            let range = match &next {
+                Some((range, on_next)) => {
+                    by.extend(on_next.iter().cloned());
+                    range.clone().under(&key)
+                }
+                None => KeyRange::prefixed(&key),
+            };
+            IndexRange { index, range, by }
+        })
+        .collect();
+    Some(Bounds {
+        ranges,
+        kind: BoundKind::ByValue,
+        fields,
+    })
+}
+
+/// The values of an `in` on `field`, an OR of one or more `Eq`s of it
+/// (SPEC §115), each encoded as a key of `fields` values holds it, with
+/// its `Eq`. `None` for anything else, or if a value has no key.
+fn in_values<'c>(
+    condition: &'c Condition,
+    field: &str,
+    fields: usize,
+) -> Option<Vec<(Vec<u8>, &'c Condition)>> {
+    let Condition::Any(branches) = condition else {
+        return None;
+    };
+    if branches.is_empty() {
+        return None;
+    }
+    (branches.iter())
+        .map(|branch| match branch {
+            Condition::Compare {
+                field: f,
+                op: Op::Eq,
+                value,
+            } if f == field => Some((key::range_for_in(&Op::Eq, value, fields)?.start, branch)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// How many of `index`'s first fields, up to `max`, an `Eq` among
 /// `conditions` fixes — and those values encoded one after another, as
 /// its keys begin, and the `Eq`s that fix them.
@@ -1777,9 +1859,21 @@ fn equal_prefix(
     conditions: &[Condition],
     max: usize,
 ) -> (Vec<u8>, usize, Vec<Condition>) {
+    equal_prefix_from(index, conditions, 0, max)
+}
+
+/// `equal_prefix` from the field `from` on: how many fields after it, up
+/// to the field `max`, an `Eq` fixes.
+fn equal_prefix_from(
+    index: &IndexMeta,
+    conditions: &[Condition],
+    from: usize,
+    max: usize,
+) -> (Vec<u8>, usize, Vec<Condition>) {
     let mut prefix = Vec::new();
     let mut by = Vec::new();
-    for (i, field) in index.fields.iter().take(max).enumerate() {
+    let mut fixed = 0;
+    for field in index.fields.iter().take(max).skip(from) {
         let equal = conditions.iter().find_map(|c| match c {
             Condition::Compare {
                 field: f,
@@ -1792,11 +1886,12 @@ fn equal_prefix(
             Some((range, condition)) => {
                 prefix.extend(range.start);
                 by.push(condition.clone());
+                fixed += 1;
             }
-            None => return (prefix, i, by),
+            None => break,
         }
     }
-    (prefix, max, by)
+    (prefix, fixed, by)
 }
 
 /// The comparisons on `field` as one range of `index`'s values for it —

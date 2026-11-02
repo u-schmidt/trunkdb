@@ -128,10 +128,8 @@ read every document. To speed up a query:
 3. Add an index on the field the most selective condition is on, or on
    several, the `=` field first, then the range's: `trunkdb index
    app.trunkdb tasks add status due` serves `status = "open" and due <
-   …`. With several values of the first field, write one `=` branch per
-   value, each with the range, `(status = "open" and due < X) or
-   (status = "late" and due < X)`: written as `status in (…) and due <
-   X`, the index reads each status whole and checks `due` after.
+   …`, and `status in ("open", "late") and due < …` too, each status's
+   range of `due` read on its own.
 4. Run `--explain` again and show the user the entries before and
    after. `count` has no `--explain`: explain the same filter with
    `find`.

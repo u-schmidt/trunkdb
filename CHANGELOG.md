@@ -957,3 +957,9 @@ limit, batches and a write-ahead log. Since then:
     another; `is not string` its NOT. The kinds are the ones `trunkdb
     fields` prints, `bool`, `int`, `float`, `string`, `binary`, `array`,
     `object`, `id` and `date`, and `number` for either number.
+132. **An `in` on a compound index's field, a range per value** (§160):
+    `status in ("open", "late") and due < 50`, with an index on
+    `(status, due)`, reads each status's entries before 50, as `status
+    = "open" and due < 50` reads one status's, where it read every
+    entry of each status. The same after `=`s on the index's first
+    fields, and with `=`s on the fields after the `in`'s.

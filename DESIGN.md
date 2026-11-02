@@ -374,7 +374,9 @@ what it picked (`QueryPlan`):
   and `not` never use an index. A sparse index is used only when the
   filter rules nulls out [§44](spec/44-sparse-indexes.md).
 - **`IndexUnion`:** one range per branch of an OR, each document read
-  once [§36.3](spec/36-or-not-and-nesting.md).
+  once [§36.3](spec/36-or-not-and-nesting.md); or one per value of an `in` on a compound index's field
+  after its `=`s, each narrowed by the `=`s and range on the fields after
+  it, as `=` would read it, and chosen as `=` is [§160](spec/160-an-in-on-a-compound-index-s-field.md).
 - **`IndexOrder`:** with a sort and a limit, walk the index on the
   first sort key and stop at the limit, past any skip [§34.2](spec/34-sorting-through-an-index.md) [§49](spec/49-a-lazy-b-tree-walk.md) [§72](spec/72-skip-for-paging.md). A compound index
   whose leading fields an `Eq` fixes gives both the filter and the order
