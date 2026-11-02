@@ -81,6 +81,7 @@ name contains "ann"                      (substring, any case)
 title starts with "Fix"                  (a prefix, case counting)
 team in ("core", "web")
 due is null                              (null or missing)
+hours is string                          (a type: number, string, date, …)
 exists(address.city)                     (present, null included)
 tags[*] = "urgent"                       (any element of the array)
 items has (sku = "A1" and qty > 2)       (one element meets all of it)
@@ -117,8 +118,8 @@ There are no joins. A document refers to another by its id
 how many entries, and its `instead:` lines what the others would have
 read. Which conditions an index can serve is in `references/filters.md`;
 in short, `=`, ranges, `in`, `starts with` and `is null` can, while
-`!=`, `not in`, `not`, `contains` and `exists` read every document. To
-speed up a query:
+`!=`, `not in`, `not`, `contains`, `exists` and a type (`is string`)
+read every document. To speed up a query:
 
 1. Run it with `--explain`. A `scan of every document` with many
    documents is what an index helps.

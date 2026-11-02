@@ -7,7 +7,7 @@
 use crate::aggregate::{Column, Kind, Window};
 use crate::datetime::DateTime;
 use crate::document::{DocId, Document};
-use crate::query::{Aggregate, Condition, Filter, Hint, Op, Sort, SortOrder};
+use crate::query::{Aggregate, Condition, Filter, Hint, Kind as ValueKind, Op, Sort, SortOrder};
 use std::fmt::{self, Formatter, Write};
 use std::str::FromStr;
 use std::time::Duration;
@@ -187,6 +187,16 @@ impl<'t> Parser<'t> {
         }
         let end = rest.find(|c| !in_word(c)).unwrap_or(rest.len());
         &rest[..end]
+    }
+
+    /// The kind named next, in any case, and past it (SPEC §159.3).
+    fn kind(&mut self) -> Option<ValueKind> {
+        self.skip_space();
+        let word = self.peek_word();
+        let kind =
+            (ValueKind::ALL.into_iter()).find(|kind| word.eq_ignore_ascii_case(kind.name()))?;
+        self.at += word.len();
+        Some(kind)
     }
 
     /// Past `keyword`, in any case, if it's the next word.
@@ -536,13 +546,23 @@ impl<'t> Parser<'t> {
         }
         let field = self.path()?;
         if self.keyword("is") {
-            let op = match self.keyword("not") {
-                true => Op::Ne,
-                false => Op::Eq,
+            let not = self.keyword("not");
+            if self.keyword("null") {
+                let op = if not { Op::Ne } else { Op::Eq };
+                let value = Document::Null;
+                return Ok(Condition::Compare { field, op, value });
+            }
+            // A kind (SPEC §159.3), `is not` its NOT.
+            let Some(kind) = self.kind() else {
+                return self.expected(
+                    "`null` or a kind (bool, int, float, number, string, binary, array, object, id, date)",
+                );
             };
-            self.expect_keyword("null")?;
-            let value = Document::Null;
-            return Ok(Condition::Compare { field, op, value });
+            let is = Condition::IsKind { field, kind };
+            return Ok(match not {
+                true => Condition::Not(Box::new(is)),
+                false => is,
+            });
         }
         if self.keyword("in") {
             return self.list(field);
@@ -1094,6 +1114,13 @@ fn write_condition(f: &mut Formatter<'_>, condition: &Condition, least: u8) -> f
     {
         return write_in(f, field, " not in (", &values);
     }
+    // A kind's NOT is `is not` (SPEC §159.3), as a stored null's is.
+    if let Condition::Not(inner) = condition
+        && let Condition::IsKind { field, kind } = only(inner)
+    {
+        write_path(f, field)?;
+        return write!(f, " is not {}", kind.name());
+    }
     let binds = match condition {
         Condition::Any(any) if any.len() >= 2 => OR,
         Condition::All(all) if all.len() >= 2 => AND,
@@ -1117,6 +1144,10 @@ fn write_condition(f: &mut Formatter<'_>, condition: &Condition, least: u8) -> f
                     write_value(f, value)?;
                 }
             }
+        }
+        Condition::IsKind { field, kind } => {
+            write_path(f, field)?;
+            write!(f, " is {}", kind.name())?;
         }
         Condition::Exists { field } => {
             f.write_str("exists(")?;
@@ -2070,7 +2101,11 @@ mod tests {
         };
         match rng.below(kinds) {
             0 | 1 => Condition::compare(random_path(rng), random_op(rng), random_value(rng, 1)),
-            2 => Condition::exists(random_path(rng)),
+            2 if rng.below(2) == 0 => Condition::exists(random_path(rng)),
+            2 => {
+                let kind = ValueKind::ALL[rng.below(ValueKind::ALL.len())];
+                Condition::is_kind(random_path(rng), kind)
+            }
             3 => Condition::size(random_path(rng), random_op(rng), rng.below(3)),
             4 => {
                 let values: Vec<Document> =

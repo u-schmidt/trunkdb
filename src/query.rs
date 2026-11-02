@@ -51,6 +51,90 @@ pub enum Op {
     StartsWith,
 }
 
+/// A kind of value, for `Condition::IsKind` (SPEC §159): `hours is
+/// string`. The names are the ones `trunkdb fields` prints, plus
+/// `Number`, either kind of number. There is no null kind: `is null`
+/// finds null and missing fields alike (SPEC §32), and `exists(x) and x
+/// is null` a stored null. `#[non_exhaustive]`, so a kind added later,
+/// a date without a time, isn't a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Kind {
+    /// `true` or `false`: `Document::Bool`.
+    Bool,
+    /// A whole number, `Document::Int`. `5.0` is a `Float`, though it
+    /// equals `5`.
+    Int,
+    /// A floating-point number, `Document::Float`, NaN and the
+    /// infinities included.
+    Float,
+    /// Either kind of number, `Int` or `Float`: what compares with a
+    /// number.
+    Number,
+    /// Text, `Document::String`.
+    String,
+    /// Bytes, `Document::Binary`.
+    Binary,
+    /// An array, `Document::Array`.
+    Array,
+    /// An object, `Document::Object`.
+    Object,
+    /// A document id, `Document::Id`.
+    Id,
+    /// A date-time, `Document::DateTime`.
+    Date,
+}
+
+impl Kind {
+    /// Every kind, in the order `trunkdb fields` prints them, `Number`
+    /// after `Float`.
+    pub const ALL: [Kind; 10] = [
+        Kind::Bool,
+        Kind::Int,
+        Kind::Float,
+        Kind::Number,
+        Kind::String,
+        Kind::Binary,
+        Kind::Array,
+        Kind::Object,
+        Kind::Id,
+        Kind::Date,
+    ];
+
+    /// Its name in a filter's text: `bool`, `int`, `float`, `number`,
+    /// `string`, `binary`, `array`, `object`, `id` or `date`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Bool => "bool",
+            Kind::Int => "int",
+            Kind::Float => "float",
+            Kind::Number => "number",
+            Kind::String => "string",
+            Kind::Binary => "binary",
+            Kind::Array => "array",
+            Kind::Object => "object",
+            Kind::Id => "id",
+            Kind::Date => "date",
+        }
+    }
+
+    /// Whether `value` is of this kind. Null is of none.
+    pub fn of(self, value: &Document) -> bool {
+        matches!(
+            (self, value),
+            (Kind::Bool, Document::Bool(_))
+                | (Kind::Int | Kind::Number, Document::Int(_))
+                | (Kind::Float | Kind::Number, Document::Float(_))
+                | (Kind::String, Document::String(_))
+                | (Kind::Binary, Document::Binary(_))
+                | (Kind::Array, Document::Array(_))
+                | (Kind::Object, Document::Object(_))
+                | (Kind::Id, Document::Id(_))
+                | (Kind::Date, Document::DateTime(_))
+        )
+    }
+}
+
 /// What a document must satisfy (SPEC §36): a comparison of one field,
 /// a test of its shape — there at all, an array of some size (§45) — or
 /// several conditions combined, nested as deep as needed.
@@ -113,6 +197,17 @@ pub enum Condition {
     /// A test of the application's own, a closure (SPEC §136): built by
     /// `Condition::custom`.
     Custom(Custom),
+    /// The field holds a value of `kind` (SPEC §159): `hours is string`.
+    /// A missing field holds none, nor does null. On a path with `[*]`:
+    /// some element is of it; without, the value itself, so an array is
+    /// `Kind::Array` whatever its elements are.
+    #[non_exhaustive]
+    IsKind {
+        /// The field, a path (SPEC §31).
+        field: String,
+        /// The kind it holds.
+        kind: Kind,
+    },
 }
 
 /// A condition of the application's own (SPEC §136): the paths it reads
@@ -424,6 +519,16 @@ impl Condition {
         }
     }
 
+    /// The field holds a value of `kind` (SPEC §159): `is_kind("hours",
+    /// Kind::String)`, the documents whose `hours` is a string, where
+    /// the others hold numbers.
+    pub fn is_kind(field: impl Into<String>, kind: Kind) -> Self {
+        Condition::IsKind {
+            field: field.into(),
+            kind,
+        }
+    }
+
     /// The field isn't there: `!Condition::exists(field)`.
     pub fn missing(field: impl Into<String>) -> Self {
         !Self::exists(field)
@@ -731,6 +836,14 @@ impl Filter {
     /// stored null from a missing field (SPEC §45.1).
     pub fn exists(self, field: impl Into<String>) -> Self {
         self.and(Condition::exists(field))
+    }
+
+    /// The field holds a value of `kind` (SPEC §159): `hours is
+    /// string` in the text. With `!` for the documents whose field
+    /// isn't of it, missing ones included:
+    /// `.and(!Condition::is_kind("hours", Kind::Number))`.
+    pub fn is_kind(self, field: impl Into<String>, kind: Kind) -> Self {
+        self.and(Condition::is_kind(field, kind))
     }
 
     /// The field isn't there at all; a stored null doesn't count.
@@ -1108,6 +1221,7 @@ impl Filter {
             match condition {
                 Condition::Compare { field, .. }
                 | Condition::Exists { field }
+                | Condition::IsKind { field, .. }
                 | Condition::Size { field, .. }
                 | Condition::ElemMatch { field, .. } => add(field, names),
                 Condition::All(conditions) | Condition::Any(conditions) => {
@@ -1183,8 +1297,9 @@ impl Filter {
                 }
                 Condition::Not(condition) => of(condition, name),
                 // A closure is called on a document, never on an entry
-                // (SPEC §136.4).
+                // (SPEC §136.4). A kind isn't decided on one (§159.2).
                 Condition::Exists { .. }
+                | Condition::IsKind { .. }
                 | Condition::Size { .. }
                 | Condition::ElemMatch { .. }
                 | Condition::Custom(_) => None,
@@ -1544,6 +1659,7 @@ fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bou
         // Nothing tells what a closure lets through (SPEC §136.4).
         Condition::Not(_)
         | Condition::Exists { .. }
+        | Condition::IsKind { .. }
         | Condition::Size { .. }
         | Condition::Custom(_) => None,
     }
@@ -1574,6 +1690,10 @@ fn within(field: &str, condition: &Condition) -> Condition {
             value: value.clone(),
         },
         Condition::Exists { field: inner } => Condition::Exists { field: path(inner) },
+        Condition::IsKind { field: inner, kind } => Condition::IsKind {
+            field: path(inner),
+            kind: *kind,
+        },
         Condition::Size {
             field: inner,
             op,
@@ -2225,6 +2345,7 @@ impl<'f> EntryMatcher<'f> {
                 Condition::Any(cs) => OnBytes::Any(all(cs)?),
                 Condition::Not(c) => OnBytes::Not(Box::new(of(c, fields)?)),
                 Condition::Exists { .. }
+                | Condition::IsKind { .. }
                 | Condition::Size { .. }
                 | Condition::ElemMatch { .. }
                 | Condition::Custom(_) => {
@@ -2440,6 +2561,10 @@ pub(crate) enum Matcher<'f> {
         needle: Option<String>,
     },
     Exists(Path<'f>),
+    IsKind {
+        path: Path<'f>,
+        kind: Kind,
+    },
     Size {
         path: Path<'f>,
         op: &'f Op,
@@ -2472,6 +2597,10 @@ impl<'f> Matcher<'f> {
                 },
             },
             Condition::Exists { field } => Matcher::Exists(Path::new(field)),
+            Condition::IsKind { field, kind } => Matcher::IsKind {
+                path: Path::new(field),
+                kind: *kind,
+            },
             Condition::Size { field, op, size } => Matcher::Size {
                 path: Path::new(field),
                 op,
@@ -2521,6 +2650,7 @@ impl<'f> Matcher<'f> {
                 }
             }
             Matcher::Exists(path) => !path.present(doc).is_empty(),
+            Matcher::IsKind { path, kind } => path.present(doc).into_iter().any(|v| kind.of(v)),
             // The lengths of the arrays at the path — none if it isn't
             // one; with `[*]`, one per element that is one (SPEC §45.2).
             Matcher::Size { path, op, size } => {
@@ -2839,7 +2969,9 @@ mod tests {
     /// looked up on every comparison. The reference §102 is checked
     /// against.
     mod before_102 {
-        use super::super::{Condition, Document, Sort, any_matches, sort_order, value_matches};
+        use super::super::{
+            Condition, Document, Kind, Sort, any_matches, sort_order, value_matches,
+        };
 
         pub fn field_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Document> {
             if path.is_empty() {
@@ -2853,6 +2985,26 @@ mod tests {
 
         pub fn value_or_null<'a>(doc: &'a Document, path: &str) -> &'a Document {
             field_value(doc, path).unwrap_or(&Document::Null)
+        }
+
+        /// Whether `value` is of `kind`, as SPEC §159.1 lists them.
+        pub fn kind_model(kind: Kind, value: &Document) -> bool {
+            let name = match value {
+                Document::Bool(_) => "bool",
+                Document::Int(_) => "int",
+                Document::Float(_) => "float",
+                Document::String(_) => "string",
+                Document::Binary(_) => "binary",
+                Document::Array(_) => "array",
+                Document::Object(_) => "object",
+                Document::Id(_) => "id",
+                Document::DateTime(_) => "date",
+                _ => return false,
+            };
+            match kind {
+                Kind::Number => name == "int" || name == "float",
+                kind => kind.name() == name,
+            }
         }
 
         pub fn walk<'a>(doc: &'a Document, path: &str, missing_is_null: bool) -> Vec<&'a Document> {
@@ -2892,6 +3044,9 @@ mod tests {
                     value_matches(op, value_or_null(doc, field), value)
                 }
                 Condition::Exists { field } => !walk(doc, field, false).is_empty(),
+                Condition::IsKind { field, kind } => walk(doc, field, false)
+                    .into_iter()
+                    .any(|value| kind_model(*kind, value)),
                 Condition::Size { field, op, size } => {
                     let lengths: Vec<Document> = walk(doc, field, true)
                         .into_iter()
@@ -2974,8 +3129,12 @@ mod tests {
         let op = ops[rng.below(ops.len())].clone();
         if depth == 0 || rng.below(3) == 0 {
             let field = random_path(rng);
-            return match rng.below(8) {
+            return match rng.below(9) {
                 0 => Condition::Exists { field },
+                3 => Condition::IsKind {
+                    field,
+                    kind: Kind::ALL[rng.below(Kind::ALL.len())],
+                },
                 1 => Condition::Size {
                     field,
                     op,

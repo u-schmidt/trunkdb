@@ -344,7 +344,8 @@ limit and a selection, applied in that order [§72](spec/72-skip-for-paging.md)
   values, an OR of `eq`s read as a point of an index per value [§115](spec/115-a-list-of-values-in.md);
 - **`all`, `any_of` and `not`**, also as `&`, `|` and `!` [§36](spec/36-or-not-and-nesting.md);
 - **`exists` and `missing`**, telling a stored null from an absent field;
-  `size` for array lengths [§45](spec/45-exists-and-array-size.md);
+  `size` for array lengths [§45](spec/45-exists-and-array-size.md); `is_kind`, a value of one kind,
+  `hours is string`, where others hold numbers [§159](spec/159-a-test-of-a-value-s-kind.md);
 - **conditions on array elements:** any element with `[*]` [§42](spec/42-array-conditions-and-multikey-indexes.md), or
   one element meeting several conditions with `elem_match` [§46](spec/46-conditions-on-one-element-elem-match.md).
 

@@ -47,6 +47,7 @@ query returns.
 | `a contains "x"` | the string `a` has `x` in it, any case |
 | `a starts with "x"` | the string `a` begins with `x`, case counting |
 | `a is null`, `a is not null` | `a` is null or missing (or neither) |
+| `a is string`, `a is not number` | `a` holds a value of that type (or doesn't, missing too) |
 | `exists(a)`, `not exists(a)` | `a` is present, even as null (or absent) |
 | `size(a) > 2` | `a` is an array of more than two elements |
 | `a has (b = 1 and c > 2)` | one element of the array `a` meets all of it |
@@ -112,15 +113,22 @@ them the same way.
 A comparison holds only between values of one kind: a string never
 equals, or is less than, a number. So `hours > 3` passes over a
 document whose `hours` is `"4"`, and `sum(hours)` and `avg(hours)`
-leave it out. `trunkdb fields` shows which paths hold several types.
-
-There is no test for a type yet. To find the documents where a field
-holds something else than a number, or than a string:
+leave it out. `trunkdb fields` shows which paths hold several types;
+`is` finds the documents with each, by the names `fields` prints:
+`bool`, `int`, `float`, `number` (int or float), `string`, `binary`,
+`array`, `object`, `id`, `date`.
 
 ```text
-exists(hours) and not (hours >= 0 or hours < 0)     -- hours, not a number
-exists(name) and not (name >= "")                   -- name, not a string
+hours is string                                     -- the odd ones
+exists(hours) and hours is not number and hours is not null
+                                                    -- stored, not a number
+tags[*] is number                                   -- some element a number
 ```
+
+`is not number` also holds where `hours` is missing or null, hence the
+`exists` and `is not null`. Without `[*]`, an array is an `array`
+whatever it holds. No index serves `is`: add a condition that one
+serves, or it reads every document.
 
 ## Null and missing
 
@@ -159,7 +167,7 @@ with anything else; the rest of the filter is checked on what it reads:
 | `=`, `<`, `<=`, `>`, `>=`, `is null` | `!=`, `not in (…)`, `not (…)` |
 | `in (…)`, `starts with` | `contains` |
 | an `or` whose every branch is served | an `or` with one branch that isn't |
-| `has (…)`, `[*]` paths, with an index on that path | `exists(…)`, `size(…)` |
+| `has (…)`, `[*]` paths, with an index on that path | `exists(…)`, `size(…)`, `is string` and the other types |
 
 So write the values you want, `status in ("open", "late")`, rather
 than the ones you don't, `status not in ("done", "cancelled")`.

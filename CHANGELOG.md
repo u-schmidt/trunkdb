@@ -951,3 +951,9 @@ limit, batches and a write-ahead log. Since then:
     beginning with a prefix, case counting as it does for `<`. An index
     on the field reads only the keys beginning with it, and decides
     each one from the key, so a count reads no document.
+131. **A test of a value's kind** (§159): `Filter::is_kind("hours",
+    Kind::String)`, or `hours is string` in a filter's text, finds the
+    documents whose field holds a value of one kind, where others hold
+    another; `is not string` its NOT. The kinds are the ones `trunkdb
+    fields` prints, `bool`, `int`, `float`, `string`, `binary`, `array`,
+    `object`, `id` and `date`, and `number` for either number.

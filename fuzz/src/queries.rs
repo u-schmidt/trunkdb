@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use trunkdb::query::{Aggregate, Condition, Filter, Op, SortOrder, Update};
+use trunkdb::query::{Aggregate, Condition, Filter, Kind, Op, SortOrder, Update};
 use trunkdb::{
     Change, Database, DocId, Document, Error, IndexOptions, Live, LiveAggregate, LiveQuery,
     LiveRow, Map, Upserted,
@@ -376,6 +376,7 @@ fn paths(condition: &Condition, into: &mut Vec<String>) {
     match condition {
         Condition::Compare { field, .. }
         | Condition::Exists { field, .. }
+        | Condition::IsKind { field, .. }
         | Condition::Size { field, .. }
         | Condition::ElemMatch { field, .. } => into.push(field.clone()),
         Condition::All(all) | Condition::Any(all) => all.iter().for_each(|c| paths(c, into)),
@@ -738,8 +739,13 @@ impl Run<'_> {
 
     fn leaf(&mut self) -> Condition {
         {
-            match self.program.below(11) {
+            match self.program.below(12) {
                 0 => Condition::exists(PATHS[self.program.below(PATHS.len())]),
+                // A kind (SPEC §159), any of them, on any path.
+                11 => {
+                    let kind = Kind::ALL[self.program.below(Kind::ALL.len())];
+                    Condition::is_kind(PATHS[self.program.below(PATHS.len())], kind)
+                }
                 1 => Condition::missing(PATHS[self.program.below(PATHS.len())]),
                 2 => {
                     let op = OPS[self.program.below(6)].clone();
