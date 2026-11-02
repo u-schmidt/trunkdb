@@ -662,28 +662,28 @@ the same documents and indexes and a durable commit everywhere, and
 checks that all four give the same answers [§48](spec/48-benchmarks-against-sqlite-redb-and-sled.md).
 
 Reads are level with SQLite, redb and sled or ahead of them, and so
-are batched inserts in these runs; a full scan, updates and compaction
-are still behind. On an M1 Pro with 100,000
-documents, the median of three runs (with §152):
+are batched inserts and updates in these runs; a full scan and
+compaction are still behind. On an M1 Pro with 100,000
+documents, the median of three runs (with §153):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 43k/s | 39k/s | 44k/s | 30k/s |
+| insert, 1000 per commit | 42k/s | 40k/s | 41k/s | 27k/s |
 | one commit | 4.5 ms | 4.7 ms | 5.0 ms | 10.1 ms |
-| get by id | 1.9 µs | 11 µs | 1.9 µs | 2.2 µs |
-| 1000 documents by index | 1.0 ms | 1.8 ms | 1.0 ms | 1.8 ms |
+| get by id | 2.0 µs | 16 µs | 2.0 µs | 2.3 µs |
+| 1000 documents by index | 0.94 ms | 1.8 ms | 1.0 ms | 1.9 ms |
 | count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
 | count of a range of 1000 | 0.01 ms | 0.02 ms | 0.04 ms | 0.34 ms |
-| count of all 100,000 | 0.09 ms | 0.01 ms | 0.00 ms | 23 ms |
-| oldest 20 of a status | 18.3 µs | 23.8 µs | 16.3 µs | 20.9 µs |
-| page 50 of 20 of a status | 27 µs | 53 µs | 45 µs | 255 µs |
-| first 50 by id | 32 µs | 35 µs | 25 µs | 30 µs |
-| 50 by id after skipping 5000 | 39 µs | 129 µs | 236 µs | 0.98 ms |
-| a tenant's first 20 by id | 23 µs | 1.3 ms | 22 µs | 25 µs |
-| scan, 100,000 for a fifth | 59 ms | 43 ms | 54 ms | 71 ms |
-| update, 1000 per commit | 14k/s | 15k/s | 20k/s | 24k/s |
-| delete, 1000 per commit | 30k/s | 20k/s | 24k/s | 34k/s |
-| compact | 0.63 s | 0.16 s | 0.42 s | — |
+| count of all 100,000 | 0.09 ms | 0.01 ms | 0.00 ms | 24 ms |
+| oldest 20 of a status | 18.1 µs | 23.4 µs | 16.5 µs | 21.7 µs |
+| page 50 of 20 of a status | 26 µs | 54 µs | 45 µs | 252 µs |
+| first 50 by id | 33 µs | 36 µs | 27 µs | 30 µs |
+| 50 by id after skipping 5000 | 38 µs | 126 µs | 228 µs | 0.97 ms |
+| a tenant's first 20 by id | 22 µs | 1.2 ms | 20 µs | 27 µs |
+| scan, 100,000 for a fifth | 58 ms | 43 ms | 54 ms | 67 ms |
+| update, 1000 per commit | 15k/s | 14k/s | 18k/s | 23k/s |
+| delete, 1000 per commit | 31k/s | 19k/s | 25k/s | 36k/s |
+| compact | 0.62 s | 0.20 s | 0.41 s | — |
 | file size after compact | 31 MB | 22 MB | 30 MB | — |
 
 Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
@@ -698,9 +698,12 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
   - a scan, 1.3× SQLite: each document's filtered fields are decoded
     into a small object to be checked;
   - "first 50 by id", 1.3× redb.
-- **Writes:** inserts 1.1× SQLite's in these runs (0.88× before §151,
+- **Writes:** inserts 1.05× SQLite's in these runs (0.88× before §151,
   and SQLite's own runs vary by a tenth from day to day), updates
-  0.93×, deletes ahead.
+  1.07× since a grown document is made room for in place
+  ([§153](spec/153-a-grown-cell-made-room-for-in-place.md)), deletes ahead; redb's and sled's updates are still
+  faster. A batch of updates writes 2.7× the pages of one of inserts,
+  each whole in the WAL (§153).
   The checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
   batches of 1,000 in 100 paid a checkpoint. Most of what is left of a
   batched commit is the CPU, not the WAL's whole pages ([§149](spec/149-wal-records-of-what-changed-measured-first.md)); a
@@ -731,6 +734,7 @@ Each gap had a measured cause, fixed one at a time:
 | Batched inserts, compact | 32k/s, 1.1 s | a binary search within B-tree pages [§150](spec/150-a-binary-search-within-b-tree-pages.md) |
 | Batched inserts, deletes | 36k/s, 27k/s | a page changed again in its batch, not copied [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md) |
 | Batched inserts, compact | 39k/s, 0.74 s | a page changed through `SlottedPage` keeps its layout mark [§152](spec/152-a-page-changed-through-slottedpage-keeps-its-mark.md) |
+| Batched updates | 13k/s | a grown cell made room for in place, compaction without an allocation per cell [§153](spec/153-a-grown-cell-made-room-for-in-place.md) |
 | First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |

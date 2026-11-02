@@ -867,3 +867,12 @@ limit, batches and a write-ahead log. Since then:
     an index entry still loses it, and a debug build checks every page
     it marks. Batched inserts about 1.1× faster, compaction 1.15×,
     reads unchanged; nothing else changes.
+124. **A grown cell made room for in place** (§153): a document that
+    grew in an update needed its whole length free on its page, which
+    a page filled by inserts doesn't have, so 83–96% of the
+    benchmark's updates compacted the whole page, each live cell
+    copied into an allocation of its own and back. Now the cells below
+    it move down by the bytes it grew, where the page has those free;
+    a compaction moves each cell in place, highest first, with no
+    allocation per cell. Batched updates about 1.15× faster, the rest
+    unchanged; nothing else changes.

@@ -352,9 +352,12 @@ impl SlottedPage {
     }
 
     /// Replaces a live cell's bytes, keeping its slot — in place if the
-    /// new bytes are no longer than the old ones, otherwise by compacting
-    /// the page around them. Returns `false`, leaving the page untouched,
-    /// if they don't fit even then (the caller moves the cell elsewhere).
+    /// new bytes are no longer than the old ones; if they are longer, in
+    /// place still where the page has the bytes they grew by free, the
+    /// cells below moved down to make room (SPEC §153); otherwise by
+    /// compacting the page around them. Returns `false`, leaving the
+    /// page untouched, if they don't fit even then (the caller moves the
+    /// cell elsewhere).
     pub fn update_cell(&mut self, slot: u16, data: &[u8]) -> bool {
         let (offset, length) = self.read_slot(slot);
         assert!(
@@ -367,6 +370,11 @@ impl SlottedPage {
             self.write_slot(slot, offset as u16, data.len() as u16);
             return true;
         }
+        let grown = data.len() - length as usize;
+        if self.free_space() >= grown {
+            self.grow_cell(slot, offset, data, grown);
+            return true;
+        }
         if self.reclaimable_space() + (length as usize) < data.len() {
             return false;
         }
@@ -376,6 +384,26 @@ impl SlottedPage {
         }
         self.place_cell(slot, data);
         true
+    }
+
+    /// `update_cell` of a cell grown by `grown` bytes, which the free
+    /// space has: the bytes from the cells' start to the cell's own move
+    /// down by that much, the slots of the cells there with them, and
+    /// the cell takes their place and its own (SPEC §153). Moves half the
+    /// page's cells on average, where a compaction moves them all.
+    fn grow_cell(&mut self, slot: u16, offset: u16, data: &[u8], grown: usize) {
+        let (start, offset) = (self.data_start() as usize, offset as usize);
+        self.bytes_mut().copy_within(start..offset, start - grown);
+        for other in 0..self.slot_count() {
+            let (at, length) = self.read_slot(other);
+            if length != 0 && (start..offset).contains(&(at as usize)) {
+                self.write_slot(other, at - grown as u16, length);
+            }
+        }
+        let to = offset - grown;
+        self.bytes_mut()[to..to + data.len()].copy_from_slice(data);
+        self.set_data_start((start - grown) as u16);
+        self.write_slot(slot, to as u16, data.len() as u16);
     }
 
     /// Writes `data` just below the packed cells and points `slot` (an
@@ -406,16 +434,43 @@ impl SlottedPage {
 
     /// `compact`, but never trims the directory below `min_slots` — for a
     /// caller about to refill a tombstoned slot, which may be trailing.
+    ///
+    /// In place (SPEC §153): the cells, highest first, each moved up
+    /// against the one above, so none is written over before it moves.
+    /// Cells that share bytes, which only a damaged page has (§54.2),
+    /// are copied out first instead, each whole, as they always were.
     fn compact_keeping(&mut self, min_slots: u16) {
-        let live: Vec<(u16, Vec<u8>)> = self
-            .iter_cells()
-            .map(|(slot, cell)| (slot, cell.to_vec()))
+        let mut live: Vec<(u16, u16, u16)> = (0..self.slot_count())
+            .map(|slot| (self.read_slot(slot), slot))
+            .filter(|&((_, length), _)| length != 0)
+            .map(|((offset, length), slot)| (offset, length, slot))
             .collect();
-        let slot_count = live.last().map_or(0, |(slot, _)| slot + 1).max(min_slots);
+        let slot_count = live.iter().map(|&(_, _, slot)| slot + 1).max().unwrap_or(0);
+        let slot_count = slot_count.max(min_slots);
+        live.sort_unstable_by_key(|&(offset, _, _)| std::cmp::Reverse(offset));
+        let apart = live
+            .windows(2)
+            .all(|pair| pair[1].0 as usize + pair[1].1 as usize <= pair[0].0 as usize);
         self.set_slot_count(slot_count);
-        self.set_data_start(USABLE_PAGE_SIZE as u16);
-        for (slot, cell) in &live {
-            self.place_cell(*slot, cell);
+        if apart {
+            let mut end = USABLE_PAGE_SIZE;
+            for &(offset, length, slot) in &live {
+                let (offset, length) = (offset as usize, length as usize);
+                let to = end - length;
+                self.bytes_mut().copy_within(offset..offset + length, to);
+                self.write_slot(slot, to as u16, length as u16);
+                end = to;
+            }
+            self.set_data_start(end as u16);
+        } else {
+            let cells: Vec<(u16, Vec<u8>)> = live
+                .iter()
+                .map(|&(_, _, slot)| (slot, self.get_cell(slot).expect("live").to_vec()))
+                .collect();
+            self.set_data_start(USABLE_PAGE_SIZE as u16);
+            for (slot, cell) in &cells {
+                self.place_cell(*slot, cell);
+            }
         }
         // Zero the gap, so bytes of deleted documents don't linger on disk.
         let gap = HEADER_LEN + slot_count as usize * SLOT_LEN..self.data_start() as usize;
@@ -477,6 +532,111 @@ impl SlottedPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cells grown in place and pages compacted in place (SPEC §153)
+    /// against a model, every slot's bytes: 300 pages of random inserts,
+    /// updates that grow, shrink or keep a cell, deletes and compactions,
+    /// each page filled to the brim. After every step the cells are the
+    /// model's, the layout checks, no two cells share a byte, the bytes
+    /// between the directory and the cells are zero after a compaction,
+    /// and an update refused is one the page has no room for.
+    #[test]
+    fn cells_grown_and_compacted_in_place_keep_every_cell() {
+        let mut seed = 11u64;
+        let mut next = |below: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below
+        };
+        for round in 0..300 {
+            let mut page = SlottedPage::new(PageType::Data);
+            let mut model: Vec<Option<Vec<u8>>> = Vec::new();
+            for step in 0..400 {
+                let fill = (round * 400 + step) as u8;
+                let live: Vec<u16> = page.iter_cells().map(|(slot, _)| slot).collect();
+                match next(10) {
+                    0..=3 => {
+                        let cell = vec![fill; 1 + next(300)];
+                        if let Some(slot) = page.insert_cell_reusing_slot(&cell) {
+                            if model.len() <= slot as usize {
+                                model.resize(slot as usize + 1, None);
+                            }
+                            model[slot as usize] = Some(cell);
+                        }
+                    }
+                    4..=7 if !live.is_empty() => {
+                        let slot = live[next(live.len())];
+                        let old = model[slot as usize].as_ref().unwrap().len();
+                        let len = match next(3) {
+                            0 => 1 + next(old),
+                            1 => old + 1 + next(16),
+                            _ => old + 1 + next(400),
+                        };
+                        let cell = vec![fill; len];
+                        let room = page.reclaimable_space() + old;
+                        let updated = page.update_cell(slot, &cell);
+                        assert_eq!(updated, len <= room, "{round} {step}");
+                        if updated {
+                            model[slot as usize] = Some(cell);
+                        }
+                    }
+                    8 if !live.is_empty() => {
+                        let slot = live[next(live.len())];
+                        page.delete_cell(slot);
+                        model[slot as usize] = None;
+                    }
+                    _ => {
+                        page.compact();
+                        model.truncate(page.slot_count() as usize);
+                        let directory = HEADER_LEN + page.slot_count() as usize * SLOT_LEN;
+                        let gap = &page.buf[directory..page.data_start() as usize];
+                        assert!(gap.iter().all(|&b| b == 0), "{round} {step}");
+                    }
+                }
+                for (slot, cell) in model.iter().enumerate() {
+                    assert_eq!(
+                        page.get_cell(slot as u16),
+                        cell.as_deref(),
+                        "{round} {step}"
+                    );
+                }
+                assert!(SlottedPage::check_layout(&page.buf).is_ok());
+                assert_eq!(page.overlapping_cells(), None, "{round} {step}");
+            }
+        }
+    }
+
+    /// A damaged page whose cells share bytes (SPEC §54.2) compacts as it
+    /// always did (§153): every cell copied out whole, then packed, so
+    /// each keeps the bytes it was read with.
+    #[test]
+    fn a_page_whose_cells_overlap_compacts_each_cell_whole() {
+        // A cell starting inside the one below it; and one stretched
+        // over the one above it, with a third below: moved in place, it
+        // would be written over the third before the third moves.
+        type Damage = fn(&mut SlottedPage, [u16; 3]);
+        let starts_inside: Damage = |page, [a, b, _]| {
+            let (offset, _) = page.read_slot(b);
+            page.write_slot(a, offset + 10, 40);
+        };
+        let stretched: Damage = |page, [_, b, _]| {
+            let (offset, _) = page.read_slot(b);
+            page.write_slot(b, offset, 80);
+        };
+        for damage in [starts_inside, stretched] {
+            let mut page = SlottedPage::new(PageType::Data);
+            let slots = [1, 2, 3].map(|fill| page.insert_cell(&[fill; 40]).unwrap());
+            damage(&mut page, slots);
+            let before = slots.map(|slot| page.get_cell(slot).unwrap().to_vec());
+            assert!(page.overlapping_cells().is_some());
+            page.compact();
+            for (slot, cell) in slots.iter().zip(&before) {
+                assert_eq!(page.get_cell(*slot).unwrap(), cell);
+            }
+            assert_eq!(page.overlapping_cells(), None);
+        }
+    }
 
     /// `fits` and `fits_reusing_slot` say beforehand what the inserts
     /// will do (SPEC §151): on pages filled to every level, with cells
