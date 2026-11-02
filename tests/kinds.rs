@@ -76,7 +76,7 @@ fn each_kind_finds_the_values_of_that_kind() {
     let tasks = tasks(&db);
     let values = values();
     let all: Vec<i64> = (0..values.len() as i64).collect();
-    for kind in Kind::ALL {
+    for &kind in Kind::ALL {
         let want: Vec<i64> = (values.iter().enumerate())
             .filter(|(_, (_, kinds))| kinds.contains(&kind.name()))
             .map(|(n, _)| n as i64)
@@ -192,6 +192,12 @@ fn the_names_are_trunkdb_fields_names() {
             "bool", "int", "float", "number", "string", "binary", "array", "object", "id", "date"
         ]
     );
+    // A slice, so a kind added later doesn't change its type (SPEC §161.1).
+    let all: &'static [Kind] = Kind::ALL;
+    assert_eq!(all.len(), names.len());
+    // Named for the variant it tests; written `date`, as its values are.
+    let now = Document::DateTime(DateTime::from_unix(0, 0).unwrap());
+    assert!(Kind::DateTime.of(&now) && Kind::DateTime.name() == "date");
     assert!(Kind::Number.of(&Document::Int(1)) && Kind::Number.of(&Document::Float(1.0)));
     assert!(!Kind::Number.of(&Document::String("1".into())));
     assert!(Kind::ALL.iter().all(|kind| !kind.of(&Document::Null)));

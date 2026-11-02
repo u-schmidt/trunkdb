@@ -17,16 +17,20 @@ use std::time::Duration;
 /// A document is listed with the batch's net effect: inserted and then
 /// updated is `Inserted`, updated and then deleted `Deleted`, and one
 /// inserted and deleted in the same batch isn't listed.
+///
+/// `PartialEq` but not `Eq`, as a report (SPEC §118.1, §161.2): a field
+/// added later, a value or a document, may hold a float.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Commit {
     /// Never empty: a batch that changed no document isn't reported.
     pub changes: Vec<Change>,
 }
 
 /// One document's change in a [`Commit`], or a collection dropped.
+/// `PartialEq` but not `Eq`, as [`Commit`].
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     /// The document wasn't there before the batch, and is after it.
     #[non_exhaustive]

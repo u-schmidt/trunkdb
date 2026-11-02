@@ -1,7 +1,7 @@
 // Options and reports can get a field that isn't `Eq`, a float say, in 1.x, so none
-// of them is `Eq` (SPEC §118). One error each.
+// of them is `Eq` (SPEC §118), nor are the hook's events (§161.2). One error each.
 use trunkdb::query::{ExecutionStats, QueryPlan, SortWork};
-use trunkdb::{CheckReport, CollectionStats, Compacted, FileInfo, ImportOptions, IndexInfo};
+use trunkdb::{Change, CheckReport, CollectionStats, Commit, Compacted, FileInfo, ImportOptions, IndexInfo};
 use trunkdb::{IndexOptions, IndexStats, OpenOptions, PageUse, Recovered, SnapshotInfo, Stats, Summary};
 
 // The calls start past line 9 and the helper is below them: a message
@@ -13,7 +13,7 @@ fn main() {
     eq::<ExecutionStats>(); eq::<SortWork>(); eq::<QueryPlan>(); eq::<Compacted>();
     eq::<SnapshotInfo>(); eq::<PageUse>(); eq::<Recovered>(); eq::<Summary>();
     eq::<CheckReport>(); eq::<FileInfo>(); eq::<Stats>(); eq::<CollectionStats>();
-    eq::<IndexStats>();
+    eq::<IndexStats>(); eq::<Commit>(); eq::<Change>();
 }
 
 fn eq<T: Eq>() {}

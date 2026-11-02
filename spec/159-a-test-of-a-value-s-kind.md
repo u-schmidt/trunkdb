@@ -22,7 +22,7 @@ exists(hours) and hours is not number and hours is not null
   `Condition::is_kind(field, kind)` and `Filter::is_kind`: the field
   holds a value of `kind`.
 - **`Kind`**: `Bool`, `Int`, `Float`, `Number`, `String`, `Binary`,
-  `Array`, `Object`, `Id` and `Date`, named `bool`, `int`, `float`,
+  `Array`, `Object`, `Id` and `DateTime` (§161.1), named `bool`, `int`, `float`,
   `number`, `string`, `binary`, `array`, `object`, `id` and `date`, as
   `trunkdb fields` prints them (§121.2). `Number` is either kind of
   number, as a comparison takes `5` and `5.0` for one value; `Int` and

@@ -81,14 +81,17 @@ pub enum Kind {
     Object,
     /// A document id, `Document::Id`.
     Id,
-    /// A date-time, `Document::DateTime`.
-    Date,
+    /// A date-time, `Document::DateTime`: `date` in a filter's text, as
+    /// its values are written `date("…")`. Named for the variant it
+    /// tests, so a date without a time can be `Date` (SPEC §161.1).
+    DateTime,
 }
 
 impl Kind {
     /// Every kind, in the order `trunkdb fields` prints them, `Number`
-    /// after `Float`.
-    pub const ALL: [Kind; 10] = [
+    /// after `Float`. A slice, not an array, so a kind added later
+    /// doesn't change its type (SPEC §161.1).
+    pub const ALL: &'static [Kind] = &[
         Kind::Bool,
         Kind::Int,
         Kind::Float,
@@ -98,7 +101,7 @@ impl Kind {
         Kind::Array,
         Kind::Object,
         Kind::Id,
-        Kind::Date,
+        Kind::DateTime,
     ];
 
     /// Its name in a filter's text: `bool`, `int`, `float`, `number`,
@@ -114,7 +117,7 @@ impl Kind {
             Kind::Array => "array",
             Kind::Object => "object",
             Kind::Id => "id",
-            Kind::Date => "date",
+            Kind::DateTime => "date",
         }
     }
 
@@ -130,7 +133,7 @@ impl Kind {
                 | (Kind::Array, Document::Array(_))
                 | (Kind::Object, Document::Object(_))
                 | (Kind::Id, Document::Id(_))
-                | (Kind::Date, Document::DateTime(_))
+                | (Kind::DateTime, Document::DateTime(_))
         )
     }
 }

@@ -194,7 +194,7 @@ impl<'t> Parser<'t> {
         self.skip_space();
         let word = self.peek_word();
         let kind =
-            (ValueKind::ALL.into_iter()).find(|kind| word.eq_ignore_ascii_case(kind.name()))?;
+            (ValueKind::ALL.iter().copied()).find(|kind| word.eq_ignore_ascii_case(kind.name()))?;
         self.at += word.len();
         Some(kind)
     }

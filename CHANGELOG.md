@@ -963,3 +963,9 @@ limit, batches and a write-ahead log. Since then:
     = "open" and due < 50` reads one status's, where it read every
     entry of each status. The same after `=`s on the index's first
     fields, and with `=`s on the fields after the `in`'s.
+133. **The public API gone through again** (§161), as in §118, for what
+    came since. **Breaking:** the hook's `Commit` and `Change` are
+    `PartialEq` but no longer `Eq`, as reports aren't, so a field that
+    holds a float can be added; `==` works as before, but neither can
+    be a `HashMap` key. `Kind::ALL` is a slice and a date-time's kind
+    `Kind::DateTime`, both before any release had them.
