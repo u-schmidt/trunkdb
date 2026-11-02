@@ -935,3 +935,13 @@ limit, batches and a write-ahead log. Since then:
     strings compare and a prefix as a range, values of another type
     that comparisons and `sum` pass over, two collections put together
     by their ids, and what an export holds.
+
+    Items 125–129 → 0.29.0: additions only, nothing to adapt.
+    `Filter::sort_by_key` and `sort_by_key_desc`; `FromStr` and
+    `Display` for `Aggregate`; the `trunkdb` command gains `count`,
+    `get`, `insert`, `update`, `delete`, `index add`/`drop`, `drop` and
+    `aggregate`, and `--json` for `info`, `check` and `fields`; the
+    earlier commands work as before. The agent skill covers
+    them. Files stay format 12 and exports as in 0.28.0, which opens
+    what 0.29.0 writes. No new fixture, as nothing changes how files
+    are written (§120.9).
