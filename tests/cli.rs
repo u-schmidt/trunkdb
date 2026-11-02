@@ -1062,3 +1062,330 @@ fn info_and_fields_print_json_for_a_program() {
     let output = trunkdb(&["fields", &db, "users", "age >", "--json"]);
     assert_eq!(output.status.code(), Some(2));
 }
+
+// Writing (SPEC §156).
+
+/// `trunkdb` with `input` on its standard input.
+fn trunkdb_with(args: &[&str], input: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_trunkdb"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .output_with(|stdin| stdin.write_all(input.as_bytes()))
+}
+
+/// The documents of `collection`, as `find` prints them, one a line.
+fn all(db: &str, collection: &str) -> Vec<serde_json::Value> {
+    (stdout(&trunkdb(&["find", db, collection])).lines())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// A database of the export's users, and its path.
+fn users_db(dir: &Path) -> String {
+    let (db, input) = (path(dir, "db.trunkdb"), path(dir, "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+    db
+}
+
+/// One document as an argument, or one per line on standard input, all
+/// in one batch; each id printed. A collection or a file that isn't
+/// there takes `--create`; a line that isn't a document inserts none.
+#[test]
+fn insert_adds_documents_and_prints_their_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = users_db(dir.path());
+    let output = trunkdb(&["insert", &db, "users", r#"{"name": "Cy", "age": 29}"#]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let id = stdout(&output).trim().to_string();
+    assert_eq!(stderr(&output), "inserted 1 document\n");
+    assert!(stdout(&trunkdb(&["get", &db, "users", &id])).contains(r#""name":"Cy""#));
+
+    let lines =
+        "{\"name\": \"Di\"}\n\n{\"name\": \"Ed\", \"at\": {\"$date\": \"2026-01-02T03:04:05Z\"}}\n";
+    let output = trunkdb_with(&["insert", &db, "users", "-"], lines);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).lines().count(), 2);
+    assert_eq!(stdout(&trunkdb(&["count", &db, "users"])), "5\n");
+    let ed = stdout(&trunkdb(&[
+        "find",
+        &db,
+        "users",
+        r#"at = date("2026-01-02T03:04:05Z")"#,
+    ]));
+    assert!(ed.contains(r#""name":"Ed""#), "tags read as values: {ed}");
+
+    // A line that isn't a document: none of them inserted.
+    let output = trunkdb_with(
+        &["insert", &db, "users", "-"],
+        "{\"name\": \"Fa\"}\n[1, 2]\n",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("line 2: a document is a JSON object"),
+        "{}",
+        stderr(&output)
+    );
+    let output = trunkdb(&["insert", &db, "users", "{\"name\": "]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&trunkdb(&["count", &db, "users"])), "5\n");
+
+    // A collection, or a file, that isn't there.
+    let output = trunkdb(&["insert", &db, "teams", r#"{"name": "core"}"#]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("teams: no such collection; --create makes it"));
+    let output = trunkdb(&["insert", &db, "teams", r#"{"name": "core"}"#, "--create"]);
+    assert!(output.status.success());
+    assert_eq!(stdout(&trunkdb(&["count", &db, "teams"])), "1\n");
+    let new = path(dir.path(), "new.trunkdb");
+    let output = trunkdb(&["insert", &new, "notes", "{}"]);
+    assert!(stderr(&output).contains("no such file"));
+    assert!(!Path::new(&new).exists(), "not created without --create");
+    assert!(
+        trunkdb(&["insert", &new, "notes", "{}", "--create"])
+            .status
+            .success()
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &new, "notes"])), "1\n");
+    let output = trunkdb(&["insert", &db, "users", "{}", "--force"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+/// Every operator of an update, as MongoDB writes it, and what each
+/// leaves (SPEC §156.2).
+#[test]
+fn update_changes_what_a_filter_finds_by_its_operators() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = users_db(dir.path());
+    let ada = r#"name = "Ada""#;
+    let changes = |update: &str, changed: &str| {
+        let output = trunkdb(&["update", &db, "users", ada, update]);
+        assert!(output.status.success(), "{update}: {}", stderr(&output));
+        assert_eq!(stderr(&output), format!("updated {changed}\n"), "{update}");
+    };
+    let run = |update: &str| changes(update, "1 document");
+    run(r#"{"$set": {"team": "core", "tags": ["a"], "n": 3}, "$inc": {"age": 1}}"#);
+    run(r#"{"$mul": {"n": 2}, "$min": {"age": 20}, "$max": {"low": 5}}"#);
+    run(
+        r#"{"$push": {"tags": {"$each": ["b", "c"]}}, "$addToSet": {"set": {"$each": [1, 1, 2]}}}"#,
+    );
+    run(r#"{"$pull": {"tags": "b"}, "$pop": {"set": -1}, "$rename": {"team": "group"}}"#);
+    // In, and out again: the document as it was, so none counts as
+    // updated.
+    changes(
+        r#"{"$push": {"tags": "d"}, "$addToSet": {"tags": "a"}, "$pop": {"tags": 1}}"#,
+        "0 documents",
+    );
+    run(r#"{"$unset": ["low"]}"#);
+    run(r#"{"$unset": {"email": ""}}"#);
+    let found = stdout(&trunkdb(&["find", &db, "users", ada]));
+    let doc: serde_json::Value = serde_json::from_str(found.trim()).unwrap();
+    assert_eq!(doc["age"], 20);
+    assert_eq!(doc["n"], 6);
+    assert_eq!(doc["tags"], serde_json::json!(["a", "c"]));
+    assert_eq!(doc["set"], serde_json::json!([2]));
+    assert_eq!(doc["group"], "core");
+    assert!(doc.get("team").is_none() && doc.get("low").is_none() && doc.get("email").is_none());
+
+    // One operator that fails fails the whole update: nothing written.
+    let output = trunkdb(&[
+        "update",
+        &db,
+        "users",
+        ada,
+        r#"{"$inc": {"n": 1}, "$pop": {"name": 1}}"#,
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let again: serde_json::Value =
+        serde_json::from_str(stdout(&trunkdb(&["find", &db, "users", ada])).trim()).unwrap();
+    assert_eq!(again["n"], 6);
+
+    // What isn't an update.
+    for (update, says) in [
+        (r#"{"name": "Al"}"#, "`name` isn't an operator"),
+        (
+            r#"{"$replace": {"a": 1}}"#,
+            "$replace: not an update operator",
+        ),
+        ("{}", "the update has no operators"),
+        ("[1]", "the update is an object of operators"),
+        (r#"{"$set": 1}"#, "$set takes an object of paths"),
+        (r#"{"$pop": {"tags": 2}}"#, "$pop takes 1"),
+        (
+            r#"{"$rename": {"a": 1}}"#,
+            "$rename takes the new path as a string",
+        ),
+        ("{", "the update isn't JSON"),
+    ] {
+        let output = trunkdb(&["update", &db, "users", ada, update]);
+        assert_eq!(output.status.code(), Some(2), "{update}");
+        assert!(
+            stderr(&output).contains(says),
+            "{update}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A write that would take every document, more than one, needs `--all`;
+/// `--dry-run` counts and writes nothing (SPEC §156.3).
+#[test]
+fn update_and_delete_ask_for_all_and_can_run_dry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = users_db(dir.path());
+    let set = r#"{"$set": {"seen": true}}"#;
+    for filter in ["", "age > 0", "limit 5"] {
+        let output = trunkdb(&["update", &db, "users", filter, set]);
+        assert_eq!(output.status.code(), Some(2), "{filter:?}");
+        assert!(stderr(&output).contains("this would update all 2 documents of users; add --all"));
+        let output = trunkdb(&["delete", &db, "users", filter]);
+        assert!(stderr(&output).contains("this would delete all 2 documents of users; add --all"));
+    }
+    let output = trunkdb(&["update", &db, "users", "", set, "--dry-run", "--all"]);
+    assert_eq!(stderr(&output), "would update 2 documents\n");
+    let output = trunkdb(&["delete", &db, "users", "age > 40", "--dry-run"]);
+    assert_eq!(stderr(&output), "would delete 1 document\n");
+    assert_eq!(
+        stdout(&trunkdb(&["count", &db, "users", "seen = true"])),
+        "0\n"
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &db, "users"])), "2\n");
+
+    let output = trunkdb(&["delete", &db, "users", "age > 40"]);
+    assert_eq!(stderr(&output), "deleted 1 document\n");
+    // One left: the one document is all of them, and needs no `--all`.
+    let output = trunkdb(&["update", &db, "users", "", set]);
+    assert_eq!(stderr(&output), "updated 1 document\n");
+    let output = trunkdb(&["delete", &db, "users", "", "--all"]);
+    assert_eq!(stderr(&output), "deleted 1 document\n");
+    assert_eq!(stdout(&trunkdb(&["count", &db, "users"])), "0\n");
+    let output = trunkdb(&["delete", &db, "users", "name =", "--all"]);
+    assert_eq!(output.status.code(), Some(2), "a filter that doesn't read");
+    let output = trunkdb(&["delete", &db, "nobody", ""]);
+    assert!(stderr(&output).contains("nobody: no such collection"));
+}
+
+/// `--upsert`: the one match updated, or a document of the filter's `=`s
+/// and the update inserted, with `$setOnInsert`.
+#[test]
+fn update_upserts_where_nothing_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = users_db(dir.path());
+    let update = r#"{"$inc": {"visits": 1}, "$setOnInsert": {"new": true}}"#;
+    let output = trunkdb(&[
+        "update",
+        &db,
+        "users",
+        r#"name = "Zed""#,
+        update,
+        "--upsert",
+        "--dry-run",
+    ]);
+    assert_eq!(stderr(&output), "would insert 1 document\n");
+    let output = trunkdb(&[
+        "update",
+        &db,
+        "users",
+        r#"name = "Zed""#,
+        update,
+        "--upsert",
+    ]);
+    assert_eq!(stderr(&output), "inserted 1 document\n");
+    let id = stdout(&output).trim().to_string();
+    let output = trunkdb(&[
+        "update",
+        &db,
+        "users",
+        r#"name = "Zed""#,
+        update,
+        "--upsert",
+    ]);
+    assert_eq!(stderr(&output), "updated 1 document\n");
+    assert_eq!(stdout(&output).trim(), id);
+    let zed: serde_json::Value =
+        serde_json::from_str(stdout(&trunkdb(&["get", &db, "users", &id])).trim()).unwrap();
+    assert_eq!(
+        (
+            zed["name"].clone(),
+            zed["visits"].clone(),
+            zed["new"].clone()
+        ),
+        ("Zed".into(), 2.into(), true.into())
+    );
+}
+
+/// Indexes added, found there already, refused where a unique one finds
+/// two equal, dropped; a collection dropped.
+#[test]
+fn indexes_and_collections_are_added_and_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = users_db(dir.path());
+    let output = trunkdb(&["index", &db, "users", "add", "name", "age", "--unique"]);
+    assert_eq!(stderr(&output), "added index (name, age) to users\n");
+    let output = trunkdb(&["index", &db, "users", "add", "name", "age", "--unique"]);
+    assert_eq!(stderr(&output), "users has index (name, age) already\n");
+    let output = trunkdb(&["index", &db, "users", "add", "city", "--sparse"]);
+    assert!(output.status.success());
+    let info = stdout(&trunkdb(&["info", &db]));
+    assert!(
+        info.contains("(name, age) (unique)") && info.contains("city (sparse)"),
+        "{info}"
+    );
+    // Two documents with no `team` collide in a unique index that isn't sparse.
+    assert!(
+        trunkdb(&["insert", &db, "users", r#"{"name": "Ada", "age": 99}"#])
+            .status
+            .success()
+    );
+    let output = trunkdb(&["index", &db, "users", "add", "name", "--unique"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(!stdout(&trunkdb(&["info", &db])).contains("name (unique)"));
+
+    let output = trunkdb(&["index", &db, "users", "drop", "name", "age"]);
+    assert_eq!(stderr(&output), "dropped index (name, age) of users\n");
+    let output = trunkdb(&["index", &db, "users", "drop", "name", "age"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("users has no index (name, age)"));
+    let output = trunkdb(&["index", &db, "users", "add"]);
+    assert_eq!(output.status.code(), Some(2));
+    let output = trunkdb(&["index", &db, "nobody", "add", "x"]);
+    assert!(stderr(&output).contains("nobody: no such collection"));
+
+    let output = trunkdb(&["drop", &db, "users"]);
+    assert_eq!(stderr(&output), "dropped users and its 3 documents\n");
+    assert!(!stdout(&trunkdb(&["info", &db])).contains("users:"));
+    let output = trunkdb(&["drop", &db, "users"]);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A file another program has open: every write refused as in use,
+/// nothing changed (SPEC §88, §156).
+#[test]
+fn writes_refuse_a_file_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = users_db(dir.path());
+    let read_only = trunkdb::OpenOptions::default().read_only(true);
+    let held = trunkdb::Database::open_with(&db_path, read_only).unwrap();
+    for args in [
+        &["insert", &db_path, "users", "{}"][..],
+        &[
+            "update",
+            &db_path,
+            "users",
+            "age > 40",
+            r#"{"$set": {"a": 1}}"#,
+        ],
+        &["delete", &db_path, "users", "age > 40"],
+        &["index", &db_path, "users", "add", "x"],
+        &["drop", &db_path, "users"],
+    ] {
+        let output = trunkdb(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr(&output).contains("in use by another program"),
+            "{args:?}"
+        );
+    }
+    close(held);
+    assert_eq!(all(&db_path, "users").len(), 2);
+}

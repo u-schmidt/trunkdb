@@ -1,9 +1,10 @@
 //! The `trunkdb` command (SPEC §39): look into a database file, check it,
 //! compact it, export it, import into it, find documents in it (§112),
 //! sum up the fields its documents have (§121), count them and get one by
-//! id, with JSON for a program or an agent to read (§155). Looking,
-//! checking, exporting, finding, summing up, counting and getting open it
-//! read-only (SPEC §88).
+//! id, with JSON for a program or an agent to read (§155); insert,
+//! update and delete documents, add and drop indexes, drop a collection
+//! (§156). Looking, checking, exporting, finding, summing up, counting
+//! and getting open it read-only (SPEC §88).
 //!
 //! Arguments are parsed by hand: seven subcommands don't need a parser
 //! crate, and a library's dependencies are compiled for everyone who uses
@@ -56,6 +57,31 @@ commands:
 --json prints what a program reads: info and check one JSON object, fields
 one JSON object per path.
 
+writing (each command is one atomic batch; the file must exist but for insert --create):
+  insert <file> <collection> <document | -> [--create]
+                              one document as JSON, or `-`: one per line on
+                              standard input; prints each new id. A missing
+                              collection is an error; --create makes it
+  update <file> <collection> <filter> <update> [--all] [--upsert] [--dry-run]
+                              change the documents the filter finds, the
+                              update as JSON operators, like
+                              '{\"$set\": {\"status\": \"done\"}, \"$inc\": {\"n\": 1}}':
+                              $set $setOnInsert $unset $inc $mul $min $max
+                              $rename $push ($each) $addToSet ($each) $pull
+                              $pop (1 last, -1 first). --upsert inserts a
+                              document made of the filter's `=`s where none
+                              matches
+  delete <file> <collection> <filter> [--all] [--dry-run]
+                              delete the documents the filter finds
+  index  <file> <collection> add <field>... [--unique] [--sparse]
+  index  <file> <collection> drop <field>...
+                              an index on one field, or on several in order
+  drop   <file> <collection>  the collection, its documents and indexes
+
+update and delete refuse to change every document of a collection unless
+given --all; --dry-run says how many they would change, writing nothing.
+The filter is one argument: quote it, '' for none.
+
 info, check, export, find, fields, count and get only read: they change
 nothing in the file or its log, not even what a crash of the program that
 had it open left there.
@@ -64,41 +90,48 @@ had it open left there.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result =
-        match args[..] {
-            ["info", file] => read_only(file).and_then(|db| info(file, &db)),
-            ["info", file, "--json"] => read_only(file).and_then(|db| info_json(file, &db)),
-            ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
-            ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
-            ["compact", file] => existing(file).and_then(|db| compact(&db)),
-            ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
-            ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
-            ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
-            ["find", file, collection, ref filter @ .., "--explain"] => read_only(file)
-                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained)),
-            ["find", file, collection, ref filter @ ..] => read_only(file)
-                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents)),
-            ["fields", file, collection, ref filter @ .., "--json"] => read_only(file)
-                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Json)),
-            ["fields", file, collection, ref filter @ ..] => read_only(file)
-                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Text)),
-            ["count", file, collection, ref filter @ ..] => {
-                read_only(file).and_then(|db| count_of(&db, collection, &filter.join(" ")))
-            }
-            ["get", file, collection, id] => {
-                read_only(file).and_then(|db| get(&db, collection, id))
-            }
-            ["import", file, input, "--max-line", limit] => max_line(limit)
-                .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
-            ["help" | "-h" | "--help"] => {
-                print!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            _ => {
-                eprint!("{USAGE}");
-                return ExitCode::from(2);
-            }
-        };
+    let result = match args[..] {
+        ["info", file] => read_only(file).and_then(|db| info(file, &db)),
+        ["info", file, "--json"] => read_only(file).and_then(|db| info_json(file, &db)),
+        ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
+        ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
+        ["compact", file] => existing(file).and_then(|db| compact(&db)),
+        ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
+        ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
+        ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
+        ["find", file, collection, ref filter @ .., "--explain"] => {
+            read_only(file).and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained))
+        }
+        ["find", file, collection, ref filter @ ..] => {
+            read_only(file).and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents))
+        }
+        ["fields", file, collection, ref filter @ .., "--json"] => {
+            read_only(file).and_then(|db| fields(&db, collection, &filter.join(" "), Format::Json))
+        }
+        ["fields", file, collection, ref filter @ ..] => {
+            read_only(file).and_then(|db| fields(&db, collection, &filter.join(" "), Format::Text))
+        }
+        ["count", file, collection, ref filter @ ..] => {
+            read_only(file).and_then(|db| count_of(&db, collection, &filter.join(" ")))
+        }
+        ["get", file, collection, id] => read_only(file).and_then(|db| get(&db, collection, id)),
+        ["insert", file, collection, ref rest @ ..] => insert(file, collection, rest),
+        ["update", file, collection, ref rest @ ..] => update(file, collection, rest),
+        ["delete", file, collection, ref rest @ ..] => delete(file, collection, rest),
+        ["index", file, collection, "add", ref rest @ ..] => index_add(file, collection, rest),
+        ["index", file, collection, "drop", ref rest @ ..] => index_drop(file, collection, rest),
+        ["drop", file, collection] => drop_collection(file, collection),
+        ["import", file, input, "--max-line", limit] => max_line(limit)
+            .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
+        ["help" | "-h" | "--help"] => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     match result {
         Ok(code) => code,
         Err(message) => {
@@ -1049,5 +1082,434 @@ fn fields(db: &Database, collection: &str, filter: &str, format: Format) -> Outc
     if summary.full {
         eprintln!("only the first {MAX_PATHS} paths found are counted; a filter can narrow it");
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+// Writing (SPEC §156).
+
+/// A command line that doesn't say what to do: why, and exit code 2, as
+/// for the usage.
+fn misused(why: &str) -> Outcome {
+    eprintln!("trunkdb: {why} (`trunkdb help` shows how)");
+    Ok(ExitCode::from(2))
+}
+
+/// `args` split into the options among them, each one of `allowed`, and
+/// the rest, in order. `Err` names one that isn't allowed.
+fn options<'a>(args: &[&'a str], allowed: &[&str]) -> Result<(Vec<&'a str>, Vec<&'a str>), String> {
+    let mut rest = Vec::new();
+    let mut given = Vec::new();
+    for &arg in args {
+        match arg.strip_prefix("--") {
+            Some(_) if allowed.contains(&arg) => given.push(arg),
+            Some(_) => return Err(format!("{arg}: not an option of this command")),
+            None => rest.push(arg),
+        }
+    }
+    Ok((rest, given))
+}
+
+/// Whether `name` is a collection of `db`.
+fn has_collection(db: &Database, name: &str) -> Result<bool, String> {
+    Ok(db
+        .collections()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|c| c == name))
+}
+
+/// `trunkdb insert` (SPEC §156): one document given as JSON, or one per
+/// line on standard input, all in one batch; each new id printed.
+fn insert(file: &str, collection: &str, args: &[&str]) -> Outcome {
+    let (rest, given) = match options(args, &["--create"]) {
+        Ok(split) => split,
+        Err(why) => return misused(&why),
+    };
+    let [source] = rest[..] else {
+        return misused(
+            "insert takes one document as JSON, or `-` to read them from standard input",
+        );
+    };
+    let create = given.contains(&"--create");
+    let mut docs = Vec::new();
+    let mut add = |text: &str, line: Option<usize>| -> Result<(), String> {
+        let at = line.map_or(String::new(), |line| format!("line {line}: "));
+        let doc: Document = text
+            .parse()
+            .map_err(|e| format!("{at}not a JSON document: {e}"))?;
+        if !matches!(doc, Document::Object(_)) {
+            return Err(format!("{at}a document is a JSON object, `{{…}}`"));
+        }
+        docs.push(doc);
+        Ok(())
+    };
+    let read = match source {
+        "-" => {
+            if io::stdin().is_terminal() {
+                return misused(
+                    "`-` reads documents from standard input, one per line; pipe them in",
+                );
+            }
+            let mut read = Ok(());
+            for (i, line) in io::stdin().lines().enumerate() {
+                let line = line.map_err(|e| format!("standard input: {e}"))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                read = add(&line, Some(i + 1));
+                if read.is_err() {
+                    break;
+                }
+            }
+            read
+        }
+        text => add(text, None),
+    };
+    if let Err(why) = read {
+        eprintln!("trunkdb: {why}; nothing inserted");
+        return Ok(ExitCode::from(2));
+    }
+    let db = match create {
+        true => open(file)?,
+        false => existing(file)?,
+    };
+    if !create && !has_collection(&db, collection)? {
+        return Err(format!(
+            "{collection}: no such collection; --create makes it"
+        ));
+    }
+    let failed = |e: trunkdb::Error| e.to_string();
+    let target = db.collection::<Document>(collection);
+    let mut batch = db.batch();
+    let mut ids = Vec::with_capacity(docs.len());
+    for doc in docs {
+        ids.push(batch.insert(&target, doc).map_err(failed)?);
+    }
+    batch.commit().map_err(failed)?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    for id in &ids {
+        if let Err(e) = writeln!(out, "{id}") {
+            return stopped_writing(e);
+        }
+    }
+    if let Err(e) = out.flush() {
+        return stopped_writing(e);
+    }
+    eprintln!("inserted {}", count(ids.len(), "document"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// An update written as MongoDB writes one (SPEC §156.2): an object of
+/// operators, each an object of paths and what to do there.
+fn parse_update(text: &str) -> Result<trunkdb::query::Update, String> {
+    use trunkdb::query::Update;
+    const OPERATORS: &str = "$set $setOnInsert $unset $inc $mul $min $max $rename $push \
+                             $addToSet $pull $pop";
+    let doc: Document = text
+        .parse()
+        .map_err(|e| format!("the update isn't JSON: {e}"))?;
+    let Document::Object(ops) = doc else {
+        return Err(
+            r#"the update is an object of operators, like {"$set": {"status": "done"}}"#
+                .to_string(),
+        );
+    };
+    if ops.is_empty() {
+        return Err(format!("the update has no operators; one of {OPERATORS}"));
+    }
+    let paths = |op: &str, args: Document| -> Result<Vec<(String, Document)>, String> {
+        match args {
+            Document::Object(fields) if !fields.is_empty() => Ok(fields.into_iter().collect()),
+            _ => Err(format!(
+                r#"{op} takes an object of paths, like {{"{op}": {{"status": …}}}}"#
+            )),
+        }
+    };
+    let mut update = Update::new();
+    for (op, args) in ops {
+        match op.as_str() {
+            "$set" | "$setOnInsert" | "$inc" | "$mul" | "$min" | "$max" | "$pull" => {
+                for (path, value) in paths(&op, args)? {
+                    update = match op.as_str() {
+                        "$set" => update.set(path, value),
+                        "$setOnInsert" => update.set_on_insert(path, value),
+                        "$inc" => update.inc(path, value),
+                        "$mul" => update.mul(path, value),
+                        "$min" => update.min(path, value),
+                        "$max" => update.max(path, value),
+                        _ => update.pull(path, value),
+                    };
+                }
+            }
+            "$unset" => {
+                let names: Vec<String> = match args {
+                    Document::Array(names) => names
+                        .into_iter()
+                        .map(|name| match name {
+                            Document::String(name) => Ok(name),
+                            _ => Err("$unset takes paths as strings".to_string()),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    args => paths(&op, args)?
+                        .into_iter()
+                        .map(|(path, _)| path)
+                        .collect(),
+                };
+                for path in names {
+                    update = update.unset(path);
+                }
+            }
+            "$rename" => {
+                for (from, to) in paths(&op, args)? {
+                    let Document::String(to) = to else {
+                        return Err(format!(
+                            "$rename takes the new path as a string, for {from}"
+                        ));
+                    };
+                    update = update.rename(from, to);
+                }
+            }
+            "$push" | "$addToSet" => {
+                for (path, value) in paths(&op, args)? {
+                    let each = match &value {
+                        Document::Object(fields) if fields.len() == 1 => {
+                            match fields.get("$each") {
+                                Some(Document::Array(values)) => Some(values.clone()),
+                                Some(_) => {
+                                    return Err(format!("{op}: $each takes an array, for {path}"));
+                                }
+                                None => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    update = match (op.as_str(), each) {
+                        ("$push", Some(values)) => update.push_all(path, values),
+                        ("$push", None) => update.push(path, value),
+                        (_, Some(values)) => values.into_iter().fold(update, |update, value| {
+                            update.add_to_set(path.clone(), value)
+                        }),
+                        (_, None) => update.add_to_set(path, value),
+                    };
+                }
+            }
+            "$pop" => {
+                for (path, end) in paths(&op, args)? {
+                    update = match end {
+                        Document::Int(1) => update.pop_last(path),
+                        Document::Int(-1) => update.pop_first(path),
+                        _ => {
+                            return Err(format!(
+                                "$pop takes 1 for the last element or -1 for the first, for {path}"
+                            ));
+                        }
+                    };
+                }
+            }
+            other if other.starts_with('$') => {
+                return Err(format!(
+                    "{other}: not an update operator; one of {OPERATORS}"
+                ));
+            }
+            field => {
+                return Err(format!(
+                    r#"`{field}` isn't an operator: say how to change it, {{"$set": {{"{field}": …}}}}; a whole document isn't replaced"#
+                ));
+            }
+        }
+    }
+    Ok(update)
+}
+
+/// A write whose filter takes every document of the collection, more than
+/// one, without `--all` (SPEC §156.3): refused, saying so.
+fn touches_all(
+    docs: &trunkdb::Collection<Document>,
+    filter: &Filter,
+    all: bool,
+    verb: &str,
+) -> Result<Option<ExitCode>, String> {
+    if all {
+        return Ok(None);
+    }
+    let failed = |e: trunkdb::Error| e.to_string();
+    let total = docs.count(Filter::new()).map_err(failed)?;
+    let taken = docs.count(filter.clone()).map_err(failed)?;
+    if total > 1 && taken == total {
+        eprintln!(
+            "trunkdb: this would {verb} all {total} documents of {}; add --all if that's meant",
+            docs.name()
+        );
+        return Ok(Some(ExitCode::from(2)));
+    }
+    Ok(None)
+}
+
+/// `trunkdb update` (SPEC §156): the documents the filter finds changed by
+/// the update's operators; with `--upsert`, one inserted where none is.
+fn update(file: &str, collection: &str, args: &[&str]) -> Outcome {
+    let (rest, given) = match options(args, &["--all", "--upsert", "--dry-run"]) {
+        Ok(split) => split,
+        Err(why) => return misused(&why),
+    };
+    let [filter, update] = rest[..] else {
+        return misused("update takes a filter and an update, each one argument in quotes");
+    };
+    let update = match parse_update(update) {
+        Ok(update) => update,
+        Err(why) => return misused(&why),
+    };
+    let db = existing(file)?;
+    let (docs, filter) = match query(&db, collection, filter)? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
+    };
+    let failed = |e: trunkdb::Error| e.to_string();
+    let dry_run = given.contains(&"--dry-run");
+    if given.contains(&"--upsert") {
+        let found = docs.count(filter.clone()).map_err(failed)?;
+        if dry_run {
+            eprintln!(
+                "would {}",
+                match found {
+                    0 => "insert 1 document".to_string(),
+                    n => format!("update {}", count(n, "document")),
+                }
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        let upserted = docs.upsert_fields(filter, &update).map_err(failed)?;
+        println!("{}", upserted.id());
+        eprintln!(
+            "{} 1 document",
+            match upserted {
+                trunkdb::Upserted::Inserted(_) => "inserted",
+                _ => "updated",
+            }
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(refused) = touches_all(&docs, &filter, given.contains(&"--all"), "update")? {
+        return Ok(refused);
+    }
+    if dry_run {
+        let n = docs.count(filter).map_err(failed)?;
+        eprintln!("would update {}", count(n, "document"));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let n = docs.update_fields(filter, &update).map_err(failed)?;
+    eprintln!("updated {}", count(n, "document"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `trunkdb delete` (SPEC §156): the documents the filter finds.
+fn delete(file: &str, collection: &str, args: &[&str]) -> Outcome {
+    let (rest, given) = match options(args, &["--all", "--dry-run"]) {
+        Ok(split) => split,
+        Err(why) => return misused(&why),
+    };
+    let [filter] = rest[..] else {
+        return misused("delete takes a filter, one argument in quotes");
+    };
+    let db = existing(file)?;
+    let (docs, filter) = match query(&db, collection, filter)? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
+    };
+    let failed = |e: trunkdb::Error| e.to_string();
+    if let Some(refused) = touches_all(&docs, &filter, given.contains(&"--all"), "delete")? {
+        return Ok(refused);
+    }
+    if given.contains(&"--dry-run") {
+        let n = docs.count(filter).map_err(failed)?;
+        eprintln!("would delete {}", count(n, "document"));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let n = docs.delete_many(filter).map_err(failed)?;
+    eprintln!("deleted {}", count(n, "document"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// An index's fields as `info` names them: `status`, `(team, email)`.
+fn index_name(fields: &[&str]) -> String {
+    match fields {
+        [one] => one.to_string(),
+        many => format!("({})", many.join(", ")),
+    }
+}
+
+/// `trunkdb index … add` (SPEC §156): an index made, over the documents
+/// already there, or found there already.
+fn index_add(file: &str, collection: &str, args: &[&str]) -> Outcome {
+    let (fields, given) = match options(args, &["--unique", "--sparse"]) {
+        Ok(split) => split,
+        Err(why) => return misused(&why),
+    };
+    if fields.is_empty() {
+        return misused("index add takes the fields to index, one or more");
+    }
+    let db = existing(file)?;
+    if !has_collection(&db, collection)? {
+        return Err(format!("{collection}: no such collection"));
+    }
+    let mut options = trunkdb::IndexOptions::new();
+    if given.contains(&"--unique") {
+        options = options.unique();
+    }
+    if given.contains(&"--sparse") {
+        options = options.sparse();
+    }
+    let made = db
+        .collection::<Document>(collection)
+        .ensure_index_with(&fields[..], options)
+        .map_err(|e| e.to_string())?;
+    let name = index_name(&fields);
+    match made {
+        true => eprintln!("added index {name} to {collection}"),
+        false => eprintln!("{collection} has index {name} already"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `trunkdb index … drop` (SPEC §156); none on those fields is exit code 1.
+fn index_drop(file: &str, collection: &str, args: &[&str]) -> Outcome {
+    let (fields, _) = match options(args, &[]) {
+        Ok(split) => split,
+        Err(why) => return misused(&why),
+    };
+    if fields.is_empty() {
+        return misused("index drop takes the fields of the index, one or more");
+    }
+    let db = existing(file)?;
+    if !has_collection(&db, collection)? {
+        return Err(format!("{collection}: no such collection"));
+    }
+    let dropped = db
+        .collection::<Document>(collection)
+        .drop_index(&fields[..])
+        .map_err(|e| e.to_string())?;
+    let name = index_name(&fields);
+    match dropped {
+        true => {
+            eprintln!("dropped index {name} of {collection}");
+            Ok(ExitCode::SUCCESS)
+        }
+        false => Err(format!("{collection} has no index {name}")),
+    }
+}
+
+/// `trunkdb drop` (SPEC §156): a collection, its documents and indexes.
+fn drop_collection(file: &str, collection: &str) -> Outcome {
+    let db = existing(file)?;
+    if !has_collection(&db, collection)? {
+        return Err(format!("{collection}: no such collection"));
+    }
+    let failed = |e: trunkdb::Error| e.to_string();
+    let n = db
+        .collection::<Document>(collection)
+        .count(Filter::new())
+        .map_err(failed)?;
+    db.drop_collection(collection).map_err(failed)?;
+    eprintln!("dropped {collection} and its {}", count(n, "document"));
     Ok(ExitCode::SUCCESS)
 }

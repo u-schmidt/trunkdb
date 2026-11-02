@@ -170,3 +170,4 @@ say what changed, and DESIGN.md says what is true now.
 153. [A grown cell made room for in place (`storage/slotted.rs`)](153-a-grown-cell-made-room-for-in-place.md)
 154. [A sort by a key of the application's own (`query.rs`, `collection.rs`, `live.rs`, `query_text.rs`)](154-a-sort-by-a-key-of-the-applications-own.md)
 155. [`trunkdb count`, `get`, and JSON for a program (`src/bin/trunkdb.rs`)](155-trunkdb-count-get-and-json.md)
+156. [`trunkdb insert`, `update`, `delete`, and indexes (`src/bin/trunkdb.rs`)](156-trunkdb-insert-update-delete-and-indexes.md)

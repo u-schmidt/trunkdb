@@ -636,7 +636,7 @@ more than four.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `info`, `check`, `export`, `find` and `fields` open the file read-only [§88](spec/88-a-read-only-open.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
@@ -858,7 +858,8 @@ src/
 ├── compact.rs         Database::compact: rebuild, file shrinks
 ├── fuzzing.rs         hooks for fuzz/, behind a feature, hidden
 └── bin/trunkdb.rs     the `trunkdb` command (info, check, compact,
-                         export, import, find, fields)
+                         export, import, find, fields, count, get,
+                         insert, update, delete, index, drop)
 tests/                 the command line, and a time-series-shaped
                          workload through the public API; ui/: what
                          #[trunkdb::document] refuses, compiled

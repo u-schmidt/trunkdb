@@ -911,3 +911,12 @@ limit, batches and a write-ahead log. Since then:
     <collection> <id>` prints the document with an id, exit code 1 if
     there is none. `info`, `check` and `fields` take `--json`, for a
     program or an AI agent to read. The agent skill uses them.
+127. **Writing through the `trunkdb` command** (§156): `insert` one
+    document as JSON, or one per line from standard input; `update`
+    with MongoDB's operators written as JSON (`$set`, `$inc`, `$push`
+    with `$each`, `$pop` and the others), `--upsert` too; `delete`;
+    `index add` and `index drop`; `drop` a collection. Each is one
+    atomic batch. An update or delete that would change every document
+    of a collection asks for `--all`; `--dry-run` says how many it
+    would change; `insert` into a collection that isn't there asks for
+    `--create`. The agent skill says how an agent writes safely.

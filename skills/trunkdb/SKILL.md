@@ -1,6 +1,6 @@
 ---
 name: trunkdb
-description: Look into trunkdb database files with the `trunkdb` command — what collections they hold, what their documents look like, finding and counting documents, checking a file for damage, backing it up as JSON Lines. Use this whenever a task involves a trunkdb file (often `*.trunkdb`, with a `*.trunkdb.wal` beside it) or a database written by an app built on the trunkdb crate, even if the user just says "look at this database", "what's in this file" or asks a question about the data in it.
+description: Look into and change trunkdb database files with the `trunkdb` command — what collections they hold, what their documents look like, finding and counting documents, inserting, updating and deleting them, adding indexes, checking a file for damage, backing it up as JSON Lines. Use this whenever a task involves a trunkdb file (often `*.trunkdb`, with a `*.trunkdb.wal` beside it) or a database written by an app built on the trunkdb crate, even if the user just says "look at this database", "what's in this file" or asks a question about the data in it.
 ---
 
 # Inspecting trunkdb files
@@ -102,16 +102,62 @@ collection is an error (exit 1), not an empty result.
   backup to make before anything changes the file, and the way to hand
   the data to another tool, but `fields` and `find` answer questions
   for a fraction of the output.
-- **Don't run `compact` or `import` unless the user asks.** They write
-  to the file. `info`, `check`, `export`, `find`, `fields`, `count` and
-  `get` only read it and can't damage it, even beside a running app.
-- **"in use by another program"** means an app has the database open
-  for writing, which locks it. Tell the user; don't copy the file to
-  get around the lock, since a copy taken while the app writes can miss
-  what is still in its `.wal` file.
-- **Changing documents isn't possible through the command yet.** Say
-  so, and offer what is: an export, edited and imported into a new
-  file, or a few lines of Rust with the trunkdb crate.
+- **Don't write unless the user asked for that change.** `insert`,
+  `update`, `delete`, `index`, `drop`, `compact` and `import` write to
+  the file (see "Changing documents" below). `info`, `check`, `export`,
+  `find`, `fields`, `count` and `get` only read it and can't damage it.
+- **"in use by another program"** means an app has the database open,
+  which locks it: for a write, against every other open; for a read,
+  against writes. Tell the user, and ask them to close the app. Don't
+  copy the file to get around the lock, since a copy taken while the
+  app writes can miss what is still in its `.wal` file.
+
+## Changing documents
+
+Each write is one atomic batch: it happens whole, or not at all. Work
+like this:
+
+1. **Count first.** Run the same filter with `count`, or the write with
+   `--dry-run`, which says how many documents it would change and writes
+   nothing. Tell the user the number if it isn't the one they expect.
+2. **Back up before a large change:** `trunkdb export <file>
+   backup.jsonl`. `import` of that into a new file undoes anything.
+3. **Then write**, the filter and the update each one argument in
+   single quotes:
+
+```text
+trunkdb insert app.trunkdb tasks '{"title": "Write docs", "status": "open"}'
+printf '%s\n' '{"title": "a"}' '{"title": "b"}' | trunkdb insert app.trunkdb tasks -
+trunkdb update app.trunkdb tasks 'status = "open" and due < date("2026-01-01T00:00:00Z")' \
+  '{"$set": {"status": "late"}, "$inc": {"reminders": 1}}'
+trunkdb update app.trunkdb counters 'name = "visits"' '{"$inc": {"n": 1}}' --upsert
+trunkdb delete app.trunkdb tasks 'status = "done" and closed < date("2025-01-01T00:00:00Z")'
+trunkdb index app.trunkdb tasks add status due      # one index on both, in that order
+trunkdb index app.trunkdb users add email --unique
+```
+
+- **`insert`** takes one JSON object, or `-` and one per line on stdin;
+  it prints each new id. Ids and dates are written `{"$id": "…"}` and
+  `{"$date": "…"}` inside JSON. A collection that doesn't exist is an
+  error, so a typo can't create one; add `--create` only when the user
+  wants a new collection.
+- **`update`** takes MongoDB's operators: `$set`, `$unset` (a list of
+  paths), `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$push` (with
+  `{"$each": […]}` for several), `$addToSet` (with `$each`), `$pull`,
+  `$pop` (1 the last, -1 the first), and `$setOnInsert` with
+  `--upsert`. A whole document isn't replaced: `{"title": "x"}` without
+  an operator is refused. `--upsert` updates the one match, or inserts
+  a document made of the filter's `=` conditions and the update.
+  "updated N documents" counts the documents that changed: one already
+  as the update leaves it doesn't count.
+- **An update or delete that would change every document** of a
+  collection is refused unless you add `--all`. Add it only when the
+  user asked for all of them.
+- **`drop`** removes a collection with its documents and indexes; it
+  can't be undone without a backup. Confirm with the user first.
+- **`index add`** on a unique index fails, and adds nothing, if two
+  documents already share a value; `find` them with the field sorted
+  to show the user which.
 
 ## Checking a file
 
