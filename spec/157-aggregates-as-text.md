@@ -77,7 +77,7 @@ opens the file read-only.
 - `an_aggregate_s_text_says_what_its_builders_say`: the doc's example
   against its builders, `count(*)`, `count(distinct …)`, any case, each
   unit, `Display`'s longest unit, `unwind` of two.
-- `an_aggregate_s_mistakes_are_named`: seventeen texts that aren't an
+- `an_aggregate_s_mistakes_are_named`: eighteen texts that aren't an
   aggregate, each with what is said.
 - `aggregate_prints_the_rows_of_its_text` (`tests/cli.rs`): rows by
   group and sorted, a column's filter, `unwind` with `having`, `last`

@@ -30,7 +30,12 @@ narrow questions:
    without guessing from samples, and which are optional (count lower
    than the collection's) or mixed (several types). Paths are printed
    exactly as filters write them, so copy them. On a large collection
-   add `limit 10000` to sum up a sample: it reads only those.
+   add `limit 10000` to sum up a sample: it reads only those. **A count
+   lower than the collection's** means the rest lack the field: a sum
+   or a filter on it passes them over. **A path with several types** (`int 211, string 9`) matters: comparisons and
+   `sum`/`avg` pass over the values of the other type without a word.
+   Say so in your answer, with the counts; `references/filters.md`
+   shows how to find those documents.
 3. **`trunkdb find <file> <collection> '<filter>'`** — the documents a
    filter finds, one JSON document per line, then `found N documents`
    on stderr. Always give it `limit`, and `select` the fields you need:
@@ -59,6 +64,10 @@ narrow questions:
 `documents`, `kinds`). Use it when you go on with `jq` or code; the
 text is shorter to read.
 
+There is no `now()`: for "today" or "overdue", write the date
+yourself, in UTC, `due < date("2026-11-02T00:00:00Z")`, and say in
+your answer which point in time you used.
+
 The filter language is SQL's `WHERE` with a few additions for nested
 documents and arrays. Wrap the whole filter in single quotes for the
 shell; strings inside it take double quotes (`'name = "Ada"'`, never
@@ -84,6 +93,46 @@ For anything beyond these — backticks for names with spaces or that
 are keywords, `@` inside `has`, how null and missing compare, what a
 mistake message means — read `references/filters.md`.
 
+## Two collections
+
+There are no joins. A document refers to another by its id
+(`"assignee": {"$id": "…"}`), and you put the two together yourself:
+
+- **Names for ids:** group or find by the id, then read the few
+  documents it refers to and put their names in your answer:
+  `trunkdb aggregate app.trunkdb tasks 'status = "done"' 'sum(hours) as
+  hours group by assignee'`, then `trunkdb find app.trunkdb users
+  'select name'`.
+- **By something of the other collection** ("the tasks of the web
+  team's people"): find the ids first, then filter by them,
+  `assignee in (id("…"), id("…"))`.
+- **An id to write:** look it up, `trunkdb find app.trunkdb users
+  'select _id where name = "Ada"'`, and write it as `{"$id": "…"}` in a
+  document or an update.
+
+## Making a query fast
+
+`--explain` after `find` (or `aggregate`) shows which index it read and
+how many entries, and its `instead:` lines what the others would have
+read. Which conditions an index can serve is in `references/filters.md`;
+in short, `=`, ranges, `in` and `is null` can, while `!=`, `not in`,
+`not`, `contains` and `exists` read every document. To speed up a query:
+
+1. Run it with `--explain`. A `scan of every document` with many
+   documents is what an index helps.
+2. Rewrite what you can into conditions an index serves: `status in
+   ("open", "late")` for `status not in ("done", "cancelled")`.
+3. Add an index on the field the most selective condition is on, or on
+   several, the `=` field first, then the range's: `trunkdb index
+   app.trunkdb tasks add status due` serves `status = "open" and due <
+   …`. With several values of the first field, write one `=` branch per
+   value, each with the range, `(status = "open" and due < X) or
+   (status = "late" and due < X)`: written as `status in (…) and due <
+   X`, the index reads each status whole and checks `due` after.
+4. Run `--explain` again and show the user the entries before and
+   after. `count` has no `--explain`: explain the same filter with
+   `find`.
+
 ## Reading what it prints
 
 Documents are compact JSON with tags for what JSON has no type for:
@@ -102,7 +151,10 @@ collection is an error (exit 1), not an empty result.
   [out.jsonl]` writes every document of every collection. It's the
   backup to make before anything changes the file, and the way to hand
   the data to another tool, but `fields` and `find` answer questions
-  for a fraction of the output.
+  for a fraction of the output. An export is JSON Lines: a first line
+  `{"$trunkdb_export": 2}`, then for each collection a line
+  `{"$collection": "…", "$indexes": […]}` and one line per document;
+  `trunkdb import <new file> <export>` makes a database of it again.
 - **Don't write unless the user asked for that change.** `insert`,
   `update`, `delete`, `index`, `drop`, `compact` and `import` write to
   the file (see "Changing documents" below). `info`, `check`, `export`,

@@ -82,8 +82,36 @@ where the difference grows. What the runs showed went back into the
 skill: the quoting and the date's time spelled out, and the count kept
 out of `jq` (`2>/dev/null`), where one run had fed it in.
 
-## 122.5 Limits
-- Reading only, as the command is. When `delete`, `update` and
-  `insert` come, the skill learns them in the same commits.
+## 122.5 Tried again, with writes (§155–§157)
+Once the command could write and aggregate, a fresh agent was given
+the skill, `trunkdb help`, and nothing else of the repository: a file
+of 7 people and 240 tasks, references from tasks to people by id, due
+dates over two years, `hours` missing in some tasks and a string in 9.
+Ten requests of a user, from "what's in it" to "mark the overdue ones
+late", a new task, a delete, an index for a slow query, and a check.
+Its answers were checked against a model worked out from the seed
+before it ran:
+- **Every answer and every write was right:** 112 overdue tasks, each
+  marked and tagged, no other; the 4 deletes and the insert, Ada's id
+  included. Before writing it exported a backup, ran `--dry-run`, and
+  counted after. One or two tries per request.
+- **What it had to work out alone, now in the skill and
+  `references/filters.md`:**
+  - which conditions an index serves (`!=`, `not in`, `not`,
+    `contains`, `exists` read everything), so a query is written with
+    `in (…)` and checked with `--explain`;
+  - that strings compare by code point, and a prefix as a range,
+    `title >= "Fix" and title < "Fiy"`;
+  - that comparisons and `sum` pass over values of another type, with
+    a way to find them (`exists(hours) and not (hours >= 0 or hours <
+    0)`);
+  - how to put two collections together without a join, by their ids;
+  - what an export holds, and that `count` is explained through `find`.
+- **What the language lacks** (ROADMAP.md): a type test, `starts with`
+  in the pattern language, and a join. And a planner gap: `status in
+  (…) and due < …` reads each status's entries of a `(status, due)`
+  index whole, where `status = … and due < …` bounds `due` too.
+
+## 122.6 Limits
 - Kept true by hand: nothing checks it against the command. A command
   added or changed is a reason to read it again.

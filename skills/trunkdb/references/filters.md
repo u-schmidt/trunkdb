@@ -1,16 +1,21 @@
 # The filter language
 
-What `trunkdb find` and `trunkdb fields` take after the collection. The
-words after the collection are joined into one filter, but quote it
-anyway: strings, `>` and `*` mean something to the shell.
+What `trunkdb find`, `fields` and `count` take after the collection,
+and `aggregate`, `update` and `delete` as their filter argument. For
+`find`, `fields` and `count` the words after the collection are joined
+into one filter, but quote it anyway: strings, `>` and `*` mean
+something to the shell.
 
 ## Contents
 - A query
 - Conditions
 - Paths and names
 - Values
+- Strings, and a prefix
+- Values of different types
 - Null and missing
 - Arrays
+- Which conditions an index serves
 - Mistakes
 
 ## A query
@@ -87,6 +92,35 @@ double quotes with JSON escapes (single quotes are an error), `true`,
 - Binary: `{"$binary": "<base64>"}`; special floats: `{"$float":
   "NaN"}`.
 
+## Strings, and a prefix
+
+Strings compare by Unicode code point, so case counts: `"B" < "a"`,
+uppercase before lowercase, and `"Ä"` after `"z"`. `order by` sorts
+them the same way.
+
+- `a contains "x"` finds `x` anywhere in `a`, in any case, but reads
+  every document.
+- There is no `starts with`, `like` or regex yet. For a prefix, use a
+  range up to the prefix with its last character raised by one:
+  `title >= "Fix" and title < "Fiy"`. It is exact, but case-sensitive,
+  and an index on `title` serves it. For any case, `contains` and
+  check the matches yourself.
+
+## Values of different types
+
+A comparison holds only between values of one kind: a string never
+equals, or is less than, a number. So `hours > 3` passes over a
+document whose `hours` is `"4"`, and `sum(hours)` and `avg(hours)`
+leave it out. `trunkdb fields` shows which paths hold several types.
+
+There is no test for a type yet. To find the documents where a field
+holds something else than a number, or than a string:
+
+```text
+exists(hours) and not (hours >= 0 or hours < 0)     -- hours, not a number
+exists(name) and not (name >= "")                   -- name, not a string
+```
+
 ## Null and missing
 
 | document | `a = null` / `a is null` | `exists(a)` | `not exists(a)` |
@@ -113,6 +147,30 @@ string, which never holds.
   elements. For one element that meets several, use `has`: `items has
   (sku = "A1" and qty > 2)`. Inside `has`, paths start at the element,
   and `@` is the element itself: `scores has (@ >= 80 and @ < 90)`.
+
+## Which conditions an index serves
+
+An index on a field narrows the read for these conditions on it, ANDed
+with anything else; the rest of the filter is checked on what it reads:
+
+| Served by an index | Read every document |
+|---|---|
+| `=`, `<`, `<=`, `>`, `>=`, `is null` | `!=`, `not in (…)`, `not (…)` |
+| `in (…)` | `contains` |
+| an `or` whose every branch is served | an `or` with one branch that isn't |
+| `has (…)`, `[*]` paths, with an index on that path | `exists(…)`, `size(…)` |
+
+So write the values you want, `status in ("open", "late")`, rather
+than the ones you don't, `status not in ("done", "cancelled")`.
+
+An index on several fields, `(status, due)`, serves `=` on the first
+and a range on the second together: `status = "open" and due < …`
+reads only those entries. With `in` on the first field, each value's
+entries are read whole, the range on `due` checked after; still fewer
+than a scan. To read only what the range takes, write a branch per
+value: `(status = "open" and due < X) or (status = "late" and due <
+X)`. `find … --explain` shows which index a filter read, and
+its `instead:` lines what the others would have read.
 
 ## Mistakes
 

@@ -58,12 +58,13 @@ commands:
                               one JSON row per line, the aggregate as
                               'count() as n, avg(hours) as mean group by
                               team having n > 5 order by n desc limit 10';
-                              columns count() sum() min() max() avg()
-                              count(distinct p) first(p) last(p), first
-                              and last with `order by p` inside, each
-                              with `filter (where …)` if it takes in only
-                              some documents; `unwind items` and `window
-                              at 5m` before them. --explain says how
+                              columns count() (of documents, no path)
+                              sum() min() max() avg() count(distinct p)
+                              first(p) last(p), first and last with
+                              `order by p` inside, each with `filter
+                              (where …)` if it takes in only some
+                              documents; `unwind items` and `window at
+                              5m` before them. --explain says how
 
 --json prints what a program reads: info and check one JSON object, fields
 one JSON object per path.

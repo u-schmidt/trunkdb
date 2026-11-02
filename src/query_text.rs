@@ -356,7 +356,13 @@ impl<'t> Parser<'t> {
         let (kind, path) = match kind {
             Kind::Count if self.keyword("distinct") => (Kind::CountDistinct, Some(self.path()?)),
             Kind::Count => {
-                self.eat("*");
+                if !self.eat("*") && !self.rest().trim_start().starts_with(')') {
+                    return self.error(
+                        "count() takes no path: it counts the documents. Those with a value \
+                         at a path: count() filter (where exists(p)); different values: \
+                         count(distinct p)",
+                    );
+                }
                 (Kind::Count, None)
             }
             kind => (kind, Some(self.path()?)),
@@ -1946,6 +1952,7 @@ mod tests {
             ("window at 99999999999999999999d", "too large"),
             ("window at 999999999999999d", "the duration is too long"),
             ("count() as n limit x", "expected a number"),
+            ("count(hours) as n", "count() takes no path"),
             ("group by a count() as n", "expected the end"),
         ] {
             let message = error(text);

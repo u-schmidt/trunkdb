@@ -39,7 +39,7 @@ document, not the clock.
 
 | Column | What, per group |
 |---|---|
-| `count()` or `count(*)` | how many documents |
+| `count()` or `count(*)` | how many documents; it takes no path: for those with a value there, `count() filter (where exists(p))` |
 | `count(distinct <path>)` | how many different values; null and missing not counted |
 | `sum(<path>)` | the numbers' total; others passed over; `0` for none |
 | `avg(<path>)` | the numbers' mean; `null` for none |

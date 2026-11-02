@@ -928,3 +928,10 @@ limit, batches and a write-ahead log. Since then:
     <collection> <filter> <aggregate>` prints the rows, `--explain`
     how it ran. The filter's language is unchanged: the aggregate's
     words mean something only in its own text.
+129. **The agent skill, after a trial** (§122.5): an agent given only
+    the skill did ten requests on a test file, reads and writes, all
+    right; what it had to work out alone is now in the skill: which
+    conditions an index serves and how to make a query fast, how
+    strings compare and a prefix as a range, values of another type
+    that comparisons and `sum` pass over, two collections put together
+    by their ids, and what an export holds.

@@ -140,7 +140,17 @@ another pass over the public API:
 - **A sort by `_id` after an OR of `Eq`s,** or after a compound index
   fixed only in part: a merge of id-ordered ranges, where §103 walks
   one (§103.7); paging by id through `status in (…)`.
-- **A pattern language:** regex or `LIKE`-style wildcards (§25.4).
+- **A pattern language:** regex or `LIKE`-style wildcards (§25.4), and
+  `starts with`, which an index serves as a range: an agent asked for
+  titles starting with "Fix" wrote the range by hand (§122.5).
+- **A test for a value's type,** `hours is string`, beside `is null`:
+  `trunkdb fields` shows a path holding several types, and nothing
+  finds the documents with the odd one but a double negation
+  (§122.5).
+- **A range carried into each value of an `in`** on an index on
+  several fields: `status in ("open", "late") and due < …` reads each
+  status's entries whole, where `status = "open" and due < …` bounds
+  `due` too (§122.5).
 - **A date without a time, and a time without a date,** as variants of
   their own; until then, noon UTC of the day serves (§69.1).
 - **PyO3 bindings,** for Python apps.
