@@ -1389,3 +1389,93 @@ fn writes_refuse_a_file_in_use() {
     close(held);
     assert_eq!(all(&db_path, "users").len(), 2);
 }
+
+// Aggregates as text (SPEC §157).
+
+/// The rows of an aggregate over what a filter finds, one JSON line
+/// each; `--explain` says how; a mistake in either text is shown where it
+/// is, exit code 2.
+#[test]
+fn aggregate_prints_the_rows_of_its_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = users_db(dir.path());
+    let lines = "{\"name\": \"Cy\", \"age\": 29, \"team\": \"web\", \"tags\": [\"a\", \"b\"]}\n\
+                 {\"name\": \"Di\", \"age\": 52, \"team\": \"core\", \"tags\": [\"b\"]}\n";
+    assert!(
+        trunkdb_with(&["insert", &db, "users", "-"], lines)
+            .status
+            .success()
+    );
+    let rows = |filter: &str, aggregate: &str| -> Vec<serde_json::Value> {
+        let output = trunkdb(&["aggregate", &db, "users", filter, aggregate]);
+        assert!(output.status.success(), "{aggregate}: {}", stderr(&output));
+        (stdout(&output).lines())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    assert_eq!(
+        rows(
+            "",
+            "count() as n, max(age) as oldest group by team order by n desc, team"
+        ),
+        [
+            serde_json::json!({"team": null, "n": 2, "oldest": 41}),
+            serde_json::json!({"team": "core", "n": 1, "oldest": 52}),
+            serde_json::json!({"team": "web", "n": 1, "oldest": 29}),
+        ]
+    );
+    assert_eq!(
+        rows(
+            "age >= 30",
+            "count() as n, count() filter (where age > 40) as over, avg(age) as mean"
+        ),
+        [serde_json::json!({"n": 3, "over": 2, "mean": 43.0})]
+    );
+    assert_eq!(
+        rows("", "unwind tags count() as n group by tags having n > 1"),
+        [serde_json::json!({"tags": "b", "n": 2})]
+    );
+    assert_eq!(
+        rows(
+            "",
+            "last(name order by age) as eldest, count(distinct team) as teams"
+        ),
+        [serde_json::json!({"eldest": "Di", "teams": 2})]
+    );
+    let output = trunkdb(&["aggregate", &db, "users", "", "count() as n group by team"]);
+    assert_eq!(stderr(&output), "3 rows\n");
+
+    let output = trunkdb(&[
+        "aggregate",
+        &db,
+        "users",
+        "age > 30",
+        "count() as n",
+        "--explain",
+    ]);
+    assert!(output.status.success());
+    assert!(
+        stdout(&output).contains("documents returned: 1"),
+        "{}",
+        stdout(&output)
+    );
+
+    let output = trunkdb(&["aggregate", &db, "users", "", "count() n"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr(&output),
+        "trunkdb: aggregate: expected `as` and the column's name, found `n` at line 1 column 9\n  count() n\n          ^\n"
+    );
+    let output = trunkdb(&["aggregate", &db, "users", "age >", "count() as n"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).starts_with("trunkdb: filter:"),
+        "{}",
+        stderr(&output)
+    );
+    let output = trunkdb(&["aggregate", &db, "nobody", "", "count() as n"]);
+    assert!(stderr(&output).contains("nobody: no such collection"));
+    // Refused as the library refuses it, before anything is read.
+    let output = trunkdb(&["aggregate", &db, "users", "", "count() as n, sum(age) as n"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+}

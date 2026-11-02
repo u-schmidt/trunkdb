@@ -415,6 +415,10 @@ let per_status = db.collection::<Document>("tasks").aggregate(
   rounded once, so it is finite wherever the numbers are; `min` and
   `max` pass over nulls.
 - Without `group_by`, one row of everything, even of nothing.
+- **As text,** as a filter has one: `"count() as n, avg(tries) as
+  average_tries, max(created) as newest group by status having n > 10
+  order by n desc".parse::<Aggregate>()?`, and `to_string()` writes it
+  back (SPEC §157). `trunkdb aggregate` takes the same text.
 
 A column can count or sum only some of a group's documents: `filter`
 before its `named` gives that one column a condition, SQL's `FILTER

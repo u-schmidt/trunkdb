@@ -920,3 +920,11 @@ limit, batches and a write-ahead log. Since then:
     of a collection asks for `--all`; `--dry-run` says how many it
     would change; `insert` into a collection that isn't there asks for
     `--create`. The agent skill says how an agent writes safely.
+128. **Aggregates as text** (§157): `"count() as n, avg(hours) as mean
+    group by team having n > 10 order by n desc".parse::<Aggregate>()`,
+    and `Display` writing one back, as a filter has its text: every
+    column (`count(distinct p)`, `last(p order by q)`, `filter (where
+    …)`), `unwind`, `window at 5m`. `trunkdb aggregate <file>
+    <collection> <filter> <aggregate>` prints the rows, `--explain`
+    how it ran. The filter's language is unchanged: the aggregate's
+    words mean something only in its own text.

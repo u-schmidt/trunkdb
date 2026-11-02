@@ -1,13 +1,16 @@
-//! Filters and conditions as text (SPEC §111): `FromStr` reads the
-//! SQL-like language into a `Filter` or `Condition`, `Display` writes one
-//! back. The text says what the builders say, no more: it compiles to
-//! the same filter, which the planner sees as it sees any other.
+//! Filters and conditions as text (SPEC §111), and aggregates (§157):
+//! `FromStr` reads the SQL-like language into a `Filter`, `Condition` or
+//! `Aggregate`, `Display` writes one back. The text says what the
+//! builders say, no more: it compiles to the same filter, which the
+//! planner sees as it sees any other.
 
+use crate::aggregate::{Column, Kind, Window};
 use crate::datetime::DateTime;
 use crate::document::{DocId, Document};
-use crate::query::{Condition, Filter, Hint, Op, Sort, SortOrder};
+use crate::query::{Aggregate, Condition, Filter, Hint, Op, Sort, SortOrder};
 use std::fmt::{self, Formatter, Write};
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Words that are never a bare field name: written in backticks, a field
 /// may have any of them as its name (`` `order` ``). The other keywords
@@ -66,6 +69,44 @@ impl FromStr for Filter {
         let filter = parser.filter()?;
         parser.end()?;
         Ok(filter)
+    }
+}
+
+/// An aggregate from its text (SPEC §157), SQL's select list, `GROUP BY`
+/// and what follows it, for `Collection::aggregate` beside a filter:
+///
+/// ```
+/// use trunkdb::query::Aggregate;
+///
+/// let per_team: Aggregate = r#"
+///     count() as n, avg(hours) as mean,
+///     count() filter (where status = "open") as open,
+///     last(status order by changed) as latest
+///     group by team
+///     having n > 10
+///     order by n desc
+///     limit 5
+/// "#.parse()?;
+/// # Ok::<(), trunkdb::query::ParseFilterError>(())
+/// ```
+///
+/// `[window <path> <duration>] [unwind <paths>] [<column>, …] [group by
+/// <paths>] [having <condition>] [order by <columns>] [limit <n>]
+/// [offset <n>]`, in that order. A column is `count()`, `sum(p)`,
+/// `min(p)`, `max(p)`, `avg(p)`, `count(distinct p)`, `first(p)` or
+/// `last(p)`, `first` and `last` with `order by <path>` inside, then
+/// `filter (where <condition>)` if it takes in only some documents, then
+/// `as <name>`. A duration is a whole number and a unit: `ns`, `us`,
+/// `ms`, `s`, `m`, `h` or `d`, `5m`. These words mean something only
+/// here, and only where a path can't be, so filters keep theirs.
+impl FromStr for Aggregate {
+    type Err = ParseFilterError;
+
+    fn from_str(text: &str) -> Result<Aggregate, ParseFilterError> {
+        let mut parser = Parser { text, at: 0 };
+        let aggregate = parser.aggregate()?;
+        parser.end()?;
+        Ok(aggregate)
     }
 }
 
@@ -214,26 +255,7 @@ impl<'t> Parser<'t> {
         };
         if self.keyword("order") {
             self.expect_keyword("by")?;
-            loop {
-                // What `Display` writes of a `Filter::sort_by_key` (SPEC §154).
-                if self.at_function("key") {
-                    return self.error(
-                        "`key(…)` is a closure in code, which has no text: build the filter in code",
-                    );
-                }
-                let field = self.path()?;
-                let order = match self.keyword("desc") {
-                    true => SortOrder::Desc,
-                    false => {
-                        self.keyword("asc");
-                        SortOrder::Asc
-                    }
-                };
-                filter.sort.push(Sort { field, order });
-                if !self.eat(",") {
-                    break;
-                }
-            }
+            filter.sort = self.sort_keys()?;
         }
         if self.keyword("limit") {
             filter.limit = Some(self.count()?);
@@ -243,6 +265,154 @@ impl<'t> Parser<'t> {
         }
         filter.hint = self.hint()?;
         Ok(filter)
+    }
+
+    /// The keys after `order by`, each `asc` or `desc`, between commas.
+    fn sort_keys(&mut self) -> Parsed<Vec<Sort>> {
+        let mut keys = Vec::new();
+        loop {
+            // What `Display` writes of a `Filter::sort_by_key` (SPEC §154).
+            if self.at_function("key") {
+                return self.error(
+                    "`key(…)` is a closure in code, which has no text: build the filter in code",
+                );
+            }
+            let field = self.path()?;
+            let order = match self.keyword("desc") {
+                true => SortOrder::Desc,
+                false => {
+                    self.keyword("asc");
+                    SortOrder::Asc
+                }
+            };
+            keys.push(Sort { field, order });
+            if !self.eat(",") {
+                return Ok(keys);
+            }
+        }
+    }
+
+    /// An aggregate's text (SPEC §157), as `FromStr for Aggregate` says.
+    fn aggregate(&mut self) -> Parsed<Aggregate> {
+        let mut aggregate = Aggregate::new();
+        if self.keyword("window") {
+            let path = self.path()?;
+            let duration = self.duration()?;
+            aggregate.window = Some(Window { path, duration });
+        }
+        if self.keyword("unwind") {
+            aggregate.unwind = self.paths()?;
+        }
+        if self.at_column() {
+            loop {
+                aggregate.columns.push(self.column()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+        }
+        if self.keyword("group") {
+            self.expect_keyword("by")?;
+            aggregate.group_by = self.paths()?;
+        }
+        if self.keyword("having") {
+            aggregate.rows.conditions = match self.condition()? {
+                Condition::All(conditions) if conditions.len() >= 2 => conditions,
+                condition => vec![condition],
+            };
+        }
+        if self.keyword("order") {
+            self.expect_keyword("by")?;
+            aggregate.rows.sort = self.sort_keys()?;
+        }
+        if self.keyword("limit") {
+            aggregate.rows.limit = Some(self.count()?);
+        }
+        if self.keyword("offset") {
+            aggregate.rows.skip = self.count()?;
+        }
+        Ok(aggregate)
+    }
+
+    /// Whether a column starts here: a column's function and its `(`.
+    fn at_column(&mut self) -> bool {
+        COLUMNS.iter().any(|(name, _)| self.at_function(name))
+    }
+
+    /// `count()`, `sum(p)` and the rest, then `filter (where …)` if any,
+    /// then `as <name>`.
+    fn column(&mut self) -> Parsed<Column> {
+        self.skip_space();
+        let word = self.peek_word();
+        let Some(&(_, kind)) = (COLUMNS.iter())
+            .find(|(name, _)| word.eq_ignore_ascii_case(name) && self.at_function(name))
+        else {
+            return self.expected(
+                "a column: count(), sum(…), min(…), max(…), avg(…), count(distinct …), first(…) or last(…)",
+            );
+        };
+        self.at += word.len();
+        self.expect("(")?;
+        let (kind, path) = match kind {
+            Kind::Count if self.keyword("distinct") => (Kind::CountDistinct, Some(self.path()?)),
+            Kind::Count => {
+                self.eat("*");
+                (Kind::Count, None)
+            }
+            kind => (kind, Some(self.path()?)),
+        };
+        let by = match kind {
+            Kind::First | Kind::Last if self.keyword("order") => {
+                self.expect_keyword("by")?;
+                Some(self.path()?)
+            }
+            _ => None,
+        };
+        self.expect(")")?;
+        let condition = match self.keyword("filter") {
+            true => {
+                self.expect("(")?;
+                self.expect_keyword("where")?;
+                let condition = self.condition()?;
+                self.expect(")")?;
+                Some(condition)
+            }
+            false => None,
+        };
+        if !self.keyword("as") {
+            return self.expected("`as` and the column's name");
+        }
+        let name = self.path()?;
+        Ok(Column {
+            name,
+            kind,
+            path,
+            condition,
+            by,
+        })
+    }
+
+    /// A duration: a whole number and its unit, `5m` (SPEC §157).
+    fn duration(&mut self) -> Parsed<Duration> {
+        self.skip_space();
+        let start = self.at;
+        let n = self.count()?;
+        let rest = self.rest();
+        let Some(&(unit, nanos)) = (UNITS.iter())
+            .filter(|(unit, _)| rest.starts_with(unit))
+            .max_by_key(|(unit, _)| unit.len())
+            .filter(|(unit, _)| !rest[unit.len()..].starts_with(in_word))
+        else {
+            return self.expected("a unit after the number: ns, us, ms, s, m, h or d");
+        };
+        self.at += unit.len();
+        match (n as u128).checked_mul(nanos) {
+            Some(total) if total <= u64::MAX as u128 * 1_000_000_000 => {
+                let secs = (total / 1_000_000_000) as u64;
+                Ok(Duration::new(secs, (total % 1_000_000_000) as u32))
+            }
+            _ => self.error_at(start, "the duration is too long"),
+        }
     }
 
     /// Whether `use index` or `use no index` is next (SPEC §132.4): two
@@ -578,6 +748,143 @@ impl<'t> Parser<'t> {
         Ok(n)
     }
 }
+
+/// An aggregate as text (SPEC §157), which reads back to the same one:
+/// each clause in its order, a column's function and its name.
+impl fmt::Display for Aggregate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut gap = "";
+        if let Some(window) = &self.window {
+            f.write_str("window ")?;
+            write_path(f, &window.path)?;
+            write!(f, " {}", DurationText(window.duration))?;
+            gap = " ";
+        }
+        if !self.unwind.is_empty() {
+            write!(f, "{gap}unwind ")?;
+            write_list(f, &self.unwind, |f, path| write_path(f, path))?;
+            gap = " ";
+        }
+        if !self.columns.is_empty() {
+            f.write_str(gap)?;
+            write_list(f, &self.columns, write_column)?;
+            gap = " ";
+        }
+        if !self.group_by.is_empty() {
+            write!(f, "{gap}group by ")?;
+            write_list(f, &self.group_by, |f, path| write_path(f, path))?;
+            gap = " ";
+        }
+        let rows = &self.rows;
+        if !rows.conditions.is_empty() {
+            write!(f, "{gap}having ")?;
+            match rows.conditions.as_slice() {
+                [one] => write_condition(f, one, OR)?,
+                all => {
+                    for (i, condition) in all.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(" and ")?;
+                        }
+                        write_condition(f, condition, NOT)?;
+                    }
+                }
+            }
+            gap = " ";
+        }
+        if !rows.sort.is_empty() {
+            write!(f, "{gap}order by ")?;
+            write_list(f, &rows.sort, |f, sort| {
+                write_path(f, &sort.field)?;
+                match sort.order {
+                    SortOrder::Asc => Ok(()),
+                    SortOrder::Desc => f.write_str(" desc"),
+                }
+            })?;
+            gap = " ";
+        }
+        if let Some(limit) = rows.limit {
+            write!(f, "{gap}limit {limit}")?;
+            gap = " ";
+        }
+        if rows.skip > 0 {
+            write!(f, "{gap}offset {}", rows.skip)?;
+        }
+        Ok(())
+    }
+}
+
+/// One column: its function, `filter (where …)`, `as` its name.
+fn write_column(f: &mut Formatter<'_>, column: &Column) -> fmt::Result {
+    let function = match column.kind {
+        Kind::Count | Kind::CountDistinct => "count",
+        Kind::Sum => "sum",
+        Kind::Min => "min",
+        Kind::Max => "max",
+        Kind::Avg => "avg",
+        Kind::First => "first",
+        Kind::Last => "last",
+    };
+    write!(f, "{function}(")?;
+    if column.kind == Kind::CountDistinct {
+        f.write_str("distinct ")?;
+    }
+    if let Some(path) = &column.path {
+        write_path(f, path)?;
+    }
+    if let Some(by) = &column.by {
+        f.write_str(" order by ")?;
+        write_path(f, by)?;
+    }
+    f.write_char(')')?;
+    if let Some(condition) = &column.condition {
+        f.write_str(" filter (where ")?;
+        write_condition(f, condition, OR)?;
+        f.write_char(')')?;
+    }
+    f.write_str(" as ")?;
+    write_path(f, &column.name)
+}
+
+/// A duration as the parser reads it: the longest unit it is a whole
+/// number of, `300s` as `5m`.
+struct DurationText(Duration);
+
+impl fmt::Display for DurationText {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let nanos = self.0.as_nanos();
+        let (unit, size) = (UNITS.iter())
+            .find(|(_, size)| nanos.is_multiple_of(*size))
+            .expect("every duration is whole nanoseconds");
+        match nanos {
+            0 => f.write_str("0s"),
+            _ => write!(f, "{}{unit}", nanos / size),
+        }
+    }
+}
+
+/// The functions an aggregate's column is (SPEC §157); `count`'s
+/// `distinct` makes it `count_distinct`.
+const COLUMNS: [(&str, Kind); 7] = [
+    ("count", Kind::Count),
+    ("sum", Kind::Sum),
+    ("min", Kind::Min),
+    ("max", Kind::Max),
+    ("avg", Kind::Avg),
+    ("first", Kind::First),
+    ("last", Kind::Last),
+];
+
+/// A duration's units and their length in nanoseconds, longest first:
+/// `Display` writes the longest that is whole.
+const UNITS: [(&str, u128); 7] = [
+    ("d", 86_400_000_000_000),
+    ("h", 3_600_000_000_000),
+    ("m", 60_000_000_000),
+    ("s", 1_000_000_000),
+    ("ms", 1_000_000),
+    ("us", 1_000),
+    ("ns", 1),
+];
 
 fn one_or(mut conditions: Vec<Condition>, many: fn(Vec<Condition>) -> Condition) -> Condition {
     match conditions.len() {
@@ -1418,6 +1725,231 @@ mod tests {
                 format!("{want:?}"),
                 "round {round}: {text}"
             );
+        }
+    }
+
+    /// Random aggregates of every shape (SPEC §157), their paths and
+    /// names drawn also from the words the aggregate's text gives a
+    /// meaning: each one's text reads back as an aggregate with the same
+    /// text, which gives the same rows.
+    #[test]
+    fn every_aggregate_reads_back_from_its_text() {
+        let mut rng = XorShift(0x5eed_2222);
+        let docs: Vec<Document> = (0..40).map(|_| random_doc(&mut rng, 2)).collect();
+        for round in 0..3000 {
+            let aggregate = random_aggregate(&mut rng);
+            let text = aggregate.to_string();
+            let read: Aggregate = text
+                .parse()
+                .unwrap_or_else(|e| panic!("round {round}: {text}: {e}"));
+            assert_eq!(read.to_string(), text, "round {round}");
+            // Read twice, the same: a condition of one, `All([c])`, is
+            // written as `c`, as for a filter.
+            let again: Aggregate = read.to_string().parse().unwrap();
+            assert_eq!(
+                format!("{again:?}"),
+                format!("{read:?}"),
+                "round {round}: {text}"
+            );
+            let (want, got) = (aggregate.apply(docs.clone()), read.apply(docs.clone()));
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{want:?}"),
+                "round {round}: {text}"
+            );
+        }
+    }
+
+    /// A path, or one of the aggregate's words, as a name.
+    fn random_aggregate_path(rng: &mut XorShift) -> String {
+        const WORDS: [&str; 12] = [
+            "count", "group", "by", "having", "as", "filter", "window", "unwind", "distinct",
+            "last", "order", "limit",
+        ];
+        match rng.below(3) {
+            0 => WORDS[rng.below(WORDS.len())].to_string(),
+            _ => random_path(rng),
+        }
+    }
+
+    fn random_aggregate(rng: &mut XorShift) -> Aggregate {
+        let mut aggregate = Aggregate::new();
+        if rng.below(4) == 0 {
+            let duration = [
+                Duration::from_secs(300),
+                Duration::from_millis(1500),
+                Duration::from_nanos(7),
+                Duration::from_secs(2 * 86_400),
+                Duration::ZERO,
+            ][rng.below(5)];
+            aggregate = aggregate.window(random_aggregate_path(rng), duration);
+        }
+        for _ in 0..rng.below(3) {
+            aggregate = aggregate.unwind(random_aggregate_path(rng));
+        }
+        for i in 0..rng.below(4) {
+            let path = random_aggregate_path(rng);
+            let column = match rng.below(8) {
+                0 => aggregate.count(),
+                1 => aggregate.sum(path),
+                2 => aggregate.min(path),
+                3 => aggregate.max(path),
+                4 => aggregate.avg(path),
+                5 => aggregate.count_distinct(path),
+                6 => aggregate.first(path),
+                _ => aggregate.last(path),
+            };
+            let column = match rng.below(3) {
+                0 => column.filter(random_condition(rng, 2)),
+                _ => column,
+            };
+            // A name of its own: two columns of one name are refused.
+            let name = format!("{}{i}", random_aggregate_path(rng));
+            aggregate = column.named(name);
+        }
+        if let Some(by) = (rng.below(3) == 0).then(|| random_aggregate_path(rng)) {
+            // `by` on a `first` or `last` only, the last column added.
+            if let Some(column) = aggregate.columns.last_mut()
+                && matches!(column.kind, Kind::First | Kind::Last)
+            {
+                column.by = Some(by);
+            }
+        }
+        for _ in 0..rng.below(3) {
+            aggregate = aggregate.group_by(random_aggregate_path(rng));
+        }
+        if rng.below(3) == 0 {
+            aggregate = aggregate.having(random_condition(rng, 2));
+        }
+        for _ in 0..rng.below(3) {
+            aggregate = match rng.below(2) {
+                0 => aggregate.then_asc(random_aggregate_path(rng)),
+                _ => aggregate.then_desc(random_aggregate_path(rng)),
+            };
+        }
+        if rng.below(3) == 0 {
+            aggregate = aggregate.limit(rng.below(5));
+        }
+        if rng.below(3) == 0 {
+            aggregate = aggregate.skip(rng.below(5));
+        }
+        aggregate
+    }
+
+    /// What the aggregate's text means, against the builders (SPEC §157):
+    /// the doc's example, each column's spelling, a duration's units.
+    #[test]
+    fn an_aggregate_s_text_says_what_its_builders_say() {
+        let read =
+            |text: &str| -> Aggregate { text.parse().unwrap_or_else(|e| panic!("{text}: {e}")) };
+        let built = Aggregate::new()
+            .count()
+            .named("n")
+            .avg("hours")
+            .named("mean")
+            .count()
+            .filter(Condition::eq("status", "open"))
+            .named("open")
+            .last("status")
+            .by("changed")
+            .named("latest")
+            .group_by("team")
+            .having(Condition::gt("n", 10))
+            .sort_desc("n")
+            .limit(5);
+        let text = r#"count() as n, avg(hours) as mean,
+            count() filter (where status = "open") as open,
+            last(status order by changed) as latest
+            group by team having n > 10 order by n desc limit 5"#;
+        assert_eq!(format!("{:?}", read(text)), format!("{built:?}"));
+        assert_eq!(
+            built.to_string(),
+            r#"count() as n, avg(hours) as mean, count() filter (where status = "open") as open, last(status order by changed) as latest group by team having n > 10 order by n desc limit 5"#
+        );
+        // `count(*)` is `count()`; `distinct` makes it `count_distinct`;
+        // any case.
+        assert_eq!(read("COUNT(*) AS n").to_string(), "count() as n");
+        assert_eq!(
+            format!("{:?}", read("count(distinct tags) as kinds")),
+            format!(
+                "{:?}",
+                Aggregate::new().count_distinct("tags").named("kinds")
+            )
+        );
+        let windowed = |text: &str| read(text).window.map(|w| (w.path, w.duration));
+        assert_eq!(
+            windowed("window at 5m"),
+            Some(("at".into(), Duration::from_secs(300)))
+        );
+        assert_eq!(
+            windowed("window at 90s").unwrap().1,
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            windowed("window at 250ms").unwrap().1,
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            windowed("window at 2d").unwrap().1,
+            Duration::from_secs(172_800)
+        );
+        assert_eq!(read("window at 120m").to_string(), "window at 2h");
+        assert_eq!(read("window at 90s").to_string(), "window at 90s");
+        assert_eq!(read("window at 0ns").to_string(), "window at 0s");
+        assert_eq!(
+            read("unwind items, items.parts sum(items.parts.qty) as n group by items.sku")
+                .to_string(),
+            "unwind items, items.parts sum(items.parts.qty) as n group by items.sku"
+        );
+        assert_eq!(read("").to_string(), "");
+        assert_eq!(read("group by a, b").group_by, ["a", "b"]);
+        // Its words are paths and names where a clause can't start.
+        let words = read("count() as having, sum(group) as as group by group having having > 1");
+        assert_eq!(words.group_by, ["group"]);
+        assert_eq!(
+            (words
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()),
+            ["having", "as"]
+        );
+        assert_eq!(words.columns[1].path.as_deref(), Some("group"));
+        assert_eq!(words.rows.conditions.len(), 1);
+        assert_eq!(read(&words.to_string()).to_string(), words.to_string());
+    }
+
+    /// An aggregate's text that isn't one, and what is said of it.
+    #[test]
+    fn an_aggregate_s_mistakes_are_named() {
+        let error = |text: &str| match text.parse::<Aggregate>() {
+            Ok(aggregate) => panic!("{text} parsed as {aggregate:?}"),
+            Err(e) => e.to_string(),
+        };
+        for (text, says) in [
+            (
+                "count() n",
+                "expected `as` and the column's name, found `n`",
+            ),
+            ("count() as", "expected a field"),
+            ("sum() as n", "expected a field"),
+            ("median(x) as m", "expected the end, found `median`"),
+            ("count() as n,", "expected a column"),
+            ("count() as n group status", "expected `by`"),
+            ("count() as n having", "expected"),
+            ("first(a order b) as f", "expected `by`"),
+            ("sum(a order by b) as s", "expected `)`"),
+            ("count() filter (status = 1) as n", "expected `where`"),
+            ("window at 5", "expected a unit after the number"),
+            ("window at 5min", "expected a unit after the number"),
+            ("window at m", "expected a number"),
+            ("window at 99999999999999999999d", "too large"),
+            ("window at 999999999999999d", "the duration is too long"),
+            ("count() as n limit x", "expected a number"),
+            ("group by a count() as n", "expected the end"),
+        ] {
+            let message = error(text);
+            assert!(message.contains(says), "{text}: {message}");
         }
     }
 

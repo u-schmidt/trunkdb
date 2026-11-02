@@ -53,6 +53,17 @@ commands:
   get    <file> <collection> <id>
                               the document with this id, as one JSON line;
                               exit code 1 if there is none
+  aggregate <file> <collection> <filter> <aggregate> [--explain]
+                              groups of the documents the filter finds,
+                              one JSON row per line, the aggregate as
+                              'count() as n, avg(hours) as mean group by
+                              team having n > 5 order by n desc limit 10';
+                              columns count() sum() min() max() avg()
+                              count(distinct p) first(p) last(p), first
+                              and last with `order by p` inside, each
+                              with `filter (where …)` if it takes in only
+                              some documents; `unwind items` and `window
+                              at 5m` before them. --explain says how
 
 --json prints what a program reads: info and check one JSON object, fields
 one JSON object per path.
@@ -82,7 +93,7 @@ update and delete refuse to change every document of a collection unless
 given --all; --dry-run says how many they would change, writing nothing.
 The filter is one argument: quote it, '' for none.
 
-info, check, export, find, fields, count and get only read: they change
+info, check, export, find, fields, count, get and aggregate only read: they change
 nothing in the file or its log, not even what a crash of the program that
 had it open left there.
 ";
@@ -90,48 +101,53 @@ had it open left there.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = match args[..] {
-        ["info", file] => read_only(file).and_then(|db| info(file, &db)),
-        ["info", file, "--json"] => read_only(file).and_then(|db| info_json(file, &db)),
-        ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
-        ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
-        ["compact", file] => existing(file).and_then(|db| compact(&db)),
-        ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
-        ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
-        ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
-        ["find", file, collection, ref filter @ .., "--explain"] => {
-            read_only(file).and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained))
-        }
-        ["find", file, collection, ref filter @ ..] => {
-            read_only(file).and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents))
-        }
-        ["fields", file, collection, ref filter @ .., "--json"] => {
-            read_only(file).and_then(|db| fields(&db, collection, &filter.join(" "), Format::Json))
-        }
-        ["fields", file, collection, ref filter @ ..] => {
-            read_only(file).and_then(|db| fields(&db, collection, &filter.join(" "), Format::Text))
-        }
-        ["count", file, collection, ref filter @ ..] => {
-            read_only(file).and_then(|db| count_of(&db, collection, &filter.join(" ")))
-        }
-        ["get", file, collection, id] => read_only(file).and_then(|db| get(&db, collection, id)),
-        ["insert", file, collection, ref rest @ ..] => insert(file, collection, rest),
-        ["update", file, collection, ref rest @ ..] => update(file, collection, rest),
-        ["delete", file, collection, ref rest @ ..] => delete(file, collection, rest),
-        ["index", file, collection, "add", ref rest @ ..] => index_add(file, collection, rest),
-        ["index", file, collection, "drop", ref rest @ ..] => index_drop(file, collection, rest),
-        ["drop", file, collection] => drop_collection(file, collection),
-        ["import", file, input, "--max-line", limit] => max_line(limit)
-            .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
-        ["help" | "-h" | "--help"] => {
-            print!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        _ => {
-            eprint!("{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
+    let result =
+        match args[..] {
+            ["info", file] => read_only(file).and_then(|db| info(file, &db)),
+            ["info", file, "--json"] => read_only(file).and_then(|db| info_json(file, &db)),
+            ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
+            ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
+            ["compact", file] => existing(file).and_then(|db| compact(&db)),
+            ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
+            ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
+            ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
+            ["find", file, collection, ref filter @ .., "--explain"] => read_only(file)
+                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained)),
+            ["find", file, collection, ref filter @ ..] => read_only(file)
+                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents)),
+            ["fields", file, collection, ref filter @ .., "--json"] => read_only(file)
+                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Json)),
+            ["fields", file, collection, ref filter @ ..] => read_only(file)
+                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Text)),
+            ["count", file, collection, ref filter @ ..] => {
+                read_only(file).and_then(|db| count_of(&db, collection, &filter.join(" ")))
+            }
+            ["get", file, collection, id] => {
+                read_only(file).and_then(|db| get(&db, collection, id))
+            }
+            ["aggregate", file, collection, filter, text] => read_only(file)
+                .and_then(|db| aggregate(&db, collection, filter, text, Show::Documents)),
+            ["aggregate", file, collection, filter, text, "--explain"] => read_only(file)
+                .and_then(|db| aggregate(&db, collection, filter, text, Show::Explained)),
+            ["insert", file, collection, ref rest @ ..] => insert(file, collection, rest),
+            ["update", file, collection, ref rest @ ..] => update(file, collection, rest),
+            ["delete", file, collection, ref rest @ ..] => delete(file, collection, rest),
+            ["index", file, collection, "add", ref rest @ ..] => index_add(file, collection, rest),
+            ["index", file, collection, "drop", ref rest @ ..] => {
+                index_drop(file, collection, rest)
+            }
+            ["drop", file, collection] => drop_collection(file, collection),
+            ["import", file, input, "--max-line", limit] => max_line(limit)
+                .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
+            ["help" | "-h" | "--help"] => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            _ => {
+                eprint!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        };
     match result {
         Ok(code) => code,
         Err(message) => {
@@ -618,6 +634,45 @@ fn find(db: &Database, collection: &str, filter: &str, show: Show) -> Outcome {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `trunkdb aggregate` (SPEC §157): the rows of `aggregate` over what
+/// `filter` finds, one JSON line each, how many to stderr; or how it ran.
+fn aggregate(db: &Database, collection: &str, filter: &str, text: &str, show: Show) -> Outcome {
+    let failed = |e: trunkdb::Error| e.to_string();
+    let parsed: trunkdb::query::Aggregate = match text.parse() {
+        Ok(aggregate) => aggregate,
+        Err(e) => {
+            eprintln!("trunkdb: {}", text_error("aggregate", text, &e));
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let (docs, filter) = match query(db, collection, filter)? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
+    };
+    if let Show::Explained = show {
+        let explained = docs.explain_aggregate(filter, &parsed).map_err(failed)?;
+        return match io::stdout()
+            .lock()
+            .write_all(explanation(&explained).as_bytes())
+        {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => stopped_writing(e),
+        };
+    }
+    let rows = docs.aggregate(filter, &parsed).map_err(failed)?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    for row in &rows {
+        if let Err(e) = writeln!(out, "{row}") {
+            return stopped_writing(e);
+        }
+    }
+    if let Err(e) = out.flush() {
+        return stopped_writing(e);
+    }
+    eprintln!("{}", count(rows.len(), "row"));
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `trunkdb count` (SPEC §155): how many documents the filter finds, the
 /// number alone on standard output, its skip and limit applied as `find`
 /// applies them.
@@ -702,12 +757,18 @@ fn stopped_writing(e: io::Error) -> Outcome {
 /// The filter's mistake, with its line of the filter and a `^` under
 /// where it is.
 fn filter_error(filter: &str, e: &ParseFilterError) -> String {
+    text_error("filter", filter, e)
+}
+
+/// `filter_error` for a text of another kind, `what`: an aggregate's
+/// (SPEC §157).
+fn text_error(what: &str, filter: &str, e: &ParseFilterError) -> String {
     let at = e.offset();
     let start = filter[..at].rfind('\n').map_or(0, |i| i + 1);
     let end = filter[at..].find('\n').map_or(filter.len(), |i| at + i);
     let column = filter[start..at].chars().count();
     format!(
-        "filter: {e}\n  {}\n  {}^",
+        "{what}: {e}\n  {}\n  {}^",
         &filter[start..end],
         " ".repeat(column)
     )

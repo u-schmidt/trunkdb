@@ -37,19 +37,20 @@ narrow questions:
    `'select name, team where status = "open" order by due limit 20'`.
 4. **`trunkdb count <file> <collection> '<filter>'`** — how many
    documents a filter finds, the number alone on stdout; from index
-   entries where they can tell, so it's cheap. For counts per group,
-   select the one field and count in the pipe, so only the counts reach
-   you: `trunkdb find app.trunkdb tasks 'select team where status =
-   "open"' 2>/dev/null | jq -r .team | sort | uniq -c`. The count line
-   of `find` goes to stderr; keep it out of `jq` (`2>/dev/null`, not
-   `2>&1`).
-5. **`--explain`** after a filter says how it ran instead of what it
+   entries where they can tell, so it's cheap.
+5. **`trunkdb aggregate <file> <collection> '<filter>' '<aggregate>'`**
+   — counts, sums and the like per group, one JSON row per group, so
+   only the totals reach you: `trunkdb aggregate app.trunkdb tasks
+   'status = "open"' 'count() as n, sum(hours) as hours group by team
+   order by n desc limit 10'`. `''` for no filter. The aggregate's
+   language is in `references/aggregates.md`.
+6. **`--explain`** after a filter (or an aggregate) says how it ran instead of what it
    found: the index used, entries and documents examined, the time. Use
    it when the user asks why a query is slow or whether an index helps.
    Its `instead:` lines are the plans it passed over, with the entries
    each would read; one marked `fewer` is the index to hint with
    `use index …`.
-6. **`trunkdb get <file> <collection> <id>`** — one document by its id,
+7. **`trunkdb get <file> <collection> <id>`** — one document by its id,
    written bare (`0192f0c4-…`) or as `id("…")`; exit code 1 if there is
    none.
 
@@ -105,7 +106,8 @@ collection is an error (exit 1), not an empty result.
 - **Don't write unless the user asked for that change.** `insert`,
   `update`, `delete`, `index`, `drop`, `compact` and `import` write to
   the file (see "Changing documents" below). `info`, `check`, `export`,
-  `find`, `fields`, `count` and `get` only read it and can't damage it.
+  `find`, `fields`, `count`, `get` and `aggregate` only read it and
+  can't damage it.
 - **"in use by another program"** means an app has the database open,
   which locks it: for a write, against every other open; for a read,
   against writes. Tell the user, and ask them to close the app. Don't
