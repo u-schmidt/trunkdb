@@ -125,19 +125,19 @@ agent reads skills.
 `bench/` runs one document workload against trunkdb, SQLite, redb and
 sled, with the same indexes, durable commits everywhere and the same
 answers checked across all four. 100,000 documents on an M1 Pro, the
-median of three runs (0.23.0 with §123):
+median of three runs (with §150):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| get by id | 2.8 µs | 6.1 µs | 2.0 µs | 2.6 µs |
-| 1000 documents by index | 0.96 ms | 1.7 ms | 1.0 ms | 1.7 ms |
-| count of 1000 by index | 0.01 ms | 0.02 ms | 0.03 ms | 0.26 ms |
-| page 50 of 20 of a status | 25 µs | 53 µs | 40 µs | 253 µs |
-| scan, 100,000 for a fifth | 61 ms | 43 ms | 50 ms | 68 ms |
-| insert, 1000 per commit | 32k/s | 44k/s | 45k/s | 30k/s |
-| update, 1000 per commit | 13k/s | 16k/s | 19k/s | 24k/s |
-| delete, 1000 per commit | 26k/s | 20k/s | 20k/s | 37k/s |
-| compact | 1.2 s | 0.16 s | 0.42 s | — |
+| get by id | 2.1 µs | 16 µs | 2.2 µs | 2.5 µs |
+| 1000 documents by index | 0.93 ms | 1.8 ms | 0.98 ms | 1.9 ms |
+| count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
+| page 50 of 20 of a status | 27 µs | 54 µs | 42 µs | 259 µs |
+| scan, 100,000 for a fifth | 59 ms | 44 ms | 54 ms | 67 ms |
+| insert, 1000 per commit | 36k/s | 41k/s | 38k/s | 28k/s |
+| update, 1000 per commit | 13k/s | 14k/s | 18k/s | 25k/s |
+| delete, 1000 per commit | 28k/s | 19k/s | 23k/s | 35k/s |
+| compact | 0.81 s | 0.16 s | 0.40 s | — |
 
 Reads through an index are level with the others or ahead; a full scan,
 inserts and compaction are still behind. The full table, why each number

@@ -164,3 +164,4 @@ say what changed, and DESIGN.md says what is true now.
 147. [Unwind (`aggregate.rs`, `collection.rs`)](147-unwind.md)
 148. [Rows of the application's own (`collection.rs`, `live.rs`, `snapshot.rs`)](148-rows-of-the-applications-own.md)
 149. [WAL records of what changed, measured first (`durability/wal.rs`, `storage/file.rs`)](149-wal-records-of-what-changed-measured-first.md) — a draft, not built
+150. [A binary search within B-tree pages (`index/btree.rs`)](150-a-binary-search-within-b-tree-pages.md)

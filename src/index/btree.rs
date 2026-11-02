@@ -225,11 +225,7 @@ impl Index for BTreeIndex {
 
     fn remove(&mut self, store: &mut dyn PageStore, key: &[u8]) -> std::io::Result<()> {
         let (page_id, mut page) = find_leaf(store, self.root, key)?;
-        let found = page
-            .iter_cells()
-            .find(|(_slot, cell)| decode_index_entry(cell).0 == key)
-            .map(|(slot, _cell)| slot);
-        if let Some(slot) = found {
+        if let Some(slot) = slot_of(&page, key) {
             page.remove_cell_at(slot);
             store.write_page(page_id, page.into_page())?;
         }
@@ -238,11 +234,8 @@ impl Index for BTreeIndex {
 
     fn lookup(&self, store: &dyn PageStore, key: &[u8]) -> std::io::Result<Option<RecordLocation>> {
         let (_page_id, page) = find_leaf(store, self.root, key)?;
-        Ok(page
-            .iter_cells()
-            .map(|(_slot, cell)| decode_index_entry(cell))
-            .find(|(k, _loc)| *k == key)
-            .map(|(_key, loc)| loc))
+        Ok(slot_of(&page, key)
+            .map(|slot| decode_index_entry(page.get_cell(slot).expect("a live slot")).1))
     }
 
     /// Every entry of the walk forward, collected (`walk`).
@@ -728,10 +721,8 @@ fn insert_into_leaf(
     loc: RecordLocation,
 ) -> std::io::Result<InsertOutcome> {
     // In place if it fits: before the first key not below it (SPEC §52).
-    let slot = page
-        .iter_cells()
-        .find(|(_slot, cell)| decode_index_entry(cell).0 >= key)
-        .map_or(page.slot_count(), |(slot, _cell)| slot);
+    let slot = first_slot_where(&page, |cell| decode_index_entry(cell).0 >= key)
+        .unwrap_or(page.slot_count());
     if page.insert_cell_at(slot, &encode_index_entry(key, loc)) {
         store.write_page(page_id, page.into_page())?;
         return Ok(InsertOutcome::Done);
@@ -793,13 +784,14 @@ fn insert_into_branch(
 ) -> std::io::Result<InsertOutcome> {
     // The first separator above `key` routes it, as in `find_child`;
     // `None` is the rightmost child.
-    let (slot, child_id) = page
-        .iter_cells()
-        .map(|(slot, cell)| (slot, decode_branch_entry(cell)))
-        .find(|(_slot, (separator, _child))| *separator > key)
-        .map_or((None, page.next_page()), |(slot, (_separator, child))| {
+    let (slot, child_id) = match first_slot_where(&page, |cell| decode_branch_entry(cell).0 > key) {
+        Some(slot) => {
+            let (_separator, child) =
+                decode_branch_entry(page.get_cell(slot).expect("a live slot"));
             (Some(slot), child)
-        });
+        }
+        None => (None, page.next_page()),
+    };
 
     let outcome = insert_into(store, child_id, key, loc, depth + 1)?;
     let InsertOutcome::Split {
@@ -961,13 +953,44 @@ fn build_branch_page(entries: &[(Vec<u8>, PageId)], rightmost: PageId) -> Option
 /// Relies on cells being stored in sorted order, which every branch page
 /// is: `insert_into_branch` puts each separator in at its place.
 fn find_child(page: &SlottedPage, target: &[u8]) -> PageId {
-    for (_slot, cell) in page.iter_cells() {
-        let (key, child) = decode_branch_entry(cell);
-        if key > target {
-            return child;
+    match first_slot_where(page, |cell| decode_branch_entry(cell).0 > target) {
+        Some(slot) => decode_branch_entry(page.get_cell(slot).expect("a live slot")).1,
+        None => page.next_page(),
+    }
+}
+
+/// The slot of `key` in leaf `page`, if the leaf holds it.
+fn slot_of(page: &SlottedPage, key: &[u8]) -> Option<u16> {
+    first_slot_where(page, |cell| decode_index_entry(cell).0 >= key)
+        .filter(|&slot| decode_index_entry(page.get_cell(slot).expect("a live slot")).0 == key)
+}
+
+/// The first live slot of a B-tree page whose cell meets `meets`, by a
+/// binary search (SPEC §150): a page's live cells are in key order, so
+/// `meets` on a key bound (`key >= x`, `key > x`) fails for every cell
+/// before that slot and holds from it on. A probe that lands on a
+/// tombstone, which a leaf written before §52 may hold, steps on to the
+/// next live slot; a stretch of them is passed over one by one.
+fn first_slot_where(page: &SlottedPage, meets: impl Fn(&[u8]) -> bool) -> Option<u16> {
+    let (mut lo, mut hi) = (0, page.slot_count());
+    let mut found = None;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        // The first live slot from `mid` on: the slots between are
+        // tombstones, so the answer is below `mid` or is this one.
+        let Some((slot, cell)) = (mid..hi).find_map(|slot| page.get_cell(slot).map(|c| (slot, c)))
+        else {
+            hi = mid;
+            continue;
+        };
+        if meets(cell) {
+            found = Some(slot);
+            hi = mid;
+        } else {
+            lo = slot + 1;
         }
     }
-    page.next_page()
+    found
 }
 
 fn corrupt_page_type(page_id: PageId, found: PageType) -> std::io::Error {
@@ -1775,6 +1798,111 @@ mod tests {
             .map(|(k, _)| k)
             .collect();
         assert_eq!(keys, expected.into_iter().collect::<Vec<_>>());
+    }
+
+    /// The binary search finds the slot the linear scan before SPEC §150
+    /// found, for every key bound, on leaves and branches whose
+    /// tombstones lie anywhere: none, scattered, in a run at the start,
+    /// the middle or the end, all of them, all but one.
+    #[test]
+    fn the_search_finds_what_a_scan_finds_around_tombstones() {
+        let key = |i: usize| format!("{:04}", i * 2).into_bytes();
+        let n = 60;
+        let patterns: Vec<(&str, Vec<u16>)> = vec![
+            ("none", vec![]),
+            ("every third", (0..n).step_by(3).collect()),
+            ("a run at the start", (0..20).collect()),
+            ("a run in the middle", (20..45).collect()),
+            ("a run at the end", (40..n).collect()),
+            ("all", (0..n).collect()),
+            ("all but one", (0..n).filter(|&s| s != 33).collect()),
+        ];
+        let leaf_entries: Vec<(Vec<u8>, RecordLocation)> = (0..n as usize)
+            .map(|i| {
+                (
+                    key(i),
+                    RecordLocation {
+                        page: 7,
+                        slot: i as u16,
+                    },
+                )
+            })
+            .collect();
+        let branch_entries: Vec<(Vec<u8>, PageId)> =
+            (0..n as usize).map(|i| (key(i), 100 + i as u64)).collect();
+        for (name, deleted) in &patterns {
+            let mut leaf = build_leaf_page(&leaf_entries, 0).unwrap();
+            let mut branch = build_branch_page(&branch_entries, 999).unwrap();
+            for &slot in deleted {
+                leaf.delete_cell(slot);
+                branch.delete_cell(slot);
+            }
+            // Probes below, at, between and above every key.
+            for probe in (0..2 * n as usize + 3).map(|p| format!("{p:04}").into_bytes()) {
+                let probe = probe.as_slice();
+                let scan = |page: &SlottedPage, meets: &dyn Fn(&[u8]) -> bool| {
+                    page.iter_cells()
+                        .find(|(_slot, cell)| meets(cell))
+                        .map(|(slot, _)| slot)
+                };
+                let at_least = |cell: &[u8]| decode_index_entry(cell).0 >= probe;
+                assert_eq!(
+                    first_slot_where(&leaf, at_least),
+                    scan(&leaf, &at_least),
+                    "{name}, leaf, >= {probe:?}"
+                );
+                let above = |cell: &[u8]| decode_branch_entry(cell).0 > probe;
+                assert_eq!(
+                    first_slot_where(&branch, above),
+                    scan(&branch, &above),
+                    "{name}, branch, > {probe:?}"
+                );
+                let found = leaf
+                    .iter_cells()
+                    .find(|(_slot, cell)| decode_index_entry(cell).0 == probe)
+                    .map(|(slot, _)| slot);
+                assert_eq!(slot_of(&leaf, probe), found, "{name}, leaf, == {probe:?}");
+            }
+        }
+    }
+
+    /// `lookup` and `remove` on a leaf an older version left with
+    /// tombstones (SPEC §52): every live key found and removed, none of
+    /// the tombstoned ones.
+    #[test]
+    fn leaves_with_tombstones_from_older_versions_take_lookups_and_removes() {
+        let (_dir, mut store, mut index) = fresh();
+        let key = |i: u32| format!("{i:04}{}", "x".repeat(60)).into_bytes();
+        for i in 0..100 {
+            index
+                .insert(
+                    &mut store,
+                    &key(i),
+                    RecordLocation {
+                        page: 1,
+                        slot: i as u16,
+                    },
+                )
+                .unwrap();
+        }
+        let mut page = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        assert_eq!(page.page_type(), PageType::IndexLeaf);
+        for slot in (0..page.slot_count()).step_by(3) {
+            page.delete_cell(slot);
+        }
+        store.write_page(index.root, page.into_page()).unwrap();
+        for i in 0..100 {
+            let want = (i % 3 != 0).then_some(RecordLocation {
+                page: 1,
+                slot: i as u16,
+            });
+            assert_eq!(index.lookup(&store, &key(i)).unwrap(), want, "{i}");
+        }
+        for i in (0..100).filter(|i| i % 3 != 0) {
+            index.remove(&mut store, &key(i)).unwrap();
+            assert_eq!(index.lookup(&store, &key(i)).unwrap(), None, "{i}");
+        }
+        assert_eq!(index.count(&store, KeyRange::everything()).unwrap(), 0);
     }
 
     #[test]

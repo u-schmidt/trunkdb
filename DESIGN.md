@@ -299,7 +299,9 @@ the caller does [§49](spec/49-a-lazy-b-tree-walk.md), and copies only the entri
 page is rebuilt when it splits; a split is by bytes, since keys differ
 in length [§28.2](spec/28-secondary-indexes.md) [§52](spec/52-b-tree-pages-changed-in-place.md). Keys arriving in order fill their leaves
 instead of leaving them half empty [§41](spec/41-compaction.md). A key is at most a quarter
-page, so every page holds at least four.
+page, so every page holds at least four. Within a page, a key is found
+by a binary search over the slots, stepping past the tombstones a leaf
+from before §52 may hold [§150](spec/150-a-binary-search-within-b-tree-pages.md).
 
 **The primary index** maps each id, 16 bytes, to its document's
 location (page and slot).
@@ -658,26 +660,26 @@ checks that all four give the same answers [§48](spec/48-benchmarks-against-sql
 
 Reads are level with SQLite, redb and sled or ahead of them; inserts, a
 full scan and compaction are still behind. On an M1 Pro with 100,000
-documents, the median of three runs (0.23.0 with §123):
+documents, the median of three runs (with §150):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 32k/s | 44k/s | 45k/s | 30k/s |
-| one commit | 4.7 ms | 4.7 ms | 4.9 ms | 10.2 ms |
-| get by id | 2.8 µs | 6.1 µs | 2.0 µs | 2.6 µs |
-| 1000 documents by index | 0.96 ms | 1.7 ms | 1.0 ms | 1.7 ms |
-| count of 1000 by index | 0.01 ms | 0.02 ms | 0.03 ms | 0.26 ms |
-| count of a range of 1000 | 0.01 ms | 0.02 ms | 0.03 ms | 0.34 ms |
-| count of all 100,000 | 0.08 ms | 0.01 ms | 0.00 ms | 24 ms |
-| oldest 20 of a status | 17.5 µs | 22.5 µs | 16.2 µs | 20.8 µs |
-| page 50 of 20 of a status | 25 µs | 53 µs | 40 µs | 253 µs |
-| first 50 by id | 32 µs | 37 µs | 23 µs | 28 µs |
-| 50 by id after skipping 5000 | 38 µs | 120 µs | 143 µs | 0.95 ms |
-| a tenant's first 20 by id | 22 µs | 1.2 ms | 20 µs | 24 µs |
-| scan, 100,000 for a fifth | 61 ms | 43 ms | 50 ms | 68 ms |
-| update, 1000 per commit | 13k/s | 16k/s | 19k/s | 24k/s |
-| delete, 1000 per commit | 26k/s | 20k/s | 20k/s | 37k/s |
-| compact | 1.2 s | 0.16 s | 0.42 s | — |
+| insert, 1000 per commit | 36k/s | 41k/s | 38k/s | 28k/s |
+| one commit | 5.0 ms | 5.2 ms | 5.6 ms | 10.9 ms |
+| get by id | 2.1 µs | 16 µs | 2.2 µs | 2.5 µs |
+| 1000 documents by index | 0.93 ms | 1.8 ms | 0.98 ms | 1.9 ms |
+| count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
+| count of a range of 1000 | 0.01 ms | 0.02 ms | 0.04 ms | 0.34 ms |
+| count of all 100,000 | 0.09 ms | 0.01 ms | 0.00 ms | 24 ms |
+| oldest 20 of a status | 18.3 µs | 24.1 µs | 15.9 µs | 20.5 µs |
+| page 50 of 20 of a status | 27 µs | 54 µs | 42 µs | 259 µs |
+| first 50 by id | 31 µs | 36 µs | 27 µs | 29 µs |
+| 50 by id after skipping 5000 | 38 µs | 126 µs | 220 µs | 0.96 ms |
+| a tenant's first 20 by id | 24 µs | 1.3 ms | 20 µs | 25 µs |
+| scan, 100,000 for a fifth | 59 ms | 44 ms | 54 ms | 67 ms |
+| update, 1000 per commit | 13k/s | 14k/s | 18k/s | 25k/s |
+| delete, 1000 per commit | 28k/s | 19k/s | 23k/s | 35k/s |
+| compact | 0.81 s | 0.16 s | 0.40 s | — |
 | file size after compact | 31 MB | 22 MB | 30 MB | — |
 
 Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
@@ -689,15 +691,16 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
 - **Still behind:**
   - the count of all documents, which trunkdb counts leaf by leaf where
     the others keep a total;
-  - a scan, 1.4× SQLite: each document's filtered fields are decoded
+  - a scan, 1.3× SQLite: each document's filtered fields are decoded
     into a small object to be checked;
-  - "first 50 by id", 1.4× redb.
-- **Writes:** inserts 0.7× SQLite's, updates 0.8×, deletes ahead, since
-  the checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
-  batches of 1,000 in 100 paid a checkpoint. Without flushes inserts
-  run at SQLite's speed; the rest is the WAL's whole pages, 10 MB a
-  commit (§123.5). Compaction inserts its entries one by one (§48.4),
-  and its file is 1.4× SQLite's.
+  - "first 50 by id", 1.1× redb.
+- **Writes:** inserts 0.88× SQLite's, updates 0.9×, deletes ahead.
+  The checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
+  batches of 1,000 in 100 paid a checkpoint. Most of what is left of a
+  batched commit is the CPU, not the WAL's whole pages ([§149](spec/149-wal-records-of-what-changed-measured-first.md)); a
+  binary search within B-tree pages took 3 ms of its 20.6 ms of CPU ([§150](spec/150-a-binary-search-within-b-tree-pages.md)).
+  Compaction inserts its entries one by one (§48.4), and its file is
+  1.4× SQLite's.
 
 ```
 cd bench && cargo run --release
@@ -716,6 +719,7 @@ Each gap had a measured cause, fixed one at a time:
 | One commit | 16 ms | one flush per commit; write-back at checkpoints [§51](spec/51-one-flush-per-commit.md) |
 | Batched inserts | 7.5k/s | B-tree pages changed in place [§52](spec/52-b-tree-pages-changed-in-place.md) |
 | Batched inserts | 22k/s | a checkpoint once 4,000 pages wait, not 1,000 [§123](spec/123-batched-writes-checkpoint-less-often.md) |
+| Batched inserts, compact | 32k/s, 1.1 s | a binary search within B-tree pages [§150](spec/150-a-binary-search-within-b-tree-pages.md) |
 | First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |
@@ -726,9 +730,11 @@ Each gap had a measured cause, fixed one at a time:
 | Two fields of 1000 by index, untyped | 1.6 ms | a selection decoded alone, 1.05 ms, or answered from index entries, 0.7 ms [§106](spec/106-projection-a-select-of-fields.md) |
 
 Still behind: in a scan, the small object each document's filtered
-fields are decoded into, and whole 8 KB page images in the WAL for
-every changed page. The copy per page read is gone [§64](spec/64-shared-pages.md), and a
-changed page is copied once, not twice: `write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md).
+fields are decoded into; in a batched commit, the CPU (§150). The copy
+per page read is gone [§64](spec/64-shared-pages.md), and a change copies a page once, not twice:
+`write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md). But a page the batch changes again is
+copied again, on every insert into it, and a batch's own pages are
+checked on every read: 11% and 7% of a batched commit's CPU (§150).
 
 ## 13. How it's tested
 

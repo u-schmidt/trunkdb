@@ -842,3 +842,10 @@ limit, batches and a write-ahead log. Since then:
     event while the live aggregate goes on. `LiveRow` and
     `LiveAggregate` default to `Document`, so code naming them is
     unchanged.
+121. **A binary search within B-tree pages** (§150): finding a key in a
+    leaf or a branch, for inserts, lookups, removes and the descent,
+    went through the page's cells in order, about 100 compared in a
+    leaf of 200; a binary search compares 8, stepping past the
+    tombstones a leaf from before §52 may hold. Batched inserts about
+    1.14× faster, compaction 1.4×, reads unchanged; nothing else
+    changes.
