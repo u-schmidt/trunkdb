@@ -876,3 +876,20 @@ limit, batches and a write-ahead log. Since then:
     a compaction moves each cell in place, highest first, with no
     allocation per cell. Batched updates about 1.15× faster, the rest
     unchanged; nothing else changes.
+
+    Items 113–124 → 0.28.0: additions only, nothing to adapt. `check`
+    finds cells that share bytes; the update operators `mul`,
+    `pop_first`, `pop_last` and `push_all`; `except`; the operators in
+    a `Batch` and `upsert_fields`, with `set_on_insert`; a live query
+    with a sort and a limit; the aggregate columns `count_distinct`,
+    `first` and `last`; `Aggregate::unwind`; rows of the application's
+    own. New names: `FromDocument` and `Upserted`; `Live`'s variants
+    gain fields, and as they are `#[non_exhaustive]` no match changes;
+    `LiveRow` and `LiveAggregate` take a type that defaults to
+    `Document`. Batched writes faster, each step profiled: inserts
+    about 1.3× (32k/s to 42k/s on the benchmark), updates 1.15×,
+    deletes 1.15×, compaction 1.8×, reads unchanged. Files stay format
+    12 and exports as in 0.27.0, which opens what 0.28.0 writes: cells
+    may sit elsewhere in a page than before, in the layout every
+    release reads. No new fixture, as nothing changes how files are
+    written (§120.9).
