@@ -78,6 +78,7 @@ common forms:
 ```text
 status = "open" and hours >= 4
 name contains "ann"                      (substring, any case)
+title starts with "Fix"                  (a prefix, case counting)
 team in ("core", "web")
 due is null                              (null or missing)
 exists(address.city)                     (present, null included)
@@ -115,8 +116,9 @@ There are no joins. A document refers to another by its id
 `--explain` after `find` (or `aggregate`) shows which index it read and
 how many entries, and its `instead:` lines what the others would have
 read. Which conditions an index can serve is in `references/filters.md`;
-in short, `=`, ranges, `in` and `is null` can, while `!=`, `not in`,
-`not`, `contains` and `exists` read every document. To speed up a query:
+in short, `=`, ranges, `in`, `starts with` and `is null` can, while
+`!=`, `not in`, `not`, `contains` and `exists` read every document. To
+speed up a query:
 
 1. Run it with `--explain`. A `scan of every document` with many
    documents is what an index helps.

@@ -945,3 +945,9 @@ limit, batches and a write-ahead log. Since then:
     them. Files stay format 12 and exports as in 0.28.0, which opens
     what 0.29.0 writes. No new fixture, as nothing changes how files
     are written (§120.9).
+
+130. **`starts with`** (§158): `Filter::starts_with("title", "Fix")`,
+    or `title starts with "Fix"` in a filter's text, finds strings
+    beginning with a prefix, case counting as it does for `<`. An index
+    on the field reads only the keys beginning with it, and decides
+    each one from the key, so a count reads no document.

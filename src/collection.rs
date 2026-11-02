@@ -4536,7 +4536,9 @@ mod tests {
             2 => Document::Int(big + rng.below(4) as i64),
             3 => Document::Float((rng.below(21) as f64 - 10.0) / 2.0),
             4 => [Document::Float(-0.0), Document::Float(f64::NAN)][rng.below(2)].clone(),
-            5 | 6 => Document::String(["", "a", "ab", "b", "B", "a\0"][rng.below(6)].to_string()),
+            5 | 6 => {
+                Document::String(["", "a", "ab", "b", "B", "a\0", "x"][rng.below(7)].to_string())
+            }
             7 => Document::String("x".repeat(1200) + ["a", "b", ""][rng.below(3)]),
             8 => Document::Bool(rng.below(2) == 1),
             9 => [Document::Null, Document::Array(vec![Document::Int(1)])][rng.below(2)].clone(),
@@ -7227,6 +7229,7 @@ mod tests {
                 Op::Gt,
                 Op::Gte,
                 Op::Contains,
+                Op::StartsWith,
             ];
             let op = ops[rng.below(ops.len())].clone();
             return match rng.below(6) {
@@ -7993,6 +7996,7 @@ mod tests {
                 Op::Gt,
                 Op::Gte,
                 Op::Contains,
+                Op::StartsWith,
             ];
             let op = ops[rng.below(ops.len())].clone();
             return match rng.below(9) {

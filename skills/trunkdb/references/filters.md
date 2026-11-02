@@ -45,6 +45,7 @@ query returns.
 | `a = 1`, `a != 1` (or `<>`), `<`, `<=`, `>`, `>=` | the comparison holds |
 | `a in (1, 2, 3)`, `a not in (…)` | `a` is one of the list (or none of it) |
 | `a contains "x"` | the string `a` has `x` in it, any case |
+| `a starts with "x"` | the string `a` begins with `x`, case counting |
 | `a is null`, `a is not null` | `a` is null or missing (or neither) |
 | `exists(a)`, `not exists(a)` | `a` is present, even as null (or absent) |
 | `size(a) > 2` | `a` is an array of more than two elements |
@@ -100,11 +101,11 @@ them the same way.
 
 - `a contains "x"` finds `x` anywhere in `a`, in any case, but reads
   every document.
-- There is no `starts with`, `like` or regex yet. For a prefix, use a
-  range up to the prefix with its last character raised by one:
-  `title >= "Fix" and title < "Fiy"`. It is exact, but case-sensitive,
-  and an index on `title` serves it. For any case, `contains` and
-  check the matches yourself.
+- `a starts with "x"` finds strings beginning with `x`, case counting:
+  `title starts with "Fix"` finds "Fix login", not "fix typo". An index
+  on `title` serves it. For any case, use `contains` and check the
+  matches yourself, or an `or` of the spellings you expect.
+- There is no `like` or regex yet.
 
 ## Values of different types
 
@@ -156,7 +157,7 @@ with anything else; the rest of the filter is checked on what it reads:
 | Served by an index | Read every document |
 |---|---|
 | `=`, `<`, `<=`, `>`, `>=`, `is null` | `!=`, `not in (…)`, `not (…)` |
-| `in (…)` | `contains` |
+| `in (…)`, `starts with` | `contains` |
 | an `or` whose every branch is served | an `or` with one branch that isn't |
 | `has (…)`, `[*]` paths, with an index on that path | `exists(…)`, `size(…)` |
 

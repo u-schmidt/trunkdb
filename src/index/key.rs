@@ -58,8 +58,8 @@ pub fn primary(id: DocId) -> Vec<u8> {
 
 /// The primary index's keys whose id `op`-compares true against `id`
 /// (SPEC §96) — exactly them, as every primary key is a whole id: the
-/// first key after `id` is `id` with a zero byte added. `None` for `Ne`
-/// and `Contains`.
+/// first key after `id` is `id` with a zero byte added. `None` for `Ne`,
+/// `Contains` and `StartsWith`.
 pub fn primary_range(op: &crate::query::Op, id: DocId) -> Option<KeyRange> {
     use crate::query::Op;
     let at = primary(id);
@@ -70,7 +70,7 @@ pub fn primary_range(op: &crate::query::Op, id: DocId) -> Option<KeyRange> {
         Op::Gte => (at, None),
         Op::Lt => (Vec::new(), Some(at)),
         Op::Lte => (Vec::new(), Some(after)),
-        Op::Ne | Op::Contains => return None,
+        Op::Ne | Op::Contains | Op::StartsWith => return None,
     };
     Some(KeyRange { start, end })
 }
@@ -481,7 +481,8 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// Every key a document can have if its field `op`-compares true against
 /// `value`, or a superset of them — `None` if no range describes it
-/// (`Ne`, `Contains`) or `value` isn't an indexed type. Bounds are
+/// (`Ne`, `Contains`) or `value` isn't an indexed type; for
+/// `StartsWith`, the strings that begin with `value`'s bytes. Bounds are
 /// inclusive of `value`'s own encoding even for `Lt`/`Gt`: different
 /// values can share an encoding, and the recheck sorts them out.
 pub fn range_for(op: &crate::query::Op, value: &Document) -> Option<KeyRange> {
@@ -505,8 +506,44 @@ pub fn range_for_in(op: &crate::query::Op, value: &Document, fields: usize) -> O
             start: same_type.start,
             end: this_value.end,
         }),
+        // A string's key is its escaped bytes, cut where the key's
+        // budget ends, then a terminator (`encode_string`): every string
+        // beginning with the prefix has a key beginning with the
+        // prefix's escaped bytes, or with as many of them as the budget
+        // keeps (SPEC §158.2).
+        Op::StartsWith => match value {
+            Document::String(_) => Some(KeyRange::prefixed(&encoded[..encoded.len() - 2])),
+            _ => None,
+        },
         Op::Ne | Op::Contains => None,
     }
+}
+
+/// Whether the string a key's `part` stands for begins with `prefix`, from
+/// the bytes alone (SPEC §158.2): `Some(false)` for a value of another
+/// type. A part that begins with the prefix's escaped bytes is a string
+/// that does, cut or not: an escaped `0x00` is `0x00 0xFF`, so the escaped
+/// prefix never runs into the `0x00 0x00` terminator. One that doesn't is
+/// a string that doesn't, unless it was cut before the prefix ended:
+/// `None` then, and the document decides.
+pub fn part_starts_with(part: &[u8], prefix: &[u8], fields: usize) -> Option<bool> {
+    if !is_string(part) {
+        return Some(false);
+    }
+    let mut body = part[1..].iter();
+    for &b in prefix {
+        let same = match b {
+            0 => body.next() == Some(&0) && body.next() == Some(&0xFF),
+            b => body.next() == Some(&b),
+        };
+        if !same {
+            return match part_is_exact(part, fields) {
+                true => Some(false),
+                false => None,
+            };
+        }
+    }
+    Some(true)
 }
 
 #[cfg(test)]
@@ -707,6 +744,83 @@ mod tests {
         assert_eq!(held(Op::Lte), [zero, five]);
         assert!(primary_range(&Op::Ne, at).is_none());
         assert!(primary_range(&Op::Contains, at).is_none());
+    }
+
+    /// A prefix's range holds the key of every string that begins with
+    /// it, and where neither the string nor the prefix was cut, only
+    /// those; an entry decides a prefix on its bytes wherever the key is
+    /// exact (SPEC §158.2). Keys of one field, whose strings are cut at
+    /// 1,005 bytes, and of eight, cut at 123.
+    #[test]
+    fn a_prefix_range_holds_the_strings_that_begin_with_it() {
+        use crate::query::Op;
+        let x = |n: usize| "x".repeat(n);
+        let mut strings: Vec<String> = [
+            "", "\0", "\0a", "a", "a\0", "a\0b", "a\u{1}", "ab", "abc", "ab\u{ff}", "b", "ß", "ßa",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for n in [122, 123, 124, 1004, 1005, 1006, 1100] {
+            strings.extend([x(n), x(n) + "a", x(n) + "b", x(n - 1) + "\0"]);
+        }
+        let others = [
+            Document::Null,
+            Document::Bool(false),
+            Document::Int(5),
+            Document::Id(DocId([1; 16])),
+        ];
+        let id = [0xAB; 16];
+        for fields in [1, 8] {
+            let budget = string_budget(fields);
+            for prefix in &strings {
+                let range =
+                    range_for_in(&Op::StartsWith, &Document::String(prefix.clone()), fields)
+                        .unwrap();
+                let prefix_cut = escaped_len(prefix.as_bytes()) > budget;
+                for s in &strings {
+                    let part = encode_value_in(&Document::String(s.clone()), fields).unwrap();
+                    let key = [&part[..], &id].concat();
+                    let starts = s.starts_with(prefix.as_str());
+                    let exact = part_is_exact(&part, fields);
+                    if starts {
+                        assert!(
+                            range.contains(&key),
+                            "{fields}: {s:?} begins with {prefix:?}"
+                        );
+                    } else if exact && !prefix_cut {
+                        assert!(!range.contains(&key), "{fields}: {s:?}, {prefix:?}");
+                    }
+                    let decided = part_starts_with(&part, prefix.as_bytes(), fields);
+                    match exact {
+                        true => assert_eq!(decided, Some(starts), "{fields}: {s:?}, {prefix:?}"),
+                        false => assert!(
+                            decided.is_none_or(|d| d == starts),
+                            "{fields}: {s:?}, {prefix:?}"
+                        ),
+                    }
+                    // Cut, but beginning with the whole prefix: decided.
+                    if !exact && starts && !prefix_cut {
+                        assert_eq!(decided, Some(true), "{fields}: {s:?}, {prefix:?}");
+                    }
+                }
+                for other in &others {
+                    let part = encode_value_in(other, fields).unwrap();
+                    assert!(!range.contains(&[&part[..], &id].concat()));
+                    assert_eq!(
+                        part_starts_with(&part, prefix.as_bytes(), fields),
+                        Some(false)
+                    );
+                }
+            }
+        }
+        assert!(range_for(&Op::StartsWith, &Document::Int(1)).is_none());
+        assert!(primary_range(&Op::StartsWith, DocId([1; 16])).is_none());
+    }
+
+    /// How many bytes `bytes` take escaped, as `encode_string` writes them.
+    fn escaped_len(bytes: &[u8]) -> usize {
+        bytes.iter().map(|&b| if b == 0 { 2 } else { 1 }).sum()
     }
 
     /// Ids have a key since format 10 (SPEC §62): 16 bytes after their

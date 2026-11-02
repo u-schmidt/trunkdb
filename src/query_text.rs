@@ -558,7 +558,9 @@ impl<'t> Parser<'t> {
             return Ok(Condition::ElemMatch { field, condition });
         }
         let Some(op) = self.op() else {
-            return self.expected("a comparison (=, !=, <, <=, >, >=, contains, is null, in, has)");
+            return self.expected(
+                "a comparison (=, !=, <, <=, >, >=, contains, starts with, is null, in, has)",
+            );
         };
         let value = self.value()?;
         Ok(Condition::Compare { field, op, value })
@@ -598,7 +600,18 @@ impl<'t> Parser<'t> {
                 return Some(op);
             }
         }
-        self.keyword("contains").then_some(Op::Contains)
+        if self.keyword("contains") {
+            return Some(Op::Contains);
+        }
+        // Two words (SPEC §158.3): `starts` alone is no operator.
+        let before = self.at;
+        if self.keyword("starts") {
+            if self.keyword("with") {
+                return Some(Op::StartsWith);
+            }
+            self.at = before;
+        }
+        None
     }
 
     /// A field path (SPEC §111.3): names, bare or in backticks, joined by
@@ -1217,6 +1230,7 @@ fn op_text(op: &Op) -> &'static str {
         Op::Gt => ">",
         Op::Gte => ">=",
         Op::Contains => "contains",
+        Op::StartsWith => "starts with",
     }
 }
 
@@ -1623,7 +1637,7 @@ mod tests {
         );
         assert_eq!(
             error("a"),
-            "expected a comparison (=, !=, <, <=, >, >=, contains, is null, in, has), found the end at line 1 column 2"
+            "expected a comparison (=, !=, <, <=, >, >=, contains, starts with, is null, in, has), found the end at line 1 column 2"
         );
         assert_eq!(
             error("select a b = 1"),
@@ -2042,7 +2056,8 @@ mod tests {
             Op::Gt,
             Op::Gte,
             Op::Contains,
-        ][rng.below(7)]
+            Op::StartsWith,
+        ][rng.below(8)]
         .clone()
     }
 

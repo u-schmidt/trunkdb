@@ -74,7 +74,7 @@ const SELECTED: [&str; 13] = [
 /// fields, without `[*]`.
 const AGGREGATED: [&str; 7] = ["a", "aa", "b", "c", "o.p", "tags", "z"];
 const SORT_KEYS: [&str; 6] = ["a", "b", "o.p", "c", "tags", "_id"];
-const OPS: [Op; 7] = [
+const OPS: [Op; 8] = [
     Op::Eq,
     Op::Ne,
     Op::Lt,
@@ -82,6 +82,7 @@ const OPS: [Op; 7] = [
     Op::Gt,
     Op::Gte,
     Op::Contains,
+    Op::StartsWith,
 ];
 
 /// The input, read a byte at a time; past its end every read is 0, so

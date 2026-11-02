@@ -42,6 +42,13 @@ pub enum Op {
     /// doesn't match. Substring only, not a pattern language — no
     /// wildcards, no regex.
     Contains,
+    /// The field is a string beginning with the condition's string value
+    /// (SPEC §158), byte for byte, so case counts, as it does for `<`:
+    /// `"Fix login"` starts with `"Fix"`, not with `"fix"`. Every string
+    /// starts with `""`. Anything that isn't a string on either side
+    /// doesn't match. An index on the field serves it as the range of
+    /// keys that begin with the prefix.
+    StartsWith,
 }
 
 /// What a document must satisfy (SPEC §36): a comparison of one field,
@@ -370,6 +377,12 @@ impl Condition {
         Self::compare(field, Op::Contains, needle.into())
     }
 
+    /// The field is a string beginning with `prefix`, case counting (see
+    /// `Op::StartsWith`).
+    pub fn starts_with(field: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self::compare(field, Op::StartsWith, prefix.into())
+    }
+
     /// The field is null or missing (SPEC §32): `eq(field, Document::Null)`.
     pub fn is_null(field: impl Into<String>) -> Self {
         Self::compare(field, Op::Eq, Document::Null)
@@ -686,6 +699,13 @@ impl Filter {
     /// `Op::Contains`).
     pub fn contains(self, field: impl Into<String>, needle: impl Into<String>) -> Self {
         self.condition(field, Op::Contains, needle.into())
+    }
+
+    /// The field is a string beginning with `prefix`, case counting (see
+    /// `Op::StartsWith`): `starts_with("title", "Fix")`. An index on the
+    /// field reads only the strings that begin with it.
+    pub fn starts_with(self, field: impl Into<String>, prefix: impl Into<String>) -> Self {
+        self.condition(field, Op::StartsWith, prefix.into())
     }
 
     /// The field is null or missing (SPEC §32).
@@ -2263,7 +2283,7 @@ impl OnBytes<'_> {
                         Document::Id(id) => Some(key::doc_id(entry.key).cmp(id)),
                         _ => None,
                     };
-                    return Some(!matches!(op, Op::Contains) && holds(op, ord));
+                    return Some(!matches!(op, Op::Contains | Op::StartsWith) && holds(op, ord));
                 };
                 let part = entry.parts[*at];
                 // An array, object or binary value in a compound key is
@@ -2276,6 +2296,15 @@ impl OnBytes<'_> {
                     // Case folding needs the text (SPEC §25).
                     return match (key::is_string(part), value) {
                         (true, Document::String(_)) => None,
+                        _ => Some(false),
+                    };
+                }
+                if let Op::StartsWith = op {
+                    // The key holds the string's first bytes (SPEC §158.2).
+                    return match value {
+                        Document::String(prefix) => {
+                            key::part_starts_with(part, prefix.as_bytes(), entry.fields)
+                        }
                         _ => Some(false),
                     };
                 }
@@ -2589,6 +2618,12 @@ fn any_matches<'a>(
 
 /// `field_value op value`, for one value.
 fn value_matches(op: &Op, field_value: &Document, value: &Document) -> bool {
+    if let Op::StartsWith = op {
+        return match (field_value, value) {
+            (Document::String(text), Document::String(prefix)) => text.starts_with(prefix.as_str()),
+            _ => false,
+        };
+    }
     if let Op::Contains = op {
         return match (field_value, value) {
             (Document::String(haystack), Document::String(needle)) => {
@@ -2663,7 +2698,7 @@ pub(crate) fn canonical(value: &Document) -> Document {
 
 /// Whether `op` holds of two values that compare as `ord` (`compare`):
 /// what `value_matches` and an entry decided on its bytes (SPEC §104.2)
-/// answer. Not for `Op::Contains`.
+/// answer. Not for `Op::Contains` or `Op::StartsWith`.
 fn holds(op: &Op, ord: Option<std::cmp::Ordering>) -> bool {
     match (op, ord) {
         (Op::Eq, Some(std::cmp::Ordering::Equal)) => true,
@@ -2934,6 +2969,7 @@ mod tests {
             Op::Gt,
             Op::Gte,
             Op::Contains,
+            Op::StartsWith,
         ];
         let op = ops[rng.below(ops.len())].clone();
         if depth == 0 || rng.below(3) == 0 {
@@ -3822,6 +3858,7 @@ mod tests {
                 Op::Gt,
                 Op::Gte,
                 Op::Contains,
+                Op::StartsWith,
             ];
             let field = match rng.below(fields.len() + 1) {
                 i if i < fields.len() => fields[i],

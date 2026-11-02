@@ -172,3 +172,4 @@ say what changed, and DESIGN.md says what is true now.
 155. [`trunkdb count`, `get`, and JSON for a program (`src/bin/trunkdb.rs`)](155-trunkdb-count-get-and-json.md)
 156. [`trunkdb insert`, `update`, `delete`, and indexes (`src/bin/trunkdb.rs`)](156-trunkdb-insert-update-delete-and-indexes.md)
 157. [Aggregates as text (`query_text.rs`, `src/bin/trunkdb.rs`)](157-aggregates-as-text.md)
+158. [`starts with` (`query.rs`, `index/key.rs`, `query_text.rs`)](158-starts-with.md)
