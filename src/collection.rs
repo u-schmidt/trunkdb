@@ -9,8 +9,8 @@ use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::live::{LiveAggregate, LiveQuery};
 use crate::query::{
-    Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, SortOrder, SortWork,
-    Update, caught,
+    Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, Rank, Ranking,
+    SortOrder, SortWork, Update, caught,
 };
 use crate::select::{Answer, Selection};
 use crate::storage::{PageId, PageStore, RecordLocation};
@@ -572,7 +572,8 @@ impl<T> Collection<T> {
         let indexes = at.catalog.indexes(&self.name);
         follow_hint(&self.name, &filter, indexes)?;
         let plan = plan_for(&filter, indexes);
-        let sort = match filter.sort.len() {
+        // A key of the application's is one more sort key, in memory.
+        let sort = match filter.sort.len() + usize::from(filter.by_key.is_some()) {
             0 => None,
             keys => {
                 let from_index = filter.index_order(indexes).map_or(0, |order| order.served);
@@ -1077,7 +1078,7 @@ impl Collection<Document> {
         convert: Convert<T>,
     ) -> crate::Result<Cursor<T>> {
         let select = filter.selection();
-        if !filter.sort.is_empty() {
+        if filter.sorted() {
             let results = self.matches_found(&filter, whole_from_index, select.as_ref())?;
             let converted = results
                 .into_iter()
@@ -1582,6 +1583,18 @@ fn find_in(
             .map(|(source, _fields)| Ok(source.found(&mut records, None, trace)?))
             .collect();
     }
+    if let Some(ranking) = filter.ranking() {
+        return find_by_key(
+            catalog,
+            store,
+            collection,
+            filter,
+            &ranking,
+            whole_from_index,
+            select,
+            trace,
+        );
+    }
     // Candidates from an index range or by id nearly all match: for a
     // caller that wants whole documents, each is decoded whole once and
     // checked on that, rather than on its fields and then again whole
@@ -1617,10 +1630,93 @@ fn find_in(
         // from an index (the sort is stable).
         matches.sort_unstable_by_key(|(source, _fields)| source.id());
     }
-    let arranged = filter.arrange(matches, |(_source, fields)| fields);
+    let arranged = filter.arrange(matches, |(_source, fields)| fields)?;
     arranged
         .into_iter()
         .map(|(source, fields)| {
+            // Only a document read was decoded whole, not an entry's.
+            let whole = whole && matches!(source, Source::Read(_));
+            let mut found = source.found(&mut records, answer.as_ref(), trace)?;
+            if whole {
+                found.decoded = Some(fields);
+            }
+            Ok(found)
+        })
+        .collect()
+}
+
+/// `find_in` for a sort by a key of the application's (SPEC §154): each
+/// match ranked as it is read, by its key's closure, and with a limit
+/// only the best `skip + limit` kept, cut back to them by a selection
+/// whenever twice as many are held. Memory stays at about that many
+/// matches, read in full, however many there are.
+#[allow(clippy::too_many_arguments)]
+fn find_by_key(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    ranking: &Ranking<'_>,
+    whole_from_index: bool,
+    select: Option<&Selection>,
+    trace: &Trace,
+) -> crate::Result<Vec<Found>> {
+    let indexes = catalog.indexes(collection);
+    // As `find_in` decides it: a candidate from an index range or by id
+    // is decoded whole once, for its check, its key and the caller.
+    let whole = whole_from_index
+        && select.is_none()
+        && (filter.ids().is_some() || filter.index_ranges(indexes).is_some());
+    let names = match whole {
+        true => None,
+        false => filter.fields(),
+    };
+    let matcher = filter.matcher();
+    let keep = filter.limit.map(|limit| filter.skip.saturating_add(limit));
+    // By the key, the fields after it, then by id: a total order.
+    let order = |(a, (source_a, _)): &(Rank, Candidate), (b, (source_b, _)): &(Rank, Candidate)| {
+        ranking
+            .compare(a, b)
+            .then_with(|| source_a.id().cmp(&source_b.id()))
+    };
+    let mut kept: Vec<(Rank, Candidate)> = Vec::new();
+    let mut matched = 0;
+    let answer = each_candidate(
+        catalog,
+        store,
+        collection,
+        filter,
+        names.as_deref(),
+        Wants { sort: true, select },
+        trace,
+        |(source, fields)| -> crate::Result<()> {
+            if !(source.decided() || matcher.matches(&fields)?) {
+                return Ok(());
+            }
+            let Some(rank) = ranking.rank(&fields)? else {
+                return Ok(()); // left out by its key
+            };
+            matched += 1;
+            if keep == Some(0) {
+                return Ok(());
+            }
+            kept.push((rank, (source, fields)));
+            if let Some(keep) = keep
+                && kept.len() > keep.saturating_mul(2)
+            {
+                kept.select_nth_unstable_by(keep, order);
+                kept.truncate(keep);
+            }
+            Ok(())
+        },
+    )?;
+    trace.matched(matched);
+    kept.sort_unstable_by(order);
+    let mut records = data::Records::new(store);
+    kept.into_iter()
+        .take(keep.unwrap_or(usize::MAX))
+        .skip(filter.skip)
+        .map(|(_rank, (source, fields))| {
             // Only a document read was decoded whole, not an entry's.
             let whole = whole && matches!(source, Source::Read(_));
             let mut found = source.found(&mut records, answer.as_ref(), trace)?;
@@ -2383,6 +2479,37 @@ fn read_candidates(
     wants: Wants,
     trace: &Trace,
 ) -> std::io::Result<(Vec<Candidate>, Option<Answer>)> {
+    let mut candidates = Vec::new();
+    let answer = each_candidate(
+        catalog,
+        store,
+        collection,
+        filter,
+        names,
+        wants,
+        trace,
+        |candidate| {
+            candidates.push(candidate);
+            Ok::<(), std::io::Error>(())
+        },
+    )?;
+    Ok((candidates, answer))
+}
+
+/// `read_candidates`, each candidate handed to `take` as it is read
+/// rather than all kept: for a sort by a key of the application's
+/// (SPEC §154), which keeps only the best of them.
+#[allow(clippy::too_many_arguments)]
+fn each_candidate<E: From<std::io::Error>>(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    names: Option<&[&str]>,
+    wants: Wants,
+    trace: &Trace,
+    mut take: impl FnMut(Candidate) -> Result<(), E>,
+) -> Result<Option<Answer>, E> {
     let Wants { sort, select } = wants;
     let (entries, indexed) = candidate_entries(catalog, store, collection, filter, trace)?;
     let mut decides = indexed.covering(filter, false).map(|c| c.decider(filter));
@@ -2394,7 +2521,6 @@ fn read_candidates(
     // keeps its key, to be answered from if it's handed out.
     let answer = answer_for(select, indexed, filter);
     let mut records = data::Records::new(store);
-    let mut candidates = Vec::new();
     for (key, loc) in entries {
         let decided = decides.as_mut().and_then(|d| d.decide(&key));
         if decided == Some(false) {
@@ -2411,16 +2537,16 @@ fn read_candidates(
         if let Some(fields) = entry {
             let id = key::doc_id(&key);
             let key = answer.is_some().then_some(key);
-            candidates.push((Source::Entry(id, loc, key), fields));
+            take((Source::Entry(id, loc, key), fields))?;
             continue;
         }
         trace.examined();
         // The id stored in the data cell itself (SPEC §11).
         let stored = records.stored(loc)?;
         let fields = stored.fields(names)?;
-        candidates.push((Source::Read(stored), fields));
+        take((Source::Read(stored), fields))?;
     }
-    Ok((candidates, answer))
+    Ok(answer)
 }
 
 /// What a caller of `read_candidates` wants of the matches besides
@@ -2442,25 +2568,42 @@ fn count_matches(
     trace: &Trace,
 ) -> crate::Result<usize> {
     follow_hint(collection, filter, catalog.indexes(collection))?;
-    let count = match count_in(catalog, store, collection, filter)? {
+    // A key of the application's leaves out the matches it gives none
+    // (SPEC §154): counted as `find` finds them, each one read.
+    let ranking = filter.ranking();
+    let counted = match ranking {
+        Some(_) => None,
+        None => count_in(catalog, store, collection, filter)?,
+    };
+    let count = match counted {
         Some(count) => count,
         None => {
-            let names = filter.fields_with(false);
+            let names = filter.fields_with(ranking.is_some());
             let matcher = filter.matcher();
             let mut count = 0;
-            let candidates = read_candidates(
+            each_candidate(
                 catalog,
                 store,
                 collection,
                 filter,
                 names.as_deref(),
-                Wants::default(),
+                // With a key, every match is read: the key needs its
+                // document, which an entry that decided it doesn't give.
+                Wants {
+                    sort: ranking.is_some(),
+                    select: None,
+                },
                 trace,
-            )?
-            .0;
-            for (source, fields) in &candidates {
-                count += usize::from(source.decided() || matcher.matches(fields)?);
-            }
+                |(source, fields)| -> crate::Result<()> {
+                    let matches = source.decided() || matcher.matches(&fields)?;
+                    let ranked = match &ranking {
+                        Some(ranking) => matches && ranking.rank(&fields)?.is_some(),
+                        None => matches,
+                    };
+                    count += usize::from(ranked);
+                    Ok(())
+                },
+            )?;
             count
         }
     };
@@ -2487,7 +2630,7 @@ pub(crate) fn aggregate_in(
     // A window is a condition once the newest is known (SPEC §139.2).
     let windowed;
     let filter = match &aggregate.window {
-        Some(_) if !filter.sort.is_empty() || filter.skip > 0 || filter.limit.is_some() => {
+        Some(_) if filter.sorted() || filter.skip > 0 || filter.limit.is_some() => {
             // Two windows, by count and by time: which first would be a
             // rule to learn, and `apply`, given the documents the filter
             // found, could keep only one of them.
@@ -2624,7 +2767,7 @@ fn aggregate_by_entries(
     trace: &Trace,
 ) -> crate::Result<Option<QueryPlan>> {
     let aggregate = groups.aggregate();
-    let picks = filter.skip > 0 || filter.limit.is_some() || !filter.sort.is_empty();
+    let picks = filter.skip > 0 || filter.limit.is_some() || filter.sorted();
     if picks || filter.ids().is_some() || aggregate.needs_documents() {
         return Ok(None);
     }
@@ -5455,6 +5598,7 @@ mod tests {
             select: None,
             except: Vec::new(),
             hint: None,
+            by_key: None,
         }
     }
 
@@ -5830,6 +5974,7 @@ mod tests {
             select: None,
             except: Vec::new(),
             hint: None,
+            by_key: None,
         }
     }
 

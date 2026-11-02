@@ -14,7 +14,7 @@ use crate::collection::aggregate_in;
 use crate::database::Reading;
 use crate::document::{DocId, Document, encode_document};
 use crate::explain::Trace;
-use crate::query::{Filter, Panicked, Sort, canonical, sort_order, value_or_null};
+use crate::query::{Filter, Panicked, SortOrder, canonical, sort_order, value_or_null};
 use crate::select::Selection;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -203,7 +203,7 @@ impl<T> Iterator for LiveQuery<T> {
 pub(crate) fn refused(filter: &Filter) -> Option<&'static str> {
     if filter.skip > 0 {
         Some("a skip")
-    } else if filter.limit.is_some() && filter.sort.is_empty() {
+    } else if filter.limit.is_some() && !filter.sorted() {
         Some("a limit without a sort")
     } else {
         None
@@ -214,7 +214,7 @@ pub(crate) fn refused(filter: &Filter) -> Option<&'static str> {
 /// documents, for their sort values; the `select` cuts them as they are
 /// sent.
 pub(crate) fn first_read(filter: &Filter) -> Filter {
-    match filter.sort.is_empty() {
+    match !filter.sorted() {
         true => filter.clone(),
         false => Filter {
             select: None,
@@ -225,7 +225,8 @@ pub(crate) fn first_read(filter: &Filter) -> Filter {
 }
 
 /// A document's place in a sorted live query (SPEC §145): its sort
-/// values, then its id, as `find` orders equal ones.
+/// values, then its id, as `find` orders equal ones. With a key of the
+/// application's (§154), the key first, as a number.
 #[derive(Debug, Clone)]
 struct Member {
     key: Vec<Document>,
@@ -233,19 +234,35 @@ struct Member {
 }
 
 impl Member {
-    fn of(sort: &[Sort], id: DocId, doc: &Document) -> Self {
+    /// `None` where `filter`'s key leaves `doc` out, as `find` does.
+    fn of(filter: &Filter, id: DocId, doc: &Document) -> Result<Option<Self>, Panicked> {
+        if let Some(ranking) = filter.ranking() {
+            let rank = ranking.rank(doc)?;
+            return Ok(rank.map(|rank| Member {
+                key: rank.into_values(),
+                id,
+            }));
+        }
         // A decoded document holds its `_id`, as `find` sorts it.
-        let key = (sort.iter())
+        let key = (filter.sort.iter())
             .map(|key| value_or_null(doc, &key.field).clone())
             .collect();
-        Member { key, id }
+        Ok(Some(Member { key, id }))
     }
 }
 
-/// `find`'s order: by the sort keys, then by id, so a total one.
-fn order(sort: &[Sort], a: &Member, b: &Member) -> Ordering {
-    (sort.iter().zip(a.key.iter().zip(&b.key)))
-        .map(|(key, (a, b))| sort_order(a, b, key.order))
+/// Which way each of a sorted live query's values runs: the key's
+/// first, where there is one (SPEC §154), then the fields'.
+fn orders(filter: &Filter) -> Vec<SortOrder> {
+    (filter.by_key.iter().map(|by_key| by_key.order()))
+        .chain(filter.sort.iter().map(|key| key.order))
+        .collect()
+}
+
+/// `find`'s order: by the sort values, then by id, so a total one.
+fn order(orders: &[SortOrder], a: &Member, b: &Member) -> Ordering {
+    (orders.iter().zip(a.key.iter().zip(&b.key)))
+        .map(|(order, (a, b))| sort_order(a, b, *order))
         .find(|ord| ord.is_ne())
         .unwrap_or_else(|| a.id.cmp(&b.id))
 }
@@ -296,9 +313,9 @@ impl Watcher {
         filter: Filter,
         now: Vec<(DocId, Document)>,
         sender: mpsc::Sender<Sent>,
-    ) -> Self {
+    ) -> crate::Result<Self> {
         let select = filter.selection();
-        let (kept, entered): (Kept, Vec<Live<Document>>) = match filter.sort.is_empty() {
+        let (kept, entered): (Kept, Vec<Live<Document>>) = match !filter.sorted() {
             true => {
                 let matching = now.iter().map(|(id, _)| *id).collect();
                 let entered = (now.into_iter())
@@ -307,10 +324,17 @@ impl Watcher {
                 (Kept::Matching(matching), entered)
             }
             false => {
-                let members = (now.iter())
-                    .map(|(id, doc)| Member::of(&filter.sort, *id, doc))
-                    .collect();
-                let entered = (now.into_iter().enumerate())
+                // As `find` found them; a key that now leaves one out,
+                // as a closure may, leaves it out of the list too.
+                let mut members = Vec::new();
+                let mut found = Vec::new();
+                for (id, doc) in now {
+                    if let Some(member) = Member::of(&filter, id, &doc)? {
+                        members.push(member);
+                        found.push((id, doc));
+                    }
+                }
+                let entered = (found.into_iter().enumerate())
                     .map(|(at, (id, doc))| Live::Entered {
                         id,
                         doc,
@@ -336,7 +360,7 @@ impl Watcher {
             // The receiver is ours still: the send can't fail.
             let _ = watcher.send(live);
         }
-        watcher
+        Ok(watcher)
     }
 
     /// `false` once it has ended: its `LiveQuery` dropped, or an error
@@ -451,7 +475,7 @@ impl Watcher {
         let Kept::Window(window) = &mut self.kept else {
             unreachable!("only a sorted live query settles");
         };
-        let sort = &self.filter.sort;
+        let sort = &orders(&self.filter);
         let matcher = self.filter.matcher();
         // What is known to match now: the list's documents not written,
         // as they were, and the written ones that match.
@@ -462,8 +486,9 @@ impl Watcher {
         for (id, now) in pending {
             if let Some(doc) = now
                 && matcher.matches(doc)?
+                && let Some(member) = Member::of(&self.filter, *id, doc)?
             {
-                known.push((Member::of(sort, *id, doc), Some(doc.clone())));
+                known.push((member, Some(doc.clone())));
             }
         }
         known.sort_by(|(a, _), (b, _)| order(sort, a, b));
@@ -562,14 +587,20 @@ fn read_again(
     let filter = Filter {
         conditions: filter.conditions.clone(),
         sort: filter.sort.clone(),
+        by_key: filter.by_key.clone(),
         limit: filter.limit,
         ..Filter::new()
     };
-    // In `find`'s order, which is `order`'s.
+    // In `find`'s order, which is `order`'s; a key that now leaves one
+    // out, as a closure may, leaves it out of the list.
     let found = crate::collection::find_at(at, collection, &filter)?;
-    Ok((found.into_iter())
-        .map(|(id, doc)| (Member::of(&filter.sort, id, &doc), Some(doc)))
-        .collect())
+    let mut members = Vec::new();
+    for (id, doc) in found {
+        if let Some(member) = Member::of(&filter, id, &doc)? {
+            members.push((member, Some(doc)));
+        }
+    }
+    Ok(members)
 }
 
 /// Checks every watcher against a commit's `changes`, `at` the state the

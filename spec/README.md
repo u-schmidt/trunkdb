@@ -168,3 +168,4 @@ say what changed, and DESIGN.md says what is true now.
 151. [A page changed again in its batch is not copied (`storage/file.rs`, `storage/scratch.rs`, `index/btree.rs`, `data.rs`)](151-a-page-changed-again-in-its-batch-is-not-copied.md)
 152. [A page changed through `SlottedPage` keeps its mark (`storage/slotted.rs`, `storage/page.rs`)](152-a-page-changed-through-slottedpage-keeps-its-mark.md)
 153. [A grown cell made room for in place (`storage/slotted.rs`)](153-a-grown-cell-made-room-for-in-place.md)
+154. [A sort by a key of the application's own (`query.rs`, `collection.rs`, `live.rs`, `query_text.rs`)](154-a-sort-by-a-key-of-the-applications-own.md)

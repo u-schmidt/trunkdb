@@ -597,7 +597,11 @@ more than four.
   `last`, the last two `by` a field [§146](spec/146-count-distinct-first-and-last.md), `unwind` [§147](spec/147-unwind.md); a condition of the
   application's own, `Condition::custom(fields, test)`, a closure given
   the fields it names, which mustn't use the database, and whose panic
-  fails the call with `Error::ClosurePanicked` [§136](spec/136-a-condition-of-the-applications-own.md).
+  fails the call with `Error::ClosurePanicked` [§136](spec/136-a-condition-of-the-applications-own.md); a sort by a key of
+  the application's own, `sort_by_key(fields, key)` and
+  `sort_by_key_desc`, a closure giving each match a number or `None`
+  to leave it out, the best `skip + limit` kept as the matches are
+  read, live too [§154](spec/154-a-sort-by-a-key-of-the-applications-own.md).
 - **Reading a document:** `get(path)`, `as_i64`, `as_f64`, `as_str` and
   the other readers, each `None` for another type [§136](spec/136-a-condition-of-the-applications-own.md).
 - **Conversions:** `Document::from_value(&t)` and `doc.into_value::<T>()`.

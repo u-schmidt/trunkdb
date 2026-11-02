@@ -893,3 +893,15 @@ limit, batches and a write-ahead log. Since then:
     may sit elsewhere in a page than before, in the layout every
     release reads. No new fixture, as nothing changes how files are
     written (§120.9).
+
+125. **A sort by a key of the application's own** (§154):
+    `Filter::sort_by_key(fields, key)`, smallest first, and
+    `sort_by_key_desc` sort by a number the application's closure
+    gives each match, from the fields it names: a distance, a
+    similarity, a score. `None` or NaN leaves the match out, for
+    `count` too; equal keys go by the `then_*` fields after it, then
+    by id. With a limit only the best `skip + limit` are kept as the
+    matches are read, so "the ten nearest" holds ten, not every match.
+    It works in `find`, `count`, `cursor`, the writes, `aggregate` and
+    `watch`; a panic fails the call with `Error::ClosurePanicked`. No
+    text form: `order by key(lat, lon)`, which the parser refuses.

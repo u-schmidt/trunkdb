@@ -215,6 +215,12 @@ impl<'t> Parser<'t> {
         if self.keyword("order") {
             self.expect_keyword("by")?;
             loop {
+                // What `Display` writes of a `Filter::sort_by_key` (SPEC §154).
+                if self.at_function("key") {
+                    return self.error(
+                        "`key(…)` is a closure in code, which has no text: build the filter in code",
+                    );
+                }
                 let field = self.path()?;
                 let order = match self.keyword("desc") {
                     true => SortOrder::Desc,
@@ -679,8 +685,20 @@ impl fmt::Display for Filter {
             }
             gap = " ";
         }
-        if !self.sort.is_empty() {
+        if self.sorted() {
             write!(f, "{gap}order by ")?;
+            // What the parser refuses (SPEC §154): a closure has no text.
+            if let Some(by_key) = &self.by_key {
+                f.write_str("key(")?;
+                write_list(f, by_key.fields(), |f, path| write_path(f, path))?;
+                f.write_char(')')?;
+                if by_key.order() == SortOrder::Desc {
+                    f.write_str(" desc")?;
+                }
+                if !self.sort.is_empty() {
+                    f.write_str(", ")?;
+                }
+            }
             write_list(f, &self.sort, |f, sort| {
                 write_path(f, &sort.field)?;
                 match sort.order {

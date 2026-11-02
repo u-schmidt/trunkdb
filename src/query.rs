@@ -129,17 +129,122 @@ impl Custom {
     /// step of each path. `None` if a path starts at the document itself
     /// (empty, or `[*]` first), which hands it all of it.
     pub(crate) fn names(&self) -> Option<Vec<&str>> {
-        let mut names: Vec<&str> = Vec::new();
-        for path in &self.fields {
-            let first = path.split(['.', '[']).next().unwrap_or_default();
-            if first.is_empty() {
-                return None;
-            }
-            if !names.contains(&first) {
-                names.push(first);
-            }
+        top_names(&self.fields)
+    }
+}
+
+/// The top-level fields a closure given `fields` gets (SPEC §136.1): the
+/// first step of each path. `None` if a path starts at the document
+/// itself (empty, or `[*]` first), which hands it all of it.
+fn top_names(fields: &[String]) -> Option<Vec<&str>> {
+    let mut names: Vec<&str> = Vec::new();
+    for path in fields {
+        let first = path.split(['.', '[']).next().unwrap_or_default();
+        if first.is_empty() {
+            return None;
         }
-        Some(names)
+        if !names.contains(&first) {
+            names.push(first);
+        }
+    }
+    Some(names)
+}
+
+/// A sort by a key of the application's own (SPEC §154): the paths it
+/// reads, the closure that turns a match into its key, and which way,
+/// from `Filter::sort_by_key` and `sort_by_key_desc`. Cloned, it shares
+/// the closure.
+#[derive(Clone)]
+pub(crate) struct KeySort {
+    fields: Vec<String>,
+    key: Arc<KeyFn>,
+    order: SortOrder,
+}
+
+/// A sort key's closure (SPEC §154).
+type KeyFn = dyn Fn(&Document) -> Option<f64> + Send + Sync;
+
+impl KeySort {
+    pub(crate) fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    pub(crate) fn order(&self) -> SortOrder {
+        self.order
+    }
+}
+
+/// `key(["lat", "lon"]) Asc`: the closure can't be shown.
+impl std::fmt::Debug for KeySort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "key({:?}) {:?}", self.fields, self.order)
+    }
+}
+
+/// As for `Custom` (SPEC §136.3): a `Filter` stays `UnwindSafe`.
+impl std::panic::UnwindSafe for KeySort {}
+impl std::panic::RefUnwindSafe for KeySort {}
+
+/// How a sort by a key of the application's orders matches (SPEC §154):
+/// by the key, then by the sort fields after it. Equal in all, the
+/// caller keeps them in id order, as a sort by fields does.
+pub(crate) struct Ranking<'f> {
+    by_key: &'f KeySort,
+    /// The top-level fields the key's closure gets (SPEC §136.1).
+    names: Option<Vec<&'f str>>,
+    then: &'f [Sort],
+    paths: Vec<Path<'f>>,
+}
+
+/// A match's place in a key sort: its key, never NaN, and its values of
+/// the sort fields after it.
+#[derive(Debug, Clone)]
+pub(crate) struct Rank {
+    key: f64,
+    then: Vec<Document>,
+}
+
+impl Rank {
+    /// The key, and the sort fields' values after it, as the values a
+    /// sorted live query keeps of its members (SPEC §145).
+    pub(crate) fn into_values(self) -> Vec<Document> {
+        let mut values = Vec::with_capacity(1 + self.then.len());
+        values.push(Document::Float(self.key));
+        values.extend(self.then);
+        values
+    }
+}
+
+impl Ranking<'_> {
+    /// `doc`'s rank: the key's closure called on the fields it names, its
+    /// panic caught. `None` where it gives `None` or NaN, which leaves
+    /// `doc` out.
+    pub(crate) fn rank(&self, doc: &Document) -> Result<Option<Rank>, Panicked> {
+        let key = run_cut(self.names.as_deref(), doc, |doc| (self.by_key.key)(doc))?;
+        let Some(key) = key.filter(|key| !key.is_nan()) else {
+            return Ok(None);
+        };
+        let then = (self.paths.iter())
+            .map(|path| path.value_or_null(doc).clone())
+            .collect();
+        Ok(Some(Rank { key, then }))
+    }
+
+    /// `a` before `b`, or after, by the key, then by the fields after it:
+    /// `Equal` leaves them to the id.
+    pub(crate) fn compare(&self, a: &Rank, b: &Rank) -> std::cmp::Ordering {
+        // Never NaN; -0.0 and 0.0 are equal.
+        let by_key = a.key.partial_cmp(&b.key).expect("a key isn't NaN");
+        let by_key = match self.by_key.order {
+            SortOrder::Asc => by_key,
+            SortOrder::Desc => by_key.reverse(),
+        };
+        by_key.then_with(|| {
+            (self.then.iter().zip(a.then.iter().zip(&b.then)))
+                .map(|(key, (a, b))| sort_order(a, b, key.order))
+                .find(|ord| ord.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 }
 
@@ -467,6 +572,10 @@ pub struct Filter {
     /// documents equal in it by the second, and so on; equal in all of
     /// them, by id. Empty: no sort.
     pub(crate) sort: Vec<Sort>,
+    /// A sort by a key of the application's own (SPEC §154), before
+    /// `sort`, whose keys then order the matches it finds equal. `None`:
+    /// none.
+    pub(crate) by_key: Option<KeySort>,
     /// How many matches to pass over, after the sort and before the
     /// limit (SPEC §72). 0: none.
     pub(crate) skip: usize,
@@ -636,12 +745,90 @@ impl Filter {
     /// Sorts by `field` — replacing any earlier sort.
     pub fn sort_by(mut self, field: impl Into<String>, order: SortOrder) -> Self {
         self.sort = Vec::new();
+        self.by_key = None;
         self.then_by(field, order)
+    }
+
+    /// Sorts by a key of the application's own, smallest first,
+    /// replacing any earlier sort (SPEC §154): `key` is given each match
+    /// with the fields it names, never more, as `Condition::custom`'s
+    /// closure is, and returns the number to sort it by, or `None` to
+    /// leave it out. `_id` too: it gets it only if named, unlike what
+    /// `select` hands out. "The ten restaurants nearest to this point":
+    ///
+    /// ```
+    /// use trunkdb::Document;
+    /// use trunkdb::query::Filter;
+    ///
+    /// let (lat, lon) = (52.52, 13.40);
+    /// let nearest = Filter::new()
+    ///     .gte("lat", lat - 0.1) // a band an index on `lat` reads
+    ///     .lte("lat", lat + 0.1)
+    ///     .sort_by_key(["lat", "lon"], move |doc| {
+    ///         let a = doc.get("lat")?.as_f64()?;
+    ///         let b = doc.get("lon")?.as_f64()?;
+    ///         Some((a - lat).hypot((b - lon) * lat.to_radians().cos()))
+    ///     })
+    ///     .limit(10);
+    /// # let _ = nearest;
+    /// ```
+    ///
+    /// - **With a limit,** only the best `skip + limit` are kept as the
+    ///   matches are read, so memory stays at about that many, however
+    ///   many match. Without one, every match is kept, as for any sort.
+    /// - **Equal keys** go by the `then_asc` and `then_desc` fields after
+    ///   it, then by id, as a sort by fields orders equal ones.
+    /// - **`None`, or NaN,** leaves the match out: `find`, `count` and the
+    ///   rest act as if it didn't match.
+    /// - **It never comes from an index:** every match is read, and its
+    ///   key computed; conditions an index bounds narrow what is read.
+    /// - **A panic** in `key` fails the read with `Error::ClosurePanicked`,
+    ///   a write with nothing written, as for `Condition::custom`; in
+    ///   memory (`Filter::apply`) it panics on. `key` mustn't use the
+    ///   database (SPEC §136.7).
+    /// - **No text form:** written as `key(lat, lon)`, which the parser
+    ///   refuses.
+    pub fn sort_by_key<F>(self, fields: impl IntoIterator<Item = impl Into<String>>, key: F) -> Self
+    where
+        F: Fn(&Document) -> Option<f64> + Send + Sync + 'static,
+    {
+        self.keyed(fields, key, SortOrder::Asc)
+    }
+
+    /// `sort_by_key`, largest first: the best scores (SPEC §154).
+    pub fn sort_by_key_desc<F>(
+        self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+        key: F,
+    ) -> Self
+    where
+        F: Fn(&Document) -> Option<f64> + Send + Sync + 'static,
+    {
+        self.keyed(fields, key, SortOrder::Desc)
+    }
+
+    fn keyed<F>(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+        key: F,
+        order: SortOrder,
+    ) -> Self
+    where
+        F: Fn(&Document) -> Option<f64> + Send + Sync + 'static,
+    {
+        self.sort = Vec::new();
+        self.by_key = Some(KeySort {
+            fields: fields.into_iter().map(Into::into).collect(),
+            key: Arc::new(key),
+            order,
+        });
+        self
     }
 
     /// Then by `field`, smallest first, for documents the sort so far
     /// finds equal (SPEC §47): `.sort_asc("status").then_desc("created")`
-    /// — by status, and within a status newest first.
+    /// — by status, and within a status newest first. After
+    /// `sort_by_key`, for equal keys (§154).
     pub fn then_asc(self, field: impl Into<String>) -> Self {
         self.then_by(field, SortOrder::Asc)
     }
@@ -915,11 +1102,32 @@ impl Filter {
             of(condition, &mut names)?;
         }
         if sort {
+            if let Some(by_key) = &self.by_key {
+                by_key.fields.iter().try_for_each(|f| add(f, &mut names))?;
+            }
             for key in &self.sort {
                 add(&key.field, &mut names)?;
             }
         }
         Some(names)
+    }
+
+    /// Whether the matches come in an order: by fields, or by a key of
+    /// the application's (SPEC §154).
+    pub(crate) fn sorted(&self) -> bool {
+        !self.sort.is_empty() || self.by_key.is_some()
+    }
+
+    /// How a sort by a key of the application's orders the matches (SPEC
+    /// §154); `None` without one.
+    pub(crate) fn ranking(&self) -> Option<Ranking<'_>> {
+        let by_key = self.by_key.as_ref()?;
+        Some(Ranking {
+            by_key,
+            names: top_names(&by_key.fields),
+            then: &self.sort,
+            paths: self.sort.iter().map(|key| Path::new(&key.field)).collect(),
+        })
     }
 
     /// Whether the entries of an index on `fields` — of the primary index
@@ -933,6 +1141,11 @@ impl Filter {
     /// values must be exact for an entry to decide. A filter without
     /// conditions (or sort) names none.
     pub(crate) fn covered_by(&self, fields: &[String], sort: bool) -> Option<Vec<bool>> {
+        // A key of the application's is computed from a document, never
+        // from an entry (SPEC §154): the entries may still reject.
+        if sort && self.by_key.is_some() {
+            return None;
+        }
         let mut named = vec![false; fields.len()];
         let mut name = |path: &str| {
             if path == ID_FIELD {
@@ -1001,6 +1214,7 @@ impl Filter {
             })
             .collect();
         self.arrange(results, doc_of)
+            .unwrap_or_else(|panicked| panicked.resume())
     }
 
     /// `apply_to` for matches already checked: sort, then skip, then
@@ -1009,13 +1223,28 @@ impl Filter {
         &self,
         mut results: Vec<T>,
         doc_of: impl Fn(&T) -> &Document,
-    ) -> Vec<T> {
+    ) -> Result<Vec<T>, Panicked> {
+        if let Some(ranking) = self.ranking() {
+            let mut ranked = Vec::new();
+            for item in results {
+                if let Some(rank) = ranking.rank(doc_of(&item))? {
+                    ranked.push((rank, item));
+                }
+            }
+            // Stable: equal, they keep the order they came in.
+            ranked.sort_by(|(a, _), (b, _)| ranking.compare(a, b));
+            let end = self
+                .limit
+                .map_or(usize::MAX, |limit| self.skip.saturating_add(limit));
+            let wanted = ranked.into_iter().take(end).skip(self.skip);
+            return Ok(wanted.map(|(_rank, item)| item).collect());
+        }
         if self.sort.is_empty() {
             results.drain(..self.skip.min(results.len()));
             if let Some(limit) = self.limit {
                 results.truncate(limit);
             }
-            return results;
+            return Ok(results);
         }
         // Each item's sort values looked up once, not on every comparison
         // (SPEC §102.5): `k` per item, side by side.
@@ -1036,10 +1265,10 @@ impl Filter {
         };
         let wanted = &order[self.skip.min(order.len())..end.min(order.len())];
         let mut items: Vec<Option<T>> = results.into_iter().map(Some).collect();
-        wanted
+        Ok(wanted
             .iter()
             .map(|&i| items[i].take().expect("each item once"))
-            .collect()
+            .collect())
     }
 }
 
@@ -1507,6 +1736,10 @@ impl Filter {
     /// A sort by `_id` walks the primary index (SPEC §96): see
     /// `id_order`.
     pub(crate) fn index_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
+        // No index holds a key of the application's (SPEC §154).
+        if self.by_key.is_some() {
+            return None;
+        }
         let indexes = self.offered(indexes);
         let sort = self.sort.first()?;
         self.limit?;
@@ -2310,6 +2543,17 @@ impl<'f> Matcher<'f> {
 /// seeing a field it didn't name, wherever it runs. Not cut where it
 /// holds no others.
 fn call(custom: &Custom, names: Option<&[&str]>, doc: &Document) -> Result<bool, Panicked> {
+    run_cut(names, doc, |doc| (custom.test)(doc))
+}
+
+/// A closure of the application's run on `doc` cut down to `names`
+/// (SPEC §136.1), its panic caught (§136.2): a condition's, or a sort
+/// key's (§154). Not cut where `doc` holds no others.
+fn run_cut<R>(
+    names: Option<&[&str]>,
+    doc: &Document,
+    run: impl FnOnce(&Document) -> R,
+) -> Result<R, Panicked> {
     let cut;
     let doc = match (names, doc) {
         (Some(names), Document::Object(map))
@@ -2327,7 +2571,7 @@ fn call(custom: &Custom, names: Option<&[&str]>, doc: &Document) -> Result<bool,
     };
     // Unwind safe: after a panic the call fails, and nothing it held is
     // looked at again.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (custom.test)(doc))).map_err(Panicked)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(doc))).map_err(Panicked)
 }
 
 /// `op` against `value` for any of `values` — `Ne` for none being equal.
@@ -2863,6 +3107,7 @@ mod tests {
                 .collect();
             let arranged: Vec<usize> = f
                 .arrange(items, |(_, doc)| doc)
+                .unwrap_or_else(|panicked| panicked.resume())
                 .into_iter()
                 .map(|(i, _)| i)
                 .collect();
@@ -4368,6 +4613,7 @@ mod tests {
             select: None,
             except: Vec::new(),
             hint: None,
+            by_key: None,
         };
         // `Filter` has no `PartialEq` (a `Float` NaN isn't equal to itself).
         assert_eq!(format!("{built:?}"), format!("{spelled_out:?}"));
@@ -4771,6 +5017,7 @@ mod tests {
             select: None,
             except: Vec::new(),
             hint: None,
+            by_key: None,
         };
 
         assert_eq!(

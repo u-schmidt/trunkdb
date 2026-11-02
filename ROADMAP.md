@@ -47,6 +47,7 @@ All of it is done:
 | 0.26.0 | **A hint in the query:** `Filter::use_index(fields)` reads that index where the rules would read another, `Filter::no_index()` scans, `"_id"` the primary index; the rules choose the rest among it alone; a hint that can't be followed, no such index or nothing to read it by, is `Error::Hint` from every read, never a quiet fall back; `explain_run` says `hinted`; `use index …` and `use no index` last in a filter's text and `trunkdb find`; a panic on `false` under a hint, found by the `queries` fuzz target, fixed before release ; **the plans `explain_run` passed over:** `Explained::alternatives`, the filter hinted to each index, `_id` and a scan, each with the entries it would read, `Exactly` or `MoreThan`, whether it reads a document per entry, and whether that's fewer; ranges counted whole a leaf at a time up to 1,000 leaves, walks in sort order as far as the run read; `instead:` lines in `trunkdb find --explain`; **aggregate columns named last** (breaking): `count().named("n")`, `sum("tries").named("total")`, a column's `filter` before its name, an `UnnamedColumn` until it has one, so a column without a name or a `filter` before any column doesn't compile | §132–§134 |
 | 0.27.0 | **A hook after each commit:** `Database::subscribe`, a `Changes` receiving a `Commit` for every batch committed after it, in commit order, once it is durable and new reads see it, never for a failed batch; each document once with the batch's net effect, `Inserted`, `Updated` or `Deleted`, `drop_collection` one `Dropped`; ids only; an unbounded `std` channel, so a writer never waits and a subscriber may write; nothing recorded without a subscriber; **a condition of the application's own:** `Condition::custom(fields, test)`, a closure `Fn(&Document) -> bool + Send + Sync` given a document of the fields it names, never more; it never bounds an index read nor is decided on an entry; a panic in it fails the call with `Error::ClosurePanicked`, a write with nothing written, the writer's lock not poisoned; no text form, the parser refusing `custom(…)`; readers on `Document`: `get(path)`, `as_bool`, `as_i64`, `as_f64`, `as_str` and the others; **a panic in `update_many`'s change** or in its `T`'s conversions, under the writer's lock, fails the call with `Error::ClosurePanicked`, nothing written, the lock not poisoned; **live queries:** `Collection::watch(filter)`, a `LiveQuery<T>` reporting first what matches, then for each commit the documents `Entered`, `Left` or `Changed`, with their id and the document as that commit left it; checked inside the commit against the documents it changed, so no transition is lost; a sort, a skip or a limit refused with `Error::NotLive`; a panic in a `custom` condition ending that query alone; **live aggregates:** `Collection::watch_aggregate(filter, &aggregate)`, a `LiveAggregate` reporting every row, then for each commit to the collection the rows `Entered`, `Left` or `Changed`, each with its group values; the aggregate run again whole inside the commit; **a window:** `Aggregate::window(path, duration)`, the documents within `duration` of the newest date-time among the matches, for `aggregate` and `apply` too, refused beside a filter's sort, skip or limit | §135–§139 |
 | 0.28.0 | **`check` finding cells that share bytes**, which a page's own check on reading leaves out; **update operators** `mul`, `pop_first`, `pop_last` and `push_all`; **`except`**, every field but these, `select * except …` in the text; **the update operators in a `Batch`**, by id, and **`upsert_fields`**, inserting from the filter's `eq`s, with `set_on_insert`; **a live query with a sort and a limit**, "the ten fastest vans", each event with its place in the list, a skip still refused; **aggregate columns `count_distinct`, `first` and `last`**, the last two by id or `by` a field, "each van's latest position"; **`Aggregate::unwind`**, one document per element of an array, MongoDB's `$unwind`, read from documents; **rows of the application's own**, `aggregate_as::<R>` and `watch_aggregate_as::<R>`, a `LiveAggregate<R>` of `LiveRow<R>`, converted on the reader's thread; **faster batched writes**, each step profiled and measured: a binary search within B-tree pages, stepping past the tombstones older leaves may hold; a page changed again in its batch not copied; a page changed through `SlottedPage` keeping its layout mark; a grown document made room for in place, where 83–96% of updates compacted their whole page. Together, on 100,000 documents, 1,000 a commit: inserts 32k/s → 42k/s, updates 13k/s → 15k/s, deletes 27k/s → 31k/s, compaction 1.1 s → 0.62 s, reads unchanged | §141–§148, §150–§153 |
+| next | **A sort by a key of the application's own:** `Filter::sort_by_key(fields, key)`, smallest first, and `sort_by_key_desc`, a closure `Fn(&Document) -> Option<f64>` given the fields it names, as `Condition::custom` is; `None` or NaN leaves a match out, for `count` too; equal keys by the `then_*` fields after it, then by id; with a limit, only the best `skip + limit` kept as the matches are read; never from an index, conditions an index serves narrowing what is read; in `find`, `count`, `cursor`, the writes, `aggregate` and `watch`, a live list of the ten nearest; a panic fails the call with `Error::ClosurePanicked`; written `order by key(lat, lon)`, which the parser refuses. "The ten restaurants nearest to this point", the nearest vectors among thousands, any score of the application's | §154 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -139,17 +140,6 @@ another pass over the public API:
 - **A sort by `_id` after an OR of `Eq`s,** or after a compound index
   fixed only in part: a merge of id-ordered ranges, where §103 walks
   one (§103.7); paging by id through `status in (…)`.
-- **A sort by a key of the application's own,** with a limit: a
-  closure given the fields it names, as `Condition::custom` is (§136),
-  returning a number to sort by, or none to leave the document out;
-  the best N kept in a heap as the matches go by, so memory stays at
-  N. "The ten restaurants nearest to this point", distance computed by
-  the application, no geometry built in; with a range on an indexed
-  `lat` around the point, only the band is measured. The same for the
-  nearest vectors, exact, by a scan of thousands to tens of thousands
-  (millions want a vector store, Not planned), and for any score of
-  the application's. To settle in its section: each key handed back
-  with its document, a live form beside §145's, no text form.
 - **A pattern language:** regex or `LIKE`-style wildcards (§25.4).
 - **A date without a time, and a time without a date,** as variants of
   their own; until then, noon UTC of the day serves (§69.1).
@@ -178,6 +168,10 @@ uses trunkdb asking for it.
 - Leaves decided whole for filters that accept several intervals of
   keys (`ne`, an OR, a NOT), each leaf checked against the intervals'
   bounds; they decide entry by entry, on bytes, since §104 (§104.6).
+- A sort by fields in memory with a limit, which still gathers every
+  match and sorts them all: the best `skip + limit` kept as they are
+  read, as §154 keeps a key sort's, would serve it too. Ten of 100,000
+  by a field no index holds took 75 ms, ten by a key 60 (§154.4).
 - A scan, 1.3× SQLite's: each document's filtered fields are decoded
   into a small object to be checked (§99); checking them as they are
   decoded would save that.
@@ -305,6 +299,6 @@ in §6.
   trunkdb, if not its main one, and stores built for it exist (pgvector
   and others). trunkdb is not a vector store; a field of floats is
   stored as any other field. A sort by a key of the application's own
-  (Planned) finds the nearest few thousand exactly, by a scan.
+  (§154) finds the nearest few thousand exactly, by a scan.
 
 Aggregates were on this list until §106.7, and came in §107.

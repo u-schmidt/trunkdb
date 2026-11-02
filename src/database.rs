@@ -662,7 +662,7 @@ impl Database {
             filter,
             now,
             sender,
-        ));
+        )?);
         Ok(LiveQuery::new(receiver, convert))
     }
 

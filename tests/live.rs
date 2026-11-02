@@ -794,6 +794,63 @@ fn a_panic_ends_a_sorted_query_alone() {
     assert_eq!(placed_waiting(&plain), [("entered", b, None, Some(0))]);
 }
 
+/// A key of the application's that panics (SPEC §154) ends its own
+/// live query, as a condition's does, and no other.
+#[test]
+fn a_panic_in_a_sort_key_ends_that_query_alone() {
+    let (_dir, db) = open();
+    let vans = vans(&db);
+    vans.insert(racer("a", 10)).unwrap();
+    let touchy = Filter::new()
+        .sort_by_key(["speed"], |doc| {
+            let speed = doc.get("speed")?.as_f64()?;
+            assert!(speed != 99.0, "too fast");
+            Some(-speed)
+        })
+        .limit(2);
+    let live = vans.watch(touchy).unwrap();
+    let plain = vans
+        .watch(Filter::new().sort_desc("speed").limit(2))
+        .unwrap();
+    placed_waiting(&live);
+    placed_waiting(&plain);
+    let b = vans.insert(racer("b", 99)).unwrap();
+    assert!(matches!(
+        live.try_recv(),
+        Some(Err(Error::ClosurePanicked { .. }))
+    ));
+    assert!(live.try_recv().is_none());
+    assert_eq!(placed_waiting(&plain), [("entered", b, None, Some(0))]);
+    // At the start, the panic fails `watch` itself.
+    let refused = vans.watch(Filter::new().sort_by_key(["speed"], |doc| {
+        assert!(doc.get("speed") != Some(&Document::Int(10)), "slow");
+        Some(0.0)
+    }));
+    assert!(matches!(refused, Err(Error::ClosurePanicked { .. })));
+}
+
+/// A document whose key is `None` isn't in the list, and leaves it when
+/// its key turns `None` (SPEC §154).
+#[test]
+fn a_key_of_none_keeps_a_document_out_of_the_list() {
+    let (_dir, db) = open();
+    let vans = vans(&db);
+    let slow = vans.insert(racer("a", 2)).unwrap();
+    let fast = vans.insert(racer("b", 9)).unwrap();
+    // Only those faster than 5, fastest first.
+    let live = vans
+        .watch(Filter::new().sort_by_key(["speed"], |doc| {
+            let speed = doc.get("speed")?.as_f64()?;
+            (speed > 5.0).then_some(-speed)
+        }))
+        .unwrap();
+    assert_eq!(placed_waiting(&live), [("entered", fast, None, Some(0))]);
+    set_speed(&vans, &slow, 12);
+    assert_eq!(placed_waiting(&live), [("entered", slow, None, Some(0))]);
+    set_speed(&vans, &fast, 1);
+    assert_eq!(placed_waiting(&live), [("left", fast, Some(1), None)]);
+}
+
 #[test]
 fn a_limit_of_nothing_reports_nothing() {
     let (_dir, db) = open();
@@ -832,6 +889,23 @@ fn the_kept_list_is_find_s_after_every_commit() {
             .then_asc("_id")
             .limit(5)
             .select(["zone"]),
+        // A key of the application's (SPEC §154): nearest to 4, ties
+        // by id; and one that leaves zone "c" out, ties by zone.
+        Filter::new()
+            .sort_by_key(["speed"], |d| {
+                d.get("speed")?.as_f64().map(|s| (s - 4.0).abs())
+            })
+            .limit(3),
+        Filter::new()
+            .sort_by_key_desc(["speed", "zone"], |d| {
+                if d.get("zone")?.as_str()? == "c" {
+                    return None;
+                }
+                d.get("speed")?.as_f64()
+            })
+            .then_asc("zone")
+            .limit(4),
+        Filter::new().sort_by_key(["speed"], |d| d.get("speed")?.as_f64().map(|s| -s)),
     ];
     for (round, filter) in filters.iter().enumerate() {
         let (_dir, db) = open();

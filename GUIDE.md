@@ -122,6 +122,41 @@ what it needs beforehand (`move` the fences in). To read or write in
 response to a match, use `watch` (below): its events arrive on your
 own thread, where anything goes.
 
+## A sort of your own
+
+To sort by something no field holds, a distance or a score, give a
+closure that turns each match into a number (SPEC §154). It gets the
+fields it names, as `custom` does, and `_id` only if you name it too:
+
+```rust
+let (lat, lon) = (52.52, 13.40);
+let nearest = restaurants.find(
+    Filter::new()
+        .gte("lat", lat - 0.1) // a band an index on `lat` reads
+        .lte("lat", lat + 0.1)
+        .sort_by_key(["lat", "lon"], move |r| {
+            let (a, b) = (r.get("lat")?.as_f64()?, r.get("lon")?.as_f64()?);
+            Some((a - lat).hypot((b - lon) * lat.to_radians().cos()))
+        })
+        .limit(10),
+)?;
+```
+
+- **Smallest first;** `sort_by_key_desc` for the best scores first.
+  Equal keys go by `then_asc`/`then_desc` fields after it, then by id.
+- **`None` leaves a match out,** as if it didn't match: here, a
+  restaurant without a position. `count` agrees with `find`.
+- **With a limit, memory stays small:** only the best ten are kept as
+  the matches are read. Every match is still read and its key
+  computed, so narrow the read with conditions an index serves, as the
+  band on `lat` does.
+- **It works everywhere a sort does:** `find`, `count`, `cursor`, the
+  writes (`delete_many` of the ten nearest), `aggregate`, and `watch`,
+  for a live list of the ten nearest vans.
+- The same for exact nearest vectors, a few thousand of them, by a
+  distance you compute; and, as with `custom`, a panic fails the call
+  with `Error::ClosurePanicked`, and there is no text form.
+
 ## Atomic batches
 
 A batch spans collections and commits all of its writes or none:
