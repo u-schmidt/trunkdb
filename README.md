@@ -134,6 +134,15 @@ counted with `--dry-run` and confirmed before it runs. Copy the folder
 to where your agent reads skills. The file must not be open in another
 program meanwhile: one that writes holds it locked.
 
+### A desktop app
+
+[TrunkDB Admin](https://github.com/u-schmidt/trunkdb-admin) looks into
+and manages a trunkdb file without code: collections and indexes,
+documents as JSON or as a table, filters as rows or as text, groups,
+explain, editing, check, export and import. It is a project of its own,
+made on macOS, and bundles a trunkdb release; while it has a file open,
+it holds the file locked.
+
 ## Performance
 
 `bench/` runs one document workload against trunkdb, SQLite, redb and
