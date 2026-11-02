@@ -969,3 +969,15 @@ limit, batches and a write-ahead log. Since then:
     holds a float can be added; `==` works as before, but neither can
     be a `HashMap` key. `Kind::ALL` is a slice and a date-time's kind
     `Kind::DateTime`, both before any release had them.
+
+    Items 130–133 → 0.30.0. **One thing to adapt:** the hook's `Commit`
+    and `Change` are no longer `Eq`, so neither can be a `HashMap` or
+    `HashSet` key; `==` works as before, and a set of what changed is
+    one of ids, from `Change::id`. Otherwise additions:
+    `Filter::starts_with` and `Op::StartsWith`; `Filter::is_kind`,
+    `Condition::is_kind`, `Condition::IsKind` and `Kind`; `starts
+    with`, `is <kind>` and `is not <kind>` in a filter's text. An `in`
+    on a compound index's field reads a range per value, so queries
+    find the same documents, faster. Files stay format 12 and exports
+    as in 0.29.0, which opens what 0.30.0 writes. No new fixture, as
+    nothing changes how files are written (§120.9).
