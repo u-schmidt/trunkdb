@@ -13,6 +13,17 @@ use super::{Page, PageId, PageType, USABLE_PAGE_SIZE};
 const HEADER_LEN: usize = 13;
 const SLOT_LEN: usize = 4;
 
+/// The shortest cell a page of type `page_type` (its byte) may hold: an
+/// index page's cells are each long enough for an entry, which the entry
+/// decoders trust (SPEC §55).
+fn min_cell(page_type: u8) -> usize {
+    match page_type {
+        t if t == PageType::IndexLeaf as u8 => crate::index::MIN_INDEX_ENTRY_LEN,
+        t if t == PageType::IndexBranch as u8 => crate::index::MIN_BRANCH_ENTRY_LEN,
+        _ => 0,
+    }
+}
+
 impl PageType {
     pub fn is_slotted(&self) -> bool {
         matches!(
@@ -35,6 +46,12 @@ impl PageType {
 #[derive(Clone)]
 pub struct SlottedPage {
     buf: Page,
+    /// Whether the bytes pass `check_layout` (SPEC §152): so from
+    /// `from_bytes`, which checked them, and from `new` with a slotted
+    /// type. Every change here keeps it, placing cells only where they
+    /// fit, but for a cell too short for an index entry. `into_page`
+    /// marks the page by it, so a page changed here isn't checked again.
+    valid: bool,
 }
 
 impl SlottedPage {
@@ -43,7 +60,10 @@ impl SlottedPage {
         let mut buf = vec![0u8; USABLE_PAGE_SIZE];
         buf[0] = page_type as u8;
         buf[11..13].copy_from_slice(&(USABLE_PAGE_SIZE as u16).to_le_bytes());
-        Self { buf: buf.into() }
+        Self {
+            buf: buf.into(),
+            valid: page_type.is_slotted(),
+        }
     }
 
     /// Interprets an existing page buffer (as read from a `PageStore`) as a
@@ -58,7 +78,7 @@ impl SlottedPage {
         if !buf.layout_checked() {
             Self::check_layout(&buf)?;
         }
-        Ok(Self { buf })
+        Ok(Self { buf, valid: true })
     }
 
     /// `from_bytes`'s check, on its own: for the store, which marks a
@@ -129,11 +149,7 @@ impl SlottedPage {
         // the entry decoders trust (SPEC §55). Checked here, with the
         // rest of the layout, so a page the cache marked isn't checked
         // again on every step of a walk (SPEC §101).
-        let min_cell = match page_type {
-            PageType::IndexLeaf => crate::index::MIN_INDEX_ENTRY_LEN,
-            PageType::IndexBranch => crate::index::MIN_BRANCH_ENTRY_LEN,
-            _ => 0,
-        };
+        let min_cell = min_cell(buf[0]);
         for slot in 0..slot_count {
             let length = field(Self::slot_offset(slot) + 2) as usize;
             if length != 0 && length < min_cell {
@@ -147,13 +163,22 @@ impl SlottedPage {
     }
 
     /// The page, to write back: `store.write_page(id, &page.into_page())`.
+    /// Marked as checked if its layout is valid, as every change here
+    /// keeps it (SPEC §152): a debug build checks that it is.
     pub fn into_page(self) -> Page {
-        self.buf
+        debug_assert!(
+            !self.valid || Self::check_layout(&self.buf).is_ok(),
+            "a change to a slotted page broke its layout"
+        );
+        match self.valid {
+            true => self.buf.known_checked(),
+            false => self.buf,
+        }
     }
 
     /// The bytes, to change: copied first if they're shared, as a page
     /// just read from the cache is. The page then counts as unchecked
-    /// (SPEC §66), until it goes into the cache again.
+    /// (SPEC §66) until `into_page` marks it again (§152).
     fn bytes_mut(&mut self) -> &mut [u8] {
         self.buf.make_mut()
     }
@@ -197,7 +222,12 @@ impl SlottedPage {
         (offset, length)
     }
 
+    /// Every cell's slot is written here, so here a cell too short for
+    /// an index entry makes the layout one `check_layout` refuses.
     fn write_slot(&mut self, index: u16, offset: u16, length: u16) {
+        if length != 0 && (length as usize) < min_cell(self.buf[0]) {
+            self.valid = false;
+        }
         let at = Self::slot_offset(index);
         self.bytes_mut()[at..at + 2].copy_from_slice(&offset.to_le_bytes());
         self.bytes_mut()[at + 2..at + 4].copy_from_slice(&length.to_le_bytes());
@@ -507,19 +537,48 @@ mod tests {
     }
 
     /// SPEC §66: a page marked checked isn't checked again, and a change
-    /// takes the mark away. Marked bytes that don't hold a valid page
-    /// show the check is skipped: only `Page::checked` marks a page, and
-    /// only a valid one, so they can't happen outside a test.
+    /// to its bytes takes the mark away; a change through `SlottedPage`
+    /// keeps it (§152). Marked bytes that don't hold a valid page show
+    /// the check is skipped: only `Page::checked` and `into_page` mark a
+    /// page, and only a valid one, so they can't happen outside a test.
     #[test]
     fn a_checked_page_is_not_checked_again_until_it_changes() {
         let mut page = SlottedPage::new(PageType::Data);
         page.insert_cell(b"cell").unwrap();
-        let valid = page.into_page().checked();
-        assert!(valid.layout_checked());
+        let valid = page.into_page();
+        assert!(valid.layout_checked(), "built here");
         let mut read = SlottedPage::from_bytes(valid.clone()).unwrap();
         read.insert_cell(b"more").unwrap();
-        assert!(!read.into_page().layout_checked());
+        read.delete_cell(0);
+        read.compact();
+        let changed = read.into_page();
+        assert!(changed.layout_checked(), "changed here");
         assert!(valid.layout_checked(), "the original kept its mark");
+        let mut raw = changed.clone();
+        raw.make_mut()[0] = PageType::Data as u8;
+        assert!(!raw.layout_checked(), "its bytes changed");
+
+        // A cell too short for an index entry: a layout the check
+        // refuses, so not marked. One just long enough is marked.
+        for (page_type, min) in [
+            (PageType::IndexLeaf, crate::index::MIN_INDEX_ENTRY_LEN),
+            (PageType::IndexBranch, crate::index::MIN_BRANCH_ENTRY_LEN),
+        ] {
+            let mut index = SlottedPage::new(page_type);
+            index.insert_cell(&vec![1; min]).unwrap();
+            index.delete_cell(0);
+            assert!(index.clone().into_page().layout_checked(), "{page_type:?}");
+            index.insert_cell(&vec![1; min - 1]).unwrap();
+            let short = index.into_page();
+            assert!(!short.layout_checked(), "{page_type:?}");
+            assert!(SlottedPage::from_bytes(short).is_err());
+        }
+        assert!(
+            !SlottedPage::new(PageType::Overflow)
+                .into_page()
+                .layout_checked(),
+            "not a slotted type"
+        );
 
         let mut damaged = vec![0u8; USABLE_PAGE_SIZE];
         damaged[0] = PageType::Data as u8;

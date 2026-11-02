@@ -13,7 +13,8 @@ use std::sync::Arc;
 pub struct Page {
     bytes: Arc<[u8]>,
     /// Whether the bytes were found a valid slotted page (SPEC §66): set
-    /// when a page goes into the cache, copied with every clone the cache
+    /// when a page goes into the cache, or by `SlottedPage::into_page`
+    /// for a page changed only there (§152), copied with every clone the cache
     /// hands out, so `SlottedPage::from_bytes` checks a cached page once,
     /// not on every read. In the handle, not with the shared bytes, so
     /// reading it touches no memory other cores write.
@@ -41,6 +42,14 @@ impl Page {
         if !self.layout_checked {
             self.layout_checked = super::SlottedPage::check_layout(&self).is_ok();
         }
+        self
+    }
+
+    /// The page marked checked without being checked again: for
+    /// `SlottedPage::into_page`, whose changes keep a valid layout valid
+    /// (SPEC §152).
+    pub(super) fn known_checked(mut self) -> Page {
+        self.layout_checked = true;
         self
     }
 

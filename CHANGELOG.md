@@ -859,3 +859,11 @@ limit, batches and a write-ahead log. Since then:
     instead of all. Batched inserts about 1.11× faster, deletes 1.11×,
     compaction 1.05×, updates and reads unchanged; nothing else
     changes.
+123. **A page changed through `SlottedPage` keeps its mark** (§152): a
+    page's layout is checked once, as it goes into the cache, but any
+    change took the mark away, so every read of a page its batch had
+    changed checked it again. A change through `SlottedPage` keeps a
+    valid layout valid, so it now keeps the mark; a cell too short for
+    an index entry still loses it, and a debug build checks every page
+    it marks. Batched inserts about 1.1× faster, compaction 1.15×,
+    reads unchanged; nothing else changes.

@@ -2219,12 +2219,18 @@ mod tests {
 
     /// A slotted page is checked when its batch commits or it comes in
     /// from the file, and every read of it after carries the mark (SPEC
-    /// §66); a staged page and one that isn't slotted don't.
+    /// §66); a staged page and one that isn't slotted don't. One built
+    /// or changed through `SlottedPage` comes marked already (§152).
     #[test]
     fn cached_pages_come_with_their_layout_checked() {
         let (_dir, path) = open_temp();
         let mut store = five_page_file(&path);
-        let slotted = super::super::SlottedPage::new(PageType::Data).into_page();
+        let built = SlottedPage::new(PageType::Data).into_page();
+        store.begin();
+        store.write_page(3, built.clone()).unwrap();
+        assert!(store.read_page(3).unwrap().layout_checked(), "built");
+        store.rollback();
+        let slotted = Page::from(built.to_vec());
         store.begin();
         store.write_page(2, slotted.clone()).unwrap();
         assert!(!store.read_page(2).unwrap().layout_checked(), "staged");

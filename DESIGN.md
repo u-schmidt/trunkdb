@@ -114,6 +114,8 @@ outside the cell area is an error saying what is wrong, not a panic [§54](spec/
 and so is a slot directory past the page's end, refused before a slot is read [§129](spec/129-a-slot-directory-past-the-pages-end.md).
 A page is checked once, as it goes into the cache or its batch
 commits, and marked; reads of a marked page skip the check [§66](spec/66-a-page-checked-once.md).
+A change through `SlottedPage` keeps the mark, as its changes keep a
+valid layout valid; a debug build checks that they do [§152](spec/152-a-page-changed-through-slottedpage-keeps-its-mark.md).
 The same holds for everything decoded from a page: bytes that run out,
 a count past what's left, a link back to a page already seen or past
 the file's end are `InvalidData` errors. Decoders read through
@@ -659,28 +661,29 @@ more than four.
 the same documents and indexes and a durable commit everywhere, and
 checks that all four give the same answers [§48](spec/48-benchmarks-against-sqlite-redb-and-sled.md).
 
-Reads are level with SQLite, redb and sled or ahead of them; inserts, a
-full scan and compaction are still behind. On an M1 Pro with 100,000
-documents, the median of three runs (with §151):
+Reads are level with SQLite, redb and sled or ahead of them, and so
+are batched inserts in these runs; a full scan, updates and compaction
+are still behind. On an M1 Pro with 100,000
+documents, the median of three runs (with §152):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 38k/s | 40k/s | 42k/s | 28k/s |
-| one commit | 4.6 ms | 4.8 ms | 5.0 ms | 10.5 ms |
-| get by id | 1.8 µs | 14 µs | 1.9 µs | 2.9 µs |
-| 1000 documents by index | 0.92 ms | 1.7 ms | 1.1 ms | 2.0 ms |
+| insert, 1000 per commit | 43k/s | 39k/s | 44k/s | 30k/s |
+| one commit | 4.5 ms | 4.7 ms | 5.0 ms | 10.1 ms |
+| get by id | 1.9 µs | 11 µs | 1.9 µs | 2.2 µs |
+| 1000 documents by index | 1.0 ms | 1.8 ms | 1.0 ms | 1.8 ms |
 | count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
 | count of a range of 1000 | 0.01 ms | 0.02 ms | 0.04 ms | 0.34 ms |
-| count of all 100,000 | 0.09 ms | 0.01 ms | 0.00 ms | 24 ms |
-| oldest 20 of a status | 18.6 µs | 24.2 µs | 16.5 µs | 21.9 µs |
-| page 50 of 20 of a status | 26 µs | 56 µs | 43 µs | 257 µs |
-| first 50 by id | 33 µs | 36 µs | 26 µs | 29 µs |
-| 50 by id after skipping 5000 | 39 µs | 126 µs | 227 µs | 0.97 ms |
-| a tenant's first 20 by id | 22 µs | 1.2 ms | 19 µs | 25 µs |
-| scan, 100,000 for a fifth | 63 ms | 47 ms | 54 ms | 68 ms |
-| update, 1000 per commit | 14k/s | 14k/s | 18k/s | 22k/s |
-| delete, 1000 per commit | 29k/s | 19k/s | 24k/s | 35k/s |
-| compact | 0.78 s | 0.16 s | 0.46 s | — |
+| count of all 100,000 | 0.09 ms | 0.01 ms | 0.00 ms | 23 ms |
+| oldest 20 of a status | 18.3 µs | 23.8 µs | 16.3 µs | 20.9 µs |
+| page 50 of 20 of a status | 27 µs | 53 µs | 45 µs | 255 µs |
+| first 50 by id | 32 µs | 35 µs | 25 µs | 30 µs |
+| 50 by id after skipping 5000 | 39 µs | 129 µs | 236 µs | 0.98 ms |
+| a tenant's first 20 by id | 23 µs | 1.3 ms | 22 µs | 25 µs |
+| scan, 100,000 for a fifth | 59 ms | 43 ms | 54 ms | 71 ms |
+| update, 1000 per commit | 14k/s | 15k/s | 20k/s | 24k/s |
+| delete, 1000 per commit | 30k/s | 20k/s | 24k/s | 34k/s |
+| compact | 0.63 s | 0.16 s | 0.42 s | — |
 | file size after compact | 31 MB | 22 MB | 30 MB | — |
 
 Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
@@ -695,12 +698,16 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
   - a scan, 1.3× SQLite: each document's filtered fields are decoded
     into a small object to be checked;
   - "first 50 by id", 1.3× redb.
-- **Writes:** inserts 0.95× SQLite's, updates level, deletes ahead.
+- **Writes:** inserts 1.1× SQLite's in these runs (0.88× before §151,
+  and SQLite's own runs vary by a tenth from day to day), updates
+  0.93×, deletes ahead.
   The checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
   batches of 1,000 in 100 paid a checkpoint. Most of what is left of a
   batched commit is the CPU, not the WAL's whole pages ([§149](spec/149-wal-records-of-what-changed-measured-first.md)); a
   binary search within B-tree pages took 3 ms of its 20.6 ms of CPU ([§150](spec/150-a-binary-search-within-b-tree-pages.md)),
-  and a page changed again in its batch is no longer copied ([§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md)).
+  a page changed again in its batch is no longer copied ([§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md)), and
+  a page changed through `SlottedPage` isn't checked again on every
+  read ([§152](spec/152-a-page-changed-through-slottedpage-keeps-its-mark.md)).
   Compaction inserts its entries one by one (§48.4), and its file is
   1.4× SQLite's.
 
@@ -723,6 +730,7 @@ Each gap had a measured cause, fixed one at a time:
 | Batched inserts | 22k/s | a checkpoint once 4,000 pages wait, not 1,000 [§123](spec/123-batched-writes-checkpoint-less-often.md) |
 | Batched inserts, compact | 32k/s, 1.1 s | a binary search within B-tree pages [§150](spec/150-a-binary-search-within-b-tree-pages.md) |
 | Batched inserts, deletes | 36k/s, 27k/s | a page changed again in its batch, not copied [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md) |
+| Batched inserts, compact | 39k/s, 0.74 s | a page changed through `SlottedPage` keeps its layout mark [§152](spec/152-a-page-changed-through-slottedpage-keeps-its-mark.md) |
 | First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |
@@ -736,9 +744,9 @@ Still behind: in a scan, the small object each document's filtered
 fields are decoded into; in a batched commit, the CPU (§150). The copy
 per page read is gone [§64](spec/64-shared-pages.md), and a change copies a page once, not twice:
 `write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md), and a page the batch changes again is
-changed in place, the batch's copy let go first (`PageStore::change_page`, [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md)). But
-a batch's own pages are checked on every read: 7% of a batched
-commit's CPU (§150).
+changed in place, the batch's copy let go first (`PageStore::change_page`, [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md)). A page
+changed through `SlottedPage` keeps its layout mark, so a batch's own
+pages aren't checked on every read [§152](spec/152-a-page-changed-through-slottedpage-keeps-its-mark.md).
 
 ## 13. How it's tested
 
