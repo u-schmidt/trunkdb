@@ -485,7 +485,8 @@ are shared, each with a lock of its own [§79](spec/79-writers-beside-the-reader
   changes only an atomic flag [§65](spec/65-a-read-lock-for-the-page-cache.md); a page coming in from the file, a
   commit and the two ends of a checkpoint take it alone, briefly. Pages
   are shared, not copied: a read gets the page itself (`Page`, an
-  `Arc`), and a change copies it first [§64](spec/64-shared-pages.md).
+  `Arc`), and a change copies it first [§64](spec/64-shared-pages.md), once a batch: a page
+  the batch changed already is changed in place [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md).
 
 **Nobody waits for anybody**, but for two short locks and `compact`:
 - a batch is staged, logged and flushed beside the readers, and
@@ -660,26 +661,26 @@ checks that all four give the same answers [§48](spec/48-benchmarks-against-sql
 
 Reads are level with SQLite, redb and sled or ahead of them; inserts, a
 full scan and compaction are still behind. On an M1 Pro with 100,000
-documents, the median of three runs (with §150):
+documents, the median of three runs (with §151):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 36k/s | 41k/s | 38k/s | 28k/s |
-| one commit | 5.0 ms | 5.2 ms | 5.6 ms | 10.9 ms |
-| get by id | 2.1 µs | 16 µs | 2.2 µs | 2.5 µs |
-| 1000 documents by index | 0.93 ms | 1.8 ms | 0.98 ms | 1.9 ms |
+| insert, 1000 per commit | 38k/s | 40k/s | 42k/s | 28k/s |
+| one commit | 4.6 ms | 4.8 ms | 5.0 ms | 10.5 ms |
+| get by id | 1.8 µs | 14 µs | 1.9 µs | 2.9 µs |
+| 1000 documents by index | 0.92 ms | 1.7 ms | 1.1 ms | 2.0 ms |
 | count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
 | count of a range of 1000 | 0.01 ms | 0.02 ms | 0.04 ms | 0.34 ms |
 | count of all 100,000 | 0.09 ms | 0.01 ms | 0.00 ms | 24 ms |
-| oldest 20 of a status | 18.3 µs | 24.1 µs | 15.9 µs | 20.5 µs |
-| page 50 of 20 of a status | 27 µs | 54 µs | 42 µs | 259 µs |
-| first 50 by id | 31 µs | 36 µs | 27 µs | 29 µs |
-| 50 by id after skipping 5000 | 38 µs | 126 µs | 220 µs | 0.96 ms |
-| a tenant's first 20 by id | 24 µs | 1.3 ms | 20 µs | 25 µs |
-| scan, 100,000 for a fifth | 59 ms | 44 ms | 54 ms | 67 ms |
-| update, 1000 per commit | 13k/s | 14k/s | 18k/s | 25k/s |
-| delete, 1000 per commit | 28k/s | 19k/s | 23k/s | 35k/s |
-| compact | 0.81 s | 0.16 s | 0.40 s | — |
+| oldest 20 of a status | 18.6 µs | 24.2 µs | 16.5 µs | 21.9 µs |
+| page 50 of 20 of a status | 26 µs | 56 µs | 43 µs | 257 µs |
+| first 50 by id | 33 µs | 36 µs | 26 µs | 29 µs |
+| 50 by id after skipping 5000 | 39 µs | 126 µs | 227 µs | 0.97 ms |
+| a tenant's first 20 by id | 22 µs | 1.2 ms | 19 µs | 25 µs |
+| scan, 100,000 for a fifth | 63 ms | 47 ms | 54 ms | 68 ms |
+| update, 1000 per commit | 14k/s | 14k/s | 18k/s | 22k/s |
+| delete, 1000 per commit | 29k/s | 19k/s | 24k/s | 35k/s |
+| compact | 0.78 s | 0.16 s | 0.46 s | — |
 | file size after compact | 31 MB | 22 MB | 30 MB | — |
 
 Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
@@ -693,12 +694,13 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
     the others keep a total;
   - a scan, 1.3× SQLite: each document's filtered fields are decoded
     into a small object to be checked;
-  - "first 50 by id", 1.1× redb.
-- **Writes:** inserts 0.88× SQLite's, updates 0.9×, deletes ahead.
+  - "first 50 by id", 1.3× redb.
+- **Writes:** inserts 0.95× SQLite's, updates level, deletes ahead.
   The checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
   batches of 1,000 in 100 paid a checkpoint. Most of what is left of a
   batched commit is the CPU, not the WAL's whole pages ([§149](spec/149-wal-records-of-what-changed-measured-first.md)); a
-  binary search within B-tree pages took 3 ms of its 20.6 ms of CPU ([§150](spec/150-a-binary-search-within-b-tree-pages.md)).
+  binary search within B-tree pages took 3 ms of its 20.6 ms of CPU ([§150](spec/150-a-binary-search-within-b-tree-pages.md)),
+  and a page changed again in its batch is no longer copied ([§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md)).
   Compaction inserts its entries one by one (§48.4), and its file is
   1.4× SQLite's.
 
@@ -720,6 +722,7 @@ Each gap had a measured cause, fixed one at a time:
 | Batched inserts | 7.5k/s | B-tree pages changed in place [§52](spec/52-b-tree-pages-changed-in-place.md) |
 | Batched inserts | 22k/s | a checkpoint once 4,000 pages wait, not 1,000 [§123](spec/123-batched-writes-checkpoint-less-often.md) |
 | Batched inserts, compact | 32k/s, 1.1 s | a binary search within B-tree pages [§150](spec/150-a-binary-search-within-b-tree-pages.md) |
+| Batched inserts, deletes | 36k/s, 27k/s | a page changed again in its batch, not copied [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md) |
 | First 50 by id | 189 ms | a walk of the primary index [§96](spec/96-sorting-by-id-through-the-primary-index.md), copying only what it hands out [§97](spec/97-a-walk-that-copies-only-what-it-hands-out.md) |
 | First 50 by id, scans | 70 µs, 168 ms | decoding only what a read needs [§99](spec/99-decoding-only-what-a-read-needs.md) |
 | Count of 1000 by index, page 50 of 20 | 0.9 ms, 1.2 ms | index entries that answer the filter [§100](spec/100-index-entries-that-answer-the-filter.md) |
@@ -732,9 +735,10 @@ Each gap had a measured cause, fixed one at a time:
 Still behind: in a scan, the small object each document's filtered
 fields are decoded into; in a batched commit, the CPU (§150). The copy
 per page read is gone [§64](spec/64-shared-pages.md), and a change copies a page once, not twice:
-`write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md). But a page the batch changes again is
-copied again, on every insert into it, and a batch's own pages are
-checked on every read: 11% and 7% of a batched commit's CPU (§150).
+`write_page` takes the `Page` [§67](spec/67-write-page-takes-the-page.md), and a page the batch changes again is
+changed in place, the batch's copy let go first (`PageStore::change_page`, [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md)). But
+a batch's own pages are checked on every read: 7% of a batched
+commit's CPU (§150).
 
 ## 13. How it's tested
 

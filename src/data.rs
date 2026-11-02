@@ -340,12 +340,19 @@ pub fn delete_record(
     free: &mut FreeSpace,
     loc: RecordLocation,
 ) -> std::io::Result<()> {
-    let mut page = read_data_page(store, loc.page)?;
+    let page = read_data_page(store, loc.page)?;
     if let Some((len, first)) = Cell::parse(live_cell(&page, loc)?)?.chain() {
         free_chain(store, first, len)?;
     }
-    page.delete_cell(loc.slot);
-    write_or_free(store, current, free, loc.page, page)
+    // Its last document: the page is freed, as `write_or_free` frees it.
+    if page.live_cells() == 1 && loc.page != current {
+        free.remove(loc.page);
+        return store.free_page(loc.page);
+    }
+    store.change_page(loc.page, page, &mut |page| {
+        page.delete_cell(loc.slot);
+        note_room(free, current, loc.page, page);
+    })
 }
 
 /// Frees every page a dropped collection's documents use (SPEC §37): the
@@ -433,29 +440,38 @@ fn place_cell(
     free: &mut FreeSpace,
     cell: &[u8],
 ) -> std::io::Result<RecordLocation> {
+    // Changed in place, not copied, if the batch changed it already
+    // (SPEC §151).
     if *current != 0 {
-        let mut page = read_data_page(store, *current)?;
-        if let Some(slot) = page.insert_cell_reusing_slot(cell) {
-            store.write_page(*current, page.into_page())?;
+        let page = read_data_page(store, *current)?;
+        if page.fits_reusing_slot(cell.len()) {
+            let mut slot = None;
+            store.change_page(*current, page, &mut |page| {
+                slot = page.insert_cell_reusing_slot(cell)
+            })?;
             return Ok(RecordLocation {
                 page: *current,
-                slot,
+                slot: slot.expect("the cell fits"),
             });
         }
     }
 
     let needed = SlottedPage::space_needed(cell.len()) as u16;
     if let Some(page_id) = free.find(needed) {
-        let mut page = read_data_page(store, page_id)?;
-        let slot = page.insert_cell_reusing_slot(cell);
-        note_room(free, *current, page_id, &page);
-        if let Some(slot) = slot {
-            store.write_page(page_id, page.into_page())?;
+        let page = read_data_page(store, page_id)?;
+        if page.fits_reusing_slot(cell.len()) {
+            let current = *current;
+            let mut slot = None;
+            store.change_page(page_id, page, &mut |page| {
+                slot = page.insert_cell_reusing_slot(cell);
+                note_room(free, current, page_id, page);
+            })?;
             return Ok(RecordLocation {
                 page: page_id,
-                slot,
+                slot: slot.expect("the cell fits"),
             });
         }
+        note_room(free, *current, page_id, &page);
     }
 
     let page_id = store.allocate_page()?;

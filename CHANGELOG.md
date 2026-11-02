@@ -849,3 +849,13 @@ limit, batches and a write-ahead log. Since then:
     tombstones a leaf from before §52 may hold. Batched inserts about
     1.14× faster, compaction 1.4×, reads unchanged; nothing else
     changes.
+122. **A page changed again in its batch is not copied** (§151): every
+    change to a page copied all of it first, as the batch held a copy
+    a read shared, though only its first change in a batch has to;
+    now the store lets go of its copy before a change, and the page is
+    changed in place. B-tree inserts and removes, documents put into a
+    page or deleted from one, and a compaction's image. Of about
+    500,000 page changes in 100 batches of 1,000 inserts, 81,000 copy
+    instead of all. Batched inserts about 1.11× faster, deletes 1.11×,
+    compaction 1.05×, updates and reads unchanged; nothing else
+    changes.

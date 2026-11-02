@@ -165,3 +165,4 @@ say what changed, and DESIGN.md says what is true now.
 148. [Rows of the application's own (`collection.rs`, `live.rs`, `snapshot.rs`)](148-rows-of-the-applications-own.md)
 149. [WAL records of what changed, measured first (`durability/wal.rs`, `storage/file.rs`)](149-wal-records-of-what-changed-measured-first.md) — a draft, not built
 150. [A binary search within B-tree pages (`index/btree.rs`)](150-a-binary-search-within-b-tree-pages.md)
+151. [A page changed again in its batch is not copied (`storage/file.rs`, `storage/scratch.rs`, `index/btree.rs`, `data.rs`)](151-a-page-changed-again-in-its-batch-is-not-copied.md)

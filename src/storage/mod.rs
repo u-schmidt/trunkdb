@@ -149,6 +149,19 @@ pub trait PageStore {
     /// `Page::make_mut` was copied once, on its first change, and is
     /// stored as it is, not copied again.
     fn write_page(&mut self, id: PageId, data: Page) -> std::io::Result<()>;
+    /// `write_page` of `page` after `change`, for a page just read to
+    /// change it (SPEC §151): a store holding a copy of its own, as a
+    /// batch holds the pages it changed, lets go of it first, so the
+    /// change is made in place instead of on a copy of the whole page.
+    fn change_page(
+        &mut self,
+        id: PageId,
+        mut page: SlottedPage,
+        change: &mut dyn FnMut(&mut SlottedPage),
+    ) -> std::io::Result<()> {
+        change(&mut page);
+        self.write_page(id, page.into_page())
+    }
     fn free_page(&mut self, id: PageId) -> std::io::Result<()>;
 }
 

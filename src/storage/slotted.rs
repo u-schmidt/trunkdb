@@ -236,6 +236,12 @@ impl SlottedPage {
         Some(slot)
     }
 
+    /// Whether `insert_cell_at` takes a cell of `data_len` bytes, after
+    /// compacting the page if it has to.
+    pub fn fits(&self, data_len: usize) -> bool {
+        self.has_room_for(data_len) || self.reclaimable_space() >= SLOT_LEN + data_len
+    }
+
     /// Inserts a cell as slot `slot`, moving the slots from there on up
     /// by one — for pages whose slot order is their key order, B-tree
     /// pages, so an insert touches one cell instead of rebuilding the
@@ -246,10 +252,10 @@ impl SlottedPage {
             slot <= self.slot_count(),
             "insert at slot {slot} past the end"
         );
+        if !self.fits(data.len()) {
+            return false;
+        }
         if !self.has_room_for(data.len()) {
-            if self.reclaimable_space() < SLOT_LEN + data.len() {
-                return false;
-            }
             self.compact_keeping(self.slot_count());
         }
         let count = self.slot_count();
@@ -282,6 +288,15 @@ impl SlottedPage {
     /// when they need to).
     pub fn delete_cell(&mut self, slot: u16) {
         self.write_slot(slot, 0, 0);
+    }
+
+    /// Whether `insert_cell_reusing_slot` takes a cell of `data_len`
+    /// bytes, after compacting the page if it has to.
+    pub fn fits_reusing_slot(&self, data_len: usize) -> bool {
+        match (0..self.slot_count()).any(|s| self.read_slot(s).1 == 0) {
+            true => self.reclaimable_space() >= data_len,
+            false => self.fits(data_len),
+        }
     }
 
     /// Like `insert_cell`, but reuses a tombstoned slot if there is one
@@ -432,6 +447,64 @@ impl SlottedPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fits` and `fits_reusing_slot` say beforehand what the inserts
+    /// will do (SPEC §151): on pages filled to every level, with cells
+    /// removed, tombstoned, or both, for every cell length up to a
+    /// quarter page.
+    #[test]
+    fn fits_says_what_the_insert_will_do() {
+        let mut seed = 7u64;
+        let mut next = |below: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below
+        };
+        for round in 0..200 {
+            let mut page = SlottedPage::new(PageType::Data);
+            let cells = next(80);
+            for _ in 0..cells {
+                if page.insert_cell(&vec![1; 1 + next(200)]).is_none() {
+                    break;
+                }
+            }
+            for slot in 0..page.slot_count() {
+                if next(3) == 0 && round % 2 == 1 {
+                    page.delete_cell(slot);
+                }
+            }
+            if round % 4 >= 2 {
+                for _ in 0..next(4) {
+                    let live: Vec<u16> = page.iter_cells().map(|(slot, _)| slot).collect();
+                    if !live.is_empty() {
+                        page.remove_cell_at(live[next(live.len())]);
+                    }
+                }
+            }
+            // Every length up to a quarter page, and those around the
+            // page's free and reclaimable bytes, where the answer turns.
+            let edges = [page.free_space(), page.reclaimable_space()]
+                .map(|edge| edge.saturating_sub(SLOT_LEN + 2)..edge + 2);
+            let lens = (0..=USABLE_PAGE_SIZE / 4).chain(edges.into_iter().flatten());
+            for len in lens {
+                let cell = vec![2; len];
+                let mut at = page.clone();
+                let slot = next(page.slot_count() as usize + 1) as u16;
+                assert_eq!(
+                    page.fits(len),
+                    at.insert_cell_at(slot, &cell),
+                    "{round} {len}"
+                );
+                let mut reusing = page.clone();
+                assert_eq!(
+                    page.fits_reusing_slot(len),
+                    reusing.insert_cell_reusing_slot(&cell).is_some(),
+                    "{round} {len}"
+                );
+            }
+        }
+    }
 
     /// SPEC §66: a page marked checked isn't checked again, and a change
     /// takes the mark away. Marked bytes that don't hold a valid page

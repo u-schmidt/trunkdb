@@ -224,10 +224,9 @@ impl Index for BTreeIndex {
     }
 
     fn remove(&mut self, store: &mut dyn PageStore, key: &[u8]) -> std::io::Result<()> {
-        let (page_id, mut page) = find_leaf(store, self.root, key)?;
+        let (page_id, page) = find_leaf(store, self.root, key)?;
         if let Some(slot) = slot_of(&page, key) {
-            page.remove_cell_at(slot);
-            store.write_page(page_id, page.into_page())?;
+            store.change_page(page_id, page, &mut |page| page.remove_cell_at(slot))?;
         }
         Ok(()) // not found anywhere is a no-op, matching InMemoryIndex
     }
@@ -716,15 +715,20 @@ fn insert_into(
 fn insert_into_leaf(
     store: &mut dyn PageStore,
     page_id: PageId,
-    mut page: SlottedPage,
+    page: SlottedPage,
     key: &[u8],
     loc: RecordLocation,
 ) -> std::io::Result<InsertOutcome> {
     // In place if it fits: before the first key not below it (SPEC §52).
+    // Changed in place, not copied, if the batch changed it already
+    // (SPEC §151).
     let slot = first_slot_where(&page, |cell| decode_index_entry(cell).0 >= key)
         .unwrap_or(page.slot_count());
-    if page.insert_cell_at(slot, &encode_index_entry(key, loc)) {
-        store.write_page(page_id, page.into_page())?;
+    let entry = encode_index_entry(key, loc);
+    if page.fits(entry.len()) {
+        store.change_page(page_id, page, &mut |page| {
+            assert!(page.insert_cell_at(slot, &entry))
+        })?;
         return Ok(InsertOutcome::Done);
     }
 
@@ -777,7 +781,7 @@ fn insert_into_leaf(
 fn insert_into_branch(
     store: &mut dyn PageStore,
     page_id: PageId,
-    mut page: SlottedPage,
+    page: SlottedPage,
     key: &[u8],
     loc: RecordLocation,
     depth: usize,
@@ -806,25 +810,24 @@ fn insert_into_branch(
     // the child that split, and what routed there now routes to its new
     // right half.
     let routing = encode_branch_entry(&separator, child_id);
-    match slot {
-        Some(slot) => {
-            let (next_separator, _child) =
-                decode_branch_entry(page.get_cell(slot).expect("a live slot"));
-            let rerouted = encode_branch_entry(next_separator, new_right);
-            if page.insert_cell_at(slot, &routing) {
-                // The same length, so in place.
-                assert!(page.update_cell(slot + 1, &rerouted));
-                store.write_page(page_id, page.into_page())?;
-                return Ok(InsertOutcome::Done);
+    if page.fits(routing.len()) {
+        match slot {
+            Some(slot) => {
+                let (next_separator, _child) =
+                    decode_branch_entry(page.get_cell(slot).expect("a live slot"));
+                let rerouted = encode_branch_entry(next_separator, new_right);
+                store.change_page(page_id, page, &mut |page| {
+                    assert!(page.insert_cell_at(slot, &routing));
+                    // The same length, so in place.
+                    assert!(page.update_cell(slot + 1, &rerouted));
+                })?;
             }
-        }
-        None => {
-            if page.insert_cell_at(page.slot_count(), &routing) {
+            None => store.change_page(page_id, page, &mut |page| {
+                assert!(page.insert_cell_at(page.slot_count(), &routing));
                 page.set_next_page(new_right);
-                store.write_page(page_id, page.into_page())?;
-                return Ok(InsertOutcome::Done);
-            }
+            })?,
         }
+        return Ok(InsertOutcome::Done);
     }
 
     // Full: split it.

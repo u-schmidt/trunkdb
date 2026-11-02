@@ -2,7 +2,7 @@
 //! instead of in memory (SPEC §108).
 
 use super::pages::{PAGE_SIZE, read_exact_at, read_page_at, write_all_at, write_page_at};
-use super::{Page, PageId, PageStore, USABLE_PAGE_SIZE};
+use super::{Page, PageId, PageStore, SlottedPage, USABLE_PAGE_SIZE};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
@@ -227,6 +227,21 @@ impl PageStore for ScratchStore {
         Ok(())
     }
 
+    /// A page held is shared with `page`, read from here, and a change
+    /// would copy it (SPEC §151): dropped first, so the change is made
+    /// in place, then written back, which can't fail before it is held
+    /// again.
+    fn change_page(
+        &mut self,
+        id: PageId,
+        mut page: SlottedPage,
+        change: &mut dyn FnMut(&mut SlottedPage),
+    ) -> io::Result<()> {
+        drop(self.held.remove(&id));
+        change(&mut page);
+        self.write_page(id, page.into_page())
+    }
+
     fn free_page(&mut self, id: PageId) -> io::Result<()> {
         Err(io::Error::other(format!(
             "page {id}: a compaction's image doesn't free pages (it only grows)"
@@ -293,9 +308,43 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::PageType;
 
     fn page(fill: u8) -> Page {
         Page::from(vec![fill; USABLE_PAGE_SIZE])
+    }
+
+    /// A page held is changed in place by `change_page` (SPEC §151), not
+    /// copied; one a reader holds is copied, and the reader keeps it.
+    #[test]
+    fn a_held_page_is_changed_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ScratchStore::create(&dir.path().join("image")).unwrap();
+        let id = store.allocate_page().unwrap();
+        store
+            .write_page(id, SlottedPage::new(PageType::Data).into_page())
+            .unwrap();
+        let change = |store: &mut ScratchStore, cell: &[u8]| {
+            let page = SlottedPage::from_bytes(store.read_page(id).unwrap()).unwrap();
+            store
+                .change_page(id, page, &mut |page| {
+                    page.insert_cell(cell).unwrap();
+                })
+                .unwrap();
+        };
+        let bytes = store.read_page(id).unwrap().as_ptr();
+        change(&mut store, b"a");
+        assert_eq!(store.read_page(id).unwrap().as_ptr(), bytes, "in place");
+        let held = store.read_page(id).unwrap();
+        change(&mut store, b"b");
+        let cells = |page: Page| -> Vec<Vec<u8>> {
+            let page = SlottedPage::from_bytes(page).unwrap();
+            page.iter_cells()
+                .map(|(_slot, cell)| cell.to_vec())
+                .collect()
+        };
+        assert_eq!(cells(held), [b"a"], "held, so copied");
+        assert_eq!(cells(store.read_page(id).unwrap()), [b"a", b"b"]);
     }
 
     #[test]

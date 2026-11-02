@@ -6,7 +6,7 @@ use super::pages::{
 use super::snapshot::Commit;
 #[cfg(test)]
 use super::snapshot::SnapshotStore;
-use super::{Page, PageId, PageStore, PageType, PendingPages, Scratch};
+use super::{Page, PageId, PageStore, PageType, PendingPages, Scratch, SlottedPage};
 use crate::FormatError;
 use crate::release::{RELEASE, Release};
 use std::collections::BTreeMap;
@@ -935,6 +935,31 @@ impl PageStore for FileStore {
             self.write_header()?;
         }
         self.write_raw(id, data)
+    }
+
+    /// A page the batch changed already is held in `dirty`, so `page`,
+    /// read from there, shares its bytes, and a change would copy them
+    /// all (SPEC §151). The batch's own copy is dropped first, and the
+    /// page goes back in its place: nothing between can fail. Its
+    /// `before` was taken with its first change. Any other page is
+    /// written as `write_page` writes it.
+    fn change_page(
+        &mut self,
+        id: PageId,
+        mut page: SlottedPage,
+        change: &mut dyn FnMut(&mut SlottedPage),
+    ) -> io::Result<()> {
+        if id != HEADER_PAGE
+            && let Some(staging) = &mut self.staging
+            && let Some(staged) = staging.dirty.remove(&id)
+        {
+            drop(staged);
+            change(&mut page);
+            staging.dirty.insert(id, page.into_page());
+            return Ok(());
+        }
+        change(&mut page);
+        self.write_page(id, page.into_page())
     }
 
     /// Puts `id` on the free list, where the next allocation takes it
@@ -2234,6 +2259,66 @@ mod tests {
         let unstaged: Page = filled(8).into();
         store.write_page(2, unstaged.clone()).unwrap();
         assert!(store.read_page(2).unwrap().shares(&unstaged));
+    }
+
+    /// `change_page` changes a page the batch changed already in place
+    /// (SPEC §151): its first change in a batch copies it, and every one
+    /// after changes that copy. Whoever holds the page keeps it as it
+    /// was, a snapshot open before the batch reads it as the batch found
+    /// it, and a rollback takes every change back. The header is refused
+    /// as `write_page` refuses it.
+    #[test]
+    fn a_page_changed_again_in_its_batch_is_changed_in_place() {
+        fn cells(page: Page) -> Vec<Vec<u8>> {
+            let page = SlottedPage::from_bytes(page).unwrap();
+            page.iter_cells()
+                .map(|(_slot, cell)| cell.to_vec())
+                .collect()
+        }
+        fn change(store: &mut FileStore, cell: &[u8]) {
+            let page = SlottedPage::from_bytes(store.read_page(2).unwrap()).unwrap();
+            store
+                .change_page(2, page, &mut |page| {
+                    page.insert_cell(cell).unwrap();
+                })
+                .unwrap();
+        }
+        let (_dir, path) = open_temp();
+        let mut store = five_page_file(&path);
+        let mut page = SlottedPage::new(PageType::Data);
+        page.insert_cell(b"a").unwrap();
+        store.write_page(2, page.into_page()).unwrap();
+        let open = store.last_commit();
+        let committed = store.read_page(2).unwrap();
+
+        store.begin();
+        change(&mut store, b"b");
+        let first = store.read_page(2).unwrap();
+        assert!(!first.shares(&committed), "copied on its first change");
+        let bytes = first.as_ptr();
+        drop(first);
+        change(&mut store, b"c");
+        assert_eq!(store.read_page(2).unwrap().as_ptr(), bytes, "in place");
+        let held = store.read_page(2).unwrap();
+        change(&mut store, b"d");
+        assert_eq!(cells(held), [b"a", b"b", b"c"], "held, so copied");
+        store.commit_beside(&[open.seq()]);
+
+        assert_eq!(cells(committed.clone()), [b"a"]);
+        assert_eq!(cells(store.at(open).read_page(2).unwrap()), [b"a"]);
+        assert_eq!(cells(store.read_page(2).unwrap()), [b"a", b"b", b"c", b"d"]);
+
+        store.begin();
+        store.allocate_page().unwrap();
+        let header = SlottedPage::new(PageType::Data);
+        assert!(
+            store.change_page(HEADER_PAGE, header, &mut |_| {}).is_err(),
+            "the header, changed in the batch, is still not a page to write"
+        );
+        change(&mut store, b"e");
+        change(&mut store, b"f");
+        store.rollback();
+        assert_eq!(cells(store.read_page(2).unwrap()), [b"a", b"b", b"c", b"d"]);
     }
 
     /// Readers share the cache (SPEC §65): while one holds it to look a
