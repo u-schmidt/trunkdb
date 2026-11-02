@@ -35,19 +35,28 @@ narrow questions:
    filter finds, one JSON document per line, then `found N documents`
    on stderr. Always give it `limit`, and `select` the fields you need:
    `'select name, team where status = "open" order by due limit 20'`.
-4. **Counting** without printing: send the documents away and keep the
-   count, `trunkdb find app.trunkdb tasks 'status = "open"' >
-   /dev/null` prints only `found 312 documents`. For counts per group,
+4. **`trunkdb count <file> <collection> '<filter>'`** — how many
+   documents a filter finds, the number alone on stdout; from index
+   entries where they can tell, so it's cheap. For counts per group,
    select the one field and count in the pipe, so only the counts reach
    you: `trunkdb find app.trunkdb tasks 'select team where status =
    "open"' 2>/dev/null | jq -r .team | sort | uniq -c`. The count line
-   goes to stderr; keep it out of `jq` (`2>/dev/null`, not `2>&1`).
+   of `find` goes to stderr; keep it out of `jq` (`2>/dev/null`, not
+   `2>&1`).
 5. **`--explain`** after a filter says how it ran instead of what it
    found: the index used, entries and documents examined, the time. Use
    it when the user asks why a query is slow or whether an index helps.
    Its `instead:` lines are the plans it passed over, with the entries
    each would read; one marked `fewer` is the index to hint with
    `use index …`.
+6. **`trunkdb get <file> <collection> <id>`** — one document by its id,
+   written bare (`0192f0c4-…`) or as `id("…")`; exit code 1 if there is
+   none.
+
+`info`, `fields` and `check` take `--json` at the end: `info` and
+`check` print one JSON object, `fields` one per path (`path`,
+`documents`, `kinds`). Use it when you go on with `jq` or code; the
+text is shorter to read.
 
 The filter language is SQL's `WHERE` with a few additions for nested
 documents and arrays. Wrap the whole filter in single quotes for the
@@ -94,8 +103,8 @@ collection is an error (exit 1), not an empty result.
   the data to another tool, but `fields` and `find` answer questions
   for a fraction of the output.
 - **Don't run `compact` or `import` unless the user asks.** They write
-  to the file. `info`, `check`, `export`, `find` and `fields` only read
-  it and can't damage it, even beside a running app.
+  to the file. `info`, `check`, `export`, `find`, `fields`, `count` and
+  `get` only read it and can't damage it, even beside a running app.
 - **"in use by another program"** means an app has the database open
   for writing, which locks it. Tell the user; don't copy the file to
   get around the lock, since a copy taken while the app writes can miss

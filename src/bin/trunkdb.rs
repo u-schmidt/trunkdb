@@ -1,7 +1,9 @@
 //! The `trunkdb` command (SPEC §39): look into a database file, check it,
 //! compact it, export it, import into it, find documents in it (§112),
-//! sum up the fields its documents have (§121). Looking, checking,
-//! exporting, finding and summing up open it read-only (SPEC §88).
+//! sum up the fields its documents have (§121), count them and get one by
+//! id, with JSON for a program or an agent to read (§155). Looking,
+//! checking, exporting, finding, summing up, counting and getting open it
+//! read-only (SPEC §88).
 //!
 //! Arguments are parsed by hand: seven subcommands don't need a parser
 //! crate, and a library's dependencies are compiled for everyone who uses
@@ -17,9 +19,9 @@ const USAGE: &str = "\
 usage: trunkdb <command> <file> [argument]
 
 commands:
-  info   <file>               format, pages, and every collection with its
+  info   <file> [--json]      format, pages, and every collection with its
                               document count and indexes
-  check  <file>               read the whole file and check that it's
+  check  <file> [--json]      read the whole file and check that it's
                               consistent; exit code 1 if it isn't
   compact <file>              rebuild the file into as few pages as it
                               needs, and cut it to that
@@ -38,14 +40,25 @@ commands:
                               after the collection are joined into one.
                               --explain runs it and prints how instead:
                               the plan, the index reads, the counts
-  fields <file> <collection> [filter]
+  fields <file> <collection> [filter] [--json]
                               every path the documents have, in how many
                               of them, and as which types: one line each,
                               to paste into a filter. A filter sums up
                               only what it finds; `limit 1000` a sample
+  count  <file> <collection> [filter]
+                              how many documents the filter finds, every
+                              document's count without one; from index
+                              entries where they can tell, reading none
+  get    <file> <collection> <id>
+                              the document with this id, as one JSON line;
+                              exit code 1 if there is none
 
-info, check, export, find and fields only read: they change nothing in the file or its
-log, not even what a crash of the program that had it open left there.
+--json prints what a program reads: info and check one JSON object, fields
+one JSON object per path.
+
+info, check, export, find, fields, count and get only read: they change
+nothing in the file or its log, not even what a crash of the program that
+had it open left there.
 ";
 
 fn main() -> ExitCode {
@@ -54,7 +67,9 @@ fn main() -> ExitCode {
     let result =
         match args[..] {
             ["info", file] => read_only(file).and_then(|db| info(file, &db)),
-            ["check", file] => read_only(file).and_then(|db| check(&db)),
+            ["info", file, "--json"] => read_only(file).and_then(|db| info_json(file, &db)),
+            ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
+            ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
             ["compact", file] => existing(file).and_then(|db| compact(&db)),
             ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
             ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
@@ -63,8 +78,15 @@ fn main() -> ExitCode {
                 .and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained)),
             ["find", file, collection, ref filter @ ..] => read_only(file)
                 .and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents)),
-            ["fields", file, collection, ref filter @ ..] => {
-                read_only(file).and_then(|db| fields(&db, collection, &filter.join(" ")))
+            ["fields", file, collection, ref filter @ .., "--json"] => read_only(file)
+                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Json)),
+            ["fields", file, collection, ref filter @ ..] => read_only(file)
+                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Text)),
+            ["count", file, collection, ref filter @ ..] => {
+                read_only(file).and_then(|db| count_of(&db, collection, &filter.join(" ")))
+            }
+            ["get", file, collection, id] => {
+                read_only(file).and_then(|db| get(&db, collection, id))
             }
             ["import", file, input, "--max-line", limit] => max_line(limit)
                 .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
@@ -138,6 +160,60 @@ fn info(file: &str, db: &Database) -> Outcome {
         stopped_writing(e)?;
     }
     gathered.map(|()| ExitCode::SUCCESS)
+}
+
+/// `trunkdb info --json` (SPEC §155): what `info` prints, as one JSON
+/// object, every count a number and every size in bytes.
+fn info_json(file: &str, db: &Database) -> Outcome {
+    let failed = |e: trunkdb::Error| e.to_string();
+    let file_info = db.file_info().map_err(failed)?;
+    let release = |release: Option<trunkdb::Release>| release.map(|r| r.to_string());
+    let stats = db.stats().ok();
+    let mut collections = Vec::new();
+    for name in db.collections().map_err(failed)? {
+        let collection = db.collection::<Document>(&name);
+        let documents = collection.count(Filter::new()).map_err(failed)?;
+        let indexes: Vec<serde_json::Value> = (collection.indexes().map_err(failed)?.iter())
+            .map(|index| {
+                serde_json::json!({
+                    "fields": index.fields(),
+                    "unique": index.is_unique(),
+                    "sparse": index.is_sparse(),
+                })
+            })
+            .collect();
+        let sizes = (stats.as_ref())
+            .and_then(|stats| stats.collections.iter().find(|c| c.name == name))
+            .map(|sizes| {
+                let index_pages: u64 = (std::iter::once(&sizes.primary).chain(&sizes.indexes))
+                    .map(|index| index.pages)
+                    .sum();
+                serde_json::json!({
+                    "document_bytes": sizes.document_bytes,
+                    "data_pages": sizes.data_pages,
+                    "overflow_pages": sizes.overflow_pages,
+                    "free_bytes": sizes.free_bytes,
+                    "index_pages": index_pages,
+                })
+            });
+        collections.push(serde_json::json!({
+            "name": name,
+            "documents": documents,
+            "indexes": indexes,
+            "sizes": sizes,
+        }));
+    }
+    print_json(&serde_json::json!({
+        "file": file,
+        "format": file_info.format_version,
+        "page_size": file_info.page_size,
+        "pages": file_info.pages,
+        "free_pages": file_info.free_pages,
+        "written_by": release(file_info.written_by),
+        "created_by": release(file_info.created_by),
+        "wal_bytes": stats.as_ref().and_then(|stats| stats.wal_bytes),
+        "collections": collections,
+    }))
 }
 
 /// The lines `info` prints, into `text`.
@@ -298,8 +374,37 @@ fn bytes(n: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-fn check(db: &Database) -> Outcome {
+/// How a command prints what it found: for a person, or as JSON for a
+/// program (SPEC §155).
+#[derive(Clone, Copy, PartialEq)]
+enum Format {
+    Text,
+    Json,
+}
+
+/// One JSON value on its own line, to standard output.
+fn print_json(value: &serde_json::Value) -> Outcome {
+    match writeln!(io::stdout().lock(), "{value}") {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e) => stopped_writing(e),
+    }
+}
+
+fn check(db: &Database, format: Format) -> Outcome {
     let report = db.check().map_err(|e| e.to_string())?;
+    if format == Format::Json {
+        print_json(&serde_json::json!({
+            "ok": report.is_ok(),
+            "collections": report.collections,
+            "documents": report.documents,
+            "pages": report.pages,
+            "problems": report.problems,
+        }))?;
+        return Ok(match report.is_ok() {
+            true => ExitCode::SUCCESS,
+            false => ExitCode::FAILURE,
+        });
+    }
     for problem in &report.problems {
         println!("problem: {problem}");
     }
@@ -478,6 +583,52 @@ fn find(db: &Database, collection: &str, filter: &str, show: Show) -> Outcome {
     }
     eprintln!("found {}", count(found, "document"));
     Ok(ExitCode::SUCCESS)
+}
+
+/// `trunkdb count` (SPEC §155): how many documents the filter finds, the
+/// number alone on standard output, its skip and limit applied as `find`
+/// applies them.
+fn count_of(db: &Database, collection: &str, filter: &str) -> Outcome {
+    let (docs, filter) = match query(db, collection, filter)? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
+    };
+    let n = docs.count(filter).map_err(|e| e.to_string())?;
+    match writeln!(io::stdout().lock(), "{n}") {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e) => stopped_writing(e),
+    }
+}
+
+/// `trunkdb get` (SPEC §155): the document with this id, one JSON line,
+/// as `find` prints it; exit code 1, and why on stderr, if there is none.
+fn get(db: &Database, collection: &str, id: &str) -> Outcome {
+    // Bare, as `find` prints it inside `{"$id": …}`, or as a filter
+    // writes it, `id("…")`.
+    let bare = id
+        .strip_prefix("id(\"")
+        .and_then(|rest| rest.strip_suffix("\")"))
+        .unwrap_or(id);
+    let Ok(parsed) = bare.parse::<trunkdb::DocId>() else {
+        eprintln!(
+            "trunkdb: {id:?} is not an id: one is written as 0192f0c4-7d7a-7c43-9e0b-1f6d1b8f0a11"
+        );
+        return Ok(ExitCode::from(2));
+    };
+    let (docs, _filter) = match query(db, collection, "")? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
+    };
+    match docs.get(&parsed).map_err(|e| e.to_string())? {
+        Some(doc) => match writeln!(io::stdout().lock(), "{doc}") {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => stopped_writing(e),
+        },
+        None => {
+            eprintln!("no document {bare} in {collection}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// A collection, and the filter to read it with.
@@ -804,7 +955,7 @@ fn walk<'s>(text: String, nameable: bool, shape: &'s Shape, lines: &mut Vec<Line
 
 /// Every path the documents `filter` finds have (SPEC §121): in how many
 /// documents, and as which kinds of value. How many documents, to stderr.
-fn fields(db: &Database, collection: &str, filter: &str) -> Outcome {
+fn fields(db: &Database, collection: &str, filter: &str, format: Format) -> Outcome {
     let failed = |e: trunkdb::Error| e.to_string();
     let (docs, filter) = match query(db, collection, filter)? {
         Ok(query) => query,
@@ -819,6 +970,39 @@ fn fields(db: &Database, collection: &str, filter: &str) -> Outcome {
     for doc in docs.cursor(filter).map_err(failed)? {
         read += 1;
         summary.add(&doc.map_err(failed)?, read);
+    }
+    if format == Format::Json {
+        let mut out = io::BufWriter::new(io::stdout().lock());
+        for line in summary.lines() {
+            let mut kinds: Vec<usize> = (0..KINDS.len())
+                .filter(|&k| line.shape.kinds[k] > 0)
+                .collect();
+            kinds.sort_by_key(|&k| std::cmp::Reverse(line.shape.kinds[k]));
+            let kinds: serde_json::Map<String, serde_json::Value> = (kinds.iter())
+                .map(|&k| (KINDS[k].to_string(), line.shape.kinds[k].into()))
+                .collect();
+            let value = serde_json::json!({
+                "path": line.text,
+                "nameable": line.nameable,
+                "documents": line.shape.documents,
+                "kinds": kinds,
+            });
+            if let Err(e) = writeln!(out, "{value}") {
+                return stopped_writing(e);
+            }
+        }
+        if let Err(e) = out.flush() {
+            return stopped_writing(e);
+        }
+        eprintln!(
+            "{} in {}",
+            count(summary.lines().len(), "path"),
+            count(read as usize, "document")
+        );
+        if summary.full {
+            eprintln!("only the first {MAX_PATHS} paths found are counted; a filter can narrow it");
+        }
+        return Ok(ExitCode::SUCCESS);
     }
     let lines: Vec<(String, &Shape)> = summary
         .lines()

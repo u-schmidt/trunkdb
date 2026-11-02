@@ -241,6 +241,19 @@ fn check_reports_a_damaged_page_and_fails() {
         report.contains(&format!("problem: page {page} is damaged")),
         "{report}"
     );
+    // As JSON (SPEC §155): the same problems, and the same exit code.
+    let output = trunkdb(&["check", &db, "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(json["ok"], false);
+    let problems = json["problems"].as_array().unwrap();
+    assert!(
+        problems.iter().any(|p| p
+            .as_str()
+            .unwrap()
+            .contains(&format!("page {page} is damaged"))),
+        "{json}"
+    );
 }
 
 #[test]
@@ -319,6 +332,18 @@ fn looking_into_a_file_opens_it_read_only() {
     assert_eq!(stderr(&output), "found 1 document\n");
     let output = trunkdb(&["fields", &db_path, "users"]);
     assert_eq!(stderr(&output), "2 paths in 1 document\n");
+    // And what came with SPEC §155.
+    assert_eq!(stdout(&trunkdb(&["count", &db_path, "users"])), "1\n");
+    assert!(trunkdb(&["info", &db_path, "--json"]).status.success());
+    assert!(trunkdb(&["check", &db_path, "--json"]).status.success());
+    assert!(
+        trunkdb(&["fields", &db_path, "users", "--json"])
+            .status
+            .success()
+    );
+    let found = stdout(&trunkdb(&["find", &db_path, "users"]));
+    let id = id_in(&found);
+    assert!(trunkdb(&["get", &db_path, "users", &id]).status.success());
     let output = trunkdb(&["compact", &db_path]);
     assert!(stderr(&output).contains("in use by another program"));
     close(db);
@@ -920,4 +945,120 @@ fn info_says_unknown_for_a_file_from_before_the_releases() {
         info.contains("\n  written by unknown, created by unknown\n"),
         "{info}"
     );
+}
+
+/// The first `{"$id": "…"}` in `text`, as `find` prints an id.
+fn id_in(text: &str) -> String {
+    let at = text.find("\"$id\":\"").expect("an id") + 7;
+    text[at..at + 36].to_string()
+}
+
+/// `count` prints the number alone, as `find` would find them, skip and
+/// limit applied (SPEC §155).
+#[test]
+fn count_prints_how_many_a_filter_finds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+    assert_eq!(stdout(&trunkdb(&["count", &db, "users"])), "2\n");
+    assert_eq!(
+        stdout(&trunkdb(&["count", &db, "users", "age", ">", "40"])),
+        "1\n"
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &db, "users", "limit 1"])), "1\n");
+    assert_eq!(
+        stdout(&trunkdb(&["count", &db, "users", "offset 5"])),
+        "0\n"
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &db, "empty"])), "0\n");
+    let output = trunkdb(&["count", &db, "nobody"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("nobody: no such collection"));
+    let output = trunkdb(&["count", &db, "users", "age >"]);
+    assert_eq!(output.status.code(), Some(2), "a filter that doesn't read");
+}
+
+/// `get` prints the document with an id, written bare or as a filter
+/// writes it; none is exit code 1, and what isn't an id 2 (SPEC §155).
+#[test]
+fn get_prints_the_document_with_an_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+    let found = stdout(&trunkdb(&["find", &db, "users", "name = \"Bob\""]));
+    let id = id_in(&found);
+    let output = trunkdb(&["get", &db, "users", &id]);
+    assert!(output.status.success());
+    assert_eq!(stdout(&output), found, "as find prints it");
+    let written = format!("id(\"{id}\")");
+    assert_eq!(stdout(&trunkdb(&["get", &db, "users", &written])), found);
+
+    let missing = "0192f0c4-7d7a-7c43-9e0b-1f6d1b8f0a11";
+    let output = trunkdb(&["get", &db, "users", missing]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), format!("no document {missing} in users\n"));
+    let output = trunkdb(&["get", &db, "users", "Bob"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("is not an id"));
+    let output = trunkdb(&["get", &db, "nobody", &id]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("nobody: no such collection"));
+}
+
+/// `--json` (SPEC §155): `info` one object with every collection, its
+/// count, indexes and sizes; `fields` an object per path, in the order
+/// the text has them.
+#[test]
+fn info_and_fields_print_json_for_a_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+
+    let output = trunkdb(&["info", &db, "--json"]);
+    assert!(output.status.success());
+    let info: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(info["format"], 12);
+    assert_eq!(info["written_by"], trunkdb::RELEASE.to_string());
+    let collections = info["collections"].as_array().unwrap();
+    let users = collections.iter().find(|c| c["name"] == "users").unwrap();
+    assert_eq!(users["documents"], 2);
+    assert_eq!(
+        users["indexes"][1],
+        serde_json::json!({"fields": ["email"], "unique": true, "sparse": false})
+    );
+    assert_eq!(
+        users["indexes"][3]["fields"],
+        serde_json::json!(["team", "email"])
+    );
+    assert!(users["sizes"]["document_bytes"].as_u64().unwrap() > 0);
+    let empty = collections.iter().find(|c| c["name"] == "empty").unwrap();
+    assert_eq!(empty["documents"], 0);
+
+    let output = trunkdb(&["fields", &db, "users", "--json"]);
+    assert!(output.status.success());
+    let lines: Vec<serde_json::Value> = (stdout(&output).lines())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let text = stdout(&trunkdb(&["fields", &db, "users"]));
+    let paths: Vec<&str> = text
+        .lines()
+        .map(|l| l.split_whitespace().next().unwrap())
+        .collect();
+    let json_paths: Vec<&str> = lines.iter().map(|l| l["path"].as_str().unwrap()).collect();
+    assert_eq!(json_paths, paths);
+    let age = lines.iter().find(|l| l["path"] == "age").unwrap();
+    assert_eq!(
+        *age,
+        serde_json::json!({"path": "age", "nameable": true, "documents": 2, "kinds": {"int": 2}})
+    );
+    assert_eq!(stderr(&output), "4 paths in 2 documents\n");
+    // A filter, and a mistake in one, as without `--json`.
+    let output = trunkdb(&["fields", &db, "users", "age > 40", "--json"]);
+    assert_eq!(stderr(&output), "4 paths in 1 document\n");
+    let output = trunkdb(&["fields", &db, "users", "age >", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
 }

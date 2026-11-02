@@ -905,3 +905,9 @@ limit, batches and a write-ahead log. Since then:
     It works in `find`, `count`, `cursor`, the writes, `aggregate` and
     `watch`; a panic fails the call with `Error::ClosurePanicked`. No
     text form: `order by key(lat, lon)`, which the parser refuses.
+126. **`trunkdb count`, `get`, and JSON** (§155): `trunkdb count <file>
+    <collection> [filter]` prints how many documents a filter finds,
+    from index entries where they can tell; `trunkdb get <file>
+    <collection> <id>` prints the document with an id, exit code 1 if
+    there is none. `info`, `check` and `fields` take `--json`, for a
+    program or an AI agent to read. The agent skill uses them.
