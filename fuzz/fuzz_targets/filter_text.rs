@@ -26,7 +26,10 @@ fuzz_target!(|input: &[u8]| {
         reads_back(text, filter);
     }
     let Ok(template) = text.parse::<Template<Filter>>() else {
-        assert!(plain.is_err(), "{text:?} reads as a filter, not as a template");
+        assert!(
+            plain.is_err(),
+            "{text:?} reads as a filter, not as a template"
+        );
         return;
     };
     assert_eq!(template.to_string(), text);
