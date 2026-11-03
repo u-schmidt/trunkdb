@@ -249,6 +249,26 @@ pub enum Error {
         /// What couldn't be done, as people read it.
         message: String,
     },
+    /// A batch's precondition didn't hold at `commit` (SPEC §162):
+    /// `Batch::require`'s filter matched no document of `collection`, or
+    /// `Batch::require_none`'s matched one. Nothing was written. What it
+    /// checked had changed since the program read it, or never held:
+    /// read again, decide again, and commit a new batch.
+    #[non_exhaustive]
+    #[error(
+        "op {op} of the batch, a precondition on collection {collection:?}, failed: {}",
+        if *.matched { "a document matches its filter" } else { "no document matches its filter" }
+    )]
+    PreconditionFailed {
+        /// The collection checked.
+        collection: String,
+        /// The precondition's place in the batch, counting every op
+        /// added before it from 0.
+        op: usize,
+        /// Whether a document matched: `true` for a `require_none`,
+        /// `false` for a `require`.
+        matched: bool,
+    },
     /// `Database::compact` was called while a snapshot was open (SPEC
     /// §80.5): a `Snapshot`, a `View` of one, or a `Cursor`. A compaction rewrites every page, and keeping each as it
     /// was for the snapshot would be keeping the whole file in memory.

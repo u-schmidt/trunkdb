@@ -176,3 +176,4 @@ say what changed, and DESIGN.md says what is true now.
 159. [A test of a value's kind (`query.rs`, `query_text.rs`)](159-a-test-of-a-value-s-kind.md)
 160. [An `in` on a compound index's field, a range per value (`query.rs`)](160-an-in-on-a-compound-index-s-field.md)
 161. [The public API, gone through again (`query.rs`, `changes.rs`)](161-the-public-api-gone-through-again.md)
+162. [A batch's preconditions (`batch.rs`, `collection.rs`, `lib.rs`)](162-a-batch-s-preconditions.md)

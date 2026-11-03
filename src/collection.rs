@@ -2611,6 +2611,60 @@ fn count_matches(
     Ok(filter.limit.map_or(count, |limit| count.min(limit)))
 }
 
+/// Whether any document of `collection` matches `filter`'s conditions,
+/// against a catalog and store the caller has locked: a batch's
+/// precondition (SPEC §162). Read as `count_matches` reads them, by id or
+/// through an index where one bounds the conditions, an entry that
+/// decides counting without its document; but the walk stops at the
+/// first match. The caller has refused sort, skip, limit and selection.
+pub(crate) fn any_match_in(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+) -> crate::Result<bool> {
+    follow_hint(collection, filter, catalog.indexes(collection))?;
+    /// Why the walk ended early: a match, or a failure to report.
+    enum Stop {
+        Matched,
+        Failed(crate::Error),
+    }
+    impl From<std::io::Error> for Stop {
+        fn from(error: std::io::Error) -> Self {
+            Stop::Failed(error.into())
+        }
+    }
+    let names = filter.fields_with(false);
+    let matcher = filter.matcher();
+    let walked = each_candidate(
+        catalog,
+        store,
+        collection,
+        filter,
+        names.as_deref(),
+        Wants {
+            sort: false,
+            select: None,
+        },
+        &Trace::default(),
+        |(source, fields)| -> Result<(), Stop> {
+            match source.decided()
+                || matcher
+                    .matches(&fields)
+                    .map_err(|panicked| Stop::Failed(panicked.into()))?
+            {
+                true => Err(Stop::Matched),
+                false => Ok(()),
+            }
+        },
+    );
+    match walked {
+        Ok(_) => Ok(false),
+        Err(Stop::Matched) => Ok(true),
+        Err(Stop::Failed(error)) => Err(error),
+    }
+}
+
 /// `Collection::aggregate` against a catalog and store the caller has
 /// locked (SPEC §107): from index entries where they hold the answer
 /// (`aggregate_by_entries`), else from the documents `find_in` finds,

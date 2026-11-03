@@ -185,6 +185,37 @@ batch.update_fields(&users, &id, &Update::new().add_to_set("tags", "mentor"))?;
 batch.commit()?;
 ```
 
+A batch can also check, at the commit, that what it was decided on
+still holds (SPEC §162). `require` must find a document matching its
+filter, `require_none` must find none; each is checked after the ops
+before it, under the same lock as the writes, so no other write comes
+in between. If one fails, nothing is written:
+
+```rust
+use trunkdb::Error;
+
+let mut batch = db.batch();
+// Only while the email is free among active users: a rule no unique index holds.
+batch.require_none(&users, Filter::new().eq("email", "grace@example.com").eq("active", true))?;
+batch.insert(&users, grace)?;
+match batch.commit() {
+    Ok(()) => {}
+    Err(Error::PreconditionFailed { op, .. }) => println!("op {op} no longer holds: nothing written"),
+    Err(other) => return Err(other),
+}
+```
+
+With `Filter::id`, `require` holds one document to what the program
+read. A program that keeps a `version` field writes back only what it
+read at that version, and reads again otherwise:
+
+```rust
+let mut batch = db.batch();
+batch.require(&contacts, Filter::new().id(id).eq("version", read_version))?;
+batch.update(&contacts, &id, changed_with_the_next_version)?;
+batch.commit()?; // Error::PreconditionFailed if another write came first
+```
+
 ## Hearing about changes
 
 `subscribe` hands out a receiver that hears of every batch committed

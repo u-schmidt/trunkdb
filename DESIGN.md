@@ -144,7 +144,8 @@ readers don't take (`Database::transact`) [§19.3](spec/19-durability-take-two-a
 
 1. **Stage.** Every page write stays in memory, in the store's staging
    area.
-2. **Apply** the batch. On any error, the staged pages and the catalog
+2. **Apply** the batch, its preconditions checked at their place among
+   its ops [§162](spec/162-a-batch-s-preconditions.md). On any error, the staged pages and the catalog
    cache are dropped: nothing reached the file, so nothing needs
    undoing [§19.5](spec/19-durability-take-two-a-page-image-wal.md).
 3. **Log** every changed page, whole, to the WAL as one record, and

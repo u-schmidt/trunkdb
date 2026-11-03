@@ -981,3 +981,11 @@ limit, batches and a write-ahead log. Since then:
     find the same documents, faster. Files stay format 12 and exports
     as in 0.29.0, which opens what 0.30.0 writes. No new fixture, as
     nothing changes how files are written (§120.9).
+134. **A batch's preconditions** (§162): `Batch::require(&collection,
+    filter)` must find a document matching the filter, and
+    `require_none` must find none, when `commit` reaches them: after
+    the ops before them, under the writer's lock, so nothing is written
+    between the check and the batch. A failed one writes nothing and
+    returns `Error::PreconditionFailed`, naming the op. A transfer only
+    while the balance covers it, a registration only while the email is
+    free among active users, a write held to the version it read.

@@ -1,7 +1,7 @@
-use crate::collection::{Collection, apply_write_op, update_by_id};
+use crate::collection::{Collection, any_match_in, apply_write_op, update_by_id};
 use crate::database::Database;
 use crate::document::{DocId, Document};
-use crate::query::Update;
+use crate::query::{Filter, Update};
 use crate::txn::WriteOp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -59,6 +59,14 @@ enum Op {
         update: Update,
         accept: fn(&Document) -> crate::Result<()>,
     },
+    /// A precondition (SPEC §162): `filter` must match a document of
+    /// `collection`, or with `none`, no document, as the ops before
+    /// leave it.
+    Require {
+        collection: String,
+        filter: Filter,
+        none: bool,
+    },
 }
 
 /// The two can't overlap: `Document` isn't `Serialize`, and being local to
@@ -85,8 +93,9 @@ impl IntoDocument for Document {
 /// serde bridge can't represent fails right there, leaving the batch as
 /// it was. Errors that depend on the stored state — an insert whose id
 /// exists (`Error::DuplicateId`), an update or delete of a missing id
-/// (`Error::NotFound`) — surface at `commit`, which then rolls back the
-/// whole batch (SPEC §22.2).
+/// (`Error::NotFound`), a precondition that doesn't hold
+/// (`Error::PreconditionFailed`, SPEC §162) — surface at `commit`, which
+/// then rolls back the whole batch (SPEC §22.2).
 ///
 /// Nothing is read or written before `commit`: reads in the meantime see
 /// the state before the batch. Ops apply in the order they were added, so
@@ -186,6 +195,88 @@ impl Batch {
         self.ops.push(Op::Write(WriteOp::Delete(name, *id)));
     }
 
+    /// Adds a precondition (SPEC §162): at `commit`, after the ops before
+    /// it and under the same lock as every write, `filter` must match at
+    /// least one document of `collection`, or the whole batch writes
+    /// nothing and fails with `Error::PreconditionFailed`. So a batch
+    /// writes only while what it was decided on still holds: no other
+    /// write can come between the check and the batch's own.
+    ///
+    /// With `Filter::id`, it holds one document to what the program read:
+    /// a `version` field the program keeps, or a balance that must cover
+    /// what the batch takes from it. A precondition writes nothing and
+    /// counts as an op, as `len` counts it.
+    ///
+    /// Only the filter's conditions count: one with a sort, a skip, a
+    /// limit or a selection is refused here, leaving the batch as it
+    /// was. Reading follows the filter as `count` does, through an index
+    /// where one bounds it, and stops at the first match.
+    ///
+    /// ```no_run
+    /// # fn main() -> trunkdb::Result<()> {
+    /// use trunkdb::{Database, DocId, Document, Error, query::{Filter, Update}};
+    ///
+    /// let db = Database::open("app.trunkdb")?;
+    /// let accounts = db.collection::<Document>("accounts");
+    /// # let (from, to) = (DocId::NIL, DocId::NIL);
+    /// let mut batch = db.batch();
+    /// batch.require(&accounts, Filter::new().id(from).gte("balance", 25))?;
+    /// batch.update_fields(&accounts, &from, &Update::new().inc("balance", -25))?;
+    /// batch.update_fields(&accounts, &to, &Update::new().inc("balance", 25))?;
+    /// match batch.commit() {
+    ///     Ok(()) => {}
+    ///     Err(Error::PreconditionFailed { .. }) => { /* not enough left: nothing moved */ }
+    ///     Err(other) => return Err(other),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn require<T>(&mut self, collection: &Collection<T>, filter: Filter) -> crate::Result<()> {
+        self.push_require(collection, filter, false)
+    }
+
+    /// Adds a precondition that `filter` matches no document of
+    /// `collection` at `commit` (SPEC §162), as `require` checks its
+    /// own: "no user has this email yet", "no booking overlaps this
+    /// slot", for a rule a unique index can't hold. Ops before it count,
+    /// so one after an insert sees the inserted document.
+    pub fn require_none<T>(
+        &mut self,
+        collection: &Collection<T>,
+        filter: Filter,
+    ) -> crate::Result<()> {
+        self.push_require(collection, filter, true)
+    }
+
+    fn push_require<T>(
+        &mut self,
+        collection: &Collection<T>,
+        filter: Filter,
+        none: bool,
+    ) -> crate::Result<()> {
+        let name = self.name_of(collection);
+        let has = [
+            (!filter.sort.is_empty() || filter.by_key.is_some(), "a sort"),
+            (filter.skip > 0, "a skip"),
+            (filter.limit.is_some(), "a limit"),
+            (
+                filter.select.is_some() || !filter.except.is_empty(),
+                "a selection",
+            ),
+        ];
+        if let Some((_, what)) = has.iter().find(|(has, _)| *has) {
+            return Err(crate::collection::invalid_input(format!(
+                "a precondition's filter can't have {what}: only its conditions are checked"
+            )));
+        }
+        self.ops.push(Op::Require {
+            collection: name,
+            filter,
+            none,
+        });
+        Ok(())
+    }
+
     /// How many ops the batch holds.
     pub fn len(&self) -> usize {
         self.ops.len()
@@ -202,7 +293,7 @@ impl Batch {
             return self.db.write_batch(Vec::new()); // reports a poisoned database
         }
         self.db.transact(|catalog, store| {
-            for op in &self.ops {
+            for (at, op) in self.ops.iter().enumerate() {
                 match op {
                     Op::Write(write) => apply_write_op(catalog, store, write)?,
                     // The document as the ops before left it: read here,
@@ -215,6 +306,21 @@ impl Batch {
                     } => update_by_id(catalog, store, collection, *id, update, &mut |doc| {
                         accept(doc)
                     })?,
+                    // The catalog and store as the ops before left them.
+                    Op::Require {
+                        collection,
+                        filter,
+                        none,
+                    } => {
+                        let matched = any_match_in(catalog, store, collection, filter)?;
+                        if matched == *none {
+                            return Err(crate::Error::PreconditionFailed {
+                                collection: collection.clone(),
+                                op: at,
+                                matched,
+                            });
+                        }
+                    }
                 }
             }
             Ok(())
