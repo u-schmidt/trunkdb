@@ -144,6 +144,17 @@ says where the need or the limit is described.
 - **PyO3 bindings,** for Python apps.
 - **Longer fuzzing runs,** with AddressSanitizer too, and short ones in
   CI on nightly (§55.6).
+- **Backups a user can trust,** answering what a user asks: how to back
+  up while the application runs, whether a backup can be restored,
+  which files a copy of the database needs, how to move between format
+  versions. A section of the guide that answers each with what is there
+  (`export` from the application's own handle, a snapshot; the file and
+  its WAL, copied only while closed; which builds open which formats);
+  an end line in the export, export version 3, its counts checked by
+  `import`, as an export cut short between two lines now imports what
+  it has without a word (§30); and `trunkdb verify <export>`, a restore
+  into a temporary file, `check`ed and its counts compared, then
+  deleted.
 
 ### Deferred
 Each waits for what its line names: a program that needs it, or a
@@ -225,6 +236,12 @@ Built in §135–§139, as one group: the hook after each commit,
   (§152). Next, the WAL record written from the pages instead of
   copied into one buffer (4–5%); then a checkpoint without the WAL's own flush, a generation
   number in its header and records.
+
+- A native backup while the application runs, `Database::backup_to(path)`:
+  a snapshot written as one compacted file without a WAL, as SQLite's
+  `VACUUM INTO`, restored by opening it. The export stays the portable
+  backup, as a native file opens only in the same build or a newer one;
+  when asked.
 
 **Concurrency**
 - Readers that run in parallel past four: four do 3.2 times the work
