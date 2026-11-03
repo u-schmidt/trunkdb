@@ -8,7 +8,7 @@ pub use crate::explain::{Alternative, EntryCount, ExecutionStats, Explained, Ind
 use crate::index::{KeyRange, key};
 use crate::map::Map;
 use crate::path::Path;
-pub use crate::query_text::ParseFilterError;
+pub use crate::query_text::{BindError, Params, ParseFilterError, Template};
 use crate::select::Selection;
 pub use crate::update::Update;
 use std::sync::Arc;

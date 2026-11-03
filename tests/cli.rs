@@ -1479,3 +1479,189 @@ fn aggregate_prints_the_rows_of_its_text() {
     let output = trunkdb(&["aggregate", &db, "users", "", "count() as n, sum(age) as n"]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
 }
+
+/// SPEC §163.6: `--param name=value` for each command that reads a
+/// filter or an aggregate, the value as JSON, `date(…)` or a word, never
+/// read as text; each mistake exit code 2.
+#[test]
+fn parameters_are_given_apart_from_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+    let sneaky = r#"{"name": "x\" or age > 0 or name = \"y", "age": 7, "code": "20", "when": {"$date": "2026-11-03T00:00:00Z"}}"#;
+    assert!(trunkdb(&["insert", &db, "users", sneaky]).status.success());
+    let ok = |args: &[&str]| -> String {
+        let output = trunkdb(args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        stdout(&output)
+    };
+    let refused = |args: &[&str]| -> String {
+        let output = trunkdb(args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stdout(&output)
+        );
+        assert!(stdout(&output).is_empty(), "{args:?}");
+        stderr(&output)
+    };
+
+    // A word is a string; JSON a number; any string compared as itself.
+    let found = ok(&["find", &db, "users", "name = :n", "--param", "n=Ada"]);
+    assert!(
+        found.contains(r#""name":"Ada""#) && found.lines().count() == 1,
+        "{found}"
+    );
+    let count = |args: &[&str]| ok(args).trim().to_string();
+    assert_eq!(
+        count(&["count", &db, "users", "age >= :a", "--param", "a=40"]),
+        "1"
+    );
+    let name = r#"n=x" or age > 0 or name = "y"#;
+    assert_eq!(
+        count(&["count", &db, "users", "name = :n", "--param", name]),
+        "1"
+    );
+    assert_eq!(
+        count(&["count", &db, "users", "code = :c", "--param", "c=20"]),
+        "0"
+    );
+    assert_eq!(
+        count(&["count", &db, "users", "code = :c", "--param", r#"c="20""#]),
+        "1"
+    );
+    let when = r#"w=date("2026-11-03T00:00:00Z")"#;
+    assert_eq!(
+        count(&["count", &db, "users", "when = :w", "--param", when]),
+        "1"
+    );
+    let list = r#"l=["Ada", "Bob", "Zed"]"#;
+    assert_eq!(
+        count(&["count", &db, "users", "name in :l", "--param", list]),
+        "2"
+    );
+    let paged = [
+        "count",
+        &db,
+        "users",
+        "age > :a limit :k",
+        "--param",
+        "a=0",
+        "--param",
+        "k=2",
+    ];
+    assert_eq!(count(&paged), "2");
+    // Anywhere among the arguments, and with --explain after.
+    let explained = ok(&[
+        "find",
+        &db,
+        "--param",
+        "a=40",
+        "users",
+        "age > :a",
+        "--explain",
+    ]);
+    assert!(explained.contains("documents returned: 1"), "{explained}");
+    let fields = ok(&[
+        "fields", &db, "users", "age < :a", "--param", "a=10", "--json",
+    ]);
+    assert!(fields.contains("code"), "{fields}");
+
+    // The aggregate's text and the filter's share the values.
+    let rows = ok(&[
+        "aggregate",
+        &db,
+        "users",
+        "age > :min",
+        "count() as n having n >= :k",
+        "--param",
+        "min=0",
+        "--param",
+        "k=3",
+    ]);
+    assert_eq!(rows, "{\"n\":3}\n");
+
+    // Writes: the filter's parameters, and the counts they'd change.
+    let update = [
+        "update",
+        &db,
+        "users",
+        "name = :n",
+        r#"{"$inc": {"age": 1}}"#,
+        "--param",
+        "n=Bob",
+    ];
+    assert!(trunkdb(&update).status.success());
+    assert_eq!(count(&["count", &db, "users", "age = 42"]), "1");
+    let delete = [
+        "delete",
+        &db,
+        "users",
+        "age < :a",
+        "--param",
+        "a=10",
+        "--dry-run",
+    ];
+    let output = trunkdb(&delete);
+    assert_eq!(stderr(&output), "would delete 1 document\n");
+
+    // Mistakes.
+    let e = refused(&["find", &db, "users", "age > :a"]);
+    assert_eq!(
+        e,
+        "trunkdb: filter: no value for the parameter :a: give it with --param a=…\n  age > :a\n        ^\n"
+    );
+    let e = refused(&[
+        "find", &db, "users", "age > :a", "--param", "a=1", "--param", "b=2",
+    ]);
+    assert_eq!(
+        e,
+        "trunkdb: --param b: no text of this command has the parameter :b\n"
+    );
+    let e = refused(&["find", &db, "users", "age > 1 limit :n", "--param", "n=-1"]);
+    assert!(
+        e.contains(":n is a count") && e.contains("\n                ^"),
+        "{e}"
+    );
+    let e = refused(&["find", &db, "users", "name in :l", "--param", "l=Ada"]);
+    assert!(e.contains("its value must be an array"), "{e}");
+    let e = refused(&["find", &db, "users", "age > :a", "--param", "a"]);
+    assert!(e.contains("--param takes a name and a value"), "{e}");
+    let e = refused(&["find", &db, "users", "age > :a", "--param"]);
+    assert!(e.contains("--param takes a name and a value"), "{e}");
+    let twice = [
+        "find", &db, "users", "age > :a", "--param", "a=1", "--param", "a=2",
+    ];
+    assert_eq!(refused(&twice), "trunkdb: --param a: given twice\n");
+    for (value, says) in [
+        ("a=[1, 2", "starts as JSON and isn't"),
+        (r#"a="open"#, "starts as JSON and isn't"),
+        (r#"a=date("2026-13-01")"#, "is not a date-time"),
+        (r#"a=id("nope")"#, "is not an id"),
+    ] {
+        let e = refused(&["find", &db, "users", "age > :a", "--param", value]);
+        assert!(e.contains(says), "{value}: {e}");
+    }
+    for command in [
+        vec!["get", &db, "users", "x", "--param", "a=1"],
+        vec!["info", &db, "--param", "a=1"],
+        vec!["insert", &db, "users", "{}", "--param", "a=1"],
+    ] {
+        let e = refused(&command);
+        assert_eq!(
+            e, "trunkdb: --param: not an option of this command\n",
+            "{command:?}"
+        );
+    }
+    let e = refused(&[
+        "find",
+        &db,
+        "users",
+        "name = :n order by :n",
+        "--param",
+        "n=Ada",
+    ]);
+    assert!(e.contains("a parameter can't stand for a field"), "{e}");
+}

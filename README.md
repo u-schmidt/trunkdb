@@ -21,8 +21,9 @@ measurements.
 ## Features
 
 - Typed documents through serde, or untyped ones (`Document`).
-- Filters in code or as text, with sort, skip and limit, and conditions
-  of your own as closures; projection and
+- Filters in code or as text, with sort, skip and limit, parameters for
+  values passed apart from the text, and conditions of your own as
+  closures; projection and
   aggregates by group, with a condition per column. Arrays, objects and binary compare by their
   contents with `=` and `!=`.
 - Secondary indexes: unique, compound, on nested paths and array
@@ -109,6 +110,8 @@ trunkdb find app.trunkdb users 'age >= 30' --explain
 trunkdb fields app.trunkdb users         # every path, in how many documents,
                                          # as which types
 trunkdb count app.trunkdb users 'age >= 30'
+trunkdb find app.trunkdb users 'name = :name' --param "name=$NAME"
+                                         # a value apart from the text
 trunkdb get app.trunkdb users 0192f0c4-7d7a-7c43-9e0b-1f6d1b8f0a11
 trunkdb aggregate app.trunkdb users 'age >= 30' 'count() as n, avg(age) as mean group by team'
 trunkdb insert app.trunkdb users '{"name": "Ada", "age": 36}'

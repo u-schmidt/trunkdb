@@ -4,16 +4,20 @@
 //! id, with JSON for a program or an agent to read (§155); insert,
 //! update and delete documents, add and drop indexes, drop a collection
 //! (§156). Looking, checking, exporting, finding, summing up, counting
-//! and getting open it read-only (SPEC §88).
+//! and getting open it read-only (SPEC §88). A filter's or an
+//! aggregate's text takes parameters, their values given apart with
+//! `--param` (§163).
 //!
 //! Arguments are parsed by hand: seven subcommands don't need a parser
 //! crate, and a library's dependencies are compiled for everyone who uses
 //! the library.
 
+use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use trunkdb::query::{Filter, ParseFilterError};
+use std::str::FromStr;
+use trunkdb::query::{BindError, Filter, Params, ParseFilterError, Template};
 use trunkdb::{Database, Document, OpenOptions};
 
 const USAGE: &str = "\
@@ -94,6 +98,18 @@ update and delete refuse to change every document of a collection unless
 given --all; --dry-run says how many they would change, writing nothing.
 The filter is one argument: quote it, '' for none.
 
+parameters (find, fields, count, aggregate, update, delete):
+  --param <name>=<value>      a value for `:name` in the filter or the
+                              aggregate, where a value or a count stands:
+                              'status = :s limit :n' --param s=open
+                              --param n=20. The value is never read as
+                              text, so it can't change what the filter
+                              says. It is JSON (5, true, null, \"text\",
+                              [1, 2], {\"a\": 1}), id(\"…\") or date(\"…\");
+                              anything else is the string as written. A
+                              string that would read as one of those is
+                              given as JSON: n='\"20\"' is a string
+
 info, check, export, find, fields, count, get and aggregate only read: they change
 nothing in the file or its log, not even what a crash of the program that
 had it open left there.
@@ -102,53 +118,61 @@ had it open left there.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result =
-        match args[..] {
-            ["info", file] => read_only(file).and_then(|db| info(file, &db)),
-            ["info", file, "--json"] => read_only(file).and_then(|db| info_json(file, &db)),
-            ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
-            ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
-            ["compact", file] => existing(file).and_then(|db| compact(&db)),
-            ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
-            ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
-            ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
-            ["find", file, collection, ref filter @ .., "--explain"] => read_only(file)
-                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Explained)),
-            ["find", file, collection, ref filter @ ..] => read_only(file)
-                .and_then(|db| find(&db, collection, &filter.join(" "), Show::Documents)),
-            ["fields", file, collection, ref filter @ .., "--json"] => read_only(file)
-                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Json)),
-            ["fields", file, collection, ref filter @ ..] => read_only(file)
-                .and_then(|db| fields(&db, collection, &filter.join(" "), Format::Text)),
-            ["count", file, collection, ref filter @ ..] => {
-                read_only(file).and_then(|db| count_of(&db, collection, &filter.join(" ")))
-            }
-            ["get", file, collection, id] => {
-                read_only(file).and_then(|db| get(&db, collection, id))
-            }
-            ["aggregate", file, collection, filter, text] => read_only(file)
-                .and_then(|db| aggregate(&db, collection, filter, text, Show::Documents)),
-            ["aggregate", file, collection, filter, text, "--explain"] => read_only(file)
-                .and_then(|db| aggregate(&db, collection, filter, text, Show::Explained)),
-            ["insert", file, collection, ref rest @ ..] => insert(file, collection, rest),
-            ["update", file, collection, ref rest @ ..] => update(file, collection, rest),
-            ["delete", file, collection, ref rest @ ..] => delete(file, collection, rest),
-            ["index", file, collection, "add", ref rest @ ..] => index_add(file, collection, rest),
-            ["index", file, collection, "drop", ref rest @ ..] => {
-                index_drop(file, collection, rest)
-            }
-            ["drop", file, collection] => drop_collection(file, collection),
-            ["import", file, input, "--max-line", limit] => max_line(limit)
-                .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
-            ["help" | "-h" | "--help"] => {
-                print!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            _ => {
-                eprint!("{USAGE}");
-                return ExitCode::from(2);
-            }
-        };
+    let (args, given) = match given_params(&args) {
+        Ok(split) => split,
+        Err(why) => {
+            eprintln!("trunkdb: {why}");
+            return ExitCode::from(2);
+        }
+    };
+    let takes_params = ["find", "fields", "count", "aggregate", "update", "delete"];
+    if !given.values.is_empty() && !args.first().is_some_and(|c| takes_params.contains(c)) {
+        eprintln!("trunkdb: --param: not an option of this command");
+        return ExitCode::from(2);
+    }
+    let given = &given;
+    let result = match args[..] {
+        ["info", file] => read_only(file).and_then(|db| info(file, &db)),
+        ["info", file, "--json"] => read_only(file).and_then(|db| info_json(file, &db)),
+        ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
+        ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
+        ["compact", file] => existing(file).and_then(|db| compact(&db)),
+        ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
+        ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
+        ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
+        ["find", file, collection, ref filter @ .., "--explain"] => read_only(file)
+            .and_then(|db| find(&db, collection, &filter.join(" "), given, Show::Explained)),
+        ["find", file, collection, ref filter @ ..] => read_only(file)
+            .and_then(|db| find(&db, collection, &filter.join(" "), given, Show::Documents)),
+        ["fields", file, collection, ref filter @ .., "--json"] => read_only(file)
+            .and_then(|db| fields(&db, collection, &filter.join(" "), given, Format::Json)),
+        ["fields", file, collection, ref filter @ ..] => read_only(file)
+            .and_then(|db| fields(&db, collection, &filter.join(" "), given, Format::Text)),
+        ["count", file, collection, ref filter @ ..] => {
+            read_only(file).and_then(|db| count_of(&db, collection, &filter.join(" "), given))
+        }
+        ["get", file, collection, id] => read_only(file).and_then(|db| get(&db, collection, id)),
+        ["aggregate", file, collection, filter, text] => read_only(file)
+            .and_then(|db| aggregate(&db, collection, filter, text, given, Show::Documents)),
+        ["aggregate", file, collection, filter, text, "--explain"] => read_only(file)
+            .and_then(|db| aggregate(&db, collection, filter, text, given, Show::Explained)),
+        ["insert", file, collection, ref rest @ ..] => insert(file, collection, rest),
+        ["update", file, collection, ref rest @ ..] => update(file, collection, rest, given),
+        ["delete", file, collection, ref rest @ ..] => delete(file, collection, rest, given),
+        ["index", file, collection, "add", ref rest @ ..] => index_add(file, collection, rest),
+        ["index", file, collection, "drop", ref rest @ ..] => index_drop(file, collection, rest),
+        ["drop", file, collection] => drop_collection(file, collection),
+        ["import", file, input, "--max-line", limit] => max_line(limit)
+            .and_then(|limit| open(file).and_then(|db| import(&db, input, Some(limit)))),
+        ["help" | "-h" | "--help"] => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     match result {
         Ok(code) => code,
         Err(message) => {
@@ -603,9 +627,9 @@ enum Show {
 /// The documents `filter` finds in `collection`, one JSON line each
 /// (SPEC §112), streamed from a cursor; how many, to stderr. Or how it
 /// found them (§113).
-fn find(db: &Database, collection: &str, filter: &str, show: Show) -> Outcome {
+fn find(db: &Database, collection: &str, filter: &str, given: &Given, show: Show) -> Outcome {
     let failed = |e: trunkdb::Error| e.to_string();
-    let (docs, filter) = match query(db, collection, filter)? {
+    let (docs, filter) = match query(db, collection, filter, given)? {
         Ok(query) => query,
         Err(usage) => return Ok(usage),
     };
@@ -637,16 +661,25 @@ fn find(db: &Database, collection: &str, filter: &str, show: Show) -> Outcome {
 
 /// `trunkdb aggregate` (SPEC §157): the rows of `aggregate` over what
 /// `filter` finds, one JSON line each, how many to stderr; or how it ran.
-fn aggregate(db: &Database, collection: &str, filter: &str, text: &str, show: Show) -> Outcome {
+fn aggregate(
+    db: &Database,
+    collection: &str,
+    filter: &str,
+    text: &str,
+    given: &Given,
+    show: Show,
+) -> Outcome {
     let failed = |e: trunkdb::Error| e.to_string();
-    let parsed: trunkdb::query::Aggregate = match text.parse() {
+    let parsed = match bound(
+        "aggregate",
+        text,
+        given,
+        Template::<trunkdb::query::Aggregate>::bind,
+    ) {
         Ok(aggregate) => aggregate,
-        Err(e) => {
-            eprintln!("trunkdb: {}", text_error("aggregate", text, &e));
-            return Ok(ExitCode::from(2));
-        }
+        Err(usage) => return Ok(usage),
     };
-    let (docs, filter) = match query(db, collection, filter)? {
+    let (docs, filter) = match query(db, collection, filter, given)? {
         Ok(query) => query,
         Err(usage) => return Ok(usage),
     };
@@ -677,8 +710,8 @@ fn aggregate(db: &Database, collection: &str, filter: &str, text: &str, show: Sh
 /// `trunkdb count` (SPEC §155): how many documents the filter finds, the
 /// number alone on standard output, its skip and limit applied as `find`
 /// applies them.
-fn count_of(db: &Database, collection: &str, filter: &str) -> Outcome {
-    let (docs, filter) = match query(db, collection, filter)? {
+fn count_of(db: &Database, collection: &str, filter: &str, given: &Given) -> Outcome {
+    let (docs, filter) = match query(db, collection, filter, given)? {
         Ok(query) => query,
         Err(usage) => return Ok(usage),
     };
@@ -704,7 +737,7 @@ fn get(db: &Database, collection: &str, id: &str) -> Outcome {
         );
         return Ok(ExitCode::from(2));
     };
-    let (docs, _filter) = match query(db, collection, "")? {
+    let (docs, _filter) = match query(db, collection, "", &Given::default())? {
         Ok(query) => query,
         Err(usage) => return Ok(usage),
     };
@@ -720,20 +753,141 @@ fn get(db: &Database, collection: &str, id: &str) -> Outcome {
     }
 }
 
+/// The values of `--param name=value` (SPEC §163.6), and the names a
+/// text of the command has used.
+#[derive(Default)]
+struct Given {
+    values: Vec<(String, Document)>,
+    used: RefCell<Vec<String>>,
+}
+
+impl Given {
+    /// A value no text took, the first given.
+    fn unused(&self) -> Option<String> {
+        let used = self.used.borrow();
+        (self.values.iter())
+            .map(|(name, _)| name)
+            .find(|name| !used.contains(name))
+            .cloned()
+    }
+}
+
+/// `args` without each `--param name=value`, and those values. A
+/// `--param` without `=`, or a name given twice, is the error.
+fn given_params<'a>(args: &[&'a str]) -> Result<(Vec<&'a str>, Given), String> {
+    let mut rest = Vec::new();
+    let mut given = Given::default();
+    let mut args = args.iter();
+    while let Some(&arg) = args.next() {
+        if arg != "--param" {
+            rest.push(arg);
+            continue;
+        }
+        let Some((name, text)) = args.next().and_then(|param| param.split_once('=')) else {
+            return Err("--param takes a name and a value: --param status=open".to_string());
+        };
+        if given.values.iter().any(|(given, _)| given == name) {
+            return Err(format!("--param {name}: given twice"));
+        }
+        let value = param_value(text).map_err(|why| format!("--param {name}: {why}"))?;
+        given.values.push((name.to_string(), value));
+    }
+    Ok((rest, given))
+}
+
+/// A `--param`'s value (SPEC §163.6): a value as a filter writes one,
+/// JSON, `id("…")` or `date("…")`; what doesn't start as one of those is
+/// a string as written. One that starts as one and doesn't read is a
+/// mistake, not a string: `[1, 2` or `date("2026-13-01")`.
+fn param_value(text: &str) -> Result<Document, String> {
+    if let Ok(value) = text.parse::<Document>() {
+        return Ok(value);
+    }
+    let call = |name: &str| {
+        let inner = text.trim().strip_prefix(name)?.strip_prefix('(')?;
+        let inner = inner.strip_suffix(')')?;
+        Some(serde_json::from_str::<String>(inner.trim()).ok())
+    };
+    if let Some(inner) = call("id") {
+        let id = inner.and_then(|inner| inner.parse::<trunkdb::DocId>().ok());
+        return id
+            .map(Document::Id)
+            .ok_or_else(|| format!("{text} is not an id"));
+    }
+    if let Some(inner) = call("date") {
+        let time = inner.and_then(|inner| inner.parse::<trunkdb::DateTime>().ok());
+        return (time.map(Document::DateTime)).ok_or_else(|| {
+            format!("{text} is not a date-time like date(\"2026-11-03T12:00:00Z\")")
+        });
+    }
+    match text.trim_start().starts_with(['[', '{', '"']) {
+        true => Err(format!(
+            "{text} starts as JSON and isn't: a string is given as JSON, \"…\""
+        )),
+        false => Ok(Document::String(text.to_string())),
+    }
+}
+
+/// `text`, a `what`, read as a template and bound to the values `given`
+/// that it has parameters for. A mistake is printed, and is exit code 2.
+fn bound<T>(
+    what: &str,
+    text: &str,
+    given: &Given,
+    bind: fn(&Template<T>, &Params) -> Result<T, BindError>,
+) -> Result<T, ExitCode>
+where
+    Template<T>: FromStr<Err = ParseFilterError>,
+{
+    let template: Template<T> = match text.parse() {
+        Ok(template) => template,
+        Err(e) => {
+            eprintln!("trunkdb: {}", text_error(what, text, &e));
+            return Err(ExitCode::from(2));
+        }
+    };
+    let mut params = Params::new();
+    for name in template.params() {
+        if let Some((_, value)) = given.values.iter().find(|(given, _)| given == name) {
+            params = params.set(name, value.clone());
+            given.used.borrow_mut().push(name.to_string());
+        }
+    }
+    bind(&template, &params).map_err(|e| {
+        let message = match &e {
+            BindError::Missing { name, .. } => format!("{e}: give it with --param {name}=…"),
+            _ => e.to_string(),
+        };
+        match e.offset() {
+            Some(at) => eprintln!("trunkdb: {}", marked(what, text, at, message)),
+            None => eprintln!("trunkdb: {what}: {message}"),
+        }
+        ExitCode::from(2)
+    })
+}
+
 /// A collection, and the filter to read it with.
 type Query = (trunkdb::Collection<Document>, Filter);
 
-/// `filter` read, and `collection` checked to be there: what `find` and
-/// `fields` start with. A filter that doesn't read is printed with its
-/// mistake, and comes back as exit code 2 in the inner `Err`.
-fn query(db: &Database, collection: &str, filter: &str) -> Result<Result<Query, ExitCode>, String> {
-    let parsed: Filter = match filter.parse() {
+/// `filter` read and bound to the `--param` values, and `collection`
+/// checked to be there: what `find` and `fields` start with. The last
+/// text of a command, so every value must have been used by now. A
+/// filter that doesn't read or bind is printed with its mistake, and
+/// comes back as exit code 2 in the inner `Err`.
+fn query(
+    db: &Database,
+    collection: &str,
+    filter: &str,
+    given: &Given,
+) -> Result<Result<Query, ExitCode>, String> {
+    let parsed = match bound("filter", filter, given, Template::<Filter>::bind) {
         Ok(filter) => filter,
-        Err(e) => {
-            eprintln!("trunkdb: {}", filter_error(filter, &e));
-            return Ok(Err(ExitCode::from(2)));
-        }
+        Err(usage) => return Ok(Err(usage)),
     };
+    if let Some(name) = given.unused() {
+        eprintln!("trunkdb: --param {name}: no text of this command has the parameter :{name}");
+        return Ok(Err(ExitCode::from(2)));
+    }
     // A typo in the name would find nothing, as if nothing matched.
     if !db
         .collections()
@@ -755,16 +909,16 @@ fn stopped_writing(e: io::Error) -> Outcome {
     }
 }
 
-/// The filter's mistake, with its line of the filter and a `^` under
-/// where it is.
-fn filter_error(filter: &str, e: &ParseFilterError) -> String {
-    text_error("filter", filter, e)
+/// A text's mistake, `what` the text is (a filter, an aggregate, SPEC
+/// §157), with its line of the text and a `^` under where it is.
+fn text_error(what: &str, filter: &str, e: &ParseFilterError) -> String {
+    marked(what, filter, e.offset(), e)
 }
 
-/// `filter_error` for a text of another kind, `what`: an aggregate's
-/// (SPEC §157).
-fn text_error(what: &str, filter: &str, e: &ParseFilterError) -> String {
-    let at = e.offset();
+/// `message` about `what`, with the line of `text` it is about and a
+/// `^` under byte `at`.
+fn marked(what: &str, filter: &str, at: usize, message: impl std::fmt::Display) -> String {
+    let e = message;
     let start = filter[..at].rfind('\n').map_or(0, |i| i + 1);
     let end = filter[at..].find('\n').map_or(filter.len(), |i| at + i);
     let column = filter[start..at].chars().count();
@@ -1050,9 +1204,9 @@ fn walk<'s>(text: String, nameable: bool, shape: &'s Shape, lines: &mut Vec<Line
 
 /// Every path the documents `filter` finds have (SPEC §121): in how many
 /// documents, and as which kinds of value. How many documents, to stderr.
-fn fields(db: &Database, collection: &str, filter: &str, format: Format) -> Outcome {
+fn fields(db: &Database, collection: &str, filter: &str, given: &Given, format: Format) -> Outcome {
     let failed = |e: trunkdb::Error| e.to_string();
-    let (docs, filter) = match query(db, collection, filter)? {
+    let (docs, filter) = match query(db, collection, filter, given)? {
         Ok(query) => query,
         Err(usage) => return Ok(usage),
     };
@@ -1409,7 +1563,7 @@ fn touches_all(
 
 /// `trunkdb update` (SPEC §156): the documents the filter finds changed by
 /// the update's operators; with `--upsert`, one inserted where none is.
-fn update(file: &str, collection: &str, args: &[&str]) -> Outcome {
+fn update(file: &str, collection: &str, args: &[&str], values: &Given) -> Outcome {
     let (rest, given) = match options(args, &["--all", "--upsert", "--dry-run"]) {
         Ok(split) => split,
         Err(why) => return misused(&why),
@@ -1422,7 +1576,7 @@ fn update(file: &str, collection: &str, args: &[&str]) -> Outcome {
         Err(why) => return misused(&why),
     };
     let db = existing(file)?;
-    let (docs, filter) = match query(&db, collection, filter)? {
+    let (docs, filter) = match query(&db, collection, filter, values)? {
         Ok(query) => query,
         Err(usage) => return Ok(usage),
     };
@@ -1465,7 +1619,7 @@ fn update(file: &str, collection: &str, args: &[&str]) -> Outcome {
 }
 
 /// `trunkdb delete` (SPEC §156): the documents the filter finds.
-fn delete(file: &str, collection: &str, args: &[&str]) -> Outcome {
+fn delete(file: &str, collection: &str, args: &[&str], values: &Given) -> Outcome {
     let (rest, given) = match options(args, &["--all", "--dry-run"]) {
         Ok(split) => split,
         Err(why) => return misused(&why),
@@ -1474,7 +1628,7 @@ fn delete(file: &str, collection: &str, args: &[&str]) -> Outcome {
         return misused("delete takes a filter, one argument in quotes");
     };
     let db = existing(file)?;
-    let (docs, filter) = match query(&db, collection, filter)? {
+    let (docs, filter) = match query(&db, collection, filter, values)? {
         Ok(query) => query,
         Err(usage) => return Ok(usage),
     };

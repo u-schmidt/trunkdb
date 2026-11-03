@@ -11,6 +11,7 @@ something to the shell.
 - Conditions
 - Paths and names
 - Values
+- Parameters
 - Strings, and a prefix
 - Values of different types
 - Null and missing
@@ -93,6 +94,31 @@ double quotes with JSON escapes (single quotes are an error), `true`,
   dates with `date(…)`.
 - Binary: `{"$binary": "<base64>"}`; special floats: `{"$float":
   "NaN"}`.
+
+## Parameters
+
+`:name` where a value stands, its value given with `--param
+name=value` (one per parameter, anywhere after the command):
+
+```text
+trunkdb find app.trunkdb tasks 'status = :s and due < :d limit :n' \
+  --param s=open --param 'd=date("2026-12-01T00:00:00Z")' --param n=20
+trunkdb count app.trunkdb tasks 'team in :teams' --param 'teams=["core", "web"]'
+```
+
+- Where: after a comparison, as a value in `in (…)`, for a whole `in`
+  list (a JSON array), and for `limit`, `offset` and `size(…) > n` (a
+  whole number from 0). Never for a field, a sort key, an index, a
+  duration, or inside `id(…)`/`date(…)`: give the id or date itself.
+- The value: JSON, `id("…")` or `date("…")`, else the string as
+  written: `s=open` is `"open"`, `n=20` is `20`, `code=007` is
+  `"007"`. A string that reads as JSON is given as JSON: `n='"20"'`.
+  Something that starts like JSON or `date(` and doesn't read is an
+  error, not a string.
+- Errors, exit code 2: a parameter without a `--param`, a `--param`
+  that no text uses, a name given twice, a value that doesn't fit (a
+  list that isn't an array, a negative limit).
+- With `aggregate`, the filter and the aggregate share the values.
 
 ## Strings, and a prefix
 

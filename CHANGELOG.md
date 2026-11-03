@@ -989,3 +989,12 @@ limit, batches and a write-ahead log. Since then:
     returns `Error::PreconditionFailed`, naming the op. A transfer only
     while the balance covers it, a registration only while the email is
     free among active users, a write held to the version it read.
+135. **Parameters in a filter's text** (§163): `:name` where a value or
+    a count stands, `status = :status limit :n`, the values passed
+    apart, so nothing in one can change what the text says.
+    `Template<Filter>` (and of a `Condition` or an `Aggregate`) reads
+    and checks the text once; `bind(&Params)` makes the filter, any
+    number of times; `params()` lists the names. A missing value, an
+    unused one, or one that doesn't fit is a `BindError`. `trunkdb`
+    takes the values as `--param name=value` for `find`, `fields`,
+    `count`, `aggregate`, `update` and `delete`.

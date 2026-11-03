@@ -91,6 +91,15 @@ owner = id("0192f0c4-…")
 select name, address.city where age > 30 order by name desc limit 10 offset 20
 ```
 
+**A value from the user goes in a `--param`, never into the filter's
+text**: `trunkdb find app.trunkdb users 'name = :name' --param
+"name=$NAME"`. `:name` stands where a value does, after a comparison,
+in `in (…)` or for the whole list (`team in :teams`, a JSON array), and
+for a count (`limit :n`). The value is JSON (`20`, `true`, `"20"` for
+the string), `id("…")` or `date("…")`, or else the string as written,
+quotes and all, and nothing in it can change the filter. A parameter
+without a value, or a value without a parameter, is exit code 2.
+
 For anything beyond these — backticks for names with spaces or that
 are keywords, `@` inside `has`, how null and missing compare, what a
 mistake message means — read `references/filters.md`.

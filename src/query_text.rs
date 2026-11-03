@@ -2,13 +2,17 @@
 //! `FromStr` reads the SQL-like language into a `Filter`, `Condition` or
 //! `Aggregate`, `Display` writes one back. The text says what the
 //! builders say, no more: it compiles to the same filter, which the
-//! planner sees as it sees any other.
+//! planner sees as it sees any other. A `Template` reads a text with
+//! parameters, `:name` where a value stands, and binds values to them
+//! (§163).
 
 use crate::aggregate::{Column, Kind, Window};
 use crate::datetime::DateTime;
 use crate::document::{DocId, Document};
 use crate::query::{Aggregate, Condition, Filter, Hint, Kind as ValueKind, Op, Sort, SortOrder};
+use std::collections::BTreeMap;
 use std::fmt::{self, Formatter, Write};
+use std::marker::PhantomData;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -65,7 +69,7 @@ impl FromStr for Filter {
     type Err = ParseFilterError;
 
     fn from_str(text: &str) -> Result<Filter, ParseFilterError> {
-        let mut parser = Parser { text, at: 0 };
+        let mut parser = Parser::new(text, Mode::Plain("Filter"));
         let filter = parser.filter()?;
         parser.end()?;
         Ok(filter)
@@ -103,7 +107,7 @@ impl FromStr for Aggregate {
     type Err = ParseFilterError;
 
     fn from_str(text: &str) -> Result<Aggregate, ParseFilterError> {
-        let mut parser = Parser { text, at: 0 };
+        let mut parser = Parser::new(text, Mode::Plain("Aggregate"));
         let aggregate = parser.aggregate()?;
         parser.end()?;
         Ok(aggregate)
@@ -115,14 +119,301 @@ impl FromStr for Condition {
     type Err = ParseFilterError;
 
     fn from_str(text: &str) -> Result<Condition, ParseFilterError> {
-        let mut parser = Parser { text, at: 0 };
+        let mut parser = Parser::new(text, Mode::Plain("Condition"));
         let condition = parser.condition()?;
         parser.end()?;
         Ok(condition)
     }
 }
 
+/// A text with parameters (SPEC §163): `:name` where a value stands,
+/// read once and bound to values any number of times, each time a `T`,
+/// for `T` one of `Filter`, `Condition` and `Aggregate`. The value is
+/// never read as text, so nothing in it can change what the text means.
+///
+/// ```
+/// use trunkdb::query::{Filter, Params, Template};
+///
+/// let open: Template<Filter> = "status = :status and owner = :me order by due limit :n".parse()?;
+/// assert_eq!(open.params(), ["status", "me", "n"]);
+///
+/// let mine = open.bind(&Params::new().set("status", "open").set("me", "ada").set("n", 20))?;
+/// assert_eq!(mine.to_string(), r#"status = "open" and owner = "ada" order by due limit 20"#);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// A parameter stands where a value does: after a comparison, in an `in`
+/// list, for the whole list (`in :list`, an array), and where a count
+/// does (`limit :n`, `offset :n`, `size(p) > :n`, a whole number from
+/// 0). Never for a field, a sort key, an index, a duration, or inside
+/// `id(…)` or `date(…)`: a value passed for `:id` is an id already.
+/// Binding a value means what writing it there would mean, with its
+/// type: the string `"5"` stays a string.
+pub struct Template<T> {
+    text: String,
+    uses: Vec<Use>,
+    read: PhantomData<fn() -> T>,
+}
+
+/// Where a parameter stands in a template's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Use {
+    name: String,
+    /// The byte its `:` is at.
+    offset: usize,
+    place: Place,
+}
+
+/// What a parameter's value must be, by where it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Any value.
+    Value,
+    /// `in :list`: an array.
+    List,
+    /// `limit`, `offset`, `size`: a whole number from 0.
+    Count,
+}
+
+impl<T> Template<T> {
+    fn read(text: &str, kind: fn(&mut Parser<'_>) -> Parsed<T>) -> Result<Self, ParseFilterError> {
+        let mut parser = Parser::new(text, Mode::Collect(Vec::new()));
+        kind(&mut parser)?;
+        parser.end()?;
+        let Mode::Collect(uses) = parser.mode else {
+            unreachable!("the mode a template is read in");
+        };
+        Ok(Template {
+            text: text.to_string(),
+            uses,
+            read: PhantomData,
+        })
+    }
+
+    /// The parameters' names, each once, in the order they first stand
+    /// in the text.
+    pub fn params(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for used in &self.uses {
+            if !names.contains(&used.name.as_str()) {
+                names.push(&used.name);
+            }
+        }
+        names
+    }
+
+    /// What `bind` refuses (SPEC §163.4), the first in the text: a
+    /// parameter without a value, or one whose value doesn't fit where
+    /// it stands; then a value no parameter takes.
+    fn check(&self, params: &Params) -> Result<(), BindError> {
+        for used in &self.uses {
+            let name = used.name.clone();
+            let offset = used.offset;
+            let Some(value) = params.values.get(&used.name) else {
+                return Err(BindError::Missing { name, offset });
+            };
+            match used.place {
+                Place::Value => {}
+                Place::List if matches!(value, Document::Array(_)) => {}
+                Place::List => return Err(BindError::NotAnArray { name, offset }),
+                Place::Count if count_of(value).is_some() => {}
+                Place::Count => return Err(BindError::NotACount { name, offset }),
+            }
+        }
+        match (params.values.keys()).find(|name| !self.uses.iter().any(|u| &u.name == *name)) {
+            Some(name) => Err(BindError::Unused { name: name.clone() }),
+            None => Ok(()),
+        }
+    }
+
+    fn bind_with(
+        &self,
+        params: &Params,
+        kind: fn(&mut Parser<'_>) -> Parsed<T>,
+    ) -> Result<T, BindError> {
+        self.check(params)?;
+        let mut parser = Parser::new(&self.text, Mode::Bind(params));
+        let bound = kind(&mut parser).and_then(|bound| parser.end().map(|()| bound));
+        // The text read as a template, and every value checked to fit
+        // where it stands: it reads the same with them.
+        Ok(bound.expect("a template's text, read before, with values that fit"))
+    }
+}
+
+/// A template's text, as it was read, `:name` and all.
+impl<T> fmt::Display for Template<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl<T> fmt::Debug for Template<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Template").field(&self.text).finish()
+    }
+}
+
+impl<T> Clone for Template<T> {
+    fn clone(&self) -> Self {
+        Template {
+            text: self.text.clone(),
+            uses: self.uses.clone(),
+            read: PhantomData,
+        }
+    }
+}
+
+/// Two templates are equal if their texts are.
+impl<T> PartialEq for Template<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl<T> Eq for Template<T> {}
+
+/// `FromStr` and `bind` for each kind of text a template can be.
+macro_rules! template_of {
+    ($kind:ty, $read:ident) => {
+        impl FromStr for Template<$kind> {
+            type Err = ParseFilterError;
+
+            fn from_str(text: &str) -> Result<Self, ParseFilterError> {
+                Template::read(text, |parser| parser.$read())
+            }
+        }
+
+        impl Template<$kind> {
+            /// The text with `params`' values where its parameters stand
+            /// (SPEC §163.3): an ordinary one, printing and planned as the
+            /// text with the values written out would be. Every parameter
+            /// needs a value that fits where it stands, and every value a
+            /// parameter.
+            pub fn bind(&self, params: &Params) -> Result<$kind, BindError> {
+                self.bind_with(params, |parser| parser.$read())
+            }
+        }
+    };
+}
+
+template_of!(Filter, filter);
+template_of!(Condition, condition);
+template_of!(Aggregate, aggregate);
+
+/// The values of a template's parameters, by name (SPEC §163.3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Params {
+    values: BTreeMap<String, Document>,
+}
+
+impl Params {
+    /// No values yet.
+    pub fn new() -> Self {
+        Params::default()
+    }
+
+    /// `name`'s value, as the builder takes one (`Filter::eq`): any
+    /// `impl Into<Document>`. Setting a name again replaces its value.
+    pub fn set(mut self, name: impl Into<String>, value: impl Into<Document>) -> Self {
+        self.values.insert(name.into(), value.into());
+        self
+    }
+
+    /// `name`'s value from any `T: Serialize`, as a document is made of
+    /// one (`to_document`).
+    pub fn set_value<T: serde::Serialize>(
+        self,
+        name: impl Into<String>,
+        value: &T,
+    ) -> Result<Self, crate::DocumentError> {
+        Ok(self.set(name, crate::serde_bridge::to_document(value)?))
+    }
+}
+
+/// Why `Template::bind` refused the values (SPEC §163.4). `offset` is
+/// where the parameter first stands, in bytes from the text's start, as
+/// `ParseFilterError::offset` says.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BindError {
+    /// A parameter of the text without a value.
+    #[error("no value for the parameter :{name}")]
+    Missing {
+        /// The parameter's name, without its `:`.
+        name: String,
+        /// Where it first stands.
+        offset: usize,
+    },
+    /// A value for a name the text has no parameter of: a typo, or a
+    /// value meant for another text.
+    #[error("a value for :{name}, which the text has no parameter of")]
+    Unused {
+        /// The value's name.
+        name: String,
+    },
+    /// `in :list` with a value that isn't an array.
+    #[error("the parameter :{name} is a list, after `in`: its value must be an array")]
+    NotAnArray {
+        /// The parameter's name, without its `:`.
+        name: String,
+        /// Where it first stands.
+        offset: usize,
+    },
+    /// `limit`, `offset` or `size` with a value that isn't a whole
+    /// number from 0.
+    #[error("the parameter :{name} is a count: its value must be a whole number from 0")]
+    NotACount {
+        /// The parameter's name, without its `:`.
+        name: String,
+        /// Where it first stands.
+        offset: usize,
+    },
+}
+
+impl BindError {
+    /// The parameter's name, without its `:`.
+    pub fn name(&self) -> &str {
+        match self {
+            BindError::Missing { name, .. }
+            | BindError::Unused { name }
+            | BindError::NotAnArray { name, .. }
+            | BindError::NotACount { name, .. } => name,
+        }
+    }
+
+    /// Where the parameter first stands in the text; `None` for a value
+    /// the text has no parameter of.
+    pub fn offset(&self) -> Option<usize> {
+        match self {
+            BindError::Missing { offset, .. }
+            | BindError::NotAnArray { offset, .. }
+            | BindError::NotACount { offset, .. } => Some(*offset),
+            BindError::Unused { .. } => None,
+        }
+    }
+}
+
+/// A value that can stand where a count does.
+fn count_of(value: &Document) -> Option<usize> {
+    match value {
+        Document::Int(n) => usize::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
 type Parsed<T> = Result<T, ParseFilterError>;
+
+/// What the parser does with a parameter, `:name` (SPEC §163).
+enum Mode<'t> {
+    /// None may be there: the text was read as this type, not as a
+    /// template of it.
+    Plain(&'static str),
+    /// A template read: each parameter recorded, a stand-in in its place.
+    Collect(Vec<Use>),
+    /// A template bound: each parameter's value in its place, checked
+    /// to fit before (`Template::check`).
+    Bind(&'t Params),
+}
 
 /// A recursive descent over the text, without tokens: what a word or a
 /// `[` means depends on where it is.
@@ -130,9 +421,99 @@ struct Parser<'t> {
     text: &'t str,
     /// The byte the next read starts at.
     at: usize,
+    mode: Mode<'t>,
+    /// Every value, list and count read, where it stands: for a test to
+    /// put parameters in their places.
+    #[cfg(test)]
+    literals: Vec<Literal>,
+}
+
+/// A value, a list or a count as the text writes it.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct Literal {
+    start: usize,
+    end: usize,
+    place: Place,
+    value: Document,
 }
 
 impl<'t> Parser<'t> {
+    fn new(text: &'t str, mode: Mode<'t>) -> Self {
+        Parser {
+            text,
+            at: 0,
+            mode,
+            #[cfg(test)]
+            literals: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn literal(&mut self, start: usize, place: Place, value: &Document) {
+        let end = self.at;
+        let value = value.clone();
+        self.literals.push(Literal {
+            start,
+            end,
+            place,
+            value,
+        });
+    }
+
+    #[cfg(not(test))]
+    fn literal(&mut self, _: usize, _: Place, _: &Document) {}
+
+    /// A parameter where `place` is, if next (SPEC §163.1): its value,
+    /// bound, or a stand-in while a template is read. Refused in a text
+    /// read as a filter, condition or aggregate itself.
+    fn parameter(&mut self, place: Place) -> Parsed<Option<Document>> {
+        self.skip_space();
+        let Some(after) = self.rest().strip_prefix(':') else {
+            return Ok(None);
+        };
+        let offset = self.at;
+        let len = match after.starts_with(starts_word) {
+            true => after.find(|c| !in_word(c)).unwrap_or(after.len()),
+            false => 0,
+        };
+        if len == 0 {
+            return self.error("expected a parameter's name after `:`");
+        }
+        let name = after[..len].to_string();
+        let value = match &mut self.mode {
+            &mut Mode::Plain(kind) => {
+                return self.error(format!(
+                    "`:{name}` is a parameter: read the text as a `Template<{kind}>` and bind it"
+                ));
+            }
+            Mode::Collect(uses) => {
+                uses.push(Use {
+                    name,
+                    offset,
+                    place,
+                });
+                Document::Null
+            }
+            // Every parameter has a value, checked before.
+            Mode::Bind(params) => params.values.get(&name).cloned().unwrap_or(Document::Null),
+        };
+        self.at += 1 + len;
+        Ok(Some(value))
+    }
+
+    /// An error if a parameter is next, where none may stand (SPEC
+    /// §163.1): `what` it can't stand for.
+    fn no_parameter(&mut self, what: &str) -> Parsed<()> {
+        self.skip_space();
+        match self.rest().starts_with(':') {
+            true => self.error(format!(
+                "a parameter can't stand for {what}: only for a value or a count"
+            )),
+            false => Ok(()),
+        }
+    }
+
     fn rest(&self) -> &'t str {
         &self.text[self.at..]
     }
@@ -410,7 +791,7 @@ impl<'t> Parser<'t> {
 
     /// A duration: a whole number and its unit, `5m` (SPEC §157).
     fn duration(&mut self) -> Parsed<Duration> {
-        self.skip_space();
+        self.no_parameter("a duration")?;
         let start = self.at;
         let n = self.count()?;
         let rest = self.rest();
@@ -589,6 +970,16 @@ impl<'t> Parser<'t> {
     /// `(value, …)` after `in` (SPEC §115): an `eq` of `field` per value,
     /// as `Condition::is_in` makes them.
     fn list(&mut self, field: String) -> Parsed<Condition> {
+        // `in :list`, the whole list (SPEC §163.1).
+        if let Some(list) = self.parameter(Place::List)? {
+            let values = match list {
+                Document::Array(values) => values,
+                _ => Vec::new(),
+            };
+            return Ok(Condition::is_in(field, values));
+        }
+        self.skip_space();
+        let start = self.at;
         self.expect("(")?;
         let mut values = Vec::new();
         if !self.eat(")") {
@@ -600,6 +991,7 @@ impl<'t> Parser<'t> {
             }
             self.expect(")")?;
         }
+        self.literal(start, Place::List, &Document::Array(values.clone()));
         Ok(Condition::is_in(field, values))
     }
 
@@ -664,6 +1056,7 @@ impl<'t> Parser<'t> {
 
     /// One name of a path, onto `path`.
     fn name(&mut self, path: &mut String) -> Parsed<()> {
+        self.no_parameter("a field")?;
         if self.rest().starts_with('`') {
             let start = self.at;
             self.at += 1;
@@ -703,8 +1096,19 @@ impl<'t> Parser<'t> {
     fn value(&mut self) -> Parsed<Document> {
         self.skip_space();
         let start = self.at;
+        let value = self.value_here()?;
+        self.literal(start, Place::Value, &value);
+        Ok(value)
+    }
+
+    fn value_here(&mut self) -> Parsed<Document> {
+        let start = self.at;
         let rest = self.rest();
         let len = match rest.chars().next() {
+            Some(':') => {
+                let value = self.parameter(Place::Value)?;
+                return Ok(value.unwrap_or(Document::Null));
+            }
             Some('"') => string_len(rest),
             Some('[' | '{') => nested_len(rest),
             Some(c) if c == '-' || c.is_ascii_digit() => Some(number_len(rest)),
@@ -753,6 +1157,7 @@ impl<'t> Parser<'t> {
     /// `("…")`, the string inside, and where it starts.
     fn argument(&mut self) -> Parsed<(usize, String)> {
         self.expect("(")?;
+        self.no_parameter("the text inside `id(…)` or `date(…)`: its value is the id or date-time itself, `_id = :id`")?;
         self.skip_space();
         let start = self.at;
         let Some(len) = self
@@ -772,7 +1177,11 @@ impl<'t> Parser<'t> {
 
     /// A count: `limit`, `offset`, `size`.
     fn count(&mut self) -> Parsed<usize> {
+        if let Some(n) = self.parameter(Place::Count)? {
+            return Ok(count_of(&n).unwrap_or(0));
+        }
         self.skip_space();
+        let start = self.at;
         let rest = self.rest();
         let len = rest
             .find(|c: char| !c.is_ascii_digit())
@@ -780,10 +1189,13 @@ impl<'t> Parser<'t> {
         if len == 0 {
             return self.expected("a number");
         }
-        let n = rest[..len]
+        let n: usize = rest[..len]
             .parse()
             .or_else(|_| self.error(format!("`{}` is too large", &rest[..len])))?;
         self.at += len;
+        if let Ok(whole) = i64::try_from(n) {
+            self.literal(start, Place::Count, &Document::Int(whole));
+        }
         Ok(n)
     }
 }
@@ -1777,6 +2189,98 @@ mod tests {
                 "round {round}: {text}"
             );
         }
+    }
+
+    /// SPEC §163.9: each random filter's text, its values, lists and
+    /// counts swapped at random for parameters, read as a template and
+    /// bound to what they were: the same filter, printing the same.
+    #[test]
+    fn a_random_template_bound_is_its_filter_written_out() {
+        let mut rng = XorShift(0x5eed_1630);
+        let mut swapped = [0; 3];
+        for round in 0..3000 {
+            let text = random_filter(&mut rng).to_string();
+            let mut parser = Parser::new(&text, Mode::Plain("Filter"));
+            let plain = parser.filter().unwrap();
+            parser.end().unwrap();
+            let mut literals = parser.literals.clone();
+            // A list before the values in it.
+            literals.sort_by_key(|literal| (literal.start, std::cmp::Reverse(literal.end)));
+            let (mut template, mut params, mut from) = (String::new(), Params::new(), 0);
+            for (n, literal) in literals.iter().enumerate() {
+                // In a list taken whole already, or left as it is.
+                if literal.start < from || rng.below(4) == 0 {
+                    continue;
+                }
+                template.push_str(&text[from..literal.start]);
+                write!(template, ":p{n}").unwrap();
+                params = params.set(format!("p{n}"), literal.value.clone());
+                from = literal.end;
+                swapped[literal.place as usize] += 1;
+            }
+            template.push_str(&text[from..]);
+            let read: Template<Filter> =
+                (template.parse()).unwrap_or_else(|e| panic!("round {round}: {template}: {e}"));
+            assert_eq!(read.to_string(), template, "round {round}");
+            let bound =
+                (read.bind(&params)).unwrap_or_else(|e| panic!("round {round}: {template}: {e}"));
+            assert_eq!(bound.to_string(), text, "round {round}: {template}");
+            assert_eq!(
+                format!("{bound:?}"),
+                format!("{plain:?}"),
+                "round {round}: {template}"
+            );
+        }
+        // Each place, many times.
+        assert!(swapped.iter().all(|&n| n > 200), "{swapped:?}");
+    }
+
+    /// SPEC §163.1: where a parameter can't stand, refused at its `:`,
+    /// read as a template or not.
+    #[test]
+    fn a_parameter_stands_only_for_a_value_or_a_count() {
+        for (text, at) in [
+            (":a = 1", 0),
+            ("a.:b = 1", 2),
+            ("a = 1 order by :b", 15),
+            ("select :a where a = 1", 7),
+            ("a = 1 use index :a", 16),
+            ("_id = id(:x)", 9),
+            ("t > date( :x)", 10),
+            ("tags has (:a = 1)", 10),
+        ] {
+            let e = text.parse::<Template<Filter>>().unwrap_err();
+            assert_eq!(e.offset(), at, "{text}: {e}");
+            assert!(
+                e.to_string().contains("a parameter can't stand for"),
+                "{text}: {e}"
+            );
+        }
+        for text in [
+            "window at :span count() as n",
+            "count() as :n",
+            "sum(:p) as n",
+        ] {
+            let e = text.parse::<Template<Aggregate>>().unwrap_err();
+            assert!(e.to_string().contains("a parameter"), "{text}: {e}");
+        }
+        assert_eq!(
+            "a = : b"
+                .parse::<Template<Filter>>()
+                .unwrap_err()
+                .to_string(),
+            "expected a parameter's name after `:` at line 1 column 5"
+        );
+        assert_eq!(
+            error("a = 1 and b = :b"),
+            "`:b` is a parameter: read the text as a `Template<Filter>` and bind it at line 1 column 15"
+        );
+        let e = "n > :n".parse::<Condition>().unwrap_err().to_string();
+        assert!(e.contains("`Template<Condition>`"), "{e}");
+        let e = "count() as n having n > :n"
+            .parse::<Aggregate>()
+            .unwrap_err();
+        assert!(e.to_string().contains("`Template<Aggregate>`"), "{e}");
     }
 
     /// Random aggregates of every shape (SPEC §157), their paths and

@@ -96,6 +96,32 @@ assert_eq!(page.to_string(), r#"team = "core" order by name limit 20 offset 40"#
 `select` are there too; a mistake comes
 back as `ParseFilterError`, with its line and column.
 
+### Parameters
+
+A value that comes from outside, a user's input or a setting, goes in
+as a parameter, never with `format!` into the text: a name like
+`x" or true or name = "y` would change what the filter says. `:name`
+stands where a value does, and the values come apart, as `@name` and
+`SqlParameter` do in ADO.NET (SPEC §163):
+
+```rust
+use trunkdb::query::{Params, Template};
+
+let by_team: Template<Filter> = "team = :team and age >= :min order by name limit :n".parse()?;
+let filter = by_team.bind(&Params::new().set("team", team).set("min", 30).set("n", 10))?;
+let found = users.find(filter)?;
+```
+
+A template is read and checked once, and binds any number of times;
+`params()` lists its names. A parameter stands after a comparison, in
+an `in` list or for the whole of one (`team in :teams`, an array), and
+where a count does (`limit`, `offset`, `size(…)`), never for a field.
+A value means what writing it there would mean, with its type: the
+string `"5"` stays a string. A missing value, one the text has no
+parameter for, or one that doesn't fit (`limit :n` with `-1`) is a
+`BindError`. `Template<Condition>` and `Template<Aggregate>` work the
+same way, and `trunkdb` takes the values as `--param team=core`.
+
 ## A condition of your own
 
 For a test no operator covers, a closure: name the fields it reads, and

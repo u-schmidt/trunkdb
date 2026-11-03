@@ -354,7 +354,10 @@ limit and a selection, applied in that order [§72](spec/72-skip-for-paging.md)
 `WHERE`, `status = "Complete" and seen >= 10 order by started_at desc
 limit 1`, which says what the methods say and compiles to the same
 `Filter`; values are JSON as a `Document` reads it, so their types
-survive the round trip [§111](spec/111-filters-as-text.md).
+survive the round trip [§111](spec/111-filters-as-text.md). A `Template` reads a text with
+parameters, `:name` where a value or a count stands, and binds values
+to them, read again with the values in their places, so a value is
+never read as text [§163](spec/163-parameters-in-a-filter-s-text.md).
 
 Values of different types never compare equal or ordered, except
 numbers: an `Int` and a `Float` compare by exact value [§34](spec/34-sorting-through-an-index.md). Arrays,
@@ -596,7 +599,7 @@ more than four.
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`
   too [§60](spec/60-a-smaller-public-api.md); or from text, `text.parse::<Filter>()`, and back with
-  `to_string()` [§111](spec/111-filters-as-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md), `except` for those it leaves out [§143](spec/143-except-every-field-but-these.md);
+  `to_string()` [§111](spec/111-filters-as-text.md), with parameters through `Template` and `Params` [§163](spec/163-parameters-in-a-filter-s-text.md); `select` for the fields a read hands out [§106](spec/106-projection-a-select-of-fields.md), `except` for those it leaves out [§143](spec/143-except-every-field-but-these.md);
   `aggregate` and `explain_aggregate` with an `Aggregate` [§107](spec/107-aggregates.md), a
   column's own condition with `filter` [§126](spec/126-a-condition-on-a-column.md), `count_distinct`, `first` and
   `last`, the last two `by` a field [§146](spec/146-count-distinct-first-and-last.md), `unwind` [§147](spec/147-unwind.md); a condition of the
@@ -641,7 +644,7 @@ more than four.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
@@ -816,7 +819,7 @@ src/
 │                        moment, to keep reading
 ├── query.rs           Filter, Condition, Sort; the planner; index
 │                        entries deciding a filter
-├── query_text.rs      a filter as text, read and printed
+├── query_text.rs      a filter as text, read and printed; templates
 ├── path.rs            field paths, parsed once per query
 ├── select.rs          projection: the fields a read hands out
 ├── aggregate.rs       Aggregate: count, sum, min, max, avg by group, a condition per column
