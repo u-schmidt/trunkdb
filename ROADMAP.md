@@ -113,7 +113,7 @@ only a checkpoint before upgrading.
   `Document` is `#[non_exhaustive]`, and a file holding one is refused
   by an older build, as above.
 - Everything **Planned** or **Deferred** below: new operators, `serde_json` behind a feature, repairing what
-  `check` finds, the planner, performance, the PyO3 bindings. None changes a file today's build
+  `check` finds, the planner, performance, the C ABI and the PyO3 bindings. None changes a file today's build
   writes or what a program or query means today.
 
 **What only use can tell:** whether the API holds up in two or three
@@ -141,7 +141,19 @@ says where the need or the limit is described.
   beginning with a fixed prefix can read the same range.
 - **A date without a time, and a time without a date,** as variants of
   their own; until then, noon UTC of the day serves (§69.1).
-- **PyO3 bindings,** for Python apps.
+- **A C ABI,** `trunkdb-ffi`, with a header made by cbindgen: the way
+  in for every language that calls C, C# through P/Invoke, Swift, Go,
+  Java, Node, Dart. Handles for a database, a cursor and a snapshot;
+  documents in and out as tagged JSON, filters and aggregates as text
+  with parameters (§163), updates as JSON operators, so about 25
+  functions carry the whole query language; errors as codes and a last
+  error's text; no panic across the boundary. Closures (custom
+  conditions, a sort by key, `update_many`'s change) have no text and
+  stay out. A thin wrapper per language on top, C# first. Built on one
+  embedding API inside trunkdb that the PyO3 bindings share.
+- **PyO3 bindings,** for Python apps: `pip install` from wheels,
+  documents as dicts, errors as exceptions, on the embedding API the C
+  ABI uses.
 - **Longer fuzzing runs,** with AddressSanitizer too, and short ones in
   CI on nightly (§55.6).
 - **Backups a user can trust,** answering what a user asks: how to back
