@@ -628,7 +628,9 @@ more than four.
   No other crate's type is in it but `serde`'s traits and `std`'s: an
   object's fields are a `Map` of trunkdb's own, the `IndexMap` inside it
   out of sight [§116](spec/116-a-map-of-its-own.md).
-- **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),
+- **Upkeep:** `export`/`import` as JSON Lines [§30](spec/30-export-and-import-as-json-lines.md), an export ending in a line
+  of its counts, which an import checks, and `verify_export`, a restore
+  tried and checked [§165](spec/165-backups-a-user-can-trust.md), `check` [§39](spec/39-the-trunkdb-command-and-database-check.md),
   `compact` [§41](spec/41-compaction.md), `checkpoint` [§51](spec/51-one-flush-per-commit.md), `drop_collection` [§37](spec/37-delete-many-and-dropping-a-collection.md),
   `stats`: pages by kind, each collection's and index's size, the WAL's,
   and the pages a `compact` would leave, worked out exactly from the
@@ -646,7 +648,7 @@ more than four.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `verify`, whether an export restores [§165](spec/165-backups-a-user-can-trust.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries

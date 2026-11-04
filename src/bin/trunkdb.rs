@@ -32,6 +32,10 @@ commands:
                               needs, and cut it to that
   export <file> [out.jsonl]   write the database as JSON Lines, to the
                               given file or to standard output
+  verify <in.jsonl>           whether an export restores: restored into a
+                              temporary file, checked and counted, then
+                              deleted; `-` reads standard input. Exit
+                              code 1, and why, if it doesn't
   import <file> <in.jsonl> [--max-line <bytes|none>]
                               read an export into the database, created if
                               it doesn't exist; `-` reads standard input.
@@ -140,6 +144,7 @@ fn main() -> ExitCode {
         ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
         ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
         ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
+        ["verify", input] => verify(input),
         ["find", file, collection, ref filter @ .., "--explain"] => read_only(file)
             .and_then(|db| find(&db, collection, &filter.join(" "), given, Show::Explained)),
         ["find", file, collection, ref filter @ ..] => read_only(file)
@@ -579,6 +584,54 @@ fn export(db: &Database, file: &str, out: Option<&str>) -> Outcome {
         count(summary.collections, "collection"),
         count(summary.documents, "document")
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `trunkdb verify` (SPEC §165.2): `input` restored into a temporary
+/// file, checked, counted and deleted, by `verify_export`. What was
+/// restored to standard output; exit code 1 and why, if it doesn't
+/// restore whole.
+fn verify(input: &str) -> Outcome {
+    let at = std::env::temp_dir().join(format!("trunkdb-verify-{}.trunkdb", std::process::id()));
+    let verified = if input == "-" {
+        if io::stdin().is_terminal() {
+            return Err("`-` reads an export from standard input; pipe one in".to_string());
+        }
+        trunkdb::verify_export(io::stdin().lock(), &at)
+    } else {
+        let file = std::fs::File::open(input).map_err(|e| format!("{input}: {e}"))?;
+        trunkdb::verify_export(io::BufReader::new(file), &at)
+    };
+    let verified = match verified {
+        Ok(verified) => verified,
+        Err(trunkdb::Error::Import { line, message, .. }) => {
+            eprintln!("trunkdb: {input}: doesn't restore: line {line}: {message}");
+            return Ok(ExitCode::FAILURE);
+        }
+        Err(e) => return Err(format!("{input}: {e}")),
+    };
+    if !verified.is_ok() {
+        eprintln!("trunkdb: {input}: doesn't restore whole:");
+        for problem in &verified.problems {
+            eprintln!("  {problem}");
+        }
+        return Ok(ExitCode::FAILURE);
+    }
+    let indexes = match verified.indexes {
+        1 => "1 index".to_string(),
+        n => format!("{n} indexes"),
+    };
+    println!(
+        "verified {input}: {}, {}, {indexes}",
+        count(verified.collections, "collection"),
+        count(verified.documents, "document"),
+    );
+    if !verified.ended {
+        eprintln!(
+            "trunkdb: {input} is an export of version 1 or 2, without an end line: \
+             it restores, but whether it is whole can't be told"
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 

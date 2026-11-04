@@ -102,7 +102,7 @@ pub use cursor::Cursor;
 pub use database::{Database, OpenOptions};
 pub use datetime::{DateTime, ParseDateTimeError};
 pub use document::{DocId, Document, ParseIdError};
-pub use export::{ImportOptions, Summary};
+pub use export::{ImportOptions, Summary, Verified, verify_export};
 pub use json::ParseDocumentError;
 pub use live::{Live, LiveAggregate, LiveQuery, LiveRow};
 pub use map::Map;

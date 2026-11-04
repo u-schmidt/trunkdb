@@ -1,17 +1,19 @@
 //! Export and import: the whole database as JSON Lines (SPEC §30).
 //!
 //! ```text
-//! {"$trunkdb_export":1}
+//! {"$trunkdb_export":3}
 //! {"$collection":"users","$indexes":["age"]}
 //! {"name":"Ada","age":36,"_id":{"$id":"0199…"}}
 //! {"name":"Bob","age":41,"_id":{"$id":"0199…"}}
 //! {"$collection":"pings","$indexes":[]}
 //! …
+//! {"$end":{"collections":2,"documents":…}}
 //! ```
 //!
 //! One header line, then for each collection a line naming it and its
 //! indexed fields, followed by its documents, one per line, in tagged
-//! JSON (`json.rs`). The file is independent of the page layout, so it's
+//! JSON (`json.rs`), and since version 3 an end line saying how many of
+//! each came before it (SPEC §165). The file is independent of the page layout, so it's
 //! also how data moves from one file format version to the next.
 
 use crate::catalog::IndexOptions;
@@ -24,11 +26,15 @@ use crate::txn::WriteOp;
 use crate::{Error, data};
 use serde_json::{Map, Value};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
 /// The version of the export format itself — not the file format
 /// (SPEC §21.2), which an export deliberately doesn't depend on. 2 since
-/// `$date` (SPEC §69); an import reads 1 too, without it.
-const EXPORT_VERSION: u64 = 2;
+/// `$date` (SPEC §69), 3 since the end line (§165); an import reads 1
+/// and 2 too, without them.
+const EXPORT_VERSION: u64 = 3;
+/// The first version with an end line (SPEC §165.1).
+const ENDED_VERSION: u64 = 3;
 const OLDEST_EXPORT_VERSION: u64 = 1;
 const HEADER_KEY: &str = "$trunkdb_export";
 const COLLECTION_KEY: &str = "$collection";
@@ -37,6 +43,9 @@ const FIELD_KEY: &str = "field";
 const FIELDS_KEY: &str = "fields";
 const UNIQUE_KEY: &str = "unique";
 const SPARSE_KEY: &str = "sparse";
+const END_KEY: &str = "$end";
+const COLLECTIONS_KEY: &str = "collections";
+const DOCUMENTS_KEY: &str = "documents";
 
 /// An import writes a batch at most this many documents…
 const CHUNK_DOCUMENTS: usize = 1000;
@@ -52,6 +61,11 @@ pub struct Summary {
     pub collections: usize,
     /// Documents written or read, every collection's together.
     pub documents: usize,
+    /// Whether the export ends with its end line (SPEC §165.1): one an
+    /// export writes always, an import of version 3 requires, and one of
+    /// version 1 or 2 never has, so that whether it is whole can't be
+    /// told.
+    pub ended: bool,
 }
 
 impl Database {
@@ -129,6 +143,10 @@ impl Database {
                 summary.documents += 1;
             }
         }
+        // Last, once every document is out: an export that stops before
+        // it has none (SPEC §165.1).
+        write_line(&mut out, &end_line(&summary))?;
+        summary.ended = true;
         out.flush()?;
         Ok(summary)
     }
@@ -153,7 +171,20 @@ impl Database {
 
     /// `import`, with `options`.
     pub fn import_with(&self, input: impl Read, options: ImportOptions) -> crate::Result<Summary> {
+        self.import_counting(input, options, &mut Vec::new())
+    }
+
+    /// `import_with`, each collection's documents counted into `counts`
+    /// as they are read, a collection named twice counted once: what
+    /// `verify_export` holds the restored database to (SPEC §165.2).
+    fn import_counting(
+        &self,
+        input: impl Read,
+        options: ImportOptions,
+        counts: &mut Vec<(String, usize)>,
+    ) -> crate::Result<Summary> {
         let mut summary = Summary::default();
+        let mut version = 0;
         let mut tags: Option<crate::json::Tags> = None;
         let mut current: Option<CollectionHeader> = None;
         let mut chunk = Chunk::default();
@@ -169,16 +200,36 @@ impl Database {
                 line: number,
                 message,
             };
+            if summary.ended {
+                return Err(fail("a line after the end line".into()));
+            }
             let value: Value =
                 serde_json::from_str(&line).map_err(|e| fail(format!("not JSON: {e}")))?;
 
             let Some(tags) = tags else {
-                let version = check_header(&value).map_err(fail)?;
+                version = check_header(&value).map_err(fail)?;
                 tags = Some(crate::json::Tags {
                     dates: version >= 2,
                 });
                 continue;
             };
+            if let Some(end) = end_counts(&value) {
+                if version < ENDED_VERSION {
+                    return Err(fail(format!(
+                        "an end line in an export of version {version}, which has none"
+                    )));
+                }
+                let (collections, documents) = end.map_err(fail)?;
+                if (collections, documents) != (summary.collections, summary.documents) {
+                    return Err(fail(format!(
+                        "the end line says {collections} collections and {documents} documents, \
+                         but {} and {} came before it",
+                        summary.collections, summary.documents
+                    )));
+                }
+                summary.ended = true;
+                continue;
+            }
             if let Some(header) = CollectionHeader::parse(&value).map_err(fail)? {
                 chunk.write(self)?;
                 if let Some(done) = current.take() {
@@ -188,6 +239,9 @@ impl Database {
                 self.transact(|catalog, store| {
                     get_or_create_meta(catalog, store, &name).map(|_| ())
                 })?;
+                if !counts.iter().any(|(counted, _)| *counted == name) {
+                    counts.push((name, 0));
+                }
                 summary.collections += 1;
                 current = Some(header);
                 continue;
@@ -211,6 +265,9 @@ impl Database {
                 line.len(),
             );
             summary.documents += 1;
+            if let Some((_, n)) = counts.iter_mut().find(|(name, _)| *name == collection.name) {
+                *n += 1;
+            }
             if chunk.is_full() {
                 chunk.write(self)?;
             }
@@ -223,6 +280,14 @@ impl Database {
             });
         }
         chunk.write(self)?;
+        // Checked after the last chunk is written, as every other line's
+        // mistake is found once those before it are (SPEC §30.3, §165.1).
+        if version >= ENDED_VERSION && !summary.ended {
+            return Err(Error::Import {
+                line: number + 1,
+                message: "the export ends before its end line: cut short?".into(),
+            });
+        }
         if let Some(done) = current {
             done.build_indexes(self)?;
         }
@@ -260,6 +325,132 @@ impl ImportOptions {
     pub fn max_line_bytes(mut self, bytes: usize) -> Self {
         self.max_line_bytes = bytes;
         self
+    }
+}
+
+/// Whether an export restores (SPEC §165.2): it is imported into a new
+/// database at `at`, as a restore would be, which is then `check`ed and
+/// each collection's documents counted against the export's lines. `at`
+/// and its WAL are deleted afterwards, whatever the outcome; an `at` that
+/// exists, or its WAL, is refused before anything is written. The restore
+/// takes about as much room as the database the export came from.
+///
+/// An export that doesn't import fails as `import` fails, with
+/// `Error::Import` and its line. One that imports comes back as a
+/// `Verified` report, as `check` gives a `CheckReport` (§39): what was
+/// restored, and `problems`, empty where it restored whole.
+///
+/// A backup an application makes while it runs, and checks:
+///
+/// ```
+/// use std::fs::File;
+/// # let dir = tempfile::tempdir()?;
+/// # let db = trunkdb::Database::open(dir.path().join("app.trunkdb"))?;
+/// # db.collection::<trunkdb::Document>("users").insert(r#"{"name": "Ada"}"#.parse()?)?;
+/// let backup = dir.path().join("backup.jsonl");
+/// let temp = dir.path().join("backup.jsonl.tmp");
+///
+/// // A snapshot (SPEC §80): reads and writes go on meanwhile.
+/// let file = File::create(&temp)?;
+/// db.export(&file)?;
+/// file.sync_all()?;
+/// // Only a whole export takes the last one's place.
+/// std::fs::rename(&temp, &backup)?;
+///
+/// let verified = trunkdb::verify_export(File::open(&backup)?, dir.path().join("verify.trunkdb"))?;
+/// assert!(verified.is_ok() && verified.ended, "{verified:?}");
+/// assert_eq!(verified.documents, 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn verify_export(input: impl Read, at: impl AsRef<Path>) -> crate::Result<Verified> {
+    let at = at.as_ref();
+    let wal = crate::durability::wal_path(at);
+    if let Some(there) = [at, wal.as_path()].into_iter().find(|path| path.exists()) {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{}: exists; an export is verified by a restore into a new file",
+                there.display()
+            ),
+        )));
+    }
+    // Declared before the database, so dropped after it: the files go
+    // once nothing has them open.
+    let _remove = Remove([at.to_path_buf(), wal]);
+    let db = Database::open(at)?;
+    let mut counts = Vec::new();
+    let summary = db.import_counting(input, ImportOptions::default(), &mut counts)?;
+    let (problems, indexes) = restored_problems(&db, &counts)?;
+    Ok(Verified {
+        collections: summary.collections,
+        documents: summary.documents,
+        indexes,
+        ended: summary.ended,
+        problems,
+    })
+}
+
+/// What's wrong with `db`, restored from an export that held `counts`
+/// documents in each collection: each collection whose count differs,
+/// then what `check` finds. With the secondary indexes it has. An import
+/// that succeeded leaves none: what an import refuses, an id twice or a
+/// unique index broken, fails it first; this is the check that the
+/// import did what it said.
+fn restored_problems(
+    db: &Database,
+    counts: &[(String, usize)],
+) -> crate::Result<(Vec<String>, usize)> {
+    let mut problems = Vec::new();
+    let mut indexes = 0;
+    for (name, exported) in counts {
+        let collection = db.collection::<crate::Document>(name);
+        let restored = collection.count(crate::query::Filter::new())?;
+        if restored != *exported {
+            problems.push(format!(
+                "collection {name:?}: {restored} documents restored, {exported} in the export"
+            ));
+        }
+        indexes += collection.indexes()?.len();
+    }
+    problems.extend(db.check()?.problems);
+    Ok((problems, indexes))
+}
+
+/// Files removed when dropped, each if it's there.
+struct Remove([PathBuf; 2]);
+
+impl Drop for Remove {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// What `verify_export` found (SPEC §165.2).
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
+pub struct Verified {
+    /// Collections restored.
+    pub collections: usize,
+    /// Documents restored, every collection's together.
+    pub documents: usize,
+    /// Secondary indexes built, every collection's together.
+    pub indexes: usize,
+    /// Whether the export ends with its end line, so that it is known to
+    /// be whole (`Summary::ended`); an export of version 1 or 2 has none.
+    pub ended: bool,
+    /// What's wrong with the restored database, one entry each: what
+    /// `check` found, and each collection whose documents differ in
+    /// number from the export's. Empty for an export that restores whole.
+    pub problems: Vec<String>,
+}
+
+impl Verified {
+    /// Whether the export restored without a problem. An export without
+    /// an end line can still be cut short: see `ended`.
+    pub fn is_ok(&self) -> bool {
+        self.problems.is_empty()
     }
 }
 
@@ -420,6 +611,39 @@ fn parse_index(index: &Value) -> Result<(Vec<String>, IndexOptions), String> {
         }
         _ => Err(wrong()),
     }
+}
+
+/// The end line of an export (SPEC §165.1).
+fn end_line(summary: &Summary) -> Value {
+    let counts = object([
+        (COLLECTIONS_KEY, summary.collections.into()),
+        (DOCUMENTS_KEY, summary.documents.into()),
+    ]);
+    object([(END_KEY, counts)])
+}
+
+/// `None` unless `value` is an end line, `{"$end": …}` and nothing else;
+/// then its counts, or what's wrong with them.
+fn end_counts(value: &Value) -> Option<Result<(usize, usize), String>> {
+    let Value::Object(object) = value else {
+        return None;
+    };
+    let end = object.get(END_KEY).filter(|_| object.len() == 1)?;
+    let wrong = || {
+        format!(
+            "an end line must be {{\"{END_KEY}\": {{\"{COLLECTIONS_KEY}\": n, \"{DOCUMENTS_KEY}\": n}}}}, got {value}"
+        )
+    };
+    let Value::Object(counts) = end else {
+        return Some(Err(wrong()));
+    };
+    let count = |key| counts.get(key).and_then(Value::as_u64).map(|n| n as usize);
+    Some(
+        match (count(COLLECTIONS_KEY), count(DOCUMENTS_KEY), counts.len()) {
+            (Some(collections), Some(documents), 2) => Ok((collections, documents)),
+            _ => Err(wrong()),
+        },
+    )
 }
 
 /// The export format version the header names, if this build reads it.
@@ -707,7 +931,8 @@ mod tests {
             summary,
             Summary {
                 collections: 4,
-                documents: 2501
+                documents: 2501,
+                ended: true,
             }
         );
         assert_same_contents(&target, &source);
@@ -756,7 +981,8 @@ mod tests {
             summary,
             Summary {
                 collections: 2,
-                documents: 2
+                documents: 2,
+                ended: false,
             }
         );
         assert_eq!(db.collections().unwrap(), ["notes", "people"]);
@@ -845,7 +1071,7 @@ mod tests {
         let collection = "{\"$collection\":\"c\"}\n";
         let cases: Vec<(String, usize, &str)> = vec![
             (String::new(), 1, "empty input"),
-            ("{\"$trunkdb_export\":3}\n".into(), 1, "version 3"),
+            ("{\"$trunkdb_export\":4}\n".into(), 1, "version 4"),
             ("{\"a\":1}\n".into(), 1, "first line must be"),
             (format!("{header}{{\"a\":1}}\n"), 2, "before the first"),
             (format!("{header}{collection}not json\n"), 3, "not JSON"),
@@ -1005,5 +1231,51 @@ mod tests {
             .collection::<Document>("c")
             .get(&DocId(199u128.to_be_bytes()));
         assert!(matches!(now.unwrap().unwrap(), Document::Object(m) if m["v"] == Document::Int(1)));
+    }
+
+    /// SPEC §165.2: what `verify_export` checks once an import succeeded,
+    /// which a correct import never trips: a count that differs, and what
+    /// `check` finds.
+    #[test]
+    fn a_restore_is_held_to_the_export_s_counts_and_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restored.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("c");
+        for n in 0..300 {
+            docs.insert(
+                format!(r#"{{"n": {n}, "pad": "{}"}}"#, "x".repeat(200))
+                    .parse()
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        docs.ensure_index("n").unwrap();
+        let counts = [("c".to_string(), 300)];
+        assert_eq!(restored_problems(&db, &counts).unwrap(), (Vec::new(), 1));
+
+        let more = [("c".to_string(), 301), ("gone".to_string(), 2)];
+        let (problems, _) = restored_problems(&db, &more).unwrap();
+        assert_eq!(
+            problems,
+            [
+                "collection \"c\": 300 documents restored, 301 in the export",
+                "collection \"gone\": 0 documents restored, 2 in the export",
+            ]
+        );
+
+        // One byte changed in the last page, as a disk would leave it.
+        drop(docs);
+        drop(db);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let page = bytes.len() / 8192 - 1;
+        bytes[page * 8192 + 100] ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+        let db = Database::open(&path).unwrap();
+        let (problems, _) = restored_problems(&db, &counts).unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("damaged")),
+            "{problems:?}"
+        );
     }
 }

@@ -1019,3 +1019,15 @@ limit, batches and a write-ahead log. Since then:
     Files stay format 12 and exports as in 0.30.0, which opens what
     0.31.0 writes. No new fixture, as nothing changes how files are
     written (§120.9).
+137. **Backups a user can trust** (§165): an export ends with a line
+    saying how many collections and documents came before it, export
+    version 3, and an import of one checks it, so an export cut short,
+    by a full disk or a crash while it was written, fails to import
+    instead of restoring in part; `Summary::ended` says whether there
+    was one. `trunkdb::verify_export` and `trunkdb verify` restore an
+    export into a file of their own, `check` it, count it against the
+    export, and delete it: a `Verified` report, exit code 1 and why on
+    the command line. A section of the guide on backups while the
+    application runs, restores, copying the file and its WAL, and moving
+    between releases. 0.31.0 and older refuse an export of version 3;
+    the guide says how to make one version 2.

@@ -659,3 +659,67 @@ An index range is counted whole, without reading documents, so the
 numbers show how much a hint saves. Past about 100,000 entries, it
 says "more than". A walk in sort order is followed only as far as the
 query itself read.
+
+## Backups, restores and upgrades
+
+An export is the backup: every collection, its indexes and every
+document with its id, as JSON Lines, from one moment while reads and
+writes go on. It ends with a line saying how many collections and
+documents came before it, so an export that was cut short, by a full
+disk or a crash while it was written, is found out instead of restored
+in part (SPEC §165).
+
+**While the application runs**, the application makes it: it holds the
+file locked, so `trunkdb export` from outside waits until it's closed.
+Export into a temporary file, sync it and rename it over the last
+backup, so only a whole one ever takes its place; then try it:
+
+```rust
+use std::fs::File;
+
+let file = File::create("backup.jsonl.tmp")?;
+db.export(&file)?; // a snapshot: the application goes on meanwhile
+file.sync_all()?;
+std::fs::rename("backup.jsonl.tmp", "backup.jsonl")?;
+
+let verified = trunkdb::verify_export(File::open("backup.jsonl")?, "verify.trunkdb")?;
+assert!(verified.is_ok() && verified.ended);
+```
+
+`verify_export` restores the export into a file of its own, runs
+`check` on it, counts what's in it against the export, and deletes it
+again: the only proof that a restore works is a restore. On the command
+line, `trunkdb verify backup.jsonl` does the same, exit code 1 and why
+if it doesn't restore.
+
+**Restoring** is an import into a new file, which the application is
+then pointed at, or which replaces the old file once it succeeded:
+
+```
+trunkdb import restored.trunkdb backup.jsonl
+```
+
+An import isn't one transaction: one that fails has written what came
+before the failing line. Into a new file, that costs nothing.
+
+**Copying the database itself** works too, but only while no process
+has it open: copy `app.trunkdb` and `app.trunkdb.wal` beside it, if
+it's there. The WAL can hold committed writes that aren't in the file
+yet, after a crash; a clean close empties it. A copy taken while the
+application runs can be torn: export instead. A `.compact` file beside
+it belongs to a compaction and is never needed.
+
+**Upgrading** to a newer release needs nothing: it opens every file
+format from 6 on, written by 0.6.0 or later, and `trunkdb info` says a
+file's format and which releases created it and last wrote it. But a
+newer release that opens an older file for writing stamps it with its
+own format, and an older release then refuses it (`Error::Format`):
+keep a copy of the file, or an export, from before the upgrade to go
+back. Export and import move data across releases either way, as far as
+the export allows: releases after 0.31.0 write exports of version 3,
+which 0.31.0 and older refuse. To take one there, make its first line
+`{"$trunkdb_export":2}` and drop its last, the `$end` line:
+
+```
+sed -e '1s/.*/{"$trunkdb_export":2}/' -e '$d' backup.jsonl > for-older.jsonl
+```

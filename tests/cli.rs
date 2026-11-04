@@ -204,7 +204,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["export", &db]);
     assert_eq!(stdout(&output), exported);
     assert!(
-        exported.starts_with("{\"$trunkdb_export\":2}\n"),
+        exported.starts_with("{\"$trunkdb_export\":3}\n"),
         "{exported}"
     );
     assert!(exported.contains(r#"{"field":"email","unique":true}"#));
@@ -1686,4 +1686,80 @@ fn explain_names_ids_looked_up_beside_an_index() {
         "{explained}"
     );
     assert!(explained.contains("documents returned: 2"), "{explained}");
+}
+
+/// SPEC §165.2: `trunkdb verify`, an export restored, checked, counted
+/// and its temporary file gone; exit code 1 and why for one that
+/// doesn't restore, a note for one without an end line.
+#[test]
+fn verify_says_whether_an_export_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input, out) = (
+        path(dir.path(), "db.trunkdb"),
+        path(dir.path(), "in.jsonl"),
+        path(dir.path(), "out.jsonl"),
+    );
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+    assert!(trunkdb(&["export", &db, &out]).status.success());
+
+    let output = trunkdb(&["verify", &out]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!("verified {out}: 2 collections, 2 documents, 4 indexes\n")
+    );
+    assert_eq!(stderr(&output), "");
+
+    // From standard input.
+    let exported = std::fs::read_to_string(&out).unwrap();
+    let piped = Command::new(env!("CARGO_BIN_EXE_trunkdb"))
+        .args(["verify", "-"])
+        .stdin(Stdio::piped())
+        .output_with(|stdin| stdin.write_all(exported.as_bytes()));
+    assert!(piped.status.success(), "{}", stderr(&piped));
+    assert!(stdout(&piped).starts_with("verified -: 2 collections"));
+
+    // Cut short: exit code 1, the line, and nothing on standard output.
+    let lines: Vec<&str> = exported.lines().collect();
+    let cut = path(dir.path(), "cut.jsonl");
+    std::fs::write(&cut, lines[..lines.len() - 1].join("\n") + "\n").unwrap();
+    let output = trunkdb(&["verify", &cut]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "trunkdb: {cut}: doesn't restore: line {}: the export ends before its end line: cut short?\n",
+            lines.len()
+        )
+    );
+
+    // Version 1, the test's own export: restores, with a note.
+    let output = trunkdb(&["verify", &input]);
+    assert!(output.status.success());
+    assert!(stdout(&output).starts_with(&format!("verified {input}:")));
+    assert!(
+        stderr(&output).contains("can't be told"),
+        "{}",
+        stderr(&output)
+    );
+
+    // A file that isn't there, and a call without one.
+    let output = trunkdb(&["verify", &path(dir.path(), "none.jsonl")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(trunkdb(&["verify"]).status.code(), Some(2));
+
+    // No restore left behind in the temporary directory.
+    let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("trunkdb-verify-")
+        })
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }

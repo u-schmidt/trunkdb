@@ -37,7 +37,8 @@ measurements.
   must agree.
 - `explain_run` and `stats` to see how a query ran, what the plans it
   passed over would have read, and where the space goes; `check`,
-  `compact`, export and import; a `trunkdb` command line.
+  `compact`, export and import, and a backup checked by restoring it; a
+  `trunkdb` command line.
 
 ## When to use it, and when not
 
@@ -103,6 +104,7 @@ trunkdb check app.trunkdb                # consistency check; exit code 1 on pro
 trunkdb compact app.trunkdb              # rebuild into as few pages as needed
 trunkdb export app.trunkdb backup.jsonl  # JSON Lines, or to standard output
 trunkdb import copy.trunkdb backup.jsonl # `-` reads standard input
+trunkdb verify backup.jsonl              # whether it restores: tried, checked, removed
 trunkdb find app.trunkdb users 'age >= 30 order by name limit 10'
                                          # one JSON document per line
 trunkdb find app.trunkdb users 'age >= 30' --explain

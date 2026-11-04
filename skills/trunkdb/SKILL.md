@@ -162,9 +162,13 @@ collection is an error (exit 1), not an empty result.
   backup to make before anything changes the file, and the way to hand
   the data to another tool, but `fields` and `find` answer questions
   for a fraction of the output. An export is JSON Lines: a first line
-  `{"$trunkdb_export": 2}`, then for each collection a line
-  `{"$collection": "…", "$indexes": […]}` and one line per document;
+  `{"$trunkdb_export": 3}`, then for each collection a line
+  `{"$collection": "…", "$indexes": […]}` and one line per document,
+  and last `{"$end": {"collections": n, "documents": n}}`;
   `trunkdb import <new file> <export>` makes a database of it again.
+  `trunkdb verify <export>` says whether one restores, by restoring it
+  into a temporary file and checking it: run it on a backup before
+  telling the user it's good, and before a change it's meant to undo.
 - **Don't write unless the user asked for that change.** `insert`,
   `update`, `delete`, `index`, `drop`, `compact` and `import` write to
   the file (see "Changing documents" below). `info`, `check`, `export`,
@@ -185,7 +189,8 @@ like this:
    `--dry-run`, which says how many documents it would change and writes
    nothing. Tell the user the number if it isn't the one they expect.
 2. **Back up before a large change:** `trunkdb export <file>
-   backup.jsonl`. `import` of that into a new file undoes anything.
+   backup.jsonl`, then `trunkdb verify backup.jsonl`. `import` of that
+   into a new file undoes anything.
 3. **Then write**, the filter and the update each one argument in
    single quotes:
 
