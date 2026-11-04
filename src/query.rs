@@ -1528,6 +1528,9 @@ fn ids_for(condition: &Condition) -> Option<Vec<DocId>> {
 /// beats one index narrowed by one (SPEC §43.3).
 struct Bounds<'a> {
     ranges: Vec<IndexRange<'a>>,
+    /// Ids looked up in the primary index beside the ranges: an OR's
+    /// branches that name ids (SPEC §164).
+    ids: Vec<DocId>,
     kind: BoundKind,
     fields: usize,
 }
@@ -1556,7 +1559,14 @@ enum BoundKind {
 /// a null: it bounds only by comparisons that null fails
 /// (`rules_out_null`), and a compound one only if such a comparison is on
 /// one of its fields.
-fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
+///
+/// `ids`: whether an OR's branch that names ids may be looked up in the
+/// primary index (SPEC §164), as it may unless a hint offers another.
+fn bounds_for_all<'a>(
+    conditions: &[Condition],
+    indexes: &'a [IndexMeta],
+    ids: bool,
+) -> Option<Bounds<'a>> {
     let mut best: Option<Bounds<'a>> = None;
     let mut consider = |candidate: Bounds<'a>| {
         if best.as_ref().is_none_or(|b| candidate.beats(b)) {
@@ -1615,13 +1625,14 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
                     };
                     consider(Bounds {
                         ranges: vec![IndexRange { index, range, by }],
+                        ids: Vec::new(),
                         kind,
                         fields: 1,
                     });
                 }
             }
             nested => {
-                if let Some(bounds) = bounds_for(nested, indexes) {
+                if let Some(bounds) = bounds_for(nested, indexes, ids) {
                     consider(bounds);
                 }
             }
@@ -1643,22 +1654,38 @@ fn bounds_for_all<'a>(conditions: &[Condition], indexes: &'a [IndexMeta]) -> Opt
 /// `Not` never — nor `Exists` or `Size`, which no index can tell
 /// (SPEC §45.3). An `ElemMatch` like its condition moved out to the
 /// array's elements (`within`, SPEC §46.3).
-fn bounds_for<'a>(condition: &Condition, indexes: &'a [IndexMeta]) -> Option<Bounds<'a>> {
+fn bounds_for<'a>(
+    condition: &Condition,
+    indexes: &'a [IndexMeta],
+    ids: bool,
+) -> Option<Bounds<'a>> {
     match condition {
-        Condition::Compare { .. } => bounds_for_all(std::slice::from_ref(condition), indexes),
-        Condition::All(conditions) => bounds_for_all(conditions, indexes),
+        Condition::Compare { .. } => bounds_for_all(std::slice::from_ref(condition), indexes, ids),
+        Condition::All(conditions) => bounds_for_all(conditions, indexes, ids),
         Condition::Any(branches) => {
-            let mut ranges = Vec::new();
+            let (mut ranges, mut found) = (Vec::new(), Vec::new());
             for branch in branches {
-                ranges.extend(bounds_for(branch, indexes)?.ranges);
+                // A branch that names ids is looked up, even where an
+                // index bounds it too: a few ids beat any index (§164.1).
+                match ids_for(branch).filter(|_| ids) {
+                    Some(named) => found.extend(named),
+                    None => {
+                        let bounds = bounds_for(branch, indexes, ids)?;
+                        ranges.extend(bounds.ranges);
+                        found.extend(bounds.ids);
+                    }
+                }
             }
             Some(Bounds {
                 ranges,
+                ids: found,
                 kind: BoundKind::Union,
                 fields: 1,
             })
         }
-        Condition::ElemMatch { field, condition } => bounds_for(&within(field, condition), indexes),
+        Condition::ElemMatch { field, condition } => {
+            bounds_for(&within(field, condition), indexes, ids)
+        }
         // Nothing tells what a closure lets through (SPEC §136.4).
         Condition::Not(_)
         | Condition::Exists { .. }
@@ -1770,6 +1797,7 @@ fn compound_bounds<'a>(index: &'a IndexMeta, conditions: &[Condition]) -> Option
     };
     Some(Bounds {
         ranges: vec![IndexRange { index, range, by }],
+        ids: Vec::new(),
         kind,
         fields,
     })
@@ -1823,6 +1851,7 @@ fn in_bounds<'a>(
         .collect();
     Some(Bounds {
         ranges,
+        ids: Vec::new(),
         kind: BoundKind::ByValue,
         fields,
     })
@@ -1941,14 +1970,33 @@ impl Filter {
     /// else a range on an indexed field. The ranges may hold documents
     /// the filter rejects, never the other way around; the same document
     /// may be in several.
+    ///
+    /// `None` too where the reads would look up ids beside the ranges
+    /// (SPEC §164): `index_reads` has those.
     pub(crate) fn index_ranges<'a>(&self, indexes: &'a [IndexMeta]) -> Option<Vec<IndexRange<'a>>> {
+        let reads = self.index_reads(indexes)?;
+        reads.ids.is_empty().then_some(reads.ranges)
+    }
+
+    /// `index_ranges`, and the ids an OR's branches name, looked up in
+    /// the primary index beside them (SPEC §164): the ids sorted, each
+    /// once, empty unless some branch of an OR the reads come from names
+    /// ids and the others are bounded by indexes.
+    pub(crate) fn index_reads<'a>(&self, indexes: &'a [IndexMeta]) -> Option<IndexReads<'a>> {
         let indexes = self.offered(indexes);
         if indexes.is_empty() {
             // Not even an OR of no branches, which no index bounds as
             // well as any: with none to read, a scan (SPEC §132.2).
             return None;
         }
-        bounds_for_all(&self.conditions, indexes).map(|b| b.ranges)
+        let bounds = bounds_for_all(&self.conditions, indexes, self.primary_offered())?;
+        let mut ids = bounds.ids;
+        ids.sort_unstable();
+        ids.dedup();
+        Some(IndexReads {
+            ids,
+            ranges: bounds.ranges,
+        })
     }
 
     /// The index `find` reads in sort order (SPEC §34.2) — for a filter
@@ -2118,7 +2166,8 @@ impl Filter {
             .filter(|c| !matches!(c, Condition::Compare { field, .. } if field == sort_field))
             .cloned()
             .collect();
-        bounds_for_all(&others, indexes).is_some_and(|b| b.kind != BoundKind::ByRange)
+        bounds_for_all(&others, indexes, self.primary_offered())
+            .is_some_and(|b| b.kind != BoundKind::ByRange)
     }
 }
 
@@ -2126,6 +2175,15 @@ impl Filter {
 /// encode to, the `Eq`s that fix them, how many, and how many sort keys
 /// it serves.
 type Walk<'a> = (&'a IndexMeta, Vec<u8>, Vec<Condition>, usize, usize);
+
+/// What `find` reads where index ranges bound the filter
+/// (`Filter::index_reads`): the ranges, and ids looked up beside them
+/// (SPEC §164).
+#[derive(Debug)]
+pub(crate) struct IndexReads<'a> {
+    pub ids: Vec<DocId>,
+    pub ranges: Vec<IndexRange<'a>>,
+}
 
 /// A range of an index `find` reads (`Filter::index_ranges`).
 #[derive(Debug)]

@@ -1007,9 +1007,19 @@ fn plan_words(plan: &trunkdb::query::QueryPlan) -> String {
         QueryPlan::Scan => "scan of every document".to_string(),
         QueryPlan::Index { field, .. } => format!("index on {field}"),
         QueryPlan::IndexOrder { field, .. } => format!("index on {field}, in its order"),
-        QueryPlan::IndexUnion { fields, .. } => {
-            format!("indexes on {}, together", fields.join(", "))
-        }
+        // Ids looked up beside index ranges, `_id` first (SPEC §164.4).
+        QueryPlan::IndexUnion { fields, .. } => match fields.split_first() {
+            Some((first, [only])) if first == "_id" => {
+                format!("ids looked up, and the index on {only}, together")
+            }
+            Some((first, rest)) if first == "_id" => {
+                format!(
+                    "ids looked up, and the indexes on {}, together",
+                    rest.join(", ")
+                )
+            }
+            _ => format!("indexes on {}, together", fields.join(", ")),
+        },
         QueryPlan::ById => "by id".to_string(),
         other => format!("{other:?}"),
     }

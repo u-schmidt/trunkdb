@@ -1355,14 +1355,20 @@ fn plan_for(filter: &Filter, indexes: &[IndexMeta]) -> QueryPlan {
             field: order.name(),
         };
     }
-    match filter.index_ranges(indexes) {
+    match filter.index_reads(indexes) {
         None => QueryPlan::Scan,
-        Some(ranges) => match &ranges[..] {
-            [range] => QueryPlan::Index {
+        Some(reads) => match (&reads.ids[..], &reads.ranges[..]) {
+            ([], [range]) => QueryPlan::Index {
                 field: range.index.name(),
             },
-            _ => QueryPlan::IndexUnion {
-                fields: ranges.iter().map(|range| range.index.name()).collect(),
+            // Ids looked up beside the ranges: the primary index first
+            // (SPEC §164.4).
+            (ids, ranges) => QueryPlan::IndexUnion {
+                fields: (!ids.is_empty())
+                    .then(|| crate::document::ID_FIELD.to_string())
+                    .into_iter()
+                    .chain(ranges.iter().map(|range| range.index.name()))
+                    .collect(),
             },
         },
     }
@@ -1478,8 +1484,10 @@ fn would_read(
             (entries, reads)
         }
         _ => {
-            let ranges = filter.index_ranges(indexes).expect("a range's plan");
+            let crate::query::IndexReads { ids, ranges } =
+                filter.index_reads(indexes).expect("a range's plan");
             let reads = match &ranges[..] {
+                _ if !ids.is_empty() => true,
                 [] => false,
                 [first, rest @ ..] if rest.iter().all(|r| std::ptr::eq(r.index, first.index)) => {
                     checks(Some(first.index))
@@ -1490,7 +1498,12 @@ fn would_read(
                 .into_iter()
                 .map(|r| (r.index.root, r.range))
                 .collect();
-            (counted(ranges)?, reads)
+            // Ids by how many, as for `ById` (SPEC §164.4).
+            let entries = match counted(ranges)? {
+                EntryCount::Exactly(n) => EntryCount::Exactly(n + ids.len() as u64),
+                EntryCount::MoreThan(n) => EntryCount::MoreThan(n + ids.len() as u64),
+            };
+            (entries, reads)
         }
     })
 }
@@ -1602,7 +1615,7 @@ fn find_in(
     // A selection is decoded from the stored document after the check.
     let whole = whole_from_index
         && select.is_none()
-        && (filter.ids().is_some() || filter.index_ranges(indexes).is_some());
+        && (filter.ids().is_some() || filter.index_reads(indexes).is_some());
     let names = match whole {
         true => None,
         false => filter.fields(),
@@ -1666,7 +1679,7 @@ fn find_by_key(
     // is decoded whole once, for its check, its key and the caller.
     let whole = whole_from_index
         && select.is_none()
-        && (filter.ids().is_some() || filter.index_ranges(indexes).is_some());
+        && (filter.ids().is_some() || filter.index_reads(indexes).is_some());
     let names = match whole {
         true => None,
         false => filter.fields(),
@@ -1903,7 +1916,7 @@ fn candidate_entries<'a>(
         }
         (entries, Indexed::Primary)
     } else {
-        match filter.index_ranges(catalog.indexes(collection)) {
+        match filter.index_reads(catalog.indexes(collection)) {
             None => {
                 let read = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
                 let entries = BTreeIndex::new(meta.index_root).scan(store)?;
@@ -1911,24 +1924,47 @@ fn candidate_entries<'a>(
                 reads.push(read);
                 (entries, Indexed::Primary)
             }
-            Some(ranges) => {
+            Some(crate::query::IndexReads { ids, ranges }) => {
                 // An OR of no branches has no ranges, and no entries.
                 let first = ranges.first().map(|range| range.index);
                 let indexed = match first {
-                    Some(first) if ranges.iter().all(|r| std::ptr::eq(r.index, first)) => {
+                    Some(first)
+                        if ids.is_empty()
+                            && ranges.iter().all(|r| std::ptr::eq(r.index, first)) =>
+                    {
                         Indexed::One(first)
                     }
                     _ => Indexed::Several,
                 };
                 // One range of an index with one key per document holds
                 // each once; several ranges, or a multikey index, may
-                // hold one several times.
+                // hold one several times; so may ids beside a range.
                 let multikey = ranges
                     .first()
                     .is_some_and(|r| r.index.fields.iter().any(|f| crate::query::is_multi(f)));
-                let once = ranges.len() == 1 && !multikey;
+                let once = ranges.len() == 1 && !multikey && ids.is_empty();
                 let mut seen = std::collections::HashSet::new();
                 let mut entries = Vec::new();
+                // The ids an OR's branches name first, looked up as
+                // `ById` looks them up (SPEC §164.2).
+                if !ids.is_empty() {
+                    let by_id = |id: &DocId| Condition::id(*id);
+                    let bounds = match &ids[..] {
+                        [id] => vec![by_id(id)],
+                        _ => vec![Condition::any(ids.iter().map(by_id))],
+                    };
+                    let read = trace.read(crate::document::ID_FIELD.to_string(), bounds, false);
+                    trace.entries(read, ids.len());
+                    reads.push(read);
+                    let primary = BTreeIndex::new(meta.index_root);
+                    for id in ids {
+                        let key = key::primary(id);
+                        if let Some(loc) = primary.lookup(store, &key)? {
+                            seen.insert(id);
+                            entries.push((key, loc));
+                        }
+                    }
+                }
                 for range in ranges {
                     let read = trace.read(range.index.name(), range.by, false);
                     let found = BTreeIndex::new(range.index.root).range(store, &range.range)?;
@@ -6313,10 +6349,17 @@ mod tests {
             };
             let multi = fields.iter().any(|field| crate::query::is_multi(field));
             let covers = !multi && f.covered_by(&fields, false).is_some();
-            let several = run
-                .reads
-                .iter()
-                .any(|other| other.index != read.index && other.index != "_id");
+            // Ids looked up beside a range make a union of several
+            // indexes too (SPEC §164), the primary among them.
+            let with_ids = matches!(
+                &run.plan,
+                QueryPlan::IndexUnion { fields, .. } if fields[0] == "_id"
+            );
+            let several = with_ids
+                || run
+                    .reads
+                    .iter()
+                    .any(|other| other.index != read.index && other.index != "_id");
             // The scan after a walk for what its index lacks reads
             // documents (§34.2).
             let after_walk = i > 0 && read.index == "_id";

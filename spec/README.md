@@ -178,3 +178,4 @@ say what changed, and DESIGN.md says what is true now.
 161. [The public API, gone through again (`query.rs`, `changes.rs`)](161-the-public-api-gone-through-again.md)
 162. [A batch's preconditions (`batch.rs`, `collection.rs`, `lib.rs`)](162-a-batch-s-preconditions.md)
 163. [Parameters in a filter's text (`query_text.rs`, `bin/trunkdb.rs`)](163-parameters-in-a-filter-s-text.md)
+164. [An OR of ids and indexed conditions (`query.rs`, `collection.rs`)](164-an-or-of-ids-and-indexed-conditions.md)

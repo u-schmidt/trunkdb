@@ -1665,3 +1665,25 @@ fn parameters_are_given_apart_from_the_text() {
     ]);
     assert!(e.contains("a parameter can't stand for a field"), "{e}");
 }
+
+/// SPEC §164.4: an OR of ids and an indexed condition, in words.
+#[test]
+fn explain_names_ids_looked_up_beside_an_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
+    std::fs::write(&input, EXPORT).unwrap();
+    assert!(trunkdb(&["import", &db, &input]).status.success());
+    let ada = stdout(&trunkdb(&["find", &db, "users", r#"name = "Ada""#]));
+    let doc: trunkdb::Document = ada.trim().parse().unwrap();
+    let Some(trunkdb::Document::Id(id)) = doc.get("_id") else {
+        panic!("{ada}")
+    };
+    let filter = format!(r#"_id = id("{id}") or age > 40"#);
+    let output = trunkdb(&["find", &db, "users", &filter, "--explain"]);
+    let explained = stdout(&output);
+    assert!(
+        explained.starts_with("plan: ids looked up, and the index on age, together\n"),
+        "{explained}"
+    );
+    assert!(explained.contains("documents returned: 2"), "{explained}");
+}

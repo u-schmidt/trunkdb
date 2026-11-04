@@ -752,11 +752,19 @@ impl Run<'_> {
                     Condition::size("tags", op, self.program.below(5))
                 }
                 // An OR of `eq`s on two paths, which a union of index
-                // ranges reads where both are indexed (SPEC §36.3).
+                // ranges reads where both are indexed (SPEC §36.3); with
+                // `_id`, ids looked up beside a range (§164).
                 4 => {
-                    let (a, b) = (self.program.below(5), self.program.below(5));
-                    let paths = ["a", "b", "o.p", "tags[*]", "tags[*].k"];
-                    let (x, y) = (self.value_for(paths[a]), self.value_for(paths[b]));
+                    let paths = ["a", "b", "o.p", "tags[*]", "tags[*].k", "_id"];
+                    let (a, b) = (
+                        self.program.below(paths.len()),
+                        self.program.below(paths.len()),
+                    );
+                    let mut value = |path: &str| match path {
+                        "_id" => Document::Id(self.some_id()),
+                        _ => self.value_for(path),
+                    };
+                    let (x, y) = (value(paths[a]), value(paths[b]));
                     Condition::eq(paths[a], x) | Condition::eq(paths[b], y)
                 }
                 // `in` (SPEC §115): an OR of `eq`s on one path, a point

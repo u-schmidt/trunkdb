@@ -998,3 +998,11 @@ limit, batches and a write-ahead log. Since then:
     unused one, or one that doesn't fit is a `BindError`. `trunkdb`
     takes the values as `--param name=value` for `find`, `fields`,
     `count`, `aggregate`, `update` and `delete`.
+136. **An OR of ids and indexed conditions** (§164): `_id in (…) or
+    updated > :since`, "these ids, or what changed since", reads the
+    ids from the primary index and the rest from an index range, each
+    document once, where it read every document of the collection: on
+    100,000 documents, ten ids and the hundred changed since, 0.17 ms
+    instead of 76. `explain` names it `IndexUnion` with `_id` first
+    among its `fields`. Every branch must name ids or have an index, or
+    the OR is a scan as before; a hinted filter reads as before.
