@@ -1006,3 +1006,16 @@ limit, batches and a write-ahead log. Since then:
     instead of 76. `explain` names it `IndexUnion` with `_id` first
     among its `fields`. Every branch must name ids or have an index, or
     the OR is a scan as before; a hinted filter reads as before.
+
+    Items 134–136 → 0.31.0. **Nothing to adapt:** additions only.
+    `Batch::require` and `Batch::require_none`, and
+    `Error::PreconditionFailed`, a new variant of an `Error` that was
+    `#[non_exhaustive]` already; `Template`, `Params` and `BindError`
+    in `trunkdb::query`; `--param` for the command's filters and
+    aggregates. Two things read differently without breaking: a
+    filter's text with `:name` in it, an error before, now names the
+    template to read it as; an OR of ids and indexed conditions is an
+    `IndexUnion` where it was a `Scan`, finding the same documents.
+    Files stay format 12 and exports as in 0.30.0, which opens what
+    0.31.0 writes. No new fixture, as nothing changes how files are
+    written (§120.9).
