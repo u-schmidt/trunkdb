@@ -152,6 +152,26 @@ says where the need or the limit is described.
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
+- **Field names stored once, numbers as varints:** a dictionary of each
+  collection's field names in the catalog, and a document's keys as
+  small numbers into it, where each key is its 4-byte length and its
+  bytes today; ints, lengths and counts as varints, where each is 8 or
+  4 bytes. Schemaless still: a new name just joins the dictionary. Old
+  documents read as before, under a type tag of their own. In the same
+  scanner's later file, 1,030,000 documents of about 217 bytes each,
+  some 104 of them field names and their lengths and about 90 the
+  values; roughly 100 bytes a document after, a quarter of the file.
+  Shapes, a whole set of names stored once, could follow on top if the
+  numbers still call for it.
+- **Prefix compression in index pages:** each key stored as the bytes
+  it shares with the one before it on the page, and the rest, as
+  RocksDB and WiredTiger do. Neighbouring keys in a compound index share
+  long beginnings: the same first field, the same leading path. In a
+  filesystem scanner's file of 415 MiB, 257,000 documents with two
+  indexes of (a scan's id, a path's 230 bytes of hex) took 229 MiB of
+  index pages against 172 MiB of documents, and `compact` would have
+  freed 78 MiB, mostly half-full index pages. A format change; a binary
+  search within a page (§150) needs restart points to keep its speed.
 - **Longer fuzzing runs,** with AddressSanitizer too, and short ones in
   CI on nightly (§55.6).
 
