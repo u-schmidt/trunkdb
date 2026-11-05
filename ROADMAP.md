@@ -158,7 +158,11 @@ says where the need or the limit is described.
   `!=` compare them (§124) and an index leaves them out (§28, §104).
   A Unix path needn't be UTF-8, so a program keeping file names exactly
   stores them as text in hex today: twice the bytes, in the index too,
-  kept only because hex sorts as its bytes do.
+  kept only because hex sorts as its bytes do. Decided: binary sorts
+  after date-times, no longer last with arrays and objects (§34), a
+  change for a sort over mixed values; no `contains` on bytes, as an
+  index can't serve it. Format 13, the indexes holding binary rebuilt
+  at open, as §62 rebuilt those holding ids.
 - **Field names stored once, numbers as varints:** a dictionary of each
   collection's field names in the catalog, and a document's keys as
   small numbers into it, where each key is its 4-byte length and its
