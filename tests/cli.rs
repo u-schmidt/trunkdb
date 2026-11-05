@@ -125,14 +125,14 @@ fn a_file_it_cannot_read_is_reported_as_before() {
     std::fs::write(&input, EXPORT).unwrap();
     assert!(trunkdb(&["import", &newer, &input]).status.success());
     let mut bytes = std::fs::read(&newer).unwrap();
-    bytes[28..32].copy_from_slice(&13u32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&14u32.to_le_bytes());
     std::fs::write(&newer, &bytes).unwrap();
 
     for (file, message) in [
         (&notes, "not a trunkdb file (bad magic)".to_string()),
         (
             &newer,
-            "file has format 13, newer than this build's 12 — open it with a newer trunkdb"
+            "file has format 14, newer than this build's 13 — open it with a newer trunkdb"
                 .to_string(),
         ),
     ] {
@@ -167,7 +167,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["info", &db]);
     assert!(output.status.success());
     let info = stdout(&output);
-    assert!(info.contains("format 12"), "{info}");
+    assert!(info.contains("format 13"), "{info}");
     // The releases (SPEC §125), beside the format.
     let release = trunkdb::RELEASE;
     assert!(
@@ -1021,7 +1021,7 @@ fn info_and_fields_print_json_for_a_program() {
     let output = trunkdb(&["info", &db, "--json"]);
     assert!(output.status.success());
     let info: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
-    assert_eq!(info["format"], 12);
+    assert_eq!(info["format"], 13);
     assert_eq!(info["written_by"], trunkdb::RELEASE.to_string());
     let collections = info["collections"].as_array().unwrap();
     let users = collections.iter().find(|c| c["name"] == "users").unwrap();

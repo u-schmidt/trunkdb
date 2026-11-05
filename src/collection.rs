@@ -3610,35 +3610,31 @@ pub(crate) fn only_objects_in_old_file(
     Ok(())
 }
 
-/// Brings a file from before ids had index keys (format 10, SPEC §62) up
-/// to date, in `Database::open`'s batch: every secondary index that a
-/// document holds an id in is rebuilt in place, and the header is
-/// stamped, so that the check runs once and a build before 10 refuses
-/// the file from then on. Only files with secondary indexes: without
-/// them nothing needs checking, and the first write stamps the file.
-/// Rebuilding a unique index can fail, if documents share an id in it:
-/// before, ids never collided.
-pub(crate) fn key_ids_in_old_indexes(
+/// Brings a file from before ids had index keys (format 10, SPEC §62),
+/// or binary (format 13, SPEC §166), up to date, in `Database::open`'s
+/// batch: every secondary index that a document holds such a value in
+/// is rebuilt in place. `Database::open` stamps the header after it, so
+/// that the check runs once and an older build refuses the file from
+/// then on. Only files with secondary indexes: without them nothing
+/// needs checking. Rebuilding a unique index can fail, if documents
+/// share an id or binary value in it: before, those never collided.
+pub(crate) fn rekey_old_indexes(
     catalog: &Catalog,
     store: &mut crate::storage::FileStore,
 ) -> crate::Result<()> {
-    if !store.predates_id_keys()? {
+    if !store.predates_binary_keys()? {
         return Ok(());
     }
-    let mut any = false;
+    let ids = store.predates_id_keys()?;
     for name in catalog.names() {
         if catalog.indexes(name).is_empty() {
             continue;
         }
-        any = true;
-        let (documents, stale) = indexes_lacking_ids(catalog, store, name)?;
+        let (documents, stale) = stale_indexes(catalog, store, name, ids)?;
         for index in stale {
             BTreeIndex::new(index.root).clear(store)?;
             fill_index(store, name, index, &documents)?;
         }
-    }
-    if any {
-        store.stamp_format_version()?;
     }
     Ok(())
 }
@@ -3646,13 +3642,14 @@ pub(crate) fn key_ids_in_old_indexes(
 /// Index entries: each key with the location of its document.
 type Entries = Vec<(Vec<u8>, RecordLocation)>;
 
-/// The secondary indexes of `collection` that a document holds an id in
-/// (`holds_id`), and the collection's documents (the primary index's
-/// entries), to rebuild them from.
-fn indexes_lacking_ids<'c>(
+/// The secondary indexes of `collection` that a document holds binary
+/// in, or an id if `ids` (`keyed_since`), and the collection's documents
+/// (the primary index's entries), to rebuild them from.
+fn stale_indexes<'c>(
     catalog: &'c Catalog,
     store: &dyn PageStore,
     collection: &str,
+    ids: bool,
 ) -> crate::Result<(Entries, Vec<&'c IndexMeta>)> {
     let indexes = catalog.indexes(collection);
     let meta = catalog.get(collection).expect("a listed collection");
@@ -3662,7 +3659,7 @@ fn indexes_lacking_ids<'c>(
     for (_key, loc) in &documents {
         let (_id, doc) = records.get(*loc)?;
         for (stale, index) in stale.iter_mut().zip(indexes) {
-            *stale |= holds_id(&doc, index);
+            *stale |= keyed_since(&doc, index, ids);
         }
     }
     let stale = indexes
@@ -3674,13 +3671,18 @@ fn indexes_lacking_ids<'c>(
     Ok((documents, stale))
 }
 
-/// Whether `doc` has an id among the values `index` keys: an entry it
-/// lacks if the index was built before format 10 (SPEC §62).
-fn holds_id(doc: &Document, index: &IndexMeta) -> bool {
-    let is_id = |value: &&Document| matches!(value, Document::Id(_));
+/// Whether `doc` has binary among the values `index` keys, or an id if
+/// `ids`: an entry it lacks, or holds as a value nothing orders, if the
+/// index was built before format 13 (SPEC §166), or 10 for ids (§62).
+fn keyed_since(doc: &Document, index: &IndexMeta, ids: bool) -> bool {
+    let new = |value: &&Document| match value {
+        Document::Binary(_) => true,
+        Document::Id(_) => ids,
+        _ => false,
+    };
     match index.single() {
-        Some(field) => crate::query::values_at(doc, field).iter().any(is_id),
-        None => field_values(doc, index).iter().any(is_id),
+        Some(field) => crate::query::values_at(doc, field).iter().any(new),
+        None => field_values(doc, index).iter().any(new),
     }
 }
 
@@ -4621,7 +4623,7 @@ mod tests {
     /// rounding to one f64, long strings agreeing past the key's cut).
     fn random_value(rng: &mut XorShift) -> Document {
         let big = 1i64 << 53;
-        match rng.below(12) {
+        match rng.below(14) {
             0 | 1 => Document::Int(rng.below(11) as i64 - 5),
             2 => Document::Int(big + rng.below(4) as i64),
             3 => Document::Float((rng.below(21) as f64 - 10.0) / 2.0),
@@ -4634,6 +4636,14 @@ mod tests {
             9 => [Document::Null, Document::Array(vec![Document::Int(1)])][rng.below(2)].clone(),
             // A few ids, which compare, sort and are indexed (SPEC §62).
             10 => Document::Id(DocId([1 + rng.below(3) as u8; 16])),
+            // Binary, ordered by its bytes and indexed (SPEC §166): zero
+            // bytes, which the key escapes, and long ones the key cuts.
+            12 => Document::Binary(
+                [&[][..], &[0], &[0, 0], &[1], &[0xFF], b"a"][rng.below(6)].to_vec(),
+            ),
+            13 => {
+                Document::Binary([vec![0; 1200], vec![1]].concat()[..1200 + rng.below(2)].to_vec())
+            }
             // A few date-times, before and after 1970 (SPEC §69).
             _ => Document::DateTime(
                 crate::DateTime::from_unix(rng.below(5) as i64 - 2, [0, 999_999_999][rng.below(2)])
@@ -8405,22 +8415,53 @@ mod tests {
     /// Makes `collection`'s index on `fields` what a build before format
     /// 10 made of it (SPEC §62): an id is left out of a one-field index,
     /// and an "other" in a compound one — as if it were a value no index
-    /// orders. Creates the index if it isn't there.
+    /// orders. Binary too, which had no key before format 13 either
+    /// (SPEC §166). Creates the index if it isn't there.
     fn key_ids_the_old_way(
         db: &Database,
         collection: &str,
         fields: &[&str],
         options: IndexOptions,
     ) {
-        fn without_ids(doc: Document) -> Document {
+        let unkeyed = |value: &Document| matches!(value, Document::Id(_) | Document::Binary(_));
+        index_the_old_way(db, collection, fields, options, unkeyed);
+    }
+
+    /// `key_ids_the_old_way` for a build of format 10 to 12 (SPEC §166):
+    /// ids keyed, binary left out as a value no index orders.
+    fn key_binary_the_old_way(
+        db: &Database,
+        collection: &str,
+        fields: &[&str],
+        options: IndexOptions,
+    ) {
+        let unkeyed = |value: &Document| matches!(value, Document::Binary(_));
+        index_the_old_way(db, collection, fields, options, unkeyed);
+    }
+
+    /// `collection`'s index on `fields` filled as if every `unkeyed`
+    /// value were NaN, which no index orders either.
+    fn index_the_old_way(
+        db: &Database,
+        collection: &str,
+        fields: &[&str],
+        options: IndexOptions,
+        unkeyed: fn(&Document) -> bool,
+    ) {
+        fn without_ids(doc: Document, unkeyed: fn(&Document) -> bool) -> Document {
             match doc {
-                Document::Id(_) => Document::Binary(Vec::new()),
-                Document::Object(map) => {
-                    Document::Object(map.into_iter().map(|(k, v)| (k, without_ids(v))).collect())
-                }
-                Document::Array(items) => {
-                    Document::Array(items.into_iter().map(without_ids).collect())
-                }
+                doc if unkeyed(&doc) => Document::Float(f64::NAN),
+                Document::Object(map) => Document::Object(
+                    map.into_iter()
+                        .map(|(k, v)| (k, without_ids(v, unkeyed)))
+                        .collect(),
+                ),
+                Document::Array(items) => Document::Array(
+                    items
+                        .into_iter()
+                        .map(|item| without_ids(item, unkeyed))
+                        .collect(),
+                ),
                 other => other,
             }
         }
@@ -8441,7 +8482,7 @@ mod tests {
             let mut tree = BTreeIndex::new(index.root);
             for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
                 let (id, doc) = data::get_record(store, loc)?;
-                for key in index_keys(&without_ids(doc), &index, id) {
+                for key in index_keys(&without_ids(doc, unkeyed), &index, id) {
                     tree.insert(store, &key, loc)?;
                 }
             }
@@ -8531,7 +8572,7 @@ mod tests {
 
             let state = db.read().unwrap();
             let at = state.snapshot();
-            let (documents, stale) = indexes_lacking_ids(at.catalog, &at.store, "cars").unwrap();
+            let (documents, stale) = stale_indexes(at.catalog, &at.store, "cars", true).unwrap();
             let stale = stale.iter().map(|index| index.name()).collect::<Vec<_>>();
             assert_eq!(
                 (documents.len(), stale),
@@ -8544,7 +8585,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 901, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 12);
+        assert_eq!(db.file_info().unwrap().format_version, 13);
         assert!(db.check().unwrap().is_ok());
         let cars = db.collection::<Document>("cars");
         assert_eq!(
@@ -8575,7 +8616,7 @@ mod tests {
         );
         drop((cars, db));
         let reads = records_read(|| drop(Database::open(&path).unwrap()));
-        assert_eq!(reads, 0, "checked once: the file says 12 now");
+        assert_eq!(reads, 0, "checked once: the file says 13 now");
 
         // Indexes, none holding an id: nothing to rebuild, but checked,
         // so the file is stamped, and not checked again.
@@ -8587,7 +8628,7 @@ mod tests {
         drop((notes, db));
         crate::storage::rewrite_format_version(&unkeyed, 9);
         let db = Database::open(&unkeyed).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 12);
+        assert_eq!(db.file_info().unwrap().format_version, 13);
         drop(db);
         let reads = records_read(|| drop(Database::open(&unkeyed).unwrap()));
         assert_eq!(reads, 0);
@@ -8602,7 +8643,7 @@ mod tests {
         drop(db);
         crate::storage::rewrite_format_version(&plain, 9);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 12);
+        assert_eq!(db.file_info().unwrap().format_version, 13);
     }
 
     /// Stores `doc` in `collection` past the check that it is an object,
@@ -8629,7 +8670,7 @@ mod tests {
     /// one of 12. The open checks every document, and stamps it, so the
     /// check runs once; a read-only open checks too, and stamps nothing.
     #[test]
-    fn an_older_file_of_objects_is_stamped_12_at_its_first_open() {
+    fn an_older_file_of_objects_is_stamped_at_its_first_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("objects.trunkdb");
         let db = Database::open(&path).unwrap();
@@ -8649,7 +8690,7 @@ mod tests {
         drop(read_only(&path).unwrap());
         assert_eq!(format_on_disk(&path), 11, "a read-only open writes nothing");
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 12);
+        assert_eq!(db.file_info().unwrap().format_version, 13);
         assert_eq!(
             db.collection::<Document>("docs")
                 .count(Filter::new())
@@ -8657,14 +8698,14 @@ mod tests {
             301
         );
         drop(db);
-        assert_eq!(format_on_disk(&path), 12);
+        assert_eq!(format_on_disk(&path), 13);
 
         // An empty file is stamped too.
         let empty = dir.path().join("empty.trunkdb");
         drop(Database::open(&empty).unwrap());
         crate::storage::rewrite_format_version(&empty, 11);
         drop(Database::open(&empty).unwrap());
-        assert_eq!(format_on_disk(&empty), 12);
+        assert_eq!(format_on_disk(&empty), 13);
     }
 
     /// SPEC §95: a file of a format before 12 that holds a document that
@@ -8732,6 +8773,226 @@ mod tests {
             key_ids_the_old_way(&db, "plates", &["car"], IndexOptions::new().unique());
         }
         crate::storage::rewrite_format_version(&path, 9);
+        let before = std::fs::read(&path).unwrap();
+        for _ in 0..2 {
+            let failed = Database::open(&path).err();
+            assert!(
+                matches!(failed, Some(crate::Error::DuplicateValue { .. })),
+                "{failed:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A file name as a program keeping names exactly stores it (SPEC
+    /// §166): bytes, with zeros and bytes no UTF-8 has. `n / 256` is the
+    /// second byte, so 0..256 share the prefix `[0x2F, 0]`.
+    fn file_name(n: u16) -> Document {
+        Document::Binary(vec![0x2F, (n >> 8) as u8, n as u8, 0xFF, 0])
+    }
+
+    /// The `[0x2F, n]` part of `file_name`s, decoded back to `n`.
+    fn file_numbers(found: &[Document]) -> Vec<u16> {
+        found
+            .iter()
+            .map(|doc| match crate::query::value_or_null(doc, "name") {
+                Document::Binary(bytes) => u16::from_be_bytes([bytes[1], bytes[2]]),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// SPEC §166: an index on a binary field serves `=`, ranges, `starts
+    /// with` and a sort, reading only what it must; a compound index
+    /// serves one size's names in order; a unique index refuses the same
+    /// bytes twice. The file checks out.
+    #[test]
+    fn an_index_on_binary_reads_only_what_it_must() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let files = db.collection::<Document>("files");
+        let mut batch = db.batch();
+        for n in 0..300 {
+            let size = Document::Int(n as i64 % 7);
+            batch
+                .insert(&files, object(vec![("name", file_name(n)), ("size", size)]))
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        files.ensure_index("name").unwrap();
+        let mut found = Vec::new();
+        let field = || "name".to_string();
+
+        let one = Filter::new().eq("name", file_name(42));
+        assert_eq!(
+            files.explain(&one).unwrap(),
+            QueryPlan::Index { field: field() }
+        );
+        let reads = records_read(|| found = files.find(one.clone()).unwrap());
+        assert_eq!((file_numbers(&found), reads), (vec![42], 1));
+
+        let range = Filter::new()
+            .gte("name", file_name(10))
+            .lt("name", file_name(20));
+        let reads = records_read(|| found = files.find(range.clone()).unwrap());
+        assert_eq!(file_numbers(&found), (10..20).collect::<Vec<_>>());
+        assert!(reads <= 11, "its own and the bound's: {reads}");
+        // Decided on the entries, which hold the names whole (SPEC §100),
+        // and answered from them.
+        let reads = records_read(|| assert_eq!(files.count(range.clone()).unwrap(), 10));
+        assert_eq!(reads, 0);
+        let names = range.clone().select(["name"]);
+        let reads = records_read(|| found = files.find(names.clone()).unwrap());
+        assert_eq!((file_numbers(&found), reads), ((10..20).collect(), 0));
+
+        let prefix = Document::Binary(vec![0x2F, 1]);
+        let under = Filter::new().and(Condition::compare("name", Op::StartsWith, prefix));
+        assert_eq!(
+            files.explain(&under).unwrap(),
+            QueryPlan::Index { field: field() }
+        );
+        let reads = records_read(|| found = files.find(under.clone()).unwrap());
+        assert_eq!((found.len(), reads), (44, 44));
+        assert_eq!(files.count(under).unwrap(), 44);
+
+        let last = Filter::new().sort_desc("name").limit(3);
+        assert_eq!(
+            files.explain(&last).unwrap(),
+            QueryPlan::IndexOrder { field: field() }
+        );
+        let reads = records_read(|| found = files.find(last.clone()).unwrap());
+        assert_eq!((file_numbers(&found), reads), (vec![299, 298, 297], 3));
+
+        files.ensure_index(vec!["size", "name"]).unwrap();
+        let smallest = Filter::new().eq("size", 3).sort_asc("name").limit(2);
+        let field = "(size, name)".to_string();
+        assert_eq!(
+            files.explain(&smallest).unwrap(),
+            QueryPlan::IndexOrder { field }
+        );
+        let reads = records_read(|| found = files.find(smallest.clone()).unwrap());
+        assert_eq!((file_numbers(&found), reads), (vec![3, 10], 2));
+
+        let names = db.collection::<Document>("names");
+        names
+            .ensure_index_with("name", IndexOptions::new().unique())
+            .unwrap();
+        names.insert(object(vec![("name", file_name(1))])).unwrap();
+        names.insert(object(vec![("name", file_name(2))])).unwrap();
+        let twice = names.insert(object(vec![("name", file_name(1))]));
+        assert!(
+            matches!(twice, Err(crate::Error::DuplicateValue { .. })),
+            "{twice:?}"
+        );
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// A file from before format 13 (SPEC §166) has indexes that leave
+    /// binary out, or hold it as "other". Opening it rebuilds those, and
+    /// only those, and stamps the file 13; the next open reads nothing.
+    #[test]
+    fn opening_a_format_12_file_keys_the_binary_its_indexes_lack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        {
+            let db = Database::open(&path).unwrap();
+            let files = db.collection::<Document>("files");
+            let mut batch = db.batch();
+            for n in 0..600 {
+                let size = Document::Int(n as i64 % 7);
+                batch
+                    .insert(&files, object(vec![("name", file_name(n)), ("size", size)]))
+                    .unwrap();
+            }
+            batch
+                .insert(&files, object(vec![("size", Document::Int(9))]))
+                .unwrap();
+            batch.commit().unwrap();
+            files.ensure_index("size").unwrap();
+            key_binary_the_old_way(&db, "files", &["name"], IndexOptions::new());
+            key_binary_the_old_way(&db, "files", &["size", "name"], IndexOptions::new());
+            let one = Filter::new().eq("name", file_name(42));
+            assert_eq!(
+                files.count(one).unwrap(),
+                0,
+                "an old index, read by this build"
+            );
+            assert!(!db.check().unwrap().is_ok());
+
+            let state = db.read().unwrap();
+            let at = state.snapshot();
+            let (documents, stale) = stale_indexes(at.catalog, &at.store, "files", false).unwrap();
+            let stale = stale.iter().map(|index| index.name()).collect::<Vec<_>>();
+            assert_eq!(
+                (documents.len(), stale),
+                (601, vec!["name".to_string(), "(size, name)".to_string()])
+            );
+        }
+        crate::storage::rewrite_format_version(&path, 12);
+
+        // A read-only open keys them in memory: its reads find them, and
+        // the file stays as it was (SPEC §166.3).
+        let before = std::fs::read(&path).unwrap();
+        let db = read_only(&path).unwrap();
+        let one = Filter::new().eq("name", file_name(42));
+        assert_eq!(db.collection::<Document>("files").count(one).unwrap(), 1);
+        drop(db);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let mut opened = None;
+        let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
+        assert!(reads >= 601, "every document checked, and read to rebuild");
+        let db = opened.unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 13);
+        assert!(db.check().unwrap().is_ok());
+        let files = db.collection::<Document>("files");
+        assert_eq!(
+            files.index_names().unwrap(),
+            ["size", "name", "(size, name)"]
+        );
+        let one = Filter::new().eq("name", file_name(42));
+        let field = "name".to_string();
+        assert_eq!(files.explain(&one).unwrap(), QueryPlan::Index { field });
+        assert_eq!(files.count(one).unwrap(), 1);
+        let smallest = Filter::new().eq("size", 3).sort_asc("name").limit(2);
+        assert_eq!(file_numbers(&files.find(smallest).unwrap()), [3, 10]);
+        drop((files, db));
+        let reads = records_read(|| drop(Database::open(&path).unwrap()));
+        assert_eq!(reads, 0, "checked once: the file says 13 now");
+
+        // Indexes without binary: nothing to key. A read-only open says
+        // what the file says, as `trunkdb info` shows it (SPEC §166.3);
+        // an open that writes stamps it.
+        let plain = dir.path().join("plain.trunkdb");
+        let db = Database::open(&plain).unwrap();
+        let notes = db.collection::<Document>("notes");
+        notes.ensure_index("n").unwrap();
+        notes.insert(object(vec![("n", Document::Int(1))])).unwrap();
+        drop((notes, db));
+        crate::storage::rewrite_format_version(&plain, 12);
+        let db = read_only(&plain).unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 12);
+        drop(db);
+        assert_eq!(format_on_disk(&plain), 12);
+        let db = Database::open(&plain).unwrap();
+        assert_eq!(db.file_info().unwrap().format_version, 13);
+    }
+
+    /// Binary never collided in a unique index before format 13 (SPEC
+    /// §166): two documents with the same bytes fail the open, as shared
+    /// ids did (§62.4), and the file is left as it was.
+    #[test]
+    fn an_older_unique_index_with_shared_binary_fails_the_open_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        {
+            let db = Database::open(&path).unwrap();
+            let names = db.collection::<Document>("names");
+            names.insert(object(vec![("name", file_name(1))])).unwrap();
+            names.insert(object(vec![("name", file_name(1))])).unwrap();
+            key_binary_the_old_way(&db, "names", &["name"], IndexOptions::new().unique());
+        }
+        crate::storage::rewrite_format_version(&path, 12);
         let before = std::fs::read(&path).unwrap();
         for _ in 0..2 {
             let failed = Database::open(&path).err();
@@ -9492,7 +9753,7 @@ mod tests {
             all
         };
         let (mut changed_any, mut failed_any) = (0, 0);
-        for _ in 0..40 {
+        for _ in 0..50 {
             let ops = (0..10)
                 .map(|_| {
                     WriteOp::Insert(

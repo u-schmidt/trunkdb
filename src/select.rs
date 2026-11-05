@@ -375,10 +375,11 @@ impl Answer {
 
     /// The result `key` tells of — `None` where a selected value can't
     /// be handed out from the key, and the document must be read. Only a
-    /// bool, a string that fits the key, an id and a date-time can: a
+    /// bool, a string or binary that fits the key (SPEC §166), an id and
+    /// a date-time can: a
     /// number is keyed as a float, `5` and `5.0` alike, and `-0.0` as
     /// `0.0`; a null is a missing field too (§32); a cut string is only
-    /// its start; arrays, objects and binary aren't held at all.
+    /// its start; arrays and objects aren't held at all.
     pub fn entry(&self, key: &[u8]) -> Option<Document> {
         // The selected values, in the leaves' order; nothing for `_id`
         // alone.
@@ -399,6 +400,7 @@ impl Answer {
                         value,
                         Document::Bool(_)
                             | Document::String(_)
+                            | Document::Binary(_)
                             | Document::Id(_)
                             | Document::DateTime(_)
                     ) {

@@ -24,8 +24,8 @@ measurements.
 - Filters in code or as text, with sort, skip and limit, parameters for
   values passed apart from the text, and conditions of your own as
   closures; projection and
-  aggregates by group, with a condition per column. Arrays, objects and binary compare by their
-  contents with `=` and `!=`.
+  aggregates by group, with a condition per column. Arrays and objects compare by their
+  contents with `=` and `!=`; binary by its bytes, with every comparison, in indexes too.
 - Secondary indexes: unique, compound, on nested paths and array
   elements, and sparse; a hint in the query names the one to read.
 - Atomic batches across collections, with preconditions checked at

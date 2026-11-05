@@ -715,7 +715,10 @@ file's format and which releases created it and last wrote it. But a
 newer release that opens an older file for writing stamps it with its
 own format, and an older release then refuses it (`Error::Format`):
 keep a copy of the file, or an export, from before the upgrade to go
-back. Export and import move data across releases either way, as far as
+back. The first open after 0.31.0 rebuilds the indexes that hold
+binary values, which had no key before (SPEC §166); a unique one in
+which two documents share the same bytes fails that open, so drop it
+or change one of them with 0.31.0 first. Export and import move data across releases either way, as far as
 the export allows: releases after 0.31.0 write exports of version 3,
 which 0.31.0 and older refuse. To take one there, make its first line
 `{"$trunkdb_export":2}` and drop its last, the `$end` line:

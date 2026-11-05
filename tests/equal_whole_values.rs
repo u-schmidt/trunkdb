@@ -67,7 +67,10 @@ const CASES: &[(&str, &[&str])] = &[
     (r#"meta < {"k": 2}"#, &[]),
     (r#"meta <= {"k": 1}"#, &[]),
     (r#"tags >= ["a", "b"]"#, &[]),
-    (r#"bin > {"$binary": "AA=="}"#, &[]),
+    // Binary is ordered by its bytes since §166: [0, 1, 2] twice, [1].
+    (r#"bin > {"$binary": "AA=="}"#, &["a", "b", "c"]),
+    (r#"bin < {"$binary": "AQ=="}"#, &["a", "b"]),
+    (r#"bin starts with {"$binary": "AAE="}"#, &["a", "b"]),
 ];
 
 fn check_every_way(c: &Collection<Document>, label: &str) {

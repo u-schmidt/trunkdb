@@ -62,10 +62,13 @@ Numbers compare across int and float: `age = 36.0` finds `36`. Values
 of different kinds never compare equal, and a string is never less or
 greater than a number: `age > 30` skips documents whose `age` is a
 string. `order by` sorts across kinds as null and missing, booleans,
-numbers, strings, ids (by when they were made), dates; arrays, objects
-and binary come last, whichever the direction. Those three compare only
-with `=` and `!=`, by their contents: `meta = {"k": 1}` finds an equal
-object whatever its field order, and `<`, `>` never hold for them.
+numbers, strings, ids (by when they were made), dates, binary (by its
+bytes); arrays and objects come last, whichever the direction. Those two
+compare only with `=` and `!=`, by their contents: `meta = {"k": 1}`
+finds an equal object whatever its field order, and `<`, `>` never hold
+for them. Binary compares byte by byte with every comparison, and
+`starts with {"$binary": "…"}` finds the values beginning with those
+bytes; an index serves both.
 
 ## Paths and names
 

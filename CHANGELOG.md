@@ -1031,3 +1031,17 @@ limit, batches and a write-ahead log. Since then:
     application runs, restores, copying the file and its WAL, and moving
     between releases. 0.31.0 and older refuse an export of version 3;
     the guide says how to make one version 2.
+138. **Binary in indexes, in the order of its bytes** (§166): binary
+    compares byte by byte, as SQLite compares a BLOB, with `<`, `>`,
+    ranges and `starts with` a binary prefix, written `{"$binary": …}`
+    in a filter's text; a sort puts it after date-times, by its bytes,
+    where it came last with arrays and objects. It has an index key,
+    so `=`, ranges, prefixes and sorts on a binary field read just
+    their entries, a count and a selection of the field none, and a
+    unique index refuses the same bytes twice. File format 13: the
+    first open of an older file rebuilds the indexes that hold binary,
+    in one batch, and 0.31.0 refuses a file this build has written.
+    A read-only open, as `trunkdb info` makes, no longer stamps the
+    format in memory, so it reports what the file says.
+    Kept as binary instead of hex text, 100,000 file paths take a
+    quarter less file and a third less index.

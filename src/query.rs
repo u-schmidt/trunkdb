@@ -27,7 +27,8 @@ pub enum Op {
     /// value of another kind.
     Ne,
     /// `Lt` to `Gte` hold between values of one kind that have an order
-    /// (SPEC §34.1): never for arrays, objects, binary or NaN.
+    /// (SPEC §34.1): never for arrays, objects or NaN. Binary by its
+    /// bytes (SPEC §166).
     Lt,
     /// Less than or equal, as `Lt`.
     Lte,
@@ -449,7 +450,8 @@ impl Condition {
     }
 
     /// `field < value`, between values of one kind that have an order
-    /// (SPEC §34.1): never for arrays, objects, binary or NaN.
+    /// (SPEC §34.1): never for arrays, objects or NaN. Binary by its
+    /// bytes (SPEC §166).
     pub fn lt(field: impl Into<String>, value: impl Into<Document>) -> Self {
         Self::compare(field, Op::Lt, value)
     }
@@ -2563,7 +2565,7 @@ impl OnBytes<'_> {
                     return Some(!matches!(op, Op::Contains | Op::StartsWith) && holds(op, ord));
                 };
                 let part = entry.parts[*at];
-                // An array, object or binary value in a compound key is
+                // An array or object value in a compound key is
                 // its tag alone (SPEC §43): equal to one asked for or
                 // not, only the document tells (§124.3).
                 if matches!(op, Op::Eq | Op::Ne) && key::is_other(part) && is_whole(value) {
@@ -2577,13 +2579,9 @@ impl OnBytes<'_> {
                     };
                 }
                 if let Op::StartsWith = op {
-                    // The key holds the string's first bytes (SPEC §158.2).
-                    return match value {
-                        Document::String(prefix) => {
-                            key::part_starts_with(part, prefix.as_bytes(), entry.fields)
-                        }
-                        _ => Some(false),
-                    };
+                    // The key holds the string's first bytes (SPEC §158.2),
+                    // or the binary value's (SPEC §166).
+                    return key::part_starts_with(part, value, entry.fields);
                 }
                 let ord = key::compare_part(part, encoded.as_deref(), entry.fields)?;
                 Some(holds(op, ord))
@@ -2907,6 +2905,7 @@ fn value_matches(op: &Op, field_value: &Document, value: &Document) -> bool {
     if let Op::StartsWith = op {
         return match (field_value, value) {
             (Document::String(text), Document::String(prefix)) => text.starts_with(prefix.as_str()),
+            (Document::Binary(bytes), Document::Binary(prefix)) => bytes.starts_with(prefix),
             _ => false,
         };
     }
@@ -2930,13 +2929,11 @@ fn value_matches(op: &Op, field_value: &Document, value: &Document) -> bool {
     holds(op, compare(field_value, value))
 }
 
-/// An array, an object or binary data: a value `=` and `!=` compare by
-/// its contents and nothing orders (SPEC §124).
+/// An array or an object: a value `=` and `!=` compare by its contents
+/// and nothing orders (SPEC §124). Binary data was one too, until it
+/// was ordered by its bytes (SPEC §166).
 pub(crate) fn is_whole(value: &Document) -> bool {
-    matches!(
-        value,
-        Document::Array(_) | Document::Object(_) | Document::Binary(_)
-    )
+    matches!(value, Document::Array(_) | Document::Object(_))
 }
 
 /// Equal, as a filter's `Eq` sees it (SPEC §124.1), and `add_to_set`
@@ -3032,6 +3029,8 @@ pub(crate) fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> 
         (Id(x), Id(y)) => Some(x.cmp(y)),
         // In time order (SPEC §69); never equal to a string or number.
         (DateTime(x), DateTime(y)) => Some(x.cmp(y)),
+        // Byte by byte, as SQLite compares BLOBs (SPEC §166).
+        (Binary(x), Binary(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
@@ -3072,14 +3071,15 @@ fn sort_rank(value: &Document) -> u8 {
         Document::String(_) => 3,
         Document::Id(_) => 4,
         Document::DateTime(_) => 5,
+        Document::Binary(_) => 6,
         _ => UNORDERED,
     }
 }
 
-const UNORDERED: u8 = 6;
+const UNORDERED: u8 = 7;
 
 /// Whether `sort_order` puts `value` among the values nothing orders —
-/// arrays, objects, binary, NaN. No index holds them.
+/// arrays, objects, NaN. No index holds them.
 pub(crate) fn is_unordered(value: &Document) -> bool {
     sort_rank(value) == UNORDERED
 }
@@ -3098,7 +3098,8 @@ fn compare_values(keys: &[Sort], a: &[&Document], b: &[&Document]) -> std::cmp::
 /// The order a sort puts two field values in (SPEC §34.1) — a total
 /// order, so any sort is well-defined: null (and missing) before bools
 /// before numbers before strings before ids (SPEC §62) before date-times
-/// (SPEC §69), each by value, reversed for `Desc`;
+/// (SPEC §69) before binary (SPEC §166), each by value, reversed for
+/// `Desc`;
 /// values nothing orders come after all of them in both directions, as
 /// equals. It is the order of an index's keys, so reading an index gives
 /// what sorting in memory gives.
@@ -4153,7 +4154,14 @@ mod tests {
             time(-5, 0),
             Document::Array(vec![Document::Int(1)]),
             Document::Object(Map::new()),
+            Document::Binary(vec![]),
+            Document::Binary(vec![0]),
+            Document::Binary(vec![0, 0]),
             Document::Binary(vec![1]),
+            Document::Binary(vec![1, 0]),
+            Document::Binary(vec![0; 2000]),
+            Document::Binary([vec![0; 2000], vec![1]].concat()),
+            Document::Binary(b"a".to_vec()),
         ]
     }
 
@@ -5263,7 +5271,7 @@ mod tests {
         let unordered = [
             v(Document::Array(vec![])),
             v(Document::Float(f64::NAN)),
-            v(Document::Binary(vec![1])),
+            v(Document::Object(Default::default())),
         ];
         // Ascending, as `sort` must return them (the null and the
         // missing field are equal, so they keep their input order).
@@ -5281,6 +5289,12 @@ mod tests {
             v(Document::String("".into())),
             v(Document::String("B".into())),
             v(Document::String("a".into())),
+            // By their bytes, after the kinds before them (SPEC §166).
+            v(Document::Binary(vec![])),
+            v(Document::Binary(vec![0])),
+            v(Document::Binary(vec![0, 0])),
+            v(Document::Binary(vec![1])),
+            v(Document::Binary(vec![0xFF])),
         ];
         // Compared as text: NaN isn't equal to itself.
         let text = |docs: Vec<Document>| format!("{docs:?}");
@@ -5527,7 +5541,6 @@ mod tests {
             (r#"{"a": null}"#, r#"{"a": null}"#),
             ("[]", "[]"),
             ("{}", "{}"),
-            (r#"{"$binary": "AAEC"}"#, r#"{"$binary": "AAEC"}"#),
             (
                 r#"[{"$date": "2026-01-01T00:00:00Z"}]"#,
                 r#"[{"$date": "2026-01-01T00:00:00Z"}]"#,
@@ -5564,5 +5577,67 @@ mod tests {
         // A missing field and a null one aren't arrays: `!=` holds.
         assert!(value_matches(&Op::Ne, &Document::Null, &v("[1]")));
         assert!(!value_matches(&Op::Eq, &Document::Null, &v("[]")));
+    }
+
+    /// SPEC §166: binary compares by its bytes, as SQLite compares BLOBs,
+    /// with every operator but `contains`; never with another kind; and
+    /// `starts with` a binary prefix holds of the values beginning with
+    /// its bytes, in a filter's text too.
+    #[test]
+    fn binary_compares_by_its_bytes() {
+        use std::cmp::Ordering::*;
+        let b = |bytes: &[u8]| Document::Binary(bytes.to_vec());
+        for (x, y, ord) in [
+            (b(&[]), b(&[]), Equal),
+            (b(&[]), b(&[0]), Less),
+            (b(&[0]), b(&[0, 0]), Less),
+            (b(&[0, 0xFF]), b(&[1]), Less),
+            (b(&[2]), b(&[1, 9, 9]), Greater),
+        ] {
+            assert_eq!(compare(&x, &y), Some(ord), "{x:?} {y:?}");
+            for op in [Op::Eq, Op::Ne, Op::Lt, Op::Lte, Op::Gt, Op::Gte] {
+                let holds = value_matches(&op, &x, &y);
+                assert_eq!(holds, super::holds(&op, Some(ord)), "{x:?} {op:?} {y:?}");
+            }
+        }
+        for other in [Document::from("a"), Document::Int(97), Document::Null] {
+            assert_eq!(compare(&b(b"a"), &other), None);
+            assert!(!value_matches(&Op::Lte, &b(b"a"), &other));
+            assert!(value_matches(&Op::Ne, &b(b"a"), &other));
+        }
+        let starts =
+            |value: &Document, prefix: &Document| value_matches(&Op::StartsWith, value, prefix);
+        assert!(starts(&b(&[0, 1, 2]), &b(&[0, 1])));
+        assert!(starts(&b(&[0, 1]), &b(&[])));
+        assert!(!starts(&b(&[0, 1]), &b(&[0, 1, 2])));
+        assert!(!starts(&b(b"ab"), &"a".into()), "bytes aren't text");
+        assert!(!starts(&"ab".into(), &b(b"a")));
+        assert!(!value_matches(&Op::Contains, &b(b"ab"), &b(b"b")));
+        assert_eq!(sort_order(&b(&[1]), &b(&[0, 5]), SortOrder::Desc), Less);
+
+        let names = |text: &str| {
+            let docs =
+                [&[0u8][..], &[0, 0], &[0, 1], &[1], &[0xFF]].map(|bytes| doc(&[("v", b(bytes))]));
+            let filter: Filter = text.parse().unwrap();
+            let found = filter.apply(docs.to_vec());
+            found
+                .iter()
+                .map(|doc| match doc.get("v") {
+                    Some(Document::Binary(bytes)) => bytes.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        // AAA= is [0, 0]; AQ== is [1]; AA== is [0].
+        assert_eq!(
+            names(r#"v > {"$binary": "AAA="} and v < {"$binary": "AQ=="}"#),
+            [vec![0, 1]]
+        );
+        assert_eq!(
+            names(r#"v starts with {"$binary": "AA=="} order by v desc"#),
+            [vec![0, 1], vec![0, 0], vec![0]]
+        );
+        let text = r#"v starts with {"$binary":"AA=="}"#;
+        assert_eq!(text.parse::<Filter>().unwrap().to_string(), text);
     }
 }

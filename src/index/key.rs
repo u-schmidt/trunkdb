@@ -35,8 +35,13 @@ const TAG_ID: u8 = 4;
 /// as a big-endian `u32`. After ids, as the sort puts them; since file
 /// format 11, the first that can hold one.
 const TAG_DATETIME: u8 = 5;
-/// A value only compound keys hold (SPEC §43.2): arrays, objects,
-/// binary, NaN — everything `encode_value` leaves out. Last, as such
+/// Binary data (SPEC §166): its bytes escaped and terminated as a
+/// string's are (`encode_escaped`), so byte order is the bytes' order,
+/// and cut to the same budget. After date-times, as the sort puts them;
+/// since file format 13, the first that can hold one.
+const TAG_BINARY: u8 = 6;
+/// A value only compound keys hold (SPEC §43.2): arrays, objects, NaN —
+/// everything `encode_value` leaves out. Last, as such
 /// values sort after everything (§34.1). No bytes after the tag: they're
 /// all one value to the index.
 const TAG_OTHER: u8 = 0xFF;
@@ -130,8 +135,8 @@ pub fn part_is_exact(part: &[u8], fields: usize) -> bool {
         }
         // Tag, escaped bytes, two-byte terminator: a cut string used at
         // least `string_budget - 1` bytes, since the next byte (up to two
-        // escaped) didn't fit.
-        TAG_STRING => value_part
+        // escaped) didn't fit. Binary is cut the same way.
+        TAG_STRING | TAG_BINARY => value_part
             .len()
             .checked_sub(3)
             .is_some_and(|len| len < string_budget(fields) - 1),
@@ -185,20 +190,11 @@ pub fn decode_part_into(part: &[u8], fields: usize, value: &mut Document) -> Opt
             if !escaped.contains(&0) {
                 text.push_str(std::str::from_utf8(escaped).ok()?);
             } else {
-                let mut bytes = Vec::with_capacity(escaped.len());
-                let mut at = 0;
-                while let Some(&b) = escaped.get(at) {
-                    match b {
-                        0 if escaped.get(at + 1) == Some(&0xFF) => at += 2,
-                        0 => return None, // a terminator inside: damage
-                        _ => at += 1,
-                    }
-                    bytes.push(b);
-                }
-                text.push_str(std::str::from_utf8(&bytes).ok()?);
+                text.push_str(std::str::from_utf8(&unescape(escaped)?).ok()?);
             }
             Document::String(text)
         }
+        (TAG_BINARY, rest) => Document::Binary(unescape(rest.strip_suffix(&[0, 0])?)?),
         (TAG_ID, rest) => Document::Id(DocId(rest.try_into().ok()?)),
         (TAG_DATETIME, rest) if rest.len() == 12 => {
             let seconds = u64::from_be_bytes(rest[..8].try_into().ok()?) ^ (1 << 63);
@@ -210,6 +206,23 @@ pub fn decode_part_into(part: &[u8], fields: usize, value: &mut Document) -> Opt
     Some(())
 }
 
+/// `encode_escaped`'s bytes back, without the terminator: `0x00 0xFF`
+/// is a zero. `None` for a `0x00` followed by anything else, a
+/// terminator inside: damage.
+fn unescape(escaped: &[u8]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(escaped.len());
+    let mut at = 0;
+    while let Some(&b) = escaped.get(at) {
+        match b {
+            0 if escaped.get(at + 1) == Some(&0xFF) => at += 2,
+            0 => return None,
+            _ => at += 1,
+        }
+        bytes.push(b);
+    }
+    Some(bytes)
+}
+
 /// Whether one value of a compound key is `TAG_OTHER`: a value that
 /// sorts after everything, whichever the direction (§34.1).
 pub fn is_other(part: &[u8]) -> bool {
@@ -218,7 +231,7 @@ pub fn is_other(part: &[u8]) -> bool {
 
 /// `value`, encoded as one of `fields` values of a key encodes it, to
 /// compare parts with (`compare_part`) — `None` for what no key holds
-/// (arrays, objects, binary, NaN).
+/// (arrays, objects, NaN).
 pub fn encode_for(value: &Document, fields: usize) -> Option<Vec<u8>> {
     encode_value_in(value, fields)
 }
@@ -331,13 +344,14 @@ pub fn secondary(value: &Document, id: DocId) -> Option<Vec<u8>> {
 /// Encodes a field value so that byte order agrees with `Filter`'s
 /// comparisons: `a < b` in `Filter` implies `encode(a) <= encode(b)`.
 /// Not strictly: some different values encode the same (large `Int`s
-/// that round to one `f64`, strings that share their first ~1000 bytes).
+/// that round to one `f64`, strings or binary that share their first
+/// ~1000 bytes).
 /// That's fine, since every document an index returns is checked against
 /// the full filter again (SPEC §28.3). Only the types a comparison can
 /// match are indexed — `Null` (which also stands for a missing field,
-/// SPEC §32), `Bool`, `Int`/`Float`, `String`, ids (SPEC §62) and
-/// date-times (SPEC §69).
-/// Anything else (arrays, objects, binary, `NaN`) is `None`: no
+/// SPEC §32), `Bool`, `Int`/`Float`, `String`, ids (SPEC §62),
+/// date-times (SPEC §69) and binary (SPEC §166).
+/// Anything else (arrays, objects, `NaN`) is `None`: no
 /// `Eq`/`Lt`/`Lte`/`Gt`/`Gte` condition can match it, so leaving it out
 /// of the index loses nothing.
 ///
@@ -356,7 +370,12 @@ fn encode_value_in(value: &Document, fields: usize) -> Option<Vec<u8>> {
         // `as f64`, like `query::compare` does for `Int` vs. `Float`.
         Document::Int(n) => encode_number(*n as f64),
         Document::Float(f) => encode_number(*f),
-        Document::String(s) => Some(encode_string(s.as_bytes(), string_budget(fields))),
+        Document::String(s) => Some(encode_escaped(
+            TAG_STRING,
+            s.as_bytes(),
+            string_budget(fields),
+        )),
+        Document::Binary(bytes) => Some(encode_escaped(TAG_BINARY, bytes, string_budget(fields))),
         Document::Id(id) => Some([&[TAG_ID][..], &id.0].concat()),
         Document::DateTime(time) => {
             let mut out = vec![TAG_DATETIME];
@@ -392,9 +411,10 @@ fn encode_number(f: f64) -> Option<Vec<u8>> {
 /// terminator makes it prefix-free ("ab" < "abc" still holds with a
 /// `DocId` after each). Cut off after `budget` escaped bytes —
 /// always at the same point for two strings that agree up to it, so the
-/// cut keeps the order (non-strictly).
-fn encode_string(bytes: &[u8], budget: usize) -> Vec<u8> {
-    let mut out = vec![TAG_STRING];
+/// cut keeps the order (non-strictly). After `tag`: a string's bytes, or
+/// binary data's (SPEC §166), which sort the same way.
+fn encode_escaped(tag: u8, bytes: &[u8], budget: usize) -> Vec<u8> {
+    let mut out = vec![tag];
     let mut used = 0;
     for &b in bytes {
         let width = if b == 0 { 2 } else { 1 };
@@ -482,7 +502,8 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Every key a document can have if its field `op`-compares true against
 /// `value`, or a superset of them — `None` if no range describes it
 /// (`Ne`, `Contains`) or `value` isn't an indexed type; for
-/// `StartsWith`, the strings that begin with `value`'s bytes. Bounds are
+/// `StartsWith`, the strings (or binary values, SPEC §166) that begin
+/// with `value`'s bytes. Bounds are
 /// inclusive of `value`'s own encoding even for `Lt`/`Gt`: different
 /// values can share an encoding, and the recheck sorts them out.
 pub fn range_for(op: &crate::query::Op, value: &Document) -> Option<KeyRange> {
@@ -507,12 +528,15 @@ pub fn range_for_in(op: &crate::query::Op, value: &Document, fields: usize) -> O
             end: this_value.end,
         }),
         // A string's key is its escaped bytes, cut where the key's
-        // budget ends, then a terminator (`encode_string`): every string
+        // budget ends, then a terminator (`encode_escaped`): every string
         // beginning with the prefix has a key beginning with the
         // prefix's escaped bytes, or with as many of them as the budget
         // keeps (SPEC §158.2).
+        // Binary's key is built the same way (SPEC §166).
         Op::StartsWith => match value {
-            Document::String(_) => Some(KeyRange::prefixed(&encoded[..encoded.len() - 2])),
+            Document::String(_) | Document::Binary(_) => {
+                Some(KeyRange::prefixed(&encoded[..encoded.len() - 2]))
+            }
             _ => None,
         },
         Op::Ne | Op::Contains => None,
@@ -520,14 +544,19 @@ pub fn range_for_in(op: &crate::query::Op, value: &Document, fields: usize) -> O
 }
 
 /// Whether the string a key's `part` stands for begins with `prefix`, from
-/// the bytes alone (SPEC §158.2): `Some(false)` for a value of another
-/// type. A part that begins with the prefix's escaped bytes is a string
+/// the bytes alone (SPEC §158.2), or the binary value, for a binary
+/// `prefix` (SPEC §166): `Some(false)` for a value of another type. A part that begins with the prefix's escaped bytes is a string
 /// that does, cut or not: an escaped `0x00` is `0x00 0xFF`, so the escaped
 /// prefix never runs into the `0x00 0x00` terminator. One that doesn't is
 /// a string that doesn't, unless it was cut before the prefix ended:
 /// `None` then, and the document decides.
-pub fn part_starts_with(part: &[u8], prefix: &[u8], fields: usize) -> Option<bool> {
-    if !is_string(part) {
+pub fn part_starts_with(part: &[u8], prefix: &Document, fields: usize) -> Option<bool> {
+    let (tag, prefix) = match prefix {
+        Document::String(text) => (TAG_STRING, text.as_bytes()),
+        Document::Binary(bytes) => (TAG_BINARY, bytes.as_slice()),
+        _ => return Some(false),
+    };
+    if part.first() != Some(&tag) {
         return Some(false);
     }
     let mut body = part[1..].iter();
@@ -679,9 +708,122 @@ mod tests {
     fn only_comparable_types_are_indexed() {
         assert!(encode_value(&Document::Bool(true)).is_some());
         assert_eq!(key(Document::Null), [TAG_NULL]);
-        for value in [Document::Binary(vec![1]), Document::Array(vec![])] {
+        for value in [
+            Document::Array(vec![]),
+            Document::Object(Default::default()),
+        ] {
             assert_eq!(encode_value(&value), None, "{value:?}");
         }
+    }
+
+    fn binary(bytes: &[u8]) -> Document {
+        Document::Binary(bytes.to_vec())
+    }
+
+    /// SPEC §166: binary is keyed in the order of its bytes, whatever the
+    /// ids after them, after every date-time and before "other"; exact
+    /// and read back whole up to the cut, cut as a string is, and split
+    /// off whole from a compound key.
+    #[test]
+    fn binary_is_keyed_in_the_order_of_its_bytes() {
+        let values = [
+            binary(&[]),
+            binary(&[0]),
+            binary(&[0, 0]),
+            binary(&[0, 1]),
+            binary(&[0, 0xFF]),
+            binary(&[1]),
+            binary(&[1, 0]),
+            binary(&[0xFF]),
+            binary(&[0xFF, 0xFF]),
+        ];
+        for pair in values.windows(2) {
+            let a = secondary(&pair[0], DocId([0xFF; 16])).unwrap();
+            let b = secondary(&pair[1], DocId([0; 16])).unwrap();
+            assert!(a < b, "{:?} vs {:?}", pair[0], pair[1]);
+        }
+        for value in &values {
+            let part = key(value.clone());
+            assert_eq!(part[0], TAG_BINARY);
+            assert!(part_is_exact(&part, 1), "{value:?}");
+            assert_eq!(decode_part(&part, 1).as_ref(), Some(value));
+            assert_eq!(parts(&part), [&part[..]]);
+        }
+        let latest = crate::DateTime::from_unix(4_102_444_800, 999_999_999).unwrap();
+        assert!(key(Document::DateTime(latest)) < key(binary(&[])));
+        let other = encode_values(&[&Document::Array(vec![])]);
+        assert!(encode_values(&[&binary(&[0xFF; 50])]) < other);
+        assert_ne!(key("a".into()), key(binary(b"a")), "text and bytes differ");
+
+        // Cut as a string is: equal keys, inexact, not read back.
+        let long = |tail: u8| binary(&[vec![0; 5000], vec![tail]].concat());
+        let (a, b) = (key(long(1)), key(long(2)));
+        assert_eq!(a, b, "they differ only past the cut");
+        assert!(a.len() + 16 <= MAX_KEY_LEN);
+        assert!(!part_is_exact(&a, 1));
+        assert_eq!(decode_part(&a, 1), None);
+
+        let k = compound(&[&binary(&[0, 0, 1]), &Document::Int(3)], DocId([7; 16]));
+        let split = parts(value_part(&k));
+        assert_eq!(split.len(), 2);
+        assert_eq!(decode_part(split[0], 2), Some(binary(&[0, 0, 1])));
+        assert_eq!(decode_part(split[1], 2), Some(Document::Float(3.0)));
+        // A terminator inside is damage, not a value.
+        assert_eq!(decode_part(&[TAG_BINARY, 0, 1, 0, 0], 1), None);
+    }
+
+    /// SPEC §166: a binary prefix's range holds exactly the binary values
+    /// beginning with its bytes, and no string; an entry decides it from
+    /// its bytes, as `part_starts_with` does for strings (§158.2).
+    #[test]
+    fn a_binary_prefix_reads_the_values_beginning_with_its_bytes() {
+        let mut values = vec![
+            binary(&[]),
+            binary(&[0]),
+            binary(&[0, 0]),
+            binary(&[0, 1]),
+            binary(&[0, 0xFF]),
+            binary(&[1]),
+            binary(&[1, 0]),
+            binary(&[0xFF]),
+        ];
+        for n in [122, 123, 1005, 1100] {
+            values.extend([binary(&vec![7; n]), binary(&[vec![7; n], vec![0]].concat())]);
+        }
+        let bytes = |value: &Document| match value {
+            Document::Binary(bytes) => bytes.clone(),
+            _ => unreachable!(),
+        };
+        let id = [0xAB; 16];
+        for fields in [1, 8] {
+            for prefix in &values {
+                let range = range_for_in(&Op::StartsWith, prefix, fields).unwrap();
+                for value in &values {
+                    let part = encode_value_in(value, fields).unwrap();
+                    let starts = bytes(value).starts_with(&bytes(prefix));
+                    let in_range = range.contains(&[&part[..], &id].concat());
+                    if starts {
+                        assert!(in_range, "{fields}: {value:?} starts with {prefix:?}");
+                    }
+                    match part_starts_with(&part, prefix, fields) {
+                        Some(decided) => assert_eq!(decided, starts, "{value:?} {prefix:?}"),
+                        None => assert!(!part_is_exact(&part, fields)),
+                    }
+                    // In the range but not beginning with it: only where
+                    // the cut hides the difference.
+                    if in_range && !starts {
+                        assert!(!part_is_exact(&part, fields), "{value:?} {prefix:?}");
+                    }
+                }
+                for text in ["", "\0", "\u{7}"] {
+                    let part = encode_value_in(&text.into(), fields).unwrap();
+                    assert!(!range.contains(&[&part[..], &id].concat()), "{text:?}");
+                    assert_eq!(part_starts_with(&part, prefix, fields), Some(false));
+                }
+            }
+        }
+        let part = key(binary(b"ab"));
+        assert_eq!(part_starts_with(&part, &"a".into(), 1), Some(false));
     }
 
     /// SPEC §69: date-times are keyed in time order, before 1970 and to
@@ -791,7 +933,7 @@ mod tests {
                     } else if exact && !prefix_cut {
                         assert!(!range.contains(&key), "{fields}: {s:?}, {prefix:?}");
                     }
-                    let decided = part_starts_with(&part, prefix.as_bytes(), fields);
+                    let decided = part_starts_with(&part, &Document::String(prefix.into()), fields);
                     match exact {
                         true => assert_eq!(decided, Some(starts), "{fields}: {s:?}, {prefix:?}"),
                         false => assert!(
@@ -808,7 +950,7 @@ mod tests {
                     let part = encode_value_in(other, fields).unwrap();
                     assert!(!range.contains(&[&part[..], &id].concat()));
                     assert_eq!(
-                        part_starts_with(&part, prefix.as_bytes(), fields),
+                        part_starts_with(&part, &Document::String(prefix.into()), fields),
                         Some(false)
                     );
                 }
@@ -818,7 +960,7 @@ mod tests {
         assert!(primary_range(&Op::StartsWith, DocId([1; 16])).is_none());
     }
 
-    /// How many bytes `bytes` take escaped, as `encode_string` writes them.
+    /// How many bytes `bytes` take escaped, as `encode_escaped` writes them.
     fn escaped_len(bytes: &[u8]) -> usize {
         bytes.iter().map(|&b| if b == 0 { 2 } else { 1 }).sum()
     }

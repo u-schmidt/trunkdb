@@ -327,7 +327,10 @@ compares values in [§34.1](spec/34-sorting-through-an-index.md). They cover:
   documents have [§44](spec/44-sparse-indexes.md);
 - **references:** a `DocId` field has a key, in the order ids were
   made, and sorts after strings [§62](spec/62-an-index-key-for-ids.md);
-- **date-times:** a key in time order, sorting after ids [§69](spec/69-a-date-time-type.md).
+- **date-times:** a key in time order, sorting after ids [§69](spec/69-a-date-time-type.md);
+- **binary:** a key in the order of its bytes, as SQLite orders a BLOB,
+  sorting after date-times; `<`, ranges and `starts with` read it
+  [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md).
 
 An index is built and kept up to date in the same batch as the
 documents it covers, so it can't disagree with them after a crash.

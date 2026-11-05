@@ -50,7 +50,7 @@ All of it is done:
 | 0.29.0 | **A sort by a key of the application's own:** `Filter::sort_by_key(fields, key)`, smallest first, and `sort_by_key_desc`, a closure `Fn(&Document) -> Option<f64>` given the fields it names, as `Condition::custom` is; `None` or NaN leaves a match out, for `count` too; equal keys by the `then_*` fields after it, then by id; with a limit, only the best `skip + limit` kept as the matches are read; never from an index, conditions an index serves narrowing what is read; in `find`, `count`, `cursor`, the writes, `aggregate` and `watch`, a live list of the ten nearest; a panic fails the call with `Error::ClosurePanicked`; written `order by key(lat, lon)`, which the parser refuses. "The ten restaurants nearest to this point", the nearest vectors among thousands, any score of the application's; **`trunkdb count` and `get`**, and `--json` for `info`, `check` and `fields`, for a program or an AI agent; **writing through the command:** `trunkdb insert`, `update` with MongoDB's operators as JSON and `--upsert`, `delete`, `index add`/`drop`, `drop`, each one batch; a write that would change every document asking for `--all`, `--dry-run` counting; **aggregates as text**, `count() as n, avg(hours) as mean group by team having n > 10`, `FromStr` and `Display` for `Aggregate`, and `trunkdb aggregate`; **the agent skill after a trial**, ten requests by an agent given only the skill, reads and writes, all right, what it had to work out alone added: which conditions an index serves, strings and prefixes, values of another type, two collections put together by id | §154–§157, §122.5 |
 | 0.30.0 | **`starts with`:** `Filter::starts_with(field, prefix)`, `title starts with "Fix"`, a string beginning with a prefix, case counting as for `<`; read from an index as the keys beginning with the prefix, alone or after a compound index's `=`s, and decided on an entry where the key holds the prefix, so a count reads no document; **a test of a value's kind:** `Filter::is_kind(field, Kind::String)`, `hours is string` and `is not`, by the names `trunkdb fields` prints, `number` for either number, no null kind beside `is null`; `[*]` for elements; checked on the documents, never from an index; **an `in` on a compound index's field, a range per value:** `status in ("open", "late") and due < 50` on `(status, due)` reads each status's entries before 50, as `=` reads one status's, where it read each status whole; after the `=`s on the fields before it, with the `=`s and a range on the fields after it; chosen as `=` is; **the public API gone through again**, as in §118, for what came since: `Kind::ALL` a slice and `Kind::DateTime` for a date-time, so a date without a time can be added; the hook's `Commit` and `Change` no longer `Eq` (breaking), as reports aren't | §158–§161 |
 | 0.31.0 | **A batch's preconditions:** `Batch::require(&collection, filter)`, at least one document matches, and `Batch::require_none`, none does, checked at `commit` at their place in the batch, after the ops before them and under the writer's lock, so no write comes between the check and the batch's own; a failed one writes nothing and returns `Error::PreconditionFailed { collection, op, matched }`; with `Filter::id`, one document held to what was read, a version the program keeps; read as `count` reads, through an index, stopping at the first match; a sort, skip, limit or selection refused **Parameters in a filter's text:** `:name` where a value or a count stands, `status = :status limit :n`, the values passed apart so none can change what the text says; `Template<Filter>`, `Template<Condition>` and `Template<Aggregate>` read and check a text once, `bind(&Params)` makes the filter, `params()` lists the names; a missing value, an unused one or one that doesn't fit a `BindError`; `trunkdb … --param name=value` for `find`, `fields`, `count`, `aggregate`, `update` and `delete` **An OR of ids and indexed conditions:** `_id in (…) or updated > t` reads the ids from the primary index and the rest from an index range, each document once, where it was a scan; `IndexUnion` with `_id` first among its `fields`; a branch neither naming ids nor indexed, or a hint, as before | §162–§164 |
-| next | **Backups a user can trust:** an export ends with a line of its counts, export version 3, which an import checks, so one cut short fails instead of restoring in part; `Summary::ended`; `verify_export` and `trunkdb verify`, a restore into a file of its own, `check`ed, counted and deleted, a `Verified` report; a section of the guide on backups while running, restores, copying the file and its WAL, and moving between releases; 0.31.0 and older refuse version 3 | §165 |
+| next | **Backups a user can trust:** an export ends with a line of its counts, export version 3, which an import checks, so one cut short fails instead of restoring in part; `Summary::ended`; `verify_export` and `trunkdb verify`, a restore into a file of its own, `check`ed, counted and deleted, a `Verified` report; a section of the guide on backups while running, restores, copying the file and its WAL, and moving between releases; 0.31.0 and older refuse version 3 **Binary in indexes, in the order of its bytes:** compared byte by byte as SQLite compares a BLOB, `<`, ranges and `starts with` a binary prefix, in the text as `{"$binary": …}`; sorted after date-times, where it came last with arrays and objects; an index key, so `=`, ranges, prefixes and sorts read just their entries, a count and a selection none, a unique index refusing the same bytes twice; file format 13, an older file's indexes holding binary rebuilt at its first open; on 100,000 file paths, binary instead of hex text a quarter of the file and a third of the index smaller | §165–§166 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -152,24 +152,13 @@ says where the need or the limit is described.
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
-- **Binary in indexes, in the order of its bytes,** as SQLite orders
-  a BLOB: binary values as index keys, alone or in a compound index, and
-  `<`, ranges, `order by` and `starts with` on bytes, where only `=` and
-  `!=` compare them (§124) and an index leaves them out (§28, §104).
-  A Unix path needn't be UTF-8, so a program keeping file names exactly
-  stores them as text in hex today: twice the bytes, in the index too,
-  kept only because hex sorts as its bytes do. Decided: binary sorts
-  after date-times, no longer last with arrays and objects (§34), a
-  change for a sort over mixed values; no `contains` on bytes, as an
-  index can't serve it. Format 13, the indexes holding binary rebuilt
-  at open, as §62 rebuilt those holding ids.
 - **Field names stored once, numbers as varints:** a dictionary of each
   collection's field names in the catalog, and a document's keys as
   small numbers into it, where each key is its 4-byte length and its
   bytes today; ints, lengths and counts as varints, where each is 8 or
   4 bytes. Schemaless still: a new name just joins the dictionary. Old
-  documents read as before, under a type tag of their own. In the same
-  scanner's later file, 1,030,000 documents of about 217 bytes each,
+  documents read as before, under a type tag of their own. In a real
+  program's later file, 1,030,000 documents of about 217 bytes each,
   some 104 of them field names and their lengths and about 90 the
   values; roughly 100 bytes a document after, a quarter of the file.
   Shapes, a whole set of names stored once, could follow on top if the
@@ -178,8 +167,8 @@ says where the need or the limit is described.
   it shares with the one before it on the page, and the rest, as
   RocksDB and WiredTiger do. Neighbouring keys in a compound index share
   long beginnings: the same first field, the same leading path. In a
-  filesystem scanner's file of 415 MiB, 257,000 documents with two
-  indexes of (a scan's id, a path's 230 bytes of hex) took 229 MiB of
+  real program's file of 415 MiB, 257,000 documents with two indexes
+  of (a run's id, a path's 230 bytes of hex) took 229 MiB of
   index pages against 172 MiB of documents, and `compact` would have
   freed 78 MiB, mostly half-full index pages. A format change; a binary
   search within a page (§150) needs restart points to keep its speed.

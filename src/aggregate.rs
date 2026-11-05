@@ -44,7 +44,7 @@ use std::time::Duration;
 ///
 /// - **Groups:** a missing field groups with `null` (SPEC §32); values a
 ///   filter finds equal are one group (`5` and `5.0`); values no
-///   comparison orders (arrays, objects, binary, NaN) one group per
+///   comparison orders (arrays, objects, NaN) one group per
 ///   equal value. A row shows its group's first document's values, by
 ///   id. An array groups as a value, not by its elements.
 /// - **`count`:** the documents in the group.
@@ -1187,7 +1187,7 @@ impl<'a> Groups<'a> {
     }
 
     fn group_index(&mut self, first: Vec<Seen>) -> usize {
-        // Arrays, objects and binary as a filter's `=` sees them: equal
+        // Arrays and objects as a filter's `=` sees them: equal
         // ones one group (SPEC §124.4).
         let key = GroupKey(
             (first.iter())
