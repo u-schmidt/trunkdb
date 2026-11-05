@@ -152,6 +152,13 @@ says where the need or the limit is described.
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
+- **Binary in indexes, in the order of its bytes,** as SQLite orders
+  a BLOB: binary values as index keys, alone or in a compound index, and
+  `<`, ranges, `order by` and `starts with` on bytes, where only `=` and
+  `!=` compare them (§124) and an index leaves them out (§28, §104).
+  A Unix path needn't be UTF-8, so a program keeping file names exactly
+  stores them as text in hex today: twice the bytes, in the index too,
+  kept only because hex sorts as its bytes do.
 - **Field names stored once, numbers as varints:** a dictionary of each
   collection's field names in the catalog, and a document's keys as
   small numbers into it, where each key is its 4-byte length and its
