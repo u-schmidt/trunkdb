@@ -221,8 +221,8 @@ impl std::str::FromStr for Document {
 }
 
 /// A document's primary key: 16 bytes, generated as a UUIDv7 by default
-/// (see `id.rs`) so ids created in sequence sort close together — good
-/// insert locality once a real B-tree index replaces `LinearIndex`.
+/// (see `id.rs`) so ids created in sequence sort close together, which
+/// keeps inserts into the primary B-tree local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DocId(pub [u8; 16]);
 

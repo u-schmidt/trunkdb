@@ -7,9 +7,9 @@ pub trait IdGenerator {
 }
 
 /// The default: UUIDv7. Chosen over UUIDv4 deliberately — v7 embeds a
-/// timestamp prefix, so ids stay roughly time-ordered, which matters once
-/// `LinearIndex` is replaced by a real B-tree (random ids scatter inserts
-/// and cause more page splits).
+/// timestamp prefix, so ids stay roughly time-ordered and new ones land
+/// at the right end of the primary B-tree; random ids would scatter
+/// inserts across its leaves and cause more page splits.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UuidV7Generator;
 
