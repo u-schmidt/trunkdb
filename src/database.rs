@@ -443,7 +443,7 @@ impl Database {
                 store.restore_in_memory(&pending)?;
             }
             store.check_header()?;
-            let catalog = Self::load_catalog(&mut store, false)?;
+            let catalog = Self::load_catalog(&mut store)?;
             if store.dirty_pages().next().is_some() {
                 // A fresh file's catalog page, or the index keys an old
                 // file lacks: committed in memory, never logged nor
@@ -473,7 +473,7 @@ impl Database {
         // next batch must not be appended after that garbage.
         durability.checkpoint()?;
 
-        let catalog = Self::load_catalog(&mut store, true)?;
+        let catalog = Self::load_catalog(&mut store)?;
         let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
         if pages.is_empty() {
             drop(pages);
@@ -499,12 +499,12 @@ impl Database {
     /// The catalog, loaded in a batch begun here and left staged: on a
     /// fresh file it bootstraps the catalog page, and on an old one it
     /// makes sure every document is an object (SPEC §95), keys the ids
-    /// and binary values its indexes lack (SPEC §62, §166), and, if
-    /// `stamp`, stamps the current format. A read-only open doesn't: what
-    /// it reports of the file (`file_info`) is what the file says, though
-    /// its reads see the indexes keyed (SPEC §166.3).
+    /// and binary values its indexes lack (SPEC §62, §166), and stamps
+    /// the current format. A read-only store keeps the file's: what it
+    /// reports (`file_info`) is what the file says, though its reads see
+    /// the indexes keyed (SPEC §166.3).
     /// Rolled back on error.
-    fn load_catalog(store: &mut FileStore, stamp: bool) -> crate::Result<Catalog> {
+    fn load_catalog(store: &mut FileStore) -> crate::Result<Catalog> {
         store.begin();
         let loaded = Catalog::load(store)
             .map_err(crate::Error::from)
@@ -513,9 +513,7 @@ impl Database {
                 let format = store.format_version()?;
                 crate::collection::only_objects_in_old_file(&catalog, store, format)?;
                 crate::collection::rekey_old_indexes(&catalog, store)?;
-                if stamp {
-                    store.stamp_format_version()?;
-                }
+                store.stamp_format_version()?;
                 Ok(catalog)
             });
         if loaded.is_err() {

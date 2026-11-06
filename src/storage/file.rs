@@ -93,14 +93,21 @@ pub(super) struct Header {
 
 impl Header {
     fn encode(&self) -> [u8; USABLE_PAGE_SIZE] {
+        self.encode_as(FORMAT_VERSION, RELEASE)
+    }
+
+    /// `encode`, saying `format_version` and `written_by` instead of this
+    /// build's: for a read-only store, whose header stays what the file
+    /// says (SPEC §166.3).
+    fn encode_as(&self, format_version: u32, written_by: Release) -> [u8; USABLE_PAGE_SIZE] {
         let mut buf = [0u8; USABLE_PAGE_SIZE];
         buf[0..8].copy_from_slice(MAGIC);
         buf[8..12].copy_from_slice(&self.page_size.to_le_bytes());
         buf[12..20].copy_from_slice(&self.page_count.to_le_bytes());
         buf[20..28].copy_from_slice(&self.free_list_head.to_le_bytes());
-        buf[28..32].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf[28..32].copy_from_slice(&format_version.to_le_bytes());
         buf[32..38].copy_from_slice(&self.created_by.to_bytes());
-        buf[38..44].copy_from_slice(&RELEASE.to_bytes());
+        buf[38..44].copy_from_slice(&written_by.to_bytes());
         buf
     }
 
@@ -243,6 +250,10 @@ pub struct FileStore {
     /// The batch in the making: the writer's alone (SPEC §77). Nothing
     /// of it is in `pages` before `commit`.
     staging: Option<Staging>,
+    /// Opened read-only (SPEC §88): nothing reaches the file, so the
+    /// header keeps the format and the release the file says, whatever
+    /// a batch held in memory changes (SPEC §166.3).
+    read_only: bool,
 }
 
 /// How `FileStore::from_file` locks the file.
@@ -386,6 +397,7 @@ impl FileStore {
             header_checked: is_fresh,
             header_error,
             staging: None,
+            read_only: matches!(lock, Lock::Shared),
         })
     }
 
@@ -472,7 +484,14 @@ impl FileStore {
         self.pages.at(commit)
     }
 
+    /// Writes the header, stamped with this build's format and release;
+    /// a read-only store's keeps the file's (`read_only`).
     fn write_header(&mut self) -> io::Result<()> {
+        if self.read_only {
+            let (format, written_by) = (self.header.format_version, self.header.written_by);
+            let header = self.header.encode_as(format, written_by);
+            return self.write_raw(HEADER_PAGE, Page::from(&header[..]));
+        }
         let header = self.header.encode();
         self.write_raw(HEADER_PAGE, Page::from(&header[..]))?;
         self.header.format_version = FORMAT_VERSION;

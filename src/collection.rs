@@ -8929,13 +8929,18 @@ mod tests {
             );
         }
         crate::storage::rewrite_format_version(&path, 12);
+        crate::storage::rewrite_releases(&path, None, None);
 
-        // A read-only open keys them in memory: its reads find them, and
-        // the file stays as it was (SPEC §166.3).
+        // A read-only open keys them in memory: its reads find them, it
+        // says what the file says, and the file stays as it was (SPEC
+        // §166.3).
         let before = std::fs::read(&path).unwrap();
         let db = read_only(&path).unwrap();
         let one = Filter::new().eq("name", file_name(42));
         assert_eq!(db.collection::<Document>("files").count(one).unwrap(), 1);
+        assert!(db.check().unwrap().is_ok());
+        let info = db.file_info().unwrap();
+        assert_eq!((info.format_version, info.written_by), (12, None));
         drop(db);
         assert_eq!(std::fs::read(&path).unwrap(), before);
 

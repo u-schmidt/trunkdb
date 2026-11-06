@@ -101,11 +101,14 @@ nothing. So `Database::open` makes sure no such index is read, the way
   said "format 13, written by" this build of a file that says 12 and
   0.31.0 on disk. It went unseen as long as every file the tests open
   read-only had the current format; the 0.23.0 fixture, format 12, is
-  the first that didn't. Now `load_catalog` stamps only for an open
-  that writes, so `info` and `file_info` say what the file says. A
-  read-only open that does rebuild an index in memory still reports
-  13: writing a page in a batch stamps the header (§59), in memory too
-  (166.5).
+  the first that didn't. Stamping it was two things: the open's own
+  stamp, and the one every page a batch writes makes (§59), which a
+  rebuild in memory made too. Now a store opened read-only keeps the
+  format and the release the file says (`FileStore::read_only`): its
+  header writes, which a batch in memory still needs for the pages it
+  adds, say the file's, the open's stamp among them. So `info`
+  and `file_info` say what the file says, whatever the open keyed in
+  memory.
 
 **Why format 13.** A build before it computes no key for binary. If it
 deleted a document holding some in an indexed field, it would leave the
@@ -146,12 +149,6 @@ faster with keys half as long.
 - **The first open of an older file is slower**, by a read of every
   document of every indexed collection (166.4), even where no document
   holds binary; once.
-- **A read-only open that rebuilds an index reports format 13** and
-  this build as the last writer, of a file whose bytes it leaves as
-  they were: the header in memory is stamped by the first page the
-  rebuild writes (166.3). Only an older file with indexes holding
-  binary, or ids before 10, opened read-only; `check` and every read
-  are right, only `file_info` says what the open made of it.
 - **No `contains` on bytes** (166.2), and no pattern beyond a prefix.
 - **A range on binary reads its bound too,** as every range does
   (`key::range_for`): different long values can share a key.
@@ -190,9 +187,10 @@ faster with keys half as long.
     stale; opening it rebuilds them, keeps the index list's order,
     stamps 13, checks out and answers through both; the next open reads
     no document;
-  - the same file opened read-only first: an `eq` finds its document
-    through the index keyed in memory, and the file's bytes stay as
-    they were; a format-12 file whose index holds no binary, opened
+  - the same file opened read-only first, marked as written by an
+    unknown release: an `eq` finds its document through the index keyed
+    in memory, `check` passes, `file_info` says format 12 and an unknown
+    writer, and the file's bytes stay as they were; a format-12 file whose index holds no binary, opened
     read-only, reports format 12 and stays 12 on disk, and an open that
     writes stamps it 13;
   - a unique index on a format-12 file with the same bytes twice fails
@@ -214,8 +212,8 @@ faster with keys half as long.
   updates with the new values among them.
 
 ## 166.7 Mutations
-Checked by breaking it on purpose, twenty-two ways, the whole suite
-run each time. Each of these fails a test, but one:
+Checked by breaking it on purpose, twenty-seven ways, the whole suite
+run each time. Each of these fails a test, but two:
 - **binary without a key,** **its zeros not escaped,** **tagged as a
   string,** **a cut value taken as exact,** **not read back from a
   key,** **an escaped zero read back as two bytes,** **no prefix range
@@ -230,7 +228,16 @@ run each time. Each of these fails a test, but one:
 - **format-12 files not rekeyed,** **binary not taken for stale,**
   **taken for stale only before format 10,** **every index rebuilt,**
   **format 12 refused,** **a read-only open stamping the format:**
-  caught by the old-file tests, the fixtures' and `info`'s.
+  caught by the old-file tests, the fixtures' and `info`'s;
+- **a store never taken as read-only,** **its header stamped by a page
+  write,** **the file's format not kept in its header writes:** caught
+  by the old-file test's read-only open and `info` on the fixture.
+- **The file's writer not kept in a read-only store's header bytes**
+  passes: `file_info` takes the releases from the header's fields,
+  which a read-only store never changes, and its bytes never reach the
+  file. Kept all the same, so the page says what the fields say. A
+  check that the open's stamp skipped a read-only store passed too, as
+  its header write keeps the file's fields anyway: it was taken out.
 - The one that passes: the tag 0xFE instead of 6, which orders binary
   the same way, after date-times and before "other", as 0xFE did for
   ids in §62.5.
