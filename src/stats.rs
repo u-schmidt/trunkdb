@@ -145,7 +145,7 @@ impl Database {
         let at = state.snapshot();
         let (catalog, store) = (at.catalog, &at.store);
         let file = Self::file_info_of(state)?;
-        let mut names: Vec<&str> = catalog.names().collect();
+        let mut names: Vec<&str> = catalog.collection_names().collect();
         names.sort();
         let mut collections = Vec::with_capacity(names.len());
         let mut compacted = 1 + catalog.rebuilt_pages();
@@ -496,7 +496,8 @@ mod tests {
         let documents: Vec<_> = entries
             .iter()
             .map(|(_key, loc)| {
-                let (id, doc) = crate::data::get_record(&at.store, *loc).unwrap();
+                let (id, doc) =
+                    crate::data::get_record(&at.store, at.catalog.names(), *loc).unwrap();
                 (id, doc, *loc)
             })
             .collect();
@@ -523,7 +524,9 @@ mod tests {
             documents: documents.len() as u64,
             document_bytes: documents
                 .iter()
-                .map(|(_, doc, _)| crate::document::encode_stored(doc).len() as u64)
+                .map(|(_, doc, _)| {
+                    crate::document::encode_stored(doc, at.catalog.names()).len() as u64
+                })
                 .sum(),
             data_pages: data_pages.len() as u64,
             overflow_pages: chain_pages.len() as u64,

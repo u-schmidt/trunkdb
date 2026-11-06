@@ -80,7 +80,7 @@ fn rebuild(
 ) -> crate::Result<(Catalog, ScratchStore)> {
     let mut image = ScratchStore::create(scratch)?;
     let mut rebuilt = Catalog::load(&mut image)?;
-    let mut names: Vec<&str> = catalog.names().collect();
+    let mut names: Vec<&str> = catalog.collection_names().collect();
     names.sort();
     for name in names {
         let meta = *catalog.get(name).expect("a listed collection");
@@ -94,10 +94,15 @@ fn rebuild(
         // Filled in order, so no page is left with room behind: the map
         // stays empty, and the rebuilt catalog's starts empty too.
         let mut free = crate::free_space::FreeSpace::default();
-        let mut records = data::Records::new(store);
+        let mut records = data::Records::new(store, catalog.names());
         for (primary_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
             let (id, doc) = records.get(loc)?;
-            let new_loc = data::insert_record(&mut image, &mut current, &mut free, id, &doc)?;
+            // The rebuilt file's dictionary learns the names as the
+            // documents come, which stores an older document's anew.
+            rebuilt.learn(&mut image, &doc)?;
+            let names = rebuilt.names();
+            let new_loc =
+                data::insert_record(&mut image, &mut current, &mut free, id, &doc, names)?;
             primary.insert(&mut image, &primary_key, new_loc)?;
             for (entries, index) in index_entries.iter_mut().zip(indexes) {
                 for key in index_keys(&doc, index, id) {
@@ -114,7 +119,7 @@ fn rebuild(
                 rebuilt.create_index(&mut image, name, &index.fields, index.options())?;
             entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             if index.unique {
-                refuse_duplicates(&image, name, &new_index, &entries)?;
+                refuse_duplicates(&image, rebuilt.names(), name, &new_index, &entries)?;
             }
             let mut tree = BTreeIndex::new(new_index.root);
             for (key, loc) in entries {
@@ -132,6 +137,7 @@ fn rebuild(
 /// isn't compacted into another one.
 fn refuse_duplicates(
     image: &dyn PageStore,
+    names: &std::sync::Arc<crate::names::FieldNames>,
     collection: &str,
     index: &IndexMeta,
     entries: &[(Vec<u8>, RecordLocation)],
@@ -140,7 +146,7 @@ fn refuse_duplicates(
     for group in groups.filter(|group| group.len() > 1) {
         let mut seen: Vec<(crate::DocId, Vec<crate::Document>)> = Vec::new();
         for (key, loc) in group {
-            let (id, doc) = data::get_record(image, *loc)?;
+            let (id, doc) = data::get_record(image, names, *loc)?;
             // The values under this entry's key — in a multikey index,
             // some of the document's elements (SPEC §42.2), in a compound
             // one, one per field (§43.4).
@@ -465,7 +471,8 @@ mod tests {
                     catalog.free_space_mut("people"),
                     loc,
                     id,
-                    &copy
+                    &copy,
+                    &crate::names::NONE
                 )?,
                 loc
             );

@@ -113,6 +113,7 @@ impl Database {
             page_count,
             problems: Vec::new(),
             incomplete: false,
+            fields: catalog.names().clone(),
         };
         // First, so a damaged page is named as such before whatever
         // couldn't be read because of it (SPEC §40.4).
@@ -143,7 +144,7 @@ impl Database {
             Err(e) => check.unreadable(e.to_string()),
         }
 
-        let mut names: Vec<&str> = catalog.names().collect();
+        let mut names: Vec<&str> = catalog.collection_names().collect();
         names.sort();
         let mut documents = 0;
         for name in &names {
@@ -222,6 +223,9 @@ struct Check {
     problems: Vec<String>,
     /// Something couldn't be read, so the pages it owns are unknown.
     incomplete: bool,
+    /// The file's dictionary of field names, which documents are read
+    /// with.
+    fields: std::sync::Arc<crate::names::FieldNames>,
 }
 
 impl Check {
@@ -315,7 +319,7 @@ fn check_collection(
     let mut documents = 0;
     let mut unreadable = BTreeSet::new();
     let (mut on_damaged, mut on_damaged_count) = (BTreeSet::new(), 0);
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, &check.fields);
     let mut order = Order::new(format!("{name:?}'s primary index"));
     let mut walk = primary.walk(store, KeyRange::everything(), false);
     while let Some(entry) = walk.step() {
@@ -419,7 +423,7 @@ fn check_index(
     }
 
     let mut order = Order::new(format!("{name:?}'s index on {:?}", index.name()));
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, &check.fields);
     let mut right = 0;
     let mut reported = BTreeSet::new();
     // The run of right entries with one value part, of a unique index.
@@ -502,7 +506,7 @@ fn same_in_run(
     if run.len() < 2 {
         return Ok(());
     }
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, &check.fields);
     let mut seen: Vec<(DocId, Vec<Document>)> = Vec::new();
     for (id, loc) in run {
         let (_, doc) = records.get(*loc)?;
@@ -557,8 +561,8 @@ fn name_missing(
     unreadable: &BTreeSet<DocId>,
     reported: &mut BTreeSet<(DocId, DocId)>,
 ) -> std::io::Result<()> {
-    let mut records = data::Records::new(store);
-    let mut others = data::Records::new(store);
+    let mut records = data::Records::new(store, &check.fields);
+    let mut others = data::Records::new(store, &check.fields);
     let mut walk = primary.walk(store, KeyRange::everything(), false);
     while let Some(entry) = walk.step() {
         let (key, loc) = entry?;
@@ -765,7 +769,7 @@ mod tests {
         assert_eq!(report.problems, Vec::<String>::new());
         assert_eq!((report.collections, report.documents), (2, 200));
         let info = db.file_info().unwrap();
-        assert_eq!((info.format_version, info.page_size), (13, PAGE_SIZE));
+        assert_eq!((info.format_version, info.page_size), (14, PAGE_SIZE));
         assert_eq!(info.pages, report.pages);
         assert!(info.free_pages > 0, "the deletes freed pages");
 
@@ -842,7 +846,8 @@ mod tests {
             let meta = *catalog.get("people").unwrap();
             let mut current = meta.current_data_page;
             let free = catalog.free_space_mut("people");
-            let copy = data::insert_record(store, &mut current, free, id, &doc)?;
+            let copy =
+                data::insert_record(store, &mut current, free, id, &doc, &crate::names::NONE)?;
             let index = &catalog.indexes("people")[0];
             let mut tree = BTreeIndex::new(index.root);
             let key = key::secondary(crate::query::value_or_null(&doc, "age"), id).unwrap();
@@ -964,7 +969,15 @@ mod tests {
             let mut current = meta.current_data_page;
             let free = catalog.free_space_mut("users");
             assert_eq!(
-                data::update_record(store, &mut current, free, loc, id, &copy)?,
+                data::update_record(
+                    store,
+                    &mut current,
+                    free,
+                    loc,
+                    id,
+                    &copy,
+                    &crate::names::NONE
+                )?,
                 loc
             );
             let index = &catalog.indexes("users")[0];
@@ -1135,7 +1148,15 @@ mod tests {
             let mut current = meta.current_data_page;
             let free = catalog.free_space_mut("users");
             assert_eq!(
-                data::update_record(store, &mut current, free, loc, id, &copy)?,
+                data::update_record(
+                    store,
+                    &mut current,
+                    free,
+                    loc,
+                    id,
+                    &copy,
+                    &crate::names::NONE
+                )?,
                 loc
             );
             Ok(())
@@ -1167,7 +1188,15 @@ mod tests {
                 .unwrap();
             let mut current = meta.current_data_page;
             let free = catalog.free_space_mut("people");
-            let new_loc = data::update_record(store, &mut current, free, loc, id, &copy)?;
+            let new_loc = data::update_record(
+                store,
+                &mut current,
+                free,
+                loc,
+                id,
+                &copy,
+                &crate::names::NONE,
+            )?;
             assert_eq!(new_loc, loc, "it shrank, so it stays in place");
             Ok(())
         })
