@@ -1112,3 +1112,14 @@ limit, batches and a write-ahead log. Since then:
     and its text, which reads back flat, plan alike, and a hint to use
     the index is followed by both. The fuzz program found them planning
     apart; the answers were the same.
+
+    Items 140–142 → 0.33.0: **one thing to adapt:** `Batch::commit`
+    returns a `Written` where it returned `()`, so a `match` on
+    `Ok(())`, or a function returning `batch.commit()` as a
+    `Result<()>`, changes as item 140 says; `batch.commit()?;`
+    compiles as before. `Condition::Regex`, `BindError::NotAPattern`
+    and the `regex` feature are additions, to enums that were
+    `#[non_exhaustive]` already; the feature is on by default, so a
+    build gains the `regex` and `regex-syntax` crates unless it turns
+    default features off. No file format changed, so no fixture
+    (§120.9): 0.32.0 and 0.33.0 read each other's files.
