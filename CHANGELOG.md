@@ -1058,3 +1058,15 @@ limit, batches and a write-ahead log. Since then:
     `QueryPlan::IndexUnion` gains `in_order`, `true` for such a merge.
     A sort by `_id` through a compound index fixed only in part moved
     to the ROADMAP's Not planned: its keys aren't in id order.
+
+    Items 137–139 → 0.32.0: nothing breaking at compile time;
+    `verify_export`, `Verified`, `Summary::ended`, `trunkdb verify` and
+    `IndexUnion`'s `in_order` are additions, to types that were
+    `#[non_exhaustive]` already. **Changed answers:** binary compares
+    by its bytes, so `<` and ranges on it find documents they didn't,
+    and a sort puts it after date-times instead of last. **File format
+    13:** the first open of an older file rebuilds the indexes that
+    hold binary; 0.31.0 and older refuse a file 0.32.0 has written, and
+    an export of version 3, so moving back goes through an export made
+    version 2, as the guide says. With its fixture (§120.9), which
+    adds a binary index to the generator.

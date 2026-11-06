@@ -48,7 +48,7 @@ impl Numbers {
 /// What this release writes: every kind of value, documents on overflow
 /// pages, indexes of each kind, one with a branch above its leaves,
 /// deletes and updates that leave free space, and a dropped collection's
-/// pages on the free list. Kept small (SPEC §120.9): 21 pages.
+/// pages on the free list. Kept small (SPEC §120.9).
 fn write_database(path: &Path) {
     let db = Database::open(path).unwrap();
 
@@ -105,6 +105,10 @@ fn write_database(path: &Path) {
     tasks
         .ensure_index_with("owner", IndexOptions::new().sparse())
         .unwrap();
+    // Binary keys (SPEC §166), some a prefix of others, the empty one
+    // and bytes above 0x7f among them.
+    tasks.ensure_index("digest").unwrap();
+    let digests = ["", "AA==", "AAE=", "AAEC", "gA==", "f/8=", "/f7/", "/w=="];
     let statuses = ["open", "blocked", "done", "dropped"];
     // Long names, so the compound index has more than a leaf's worth of
     // entries and a branch above them, with 60 documents.
@@ -123,7 +127,7 @@ fn write_database(path: &Path) {
             _ => format!(r#", "owner": "person-{}""#, random.next(30)),
         };
         let json = format!(
-            r#"{{"n": {n}, "title": "task {n}", "status": "{}", "team": "{}", "hours": {hours}, "created": {{"$date": "2026-{:02}-{:02}T{:02}:00:00Z"}}, "tags": ["t{}", "t{}"]{owner}}}"#,
+            r#"{{"n": {n}, "title": "task {n}", "status": "{}", "team": "{}", "hours": {hours}, "created": {{"$date": "2026-{:02}-{:02}T{:02}:00:00Z"}}, "tags": ["t{}", "t{}"], "digest": {{"$binary": "{}"}}{owner}}}"#,
             statuses[random.next(4) as usize],
             teams[random.next(5) as usize],
             1 + random.next(12),
@@ -131,6 +135,7 @@ fn write_database(path: &Path) {
             random.next(24),
             random.next(10),
             random.next(10),
+            digests[random.next(8) as usize],
         );
         ids.push(tasks.insert(doc(&json)).unwrap());
     }
