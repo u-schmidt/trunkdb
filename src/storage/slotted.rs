@@ -20,6 +20,8 @@ fn min_cell(page_type: u8) -> usize {
     match page_type {
         t if t == PageType::IndexLeaf as u8 => crate::index::MIN_INDEX_ENTRY_LEN,
         t if t == PageType::IndexBranch as u8 => crate::index::MIN_BRANCH_ENTRY_LEN,
+        // The anchor: its marker byte; `check_packed` checks the rest.
+        t if t == PageType::IndexLeafPacked as u8 => 1,
         _ => 0,
     }
 }
@@ -28,7 +30,11 @@ impl PageType {
     pub fn is_slotted(&self) -> bool {
         matches!(
             self,
-            PageType::Catalog | PageType::Data | PageType::IndexBranch | PageType::IndexLeaf
+            PageType::Catalog
+                | PageType::Data
+                | PageType::IndexBranch
+                | PageType::IndexLeaf
+                | PageType::IndexLeafPacked
         )
     }
 }
@@ -158,6 +164,16 @@ impl SlottedPage {
                     format!("slot {slot} is {length} bytes, shorter than any entry"),
                 ));
             }
+        }
+        // A packed leaf's entries, against its anchor.
+        if buf[0] == PageType::IndexLeafPacked as u8 {
+            let cells = (0..slot_count).filter_map(|slot| {
+                let at = Self::slot_offset(slot);
+                let (offset, length) = (field(at) as usize, field(at + 2) as usize);
+                (length != 0).then(|| &buf[offset..offset + length])
+            });
+            crate::index::check_packed(cells)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         }
         Ok(())
     }

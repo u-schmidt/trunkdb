@@ -419,13 +419,18 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|page| SlottedPage::from_bytes(at.store.read_page(page).unwrap()).unwrap())
-            .filter(|page| page.page_type() == PageType::IndexLeaf)
-            .map(|page| page.iter_cells().count())
+            .filter(|page| page.page_type() == PageType::IndexLeafPacked)
+            // Less the anchor.
+            .map(|page| page.iter_cells().count() - 1)
             .collect();
         leaves.sort_unstable();
         let full = *leaves.last().unwrap();
         assert!(leaves.len() > 5, "{leaves:?}");
-        assert!(leaves[1..].iter().all(|&n| n == full), "{leaves:?}");
+        // Full, give or take what each key shares with its leaf's anchor.
+        assert!(
+            leaves[1..].iter().all(|&n| n * 10 >= full * 9),
+            "{leaves:?}"
+        );
     }
 
     #[test]

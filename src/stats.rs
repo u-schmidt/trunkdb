@@ -280,7 +280,7 @@ fn index_stats(
         let (key, loc) = entry?;
         entries += 1;
         key_bytes += key.len() as u64;
-        rebuilt.push(key.len());
+        rebuilt.push(&key, loc);
         visit(key.len(), loc)?;
     }
     let stats = IndexStats {
@@ -390,11 +390,11 @@ mod tests {
         let db = Database::open(path).unwrap();
         let docs = db.collection::<Document>("long");
         docs.ensure_index("key").unwrap();
-        let batch: Vec<Document> = (0..6000)
-            .map(|i| object(&[("key", Document::String(format!("{i:0>200}")))]))
-            .collect();
+        // Long keys that differ early, so a leaf's anchor saves little.
+        let key = |i: usize| Document::String(format!("{i:04}{}", "x".repeat(196)));
+        let batch: Vec<Document> = (0..6000).map(|i| object(&[("key", key(i))])).collect();
         insert_all(&db, "long", batch);
-        docs.delete_many(Filter::new().lt("key", Document::String(format!("{:0>200}", 1500))))
+        docs.delete_many(Filter::new().lt("key", key(1500)))
             .unwrap();
         db
     }
@@ -751,10 +751,14 @@ mod tests {
             let db = make(&dir.path().join("db.trunkdb"));
             let stats = db.stats().unwrap();
             let compacted = db.compact().unwrap();
-            assert_eq!(
-                (stats.file.pages, stats.compacted_pages_estimate()),
-                (compacted.pages_before, compacted.pages_after),
-                "{shape}"
+            // Packed leaves hold the old locations' varints, where the
+            // rebuild's differ a little: within a page in a hundred.
+            let estimate = stats.compacted_pages_estimate();
+            assert_eq!(stats.file.pages, compacted.pages_before, "{shape}");
+            assert!(
+                estimate.abs_diff(compacted.pages_after) <= 1 + compacted.pages_after / 100,
+                "{shape}: {estimate} for {}",
+                compacted.pages_after
             );
             // And of the compacted file, itself.
             let again = db.stats().unwrap();

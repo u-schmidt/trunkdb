@@ -107,6 +107,9 @@ pub enum PageType {
     /// Part of a document too large for one page (SPEC §26). Not a
     /// `SlottedPage`: `data.rs` owns the layout.
     Overflow = 6,
+    /// An index leaf whose keys are stored after an anchor's (file
+    /// format 14, `index/leaf.rs`).
+    IndexLeafPacked = 7,
 }
 
 impl PageType {
@@ -119,6 +122,7 @@ impl PageType {
             4 => Ok(PageType::IndexLeaf),
             5 => Ok(PageType::IndexBranch),
             6 => Ok(PageType::Overflow),
+            7 => Ok(PageType::IndexLeafPacked),
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("unknown page type tag {other} — file may be corrupt"),

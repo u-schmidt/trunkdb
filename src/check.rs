@@ -729,7 +729,7 @@ mod tests {
                 .unwrap()
         };
         let data_page = first_of(PageType::Data);
-        let index_page = first_of(PageType::IndexLeaf);
+        let index_page = first_of(PageType::IndexLeafPacked);
 
         for (page, then) in [
             (data_page, "documents can't be read, on damaged page"),
@@ -881,14 +881,7 @@ mod tests {
         assert_eq!(was.len(), now.len());
         db.transact(|catalog, store| {
             let root = catalog.indexes("people")[0].root;
-            for page_id in BTreeIndex::new(root).pages(store)? {
-                let mut page = store.read_page(page_id)?;
-                let bytes = page.make_mut();
-                if let Some(at) = bytes.windows(was.len()).position(|w| w == was) {
-                    bytes[at..at + now.len()].copy_from_slice(&now);
-                    store.write_page(page_id, page)?;
-                }
-            }
+            crate::index::rewrite_key_in_place(store, root, &was, &now)?;
             Ok(())
         })
         .unwrap();

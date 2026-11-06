@@ -12618,8 +12618,10 @@ mod tests {
         tasks.ensure_index(["tenant", "tries"]).unwrap();
         tasks.ensure_index(["tenant", "status"]).unwrap();
         let start = 1_700_000_000;
+        // Groups of (tenant, status) bigger than a packed leaf holds.
+        const N: i64 = 30_000;
         let mut batch = db.batch();
-        for n in 0..3000i64 {
+        for n in 0..N {
             let created = crate::DateTime::from_unix(start + n, 0).unwrap();
             batch
                 .insert(
@@ -12662,7 +12664,7 @@ mod tests {
         );
         assert_eq!(
             (r.stats.documents_examined, r.stats.from_entries),
-            (0, 3000),
+            (0, N as u64),
             "{r:?}"
         );
         // Per tenant, all and the running ones: `(tenant, status)`, its
@@ -12686,7 +12688,7 @@ mod tests {
         // Per status, all and those since a date: from the entries, but
         // entry by entry, as `decide_all` can't decide a leaf whose ends
         // differ in `created` (SPEC §126.4).
-        let since = crate::DateTime::from_unix(start + 2000, 0).unwrap();
+        let since = crate::DateTime::from_unix(start + N * 2 / 3, 0).unwrap();
         let recent = Aggregate::new()
             .group_by("status")
             .count()
@@ -12703,7 +12705,7 @@ mod tests {
         );
         assert_eq!(
             (r.stats.documents_examined, r.stats.from_entries, leaves),
-            (0, 3000, 0),
+            (0, N as u64, 0),
             "{r:?}"
         );
         // A condition on a field no index holds beside the others: the
@@ -12715,7 +12717,7 @@ mod tests {
             .named("mean_done");
         let (r, _) = run(Filter::new(), &done);
         assert_eq!(r.plan, QueryPlan::Scan);
-        assert_eq!(r.stats.documents_examined, 3000, "{r:?}");
+        assert_eq!(r.stats.documents_examined, N as u64, "{r:?}");
         // A condition on a string cut in its key: those entries' documents
         // only.
         let notes = db.collection::<Document>("notes");

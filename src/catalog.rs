@@ -600,7 +600,10 @@ impl Catalog {
 /// (SPEC §10.7).
 fn allocate_index_root(store: &mut dyn PageStore) -> std::io::Result<PageId> {
     let root = store.allocate_page()?;
-    store.write_page(root, SlottedPage::new(PageType::IndexLeaf).into_page())?;
+    store.write_page(
+        root,
+        SlottedPage::new(PageType::IndexLeafPacked).into_page(),
+    )?;
     Ok(root)
 }
 

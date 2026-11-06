@@ -2831,7 +2831,7 @@ mod tests {
                 apply_write_op(catalog, store, &op(i)).unwrap();
                 let now = store
                     .dirty_pages()
-                    .filter(|(_id, page)| page[0] == PageType::IndexLeaf as u8)
+                    .filter(|(_id, page)| page[0] == PageType::IndexLeafPacked as u8)
                     .count();
                 if leaves.is_some_and(|before| now > before) {
                     store.rollback();
