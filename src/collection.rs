@@ -928,30 +928,7 @@ impl Collection<Document> {
         mut change: impl FnMut(DocId, Document) -> crate::Result<Document>,
     ) -> crate::Result<usize> {
         self.db.transact(|catalog, store| {
-            // The whole documents, whatever is selected: what `change`
-            // returns is written back (SPEC §106.3).
-            let found = find_in(
-                catalog,
-                store,
-                &self.name,
-                &filter,
-                true,
-                None,
-                &Trace::default(),
-            )?;
-            let mut changed = 0;
-            for found in found {
-                let (id, old) = (found.id(), found.decode(None)?);
-                let new = with_id(change(id, old.clone())?, id);
-                // By encoding, not `==`: a NaN isn't equal to itself, and
-                // a document holding one would never count as unchanged.
-                if encode_document(&new) == encode_document(&old) {
-                    continue; // nothing to write
-                }
-                apply_write_op(catalog, store, &WriteOp::Update(self.name.clone(), id, new))?;
-                changed += 1;
-            }
-            Ok(changed)
+            update_matching_in(catalog, store, &self.name, &filter, &mut change)
         })
     }
 
@@ -962,22 +939,8 @@ impl Collection<Document> {
     /// deletes. A collection that doesn't exist has nothing to delete and
     /// isn't created.
     pub fn delete_many(&self, filter: Filter) -> crate::Result<usize> {
-        self.db.transact(|catalog, store| {
-            let doomed = find_in(
-                catalog,
-                store,
-                &self.name,
-                &filter,
-                false,
-                None,
-                &Trace::default(),
-            )?;
-            for found in &doomed {
-                let op = WriteOp::Delete(self.name.clone(), found.id());
-                apply_write_op(catalog, store, &op)?;
-            }
-            Ok(doomed.len())
-        })
+        self.db
+            .transact(|catalog, store| delete_matching_in(catalog, store, &self.name, &filter))
     }
 
     /// Every match with the id of its cell: what `find` and a sorted
@@ -1287,6 +1250,7 @@ pub(crate) fn invalid_input(message: String) -> crate::Error {
 /// that left it as it was, judged by its encoding (SPEC §68.2): for
 /// `upsert_fields` and a batch's `update_fields` (§144). `accept` may
 /// refuse the changed document; `Error::NotFound` if there's none.
+/// Whether it wrote.
 pub(crate) fn update_by_id(
     catalog: &mut Catalog,
     store: &mut dyn PageStore,
@@ -1294,7 +1258,7 @@ pub(crate) fn update_by_id(
     id: DocId,
     update: &Update,
     accept: &mut dyn FnMut(&Document) -> crate::Result<()>,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
     let (_, loc) = locate(catalog, store, collection, &id)?;
     let old = with_id(data::get_record(store, loc)?.1, id);
     let mut new = old.clone();
@@ -1308,13 +1272,80 @@ pub(crate) fn update_by_id(
     let new = with_id(new, id);
     accept(&new)?;
     if encode_document(&new) == encode_document(&old) {
-        return Ok(()); // nothing to write
+        return Ok(false); // nothing to write
     }
     apply_write_op(
         catalog,
         store,
         &WriteOp::Update(collection.to_string(), id, new),
-    )
+    )?;
+    Ok(true)
+}
+
+/// The documents `find_in` finds for `filter`, `sort`, `skip` and
+/// `limit` included, each mapped by `change` and written where that
+/// changed it, judged by its encoding; how many were. For `update_many`
+/// and `update_fields`, and a batch's `update_many` (SPEC §168).
+pub(crate) fn update_matching_in(
+    catalog: &mut Catalog,
+    store: &mut dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    change: &mut dyn FnMut(DocId, Document) -> crate::Result<Document>,
+) -> crate::Result<usize> {
+    // The whole documents, whatever is selected: what `change` returns
+    // is written back (SPEC §106.3).
+    let found = find_in(
+        catalog,
+        store,
+        collection,
+        filter,
+        true,
+        None,
+        &Trace::default(),
+    )?;
+    let mut changed = 0;
+    for found in found {
+        let (id, old) = (found.id(), found.decode(None)?);
+        let new = with_id(change(id, old.clone())?, id);
+        // By encoding, not `==`: a NaN isn't equal to itself, and a
+        // document holding one would never count as unchanged.
+        if encode_document(&new) == encode_document(&old) {
+            continue; // nothing to write
+        }
+        apply_write_op(
+            catalog,
+            store,
+            &WriteOp::Update(collection.to_string(), id, new),
+        )?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Deletes the documents `find_in` finds for `filter`, `sort`, `skip`
+/// and `limit` included; how many. For `delete_many`, and a batch's
+/// (SPEC §168).
+pub(crate) fn delete_matching_in(
+    catalog: &mut Catalog,
+    store: &mut dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+) -> crate::Result<usize> {
+    let doomed = find_in(
+        catalog,
+        store,
+        collection,
+        filter,
+        false,
+        None,
+        &Trace::default(),
+    )?;
+    for found in &doomed {
+        let op = WriteOp::Delete(collection.to_string(), found.id());
+        apply_write_op(catalog, store, &op)?;
+    }
+    Ok(doomed.len())
 }
 
 // Each match with its id, for tests that need the id of a document they

@@ -222,6 +222,28 @@ trunkdb index app.trunkdb users add email --unique
 - **An update or delete that would change every document** of a
   collection is refused unless you add `--all`. Add it only when the
   user asked for all of them.
+- **`batch`** commits several writes as one: a file of ops, or `-` for
+  stdin, one JSON object a line, all written or none. Use it when the
+  writes belong together ("mark the overdue tasks and log it"), or when
+  one must only happen if something still holds:
+
+  ```text
+  trunkdb batch app.trunkdb - --dry-run --param now='date("2026-11-06T12:00:00Z")' <<'END'
+  {"op": "require", "collection": "tasks", "filter": "due < :now and done = false"}
+  {"op": "update", "collection": "tasks", "filter": "due < :now and done = false", "update": {"$set": {"overdue": true}}}
+  {"op": "insert", "collection": "log", "document": {"what": "marked overdue tasks"}}
+  {"op": "delete", "collection": "drafts", "filter": "empty = true"}
+  END
+  ```
+
+  Each line has `op` and `collection`: `insert` takes `document`;
+  `update` takes `filter` and `update` (operators as above); `delete`
+  takes `filter`; `require` and `require_none` take `filter` and stop
+  the whole batch unless a document matches, or none does. Each op sees
+  what the lines before it wrote. An update or delete with an empty
+  filter needs `"all": true`. Run it with `--dry-run` first: it prints
+  what each line would write and writes nothing. A failure names its
+  line and writes nothing.
 - **`drop`** removes a collection with its documents and indexes; it
   can't be undone without a backup. Confirm with the user first.
 - **`index add`** on a unique index fails, and adds nothing, if two

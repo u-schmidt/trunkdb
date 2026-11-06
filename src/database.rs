@@ -843,6 +843,22 @@ impl Database {
     /// A crash before 3 completes leaves the state before; a crash after
     /// it leaves complete WAL records that `open` writes back, giving the
     /// state after. Never anything in between.
+    /// `apply` run as `transact` runs it, under the writer's lock on a
+    /// copy of the catalog, and rolled back whatever it returns: nothing
+    /// staged is logged or written, and no one hears of it (SPEC §168.4).
+    pub(crate) fn rehearse<R>(
+        &self,
+        apply: impl FnOnce(&mut Catalog, &mut FileStore) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        let mut guard = self.write()?;
+        let writer = &mut *guard;
+        let mut catalog = self.current().catalog().clone();
+        writer.store.begin();
+        let result = apply(&mut catalog, &mut writer.store);
+        writer.store.rollback();
+        result
+    }
+
     pub(crate) fn transact<R>(
         &self,
         apply: impl FnOnce(&mut Catalog, &mut FileStore) -> crate::Result<R>,
@@ -1590,7 +1606,7 @@ mod tests {
             ("an index that exists", posts.ensure_index("a").map(drop)),
             ("drop_index", posts.drop_index("a").map(drop)),
             ("drop_collection", db.drop_collection("posts").map(drop)),
-            ("batch", batch.commit()),
+            ("batch", batch.commit().map(drop)),
             ("import", db.import(&export[..]).map(drop)),
             ("compact", db.compact().map(drop)),
             ("checkpoint", db.checkpoint()),

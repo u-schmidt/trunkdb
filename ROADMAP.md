@@ -51,6 +51,7 @@ All of it is done:
 | 0.30.0 | **`starts with`:** `Filter::starts_with(field, prefix)`, `title starts with "Fix"`, a string beginning with a prefix, case counting as for `<`; read from an index as the keys beginning with the prefix, alone or after a compound index's `=`s, and decided on an entry where the key holds the prefix, so a count reads no document; **a test of a value's kind:** `Filter::is_kind(field, Kind::String)`, `hours is string` and `is not`, by the names `trunkdb fields` prints, `number` for either number, no null kind beside `is null`; `[*]` for elements; checked on the documents, never from an index; **an `in` on a compound index's field, a range per value:** `status in ("open", "late") and due < 50` on `(status, due)` reads each status's entries before 50, as `=` reads one status's, where it read each status whole; after the `=`s on the fields before it, with the `=`s and a range on the fields after it; chosen as `=` is; **the public API gone through again**, as in §118, for what came since: `Kind::ALL` a slice and `Kind::DateTime` for a date-time, so a date without a time can be added; the hook's `Commit` and `Change` no longer `Eq` (breaking), as reports aren't | §158–§161 |
 | 0.31.0 | **A batch's preconditions:** `Batch::require(&collection, filter)`, at least one document matches, and `Batch::require_none`, none does, checked at `commit` at their place in the batch, after the ops before them and under the writer's lock, so no write comes between the check and the batch's own; a failed one writes nothing and returns `Error::PreconditionFailed { collection, op, matched }`; with `Filter::id`, one document held to what was read, a version the program keeps; read as `count` reads, through an index, stopping at the first match; a sort, skip, limit or selection refused **Parameters in a filter's text:** `:name` where a value or a count stands, `status = :status limit :n`, the values passed apart so none can change what the text says; `Template<Filter>`, `Template<Condition>` and `Template<Aggregate>` read and check a text once, `bind(&Params)` makes the filter, `params()` lists the names; a missing value, an unused one or one that doesn't fit a `BindError`; `trunkdb … --param name=value` for `find`, `fields`, `count`, `aggregate`, `update` and `delete` **An OR of ids and indexed conditions:** `_id in (…) or updated > t` reads the ids from the primary index and the rest from an index range, each document once, where it was a scan; `IndexUnion` with `_id` first among its `fields`; a branch neither naming ids nor indexed, or a hint, as before | §162–§164 |
 | 0.32.0 | **Backups a user can trust:** an export ends with a line of its counts, export version 3, which an import checks, so one cut short fails instead of restoring in part; `Summary::ended`; `verify_export` and `trunkdb verify`, a restore into a file of its own, `check`ed, counted and deleted, a `Verified` report; a section of the guide on backups while running, restores, copying the file and its WAL, and moving between releases; 0.31.0 and older refuse version 3 **Binary in indexes, in the order of its bytes:** compared byte by byte as SQLite compares a BLOB, `<`, ranges and `starts with` a binary prefix, in the text as `{"$binary": …}`; sorted after date-times, where it came last with arrays and objects; an index key, so `=`, ranges, prefixes and sorts read just their entries, a count and a selection none, a unique index refusing the same bytes twice; file format 13, an older file's indexes holding binary rebuilt at its first open; on 100,000 file paths, binary instead of hex text a quarter of the file and a third of the index smaller **An OR of `Eq`s merged by id:** a sort by `_id` with a limit after an OR or an `in` whose ranges `Eq`s fix whole, one index or several, walks the ranges side by side and merges them by id, stopping at the limit, where it read every match and sorted them; `_id` comparisons narrow each range, so paging by the last id works through `tenant in (…)`; `QueryPlan::IndexUnion` says so in `in_order` | §165–§167 |
+| next | **Writes by a filter in a batch:** `Batch::update_many(&collection, filter, &update)`, the operators made to what the filter finds at `commit`, and `Batch::delete_many`, at their place among the ops, under the writer's lock, sort, skip and limit counting; `commit` returns a `Written`, how many documents each op wrote; `Batch::dry_run`, every op run and rolled back, the counts or the error `commit` would give. **`trunkdb batch <file> <ops.jsonl \| ->`:** one op a line as JSON, `insert`, `update`, `delete`, `require` and `require_none`, committed whole or not at all, with `--param`, `--create` and `--dry-run`, each new id printed, what each line wrote, and the line a failure came from | §168 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -131,16 +132,6 @@ says where the need or the limit is described.
   readings of each server", SQL's `ROW_NUMBER() OVER (PARTITION BY …)`,
   for live aggregates too: where groups report at rates far apart
   (§139.6). After `first` and `last`, which give the last one of each.
-- **A batch through the command:** `trunkdb batch <file> -`, one
-  operation a line as JSON, `insert`, `update` and `delete` by a
-  filter, `require` and `require_none`, committed whole or not at all,
-  with `--dry-run` and `--param`, and the line that failed named. For
-  it, `Batch` takes filters too: `update_many` and `delete_many` in a
-  batch, run at commit at their place in it, under the writer's lock,
-  as `require` is (§162), where its writes are by id alone today.
-  "Mark every overdue task and log that it was done" in one commit,
-  with no gap between reading and writing; each command is a batch of
-  its own today (§156).
 - **A regex:** `Filter::matches(field, pattern)`, `notes matches
   "time-?out"` in the text, `(?i)` to ignore case, the pattern a
   parameter too (§163); what a `LIKE` pattern says, a regex says, so
@@ -322,6 +313,14 @@ Built in §135–§139, as one group: the hook after each commit,
 - A batch's precondition on a count, `require_count(filter, n)`, beside
   `require` and `require_none` (§162.5), when a program needs more than
   "at least one" or "none".
+- An upsert in a batch, `Batch::upsert_fields`, and an `upsert` line
+  for `trunkdb batch` (§168.6): a `require_none` and an insert, or a
+  `require` and an `update_many`, do it in two ops today. When a
+  program needs it in one.
+- A closure in a batch's `update_many`, as `Collection::update_many`
+  takes one (§168.1): it would have to be `Send + 'static` and run with
+  every write waiting. When a program has a change no operator makes
+  and reading by id with a `require` doesn't serve.
 - A version kept by trunkdb on every document, raised by every write,
   for `require` to hold a read-modify-write to (§162.5): a format change
   and a cost to every write, where a program's own `version` field does

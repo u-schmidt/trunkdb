@@ -1,7 +1,11 @@
-use crate::collection::{Collection, any_match_in, apply_write_op, update_by_id};
+use crate::catalog::Catalog;
+use crate::collection::{
+    Collection, any_match_in, apply_write_op, delete_matching_in, update_by_id, update_matching_in,
+};
 use crate::database::Database;
 use crate::document::{DocId, Document};
 use crate::query::{Filter, Update};
+use crate::storage::PageStore;
 use crate::txn::WriteOp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -67,6 +71,45 @@ enum Op {
         filter: Filter,
         none: bool,
     },
+    /// `update`'s operators made to what `filter` finds (SPEC §168), as
+    /// the ops before leave it.
+    UpdateMany {
+        collection: String,
+        filter: Filter,
+        update: Update,
+        accept: fn(&Document) -> crate::Result<()>,
+    },
+    /// What `filter` finds deleted (SPEC §168), as the ops before leave
+    /// it.
+    DeleteMany {
+        collection: String,
+        filter: Filter,
+    },
+}
+
+/// What a batch did (SPEC §168): `Batch::commit` returns it, and
+/// `Batch::dry_run`, which writes nothing, says what it would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Written {
+    counts: Vec<usize>,
+}
+
+impl Written {
+    /// For each op, in the order they were added, how many documents it
+    /// wrote: 1 for an insert, an update or a delete by id; for
+    /// `update_fields` 1, or 0 where the operators left the document as it
+    /// was; for `update_many` the documents it changed, for `delete_many`
+    /// those it deleted; 0 for a precondition.
+    pub fn counts(&self) -> &[usize] {
+        &self.counts
+    }
+
+    /// How many documents the ops wrote, all of them together: a document
+    /// two ops wrote counts twice.
+    pub fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
 }
 
 /// The two can't overlap: `Document` isn't `Serialize`, and being local to
@@ -224,7 +267,7 @@ impl Batch {
     /// batch.update_fields(&accounts, &from, &Update::new().inc("balance", -25))?;
     /// batch.update_fields(&accounts, &to, &Update::new().inc("balance", 25))?;
     /// match batch.commit() {
-    ///     Ok(()) => {}
+    ///     Ok(_) => {}
     ///     Err(Error::PreconditionFailed { .. }) => { /* not enough left: nothing moved */ }
     ///     Err(other) => return Err(other),
     /// }
@@ -277,6 +320,70 @@ impl Batch {
         Ok(())
     }
 
+    /// Adds `update`'s operators, made at `commit` to every document of
+    /// `collection` that `filter` finds then (SPEC §168): at the op's
+    /// place, on the documents as the ops before it leave them, under the
+    /// writer's lock, so no other write comes between finding them and
+    /// changing them. As `Collection::update_fields` with a filter: its
+    /// sort, skip and limit count, "the oldest ten", and a document the
+    /// operators leave as it was isn't written. `Written::counts`
+    /// says how many were.
+    ///
+    /// An update refused as written is refused here, leaving the batch as
+    /// it was. At `commit`, an operator that can't be made fails the whole
+    /// batch (`Error::Update`), as does, on a typed collection, a changed
+    /// document that no longer converts to `T`. Finding nothing is no
+    /// error: a `require` before it says that something must be there.
+    ///
+    /// ```no_run
+    /// # fn main() -> trunkdb::Result<()> {
+    /// use trunkdb::{Database, DateTime, Document, Map, query::{Filter, Update}};
+    ///
+    /// let db = Database::open("app.trunkdb")?;
+    /// let (tasks, log) = (db.collection::<Document>("tasks"), db.collection::<Document>("log"));
+    /// let now = DateTime::now();
+    /// let overdue = Filter::new().lt("due", now).eq("done", false).eq("overdue", false);
+    /// let mut entry = Map::new();
+    /// entry.insert("at".to_string(), Document::DateTime(now));
+    /// entry.insert("what".to_string(), "marked overdue tasks".into());
+    /// let mut batch = db.batch();
+    /// batch.update_many(&tasks, overdue, &Update::new().set("overdue", true))?;
+    /// batch.insert(&log, Document::from(entry))?;
+    /// let written = batch.commit()?;
+    /// println!("{} marked", written.counts()[0]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_many<T: FromDocument>(
+        &mut self,
+        collection: &Collection<T>,
+        filter: Filter,
+        update: &Update,
+    ) -> crate::Result<()> {
+        let name = self.name_of(collection);
+        update.check().map_err(crate::collection::invalid_input)?;
+        self.ops.push(Op::UpdateMany {
+            collection: name,
+            filter,
+            update: update.clone(),
+            accept: T::accept,
+        });
+        Ok(())
+    }
+
+    /// Adds a delete of every document of `collection` that `filter`
+    /// finds at `commit` (SPEC §168), at the op's place and under the
+    /// writer's lock, as `update_many` finds them; its sort, skip and
+    /// limit count, as for `Collection::delete_many`. Finding nothing is
+    /// no error. No document is converted to `T`.
+    pub fn delete_many<T>(&mut self, collection: &Collection<T>, filter: Filter) {
+        let name = self.name_of(collection);
+        self.ops.push(Op::DeleteMany {
+            collection: name,
+            filter,
+        });
+    }
+
     /// How many ops the batch holds.
     pub fn len(&self) -> usize {
         self.ops.len()
@@ -287,44 +394,92 @@ impl Batch {
         self.ops.is_empty()
     }
 
-    /// Applies every op as one atomic, durable unit (SPEC §19.3).
-    pub fn commit(self) -> crate::Result<()> {
+    /// Applies every op as one atomic, durable unit (SPEC §19.3), and
+    /// says how many documents each wrote (SPEC §168).
+    pub fn commit(self) -> crate::Result<Written> {
         if self.ops.is_empty() {
-            return self.db.write_batch(Vec::new()); // reports a poisoned database
+            // Reports a poisoned database.
+            return self
+                .db
+                .write_batch(Vec::new())
+                .map(|()| Written { counts: Vec::new() });
         }
-        self.db.transact(|catalog, store| {
-            for (at, op) in self.ops.iter().enumerate() {
-                match op {
-                    Op::Write(write) => apply_write_op(catalog, store, write)?,
-                    // The document as the ops before left it: read here,
-                    // under the writer's lock.
-                    Op::Fields {
-                        collection,
-                        id,
-                        update,
-                        accept,
-                    } => update_by_id(catalog, store, collection, *id, update, &mut |doc| {
-                        accept(doc)
-                    })?,
-                    // The catalog and store as the ops before left them.
-                    Op::Require {
-                        collection,
-                        filter,
-                        none,
-                    } => {
-                        let matched = any_match_in(catalog, store, collection, filter)?;
-                        if matched == *none {
-                            return Err(crate::Error::PreconditionFailed {
-                                collection: collection.clone(),
-                                op: at,
-                                matched,
-                            });
-                        }
-                    }
+        self.db.transact(|catalog, store| self.run(catalog, store))
+    }
+
+    /// Runs every op as `commit` would, under the writer's lock, and
+    /// writes nothing (SPEC §168.4): what each would write, or the error
+    /// `commit` would fail with, against the database as it is now. Not a
+    /// promise: a write after it can change what `commit` finds. It waits
+    /// for the writer's lock as a commit does, and a read-only database
+    /// refuses it with `Error::ReadOnly`, as it refuses a commit.
+    pub fn dry_run(&self) -> crate::Result<Written> {
+        self.db.rehearse(|catalog, store| self.run(catalog, store))
+    }
+
+    /// The ops, in order, on the catalog and store each leaves for the
+    /// next.
+    fn run(&self, catalog: &mut Catalog, store: &mut dyn PageStore) -> crate::Result<Written> {
+        let mut counts = Vec::with_capacity(self.ops.len());
+        for (at, op) in self.ops.iter().enumerate() {
+            counts.push(match op {
+                Op::Write(write) => {
+                    apply_write_op(catalog, store, write)?;
+                    1
                 }
-            }
-            Ok(())
-        })
+                // The document as the ops before left it: read here,
+                // under the writer's lock.
+                Op::Fields {
+                    collection,
+                    id,
+                    update,
+                    accept,
+                } => usize::from(update_by_id(
+                    catalog,
+                    store,
+                    collection,
+                    *id,
+                    update,
+                    &mut |doc| accept(doc),
+                )?),
+                // The catalog and store as the ops before left them.
+                Op::Require {
+                    collection,
+                    filter,
+                    none,
+                } => {
+                    let matched = any_match_in(catalog, store, collection, filter)?;
+                    if matched == *none {
+                        return Err(crate::Error::PreconditionFailed {
+                            collection: collection.clone(),
+                            op: at,
+                            matched,
+                        });
+                    }
+                    0
+                }
+                Op::UpdateMany {
+                    collection,
+                    filter,
+                    update,
+                    accept,
+                } => update_matching_in(catalog, store, collection, filter, &mut |id, mut doc| {
+                    update
+                        .apply(&mut doc)
+                        .map_err(|message| crate::Error::Update {
+                            collection: collection.clone(),
+                            id,
+                            message,
+                        })?;
+                    accept(&doc)?;
+                    Ok(doc)
+                })?,
+                Op::DeleteMany { collection, filter } => {
+                    delete_matching_in(catalog, store, collection, filter)?
+                }
+            });
+        }
+        Ok(Written { counts })
     }
 
     /// The collection's name — after checking the handle belongs to this

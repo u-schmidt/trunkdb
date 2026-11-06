@@ -3,8 +3,9 @@
 //! sum up the fields its documents have (§121), count them and get one by
 //! id, with JSON for a program or an agent to read (§155); insert,
 //! update and delete documents, add and drop indexes, drop a collection
-//! (§156). Looking, checking, exporting, finding, summing up, counting
-//! and getting open it read-only (SPEC §88). A filter's or an
+//! (§156), and write many ops as one batch, one op a line (§168).
+//! Looking, checking, exporting, finding, summing up, counting and
+//! getting open it read-only (SPEC §88). A filter's or an
 //! aggregate's text takes parameters, their values given apart with
 //! `--param` (§163).
 //!
@@ -93,6 +94,21 @@ writing (each command is one atomic batch; the file must exist but for insert --
                               matches
   delete <file> <collection> <filter> [--all] [--dry-run]
                               delete the documents the filter finds
+  batch  <file> <ops.jsonl | -> [--create] [--dry-run]
+                              one op a line as JSON, all committed as one
+                              batch or none of them, each at its place
+                              seeing what the ones before wrote:
+                              {\"op\": \"insert\", \"collection\": \"log\", \"document\": {…}}
+                              {\"op\": \"update\", \"collection\": \"tasks\",
+                               \"filter\": \"due < :now\", \"update\": {\"$set\": …}}
+                              {\"op\": \"delete\", \"collection\": …, \"filter\": …}
+                              {\"op\": \"require\" or \"require_none\", \"collection\": …,
+                               \"filter\": …}: must find a document, or none,
+                              or nothing is written. An update or delete
+                              with an empty filter needs \"all\": true.
+                              Prints each new id; a failure names its
+                              line. --create makes missing collections;
+                              --dry-run says what it would do
   index  <file> <collection> add <field>... [--unique] [--sparse]
   index  <file> <collection> drop <field>...
                               an index on one field, or on several in order
@@ -102,7 +118,7 @@ update and delete refuse to change every document of a collection unless
 given --all; --dry-run says how many they would change, writing nothing.
 The filter is one argument: quote it, '' for none.
 
-parameters (find, fields, count, aggregate, update, delete):
+parameters (find, fields, count, aggregate, update, delete, batch):
   --param <name>=<value>      a value for `:name` in the filter or the
                               aggregate, where a value or a count stands:
                               'status = :s limit :n' --param s=open
@@ -129,7 +145,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let takes_params = ["find", "fields", "count", "aggregate", "update", "delete"];
+    let takes_params = [
+        "find",
+        "fields",
+        "count",
+        "aggregate",
+        "update",
+        "delete",
+        "batch",
+    ];
     if !given.values.is_empty() && !args.first().is_some_and(|c| takes_params.contains(c)) {
         eprintln!("trunkdb: --param: not an option of this command");
         return ExitCode::from(2);
@@ -164,6 +188,7 @@ fn main() -> ExitCode {
         ["insert", file, collection, ref rest @ ..] => insert(file, collection, rest),
         ["update", file, collection, ref rest @ ..] => update(file, collection, rest, given),
         ["delete", file, collection, ref rest @ ..] => delete(file, collection, rest, given),
+        ["batch", file, ref rest @ ..] => batch(file, rest, given),
         ["index", file, collection, "add", ref rest @ ..] => index_add(file, collection, rest),
         ["index", file, collection, "drop", ref rest @ ..] => index_drop(file, collection, rest),
         ["drop", file, collection] => drop_collection(file, collection),
@@ -1481,12 +1506,18 @@ fn insert(file: &str, collection: &str, args: &[&str]) -> Outcome {
 /// An update written as MongoDB writes one (SPEC §156.2): an object of
 /// operators, each an object of paths and what to do there.
 fn parse_update(text: &str) -> Result<trunkdb::query::Update, String> {
-    use trunkdb::query::Update;
-    const OPERATORS: &str = "$set $setOnInsert $unset $inc $mul $min $max $rename $push \
-                             $addToSet $pull $pop";
     let doc: Document = text
         .parse()
         .map_err(|e| format!("the update isn't JSON: {e}"))?;
+    update_from(doc)
+}
+
+/// An update given as a document of operators, as `parse_update` reads
+/// one: for `trunkdb batch`, where it is a value in a line (SPEC §168).
+fn update_from(doc: Document) -> Result<trunkdb::query::Update, String> {
+    use trunkdb::query::Update;
+    const OPERATORS: &str = "$set $setOnInsert $unset $inc $mul $min $max $rename $push \
+                             $addToSet $pull $pop";
     let Document::Object(ops) = doc else {
         return Err(
             r#"the update is an object of operators, like {"$set": {"status": "done"}}"#
@@ -1706,6 +1737,312 @@ fn delete(file: &str, collection: &str, args: &[&str], values: &Given) -> Outcom
     }
     let n = docs.delete_many(filter).map_err(failed)?;
     eprintln!("deleted {}", count(n, "document"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One line of `trunkdb batch` (SPEC §168), read and checked.
+enum Step {
+    Insert(Document),
+    Update(Filter, trunkdb::query::Update),
+    Delete(Filter),
+    Require(Filter, bool),
+}
+
+/// A line's op, with the collection it names and its line number.
+struct BatchOp {
+    line: usize,
+    collection: String,
+    op: Step,
+}
+
+/// `text`, a line of a batch, as an op: a JSON object with `op` and
+/// `collection`, and what that op takes. `Err(Some(why))` is a mistake
+/// to print; `Err(None)` one already printed, as `bound` prints a
+/// filter's.
+fn batch_line(text: &str, given: &Given, line: usize) -> Result<BatchOp, Option<String>> {
+    let doc: Document = text
+        .parse()
+        .map_err(|e| Some(format!("not a JSON object: {e}")))?;
+    let Document::Object(mut fields) = doc else {
+        return Err(Some(
+            r#"an op is a JSON object, like {"op": "delete", "collection": "tasks", "filter": "done = true"}"#
+                .to_string(),
+        ));
+    };
+    let mut take = |name: &str| fields.remove(name);
+    let op = match take("op") {
+        Some(Document::String(op)) => op,
+        Some(_) => return Err(Some("`op` is a string".to_string())),
+        None => {
+            return Err(Some(
+                "no `op`: one of insert, update, delete, require, require_none".to_string(),
+            ));
+        }
+    };
+    let collection = match take("collection") {
+        Some(Document::String(name)) if !name.is_empty() => name,
+        Some(_) => {
+            return Err(Some(
+                "`collection` is a collection's name, a string".to_string(),
+            ));
+        }
+        None => return Err(Some(format!("{op}: no `collection`"))),
+    };
+    let filter_text = take("filter");
+    let filter = |what: &str| -> Result<(Filter, bool), Option<String>> {
+        let text = match filter_text.clone() {
+            Some(Document::String(text)) => text,
+            Some(_) => {
+                return Err(Some(format!(
+                    "{what}: `filter` is a filter's text, a string, \"\" for none"
+                )));
+            }
+            None => {
+                return Err(Some(format!(
+                    "{what}: no `filter`; \"\" takes every document"
+                )));
+            }
+        };
+        let parsed = bound(
+            &format!("line {line}: filter"),
+            &text,
+            given,
+            Template::<Filter>::bind,
+        )
+        .map_err(|_| None)?;
+        Ok((parsed, text.trim().is_empty()))
+    };
+    let op = match op.as_str() {
+        "insert" => match take("document") {
+            Some(doc @ Document::Object(_)) => Step::Insert(doc),
+            Some(_) => return Err(Some("insert: `document` is a JSON object".to_string())),
+            None => return Err(Some("insert: no `document`".to_string())),
+        },
+        "update" | "delete" => {
+            let (parsed, empty) = filter(&op)?;
+            let all = match take("all") {
+                Some(Document::Bool(all)) => all,
+                None => false,
+                Some(_) => return Err(Some(format!("{op}: `all` is true or false"))),
+            };
+            if empty && !all {
+                return Err(Some(format!(
+                    "{op}: the filter is empty, which takes every document of {collection}; add \"all\": true if that's meant"
+                )));
+            }
+            match op.as_str() {
+                "update" => {
+                    let update = match take("update") {
+                        Some(update) => update_from(update).map_err(Some)?,
+                        None => return Err(Some(
+                            r#"update: no `update`, the operators, like {"$set": {"status": "done"}}"#
+                                .to_string(),
+                        )),
+                    };
+                    Step::Update(parsed, update)
+                }
+                _ => Step::Delete(parsed),
+            }
+        }
+        "require" | "require_none" => Step::Require(filter(&op)?.0, op == "require_none"),
+        other => {
+            return Err(Some(format!(
+                "{other}: not an op; one of insert, update, delete, require, require_none"
+            )));
+        }
+    };
+    if filter_text.is_some() && matches!(op, Step::Insert(_)) {
+        return Err(Some("insert: takes no `filter`".to_string()));
+    }
+    if let Some(name) = fields.keys().next() {
+        return Err(Some(format!("`{name}`: not a field of an op line")));
+    }
+    Ok(BatchOp {
+        line,
+        collection,
+        op,
+    })
+}
+
+/// `ops` as a batch of `db`; `Err` names the line whose op is refused as
+/// written, as a precondition with a limit is.
+fn batch_of(
+    db: &Database,
+    ops: &[BatchOp],
+) -> Result<(trunkdb::Batch, Vec<trunkdb::DocId>), String> {
+    let mut batch = db.batch();
+    let mut ids = Vec::new();
+    for op in ops {
+        let target = db.collection::<Document>(&op.collection);
+        let added = match &op.op {
+            Step::Insert(doc) => batch.insert(&target, doc.clone()).map(|id| ids.push(id)),
+            Step::Update(filter, update) => batch.update_many(&target, filter.clone(), update),
+            Step::Delete(filter) => {
+                batch.delete_many(&target, filter.clone());
+                Ok(())
+            }
+            Step::Require(filter, false) => batch.require(&target, filter.clone()),
+            Step::Require(filter, true) => batch.require_none(&target, filter.clone()),
+        };
+        added.map_err(|e| format!("line {}: {e}", op.line))?;
+    }
+    Ok((batch, ids))
+}
+
+/// The line of the op a batch failed at: a precondition's own, any other
+/// error's by dry runs of ever shorter beginnings of the batch, the
+/// first that fails ending at it. The file is locked while open (SPEC
+/// §27), so nothing else writes between them.
+fn failed_line(db: &Database, ops: &[BatchOp], error: &trunkdb::Error) -> Option<usize> {
+    if let trunkdb::Error::PreconditionFailed { op, .. } = error {
+        return ops.get(*op).map(|op| op.line);
+    }
+    // A beginning of `ok` ops runs; one of `fails` doesn't.
+    let (mut ok, mut fails) = (0, ops.len());
+    while fails - ok > 1 {
+        let mid = (ok + fails) / 2;
+        match batch_of(db, &ops[..mid]).ok()?.0.dry_run() {
+            Ok(_) => ok = mid,
+            Err(_) => fails = mid,
+        }
+    }
+    Some(ops[fails - 1].line)
+}
+
+/// `trunkdb batch` (SPEC §168): one op a line, as JSON, all committed in
+/// one batch, or none of them.
+fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
+    use std::io::BufRead;
+    let (rest, given) = match options(args, &["--create", "--dry-run"]) {
+        Ok(split) => split,
+        Err(why) => return misused(&why),
+    };
+    let [source] = rest[..] else {
+        return misused(
+            "batch takes a file of ops, one JSON object a line, or `-` for standard input",
+        );
+    };
+    let (create, dry_run) = (given.contains(&"--create"), given.contains(&"--dry-run"));
+    let lines: Box<dyn BufRead> = match source {
+        "-" if io::stdin().is_terminal() => {
+            return misused("`-` reads the ops from standard input, one per line; pipe them in");
+        }
+        "-" => Box::new(io::stdin().lock()),
+        path => match std::fs::File::open(path) {
+            Ok(opened) => Box::new(io::BufReader::new(opened)),
+            Err(e) => return Err(format!("{path}: {e}")),
+        },
+    };
+    let mut ops = Vec::new();
+    for (i, text) in lines.lines().enumerate() {
+        let text = text.map_err(|e| format!("{source}: {e}"))?;
+        if text.trim().is_empty() {
+            continue;
+        }
+        match batch_line(&text, values, i + 1) {
+            Ok(op) => ops.push(op),
+            Err(why) => {
+                if let Some(why) = why {
+                    eprintln!("trunkdb: line {}: {why}; nothing written", i + 1);
+                }
+                return Ok(ExitCode::from(2));
+            }
+        }
+    }
+    if let Some(name) = values.unused() {
+        eprintln!("trunkdb: --param {name}: no filter of the batch has the parameter :{name}");
+        return Ok(ExitCode::from(2));
+    }
+    let db = match create {
+        true => open(file)?,
+        false => existing(file)?,
+    };
+    if !create {
+        let names = db.collections().map_err(|e| e.to_string())?;
+        if let Some(op) = ops.iter().find(|op| !names.contains(&op.collection)) {
+            return Err(format!(
+                "line {}: {}: no such collection; --create makes it; nothing written",
+                op.line, op.collection
+            ));
+        }
+    }
+    if ops.is_empty() {
+        eprintln!("no ops; nothing written");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let (batch, ids) = match batch_of(&db, &ops) {
+        Ok(built) => built,
+        Err(why) => {
+            eprintln!("trunkdb: {why}; nothing written");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let outcome = match dry_run {
+        true => batch.dry_run(),
+        false => batch.commit(),
+    };
+    let written = match outcome {
+        Ok(written) => written,
+        Err(e) => {
+            let at =
+                failed_line(&db, &ops, &e).map_or(String::new(), |line| format!("line {line}: "));
+            return Err(format!("{at}{e}; nothing written"));
+        }
+    };
+    if !dry_run {
+        // The new ids, as `trunkdb insert` prints them: a script reads them.
+        let mut out = io::BufWriter::new(io::stdout().lock());
+        for id in &ids {
+            if let Err(e) = writeln!(out, "{id}") {
+                return stopped_writing(e);
+            }
+        }
+        if let Err(e) = out.flush() {
+            return stopped_writing(e);
+        }
+    }
+    let would = if dry_run { "would " } else { "" };
+    let (mut inserted, mut updated, mut deleted) = (0, 0, 0);
+    for (op, &n) in ops.iter().zip(written.counts()) {
+        let verb = match op.op {
+            Step::Insert(_) => {
+                inserted += n;
+                continue;
+            }
+            Step::Update(..) => {
+                updated += n;
+                if dry_run { "update" } else { "updated" }
+            }
+            Step::Delete(_) => {
+                deleted += n;
+                if dry_run { "delete" } else { "deleted" }
+            }
+            Step::Require(..) => continue,
+        };
+        eprintln!("line {}: {would}{verb} {}", op.line, count(n, "document"));
+    }
+    let done: Vec<String> = [
+        ("insert", "inserted", inserted),
+        ("update", "updated", updated),
+        ("delete", "deleted", deleted),
+    ]
+    .iter()
+    .filter(|(.., n)| *n > 0)
+    .map(|&(verb, past, n)| {
+        let verb = if dry_run { verb } else { past };
+        format!("{verb} {}", count(n, "document"))
+    })
+    .collect();
+    let done = match done.as_slice() {
+        [] if dry_run => "write nothing".to_string(),
+        [] => "wrote nothing".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    match dry_run {
+        true => eprintln!("{} would {done}; nothing written", count(ops.len(), "op")),
+        false => eprintln!("committed {}: {done}", count(ops.len(), "op")),
+    }
     Ok(ExitCode::SUCCESS)
 }
 

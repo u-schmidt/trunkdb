@@ -1070,3 +1070,22 @@ limit, batches and a write-ahead log. Since then:
     an export of version 3, so moving back goes through an export made
     version 2, as the guide says. With its fixture (§120.9), which
     adds a binary index to the generator.
+140. **Writes by a filter in a batch, and a batch through the command**
+    (§168): `Batch::update_many(&collection, filter, &update)` makes the
+    operators to every document the filter finds at `commit`, and
+    `Batch::delete_many` deletes them, each at its place among the ops,
+    under the writer's lock, so nothing writes between finding the
+    documents and changing them; the filter's sort, skip and limit
+    count, as for `Collection::update_fields` and `delete_many`.
+    `Batch::dry_run` runs every op and rolls it back, saying what
+    `commit` would write or how it would fail. `trunkdb batch <file>
+    <ops.jsonl | ->` reads one op a line as JSON, `insert`, `update`,
+    `delete`, `require` and `require_none`, and commits them as one
+    batch or not at all, with `--param`, `--create` and `--dry-run`; it
+    prints each new id and what each line wrote, and names the line a
+    failure came from. An update or delete with an empty filter asks
+    for `"all": true`. **One thing to adapt:** `Batch::commit` returns
+    a `Written`, how many documents each op wrote, where it returned
+    `()`. `batch.commit()?;` compiles as before; a function returning
+    `batch.commit()` as a `Result<()>` adds `.map(drop)`, and a `match`
+    on `Ok(())` reads `Ok(_)`.

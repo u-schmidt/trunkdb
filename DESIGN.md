@@ -144,8 +144,8 @@ readers don't take (`Database::transact`) [§19.3](spec/19-durability-take-two-a
 
 1. **Stage.** Every page write stays in memory, in the store's staging
    area.
-2. **Apply** the batch, its preconditions checked at their place among
-   its ops [§162](spec/162-a-batch-s-preconditions.md). On any error, the staged pages and the catalog
+2. **Apply** the batch, its preconditions checked and its writes by a
+   filter found at their place among its ops [§162](spec/162-a-batch-s-preconditions.md), [§168](spec/168-a-batch-through-the-command.md). On any error, the staged pages and the catalog
    cache are dropped: nothing reached the file, so nothing needs
    undoing [§19.5](spec/19-durability-take-two-a-page-image-wal.md).
 3. **Log** every changed page, whole, to the WAL as one record, and
@@ -655,7 +655,7 @@ more than four.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `verify`, whether an export restores [§165](spec/165-backups-a-user-can-trust.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `batch`, a file of ops, one JSON object a line, committed as one batch [§168](spec/168-a-batch-through-the-command.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `verify`, whether an export restores [§165](spec/165-backups-a-user-can-trust.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries

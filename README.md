@@ -119,6 +119,7 @@ trunkdb aggregate app.trunkdb users 'age >= 30' 'count() as n, avg(age) as mean 
 trunkdb insert app.trunkdb users '{"name": "Ada", "age": 36}'
 trunkdb update app.trunkdb users 'name = "Ada"' '{"$inc": {"age": 1}}'
 trunkdb delete app.trunkdb users 'age < 18' --dry-run
+trunkdb batch app.trunkdb ops.jsonl     # one op a line, committed whole or not at all
 trunkdb index app.trunkdb users add team age
 trunkdb drop app.trunkdb old_users
 ```

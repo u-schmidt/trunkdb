@@ -1763,3 +1763,261 @@ fn verify_says_whether_an_export_restores() {
         .collect();
     assert!(left.is_empty(), "{left:?}");
 }
+
+/// A file of tasks and a log, for `trunkdb batch` (SPEC §168).
+fn tasks_db(dir: &Path) -> String {
+    let db = path(dir, "tasks.trunkdb");
+    let tasks = "{\"title\": \"a\", \"due\": 1, \"done\": false}\n\
+                 {\"title\": \"b\", \"due\": 2, \"done\": true}\n\
+                 {\"title\": \"c\", \"due\": 9, \"done\": false}\n";
+    let made = trunkdb_with(&["insert", &db, "tasks", "-", "--create"], tasks);
+    assert!(made.status.success(), "{}", stderr(&made));
+    assert!(
+        trunkdb(&["insert", &db, "log", r#"{"what": "start"}"#, "--create"])
+            .status
+            .success()
+    );
+    db
+}
+
+const MARK_OVERDUE: &str = r#"{"op": "require", "collection": "tasks", "filter": "done = false"}
+{"op": "update", "collection": "tasks", "filter": "due < :now and done = false", "update": {"$set": {"overdue": true}}}
+{"op": "insert", "collection": "log", "document": {"what": "marked", "at": {"$date": "2026-11-06T12:00:00Z"}}}
+
+{"op": "delete", "collection": "tasks", "filter": "done = true"}
+"#;
+
+/// SPEC §168: one op a line, from a file or standard input, committed
+/// whole; what each line wrote, the new ids on standard output, and a
+/// dry run that says so and writes nothing.
+#[test]
+fn batch_commits_every_line_or_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = tasks_db(dir.path());
+    let ops = path(dir.path(), "ops.jsonl");
+    std::fs::write(&ops, MARK_OVERDUE).unwrap();
+
+    let output = trunkdb(&["batch", &db, &ops, "--dry-run", "--param", "now=5"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "line 2: would update 1 document\nline 5: would delete 1 document\n\
+         4 ops would insert 1 document, update 1 document and delete 1 document; nothing written\n"
+    );
+    assert_eq!(
+        stdout(&trunkdb(&["count", &db, "tasks", "overdue = true"])),
+        "0\n"
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &db, "log"])), "1\n");
+
+    let output = trunkdb(&["batch", &db, &ops, "--param", "now=5"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        "line 2: updated 1 document\nline 5: deleted 1 document\n\
+         committed 4 ops: inserted 1 document, updated 1 document and deleted 1 document\n"
+    );
+    let id = stdout(&output).trim().to_string();
+    let logged = stdout(&trunkdb(&["get", &db, "log", &id]));
+    assert!(logged.contains(r#""what":"marked""#), "{logged}");
+    assert!(
+        logged.contains(r#""$date""#),
+        "tags read as values: {logged}"
+    );
+    assert_eq!(
+        stdout(&trunkdb(&["count", &db, "tasks", "overdue = true"])),
+        "1\n"
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &db, "tasks"])), "2\n");
+
+    // From standard input: every task marked done, and a precondition
+    // after it that a done task breaks; the whole batch writes nothing.
+    let output = trunkdb_with(
+        &["batch", &db, "-"],
+        r#"{"op": "update", "collection": "tasks", "filter": "", "all": true, "update": {"$set": {"done": true}}}
+{"op": "insert", "collection": "log", "document": {"what": "all done"}}
+{"op": "require_none", "collection": "tasks", "filter": "done = true"}
+"#,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("trunkdb: line 3: op 2 of the batch, a precondition"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).ends_with("; nothing written\n"));
+    assert_eq!(stdout(&output), "", "no id of an insert rolled back");
+    assert_eq!(
+        stdout(&trunkdb(&["count", &db, "tasks", "done = true"])),
+        "0\n"
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &db, "log"])), "2\n");
+    assert!(trunkdb(&["check", &db]).status.success());
+}
+
+/// A failure at the commit names the line it came from, whatever the
+/// error: a unique index refusing an insert, an operator that can't be
+/// made to a document found.
+#[test]
+fn batch_names_the_line_a_commit_failed_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = tasks_db(dir.path());
+    assert!(
+        trunkdb(&["index", &db, "log", "add", "what", "--unique"])
+            .status
+            .success()
+    );
+    let insert = |what: &str| {
+        format!(r#"{{"op": "insert", "collection": "log", "document": {{"what": "{what}"}}}}"#)
+    };
+    let update = r#"{"op": "update", "collection": "tasks", "filter": "due > 0", "update": {"$inc": {"due": 1}}}"#;
+    let mut lines = Vec::new();
+    for n in 0..9 {
+        lines.push(insert(&format!("n{n}")));
+        lines.push(update.to_string());
+    }
+    lines.insert(13, insert("n2")); // line 14: n2 again
+    let output = trunkdb_with(&["batch", &db, "-"], &(lines.join("\n") + "\n"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("trunkdb: line 14: collection \"log\" has a unique index"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = trunkdb_with(
+        &["batch", &db, "-"],
+        &format!(
+            "{}\n{}\n",
+            insert("x"),
+            r#"{"op": "update", "collection": "tasks", "filter": "title = \"a\"", "update": {"$inc": {"title": 1}}}"#
+        ),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("trunkdb: line 2: "),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&trunkdb(&["count", &db, "log"])), "1\n");
+    assert_eq!(stdout(&trunkdb(&["count", &db, "tasks", "due = 1"])), "1\n");
+}
+
+/// Mistakes in the lines are found before anything is opened for
+/// writing, named with their line, exit code 2: nothing written.
+#[test]
+fn batch_names_a_mistake_in_a_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = tasks_db(dir.path());
+    let refused = |lines: &str, says: &str| {
+        let output = trunkdb_with(&["batch", &db, "-"], lines);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{lines}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(says),
+            "{lines}: {}",
+            stderr(&output)
+        );
+    };
+    let ok = r#"{"op": "insert", "collection": "log", "document": {}}"#;
+    refused(&format!("{ok}\n{{\"op\": \n"), "line 2: not a JSON object");
+    refused("[1]\n", "line 1: an op is a JSON object");
+    refused(r#"{"collection": "log"}"#, "line 1: no `op`");
+    refused(
+        r#"{"op": "upsert", "collection": "log"}"#,
+        "upsert: not an op",
+    );
+    refused(
+        r#"{"op": "insert", "document": {}}"#,
+        "insert: no `collection`",
+    );
+    refused(
+        r#"{"op": "insert", "collection": "log", "document": 1}"#,
+        "`document` is a JSON object",
+    );
+    refused(
+        r#"{"op": "insert", "collection": "log", "document": {}, "filter": ""}"#,
+        "insert: takes no `filter`",
+    );
+    refused(
+        r#"{"op": "delete", "collection": "log"}"#,
+        "delete: no `filter`",
+    );
+    refused(
+        r#"{"op": "delete", "collection": "log", "filter": " "}"#,
+        "the filter is empty, which takes every document of log; add \"all\": true",
+    );
+    refused(
+        r#"{"op": "delete", "collection": "log", "filter": "a = 1", "limit": 1}"#,
+        "`limit`: not a field of an op line",
+    );
+    refused(
+        r#"{"op": "delete", "collection": "log", "filter": "a = "}"#,
+        "line 1: filter: expected a value",
+    );
+    refused(
+        r#"{"op": "update", "collection": "log", "filter": "a = 1"}"#,
+        "update: no `update`",
+    );
+    refused(
+        r#"{"op": "update", "collection": "log", "filter": "a = 1", "update": {"a": 1}}"#,
+        "`a` isn't an operator",
+    );
+    refused(
+        r#"{"op": "require", "collection": "log", "filter": "limit 1"}"#,
+        "line 1: a precondition's filter can't have a limit",
+    );
+    refused(
+        r#"{"op": "require", "collection": "log", "filter": "a = :a"}"#,
+        "line 1: filter: no value for the parameter :a",
+    );
+    let output = trunkdb_with(&["batch", &db, "-", "--param", "b=1"], &format!("{ok}\n"));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("--param b: no filter of the batch has the parameter :b"));
+    assert_eq!(stdout(&trunkdb(&["count", &db, "log"])), "1\n");
+
+    let output = trunkdb_with(&["batch", &db, "-"], "\n\n");
+    assert!(output.status.success());
+    assert_eq!(stderr(&output), "no ops; nothing written\n");
+    let output = trunkdb(&["batch", &db, &path(dir.path(), "none.jsonl")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(trunkdb(&["batch", &db]).status.code(), Some(2));
+    assert_eq!(
+        trunkdb(&["batch", &db, "-", "--all"]).status.code(),
+        Some(2)
+    );
+}
+
+/// A collection a line names must be there, or `--create` makes it; a
+/// file that isn't there takes `--create` too.
+#[test]
+fn batch_makes_collections_only_with_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = tasks_db(dir.path());
+    let lines = r#"{"op": "insert", "collection": "notes", "document": {"a": 1}}
+{"op": "delete", "collection": "drafts", "filter": "a = 1"}
+"#;
+    let output = trunkdb_with(&["batch", &db, "-"], lines);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("line 1: notes: no such collection; --create makes it"),
+        "{}",
+        stderr(&output)
+    );
+    let output = trunkdb_with(&["batch", &db, "-", "--create"], lines);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&trunkdb(&["count", &db, "notes"])), "1\n");
+
+    let new = path(dir.path(), "new.trunkdb");
+    let output = trunkdb_with(&["batch", &new, "-"], lines);
+    assert!(stderr(&output).contains("no such file"));
+    assert!(!Path::new(&new).exists());
+    let output = trunkdb_with(&["batch", &new, "-", "--create"], lines);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&trunkdb(&["count", &new, "notes"])), "1\n");
+}

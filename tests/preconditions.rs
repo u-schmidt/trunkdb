@@ -30,7 +30,7 @@ fn field(doc: &Document, name: &str) -> i64 {
 }
 
 /// `(op, matched)` of a `PreconditionFailed`, after checking its collection.
-fn failed(result: trunkdb::Result<()>, collection: &str) -> (usize, bool) {
+fn failed<T: std::fmt::Debug>(result: trunkdb::Result<T>, collection: &str) -> (usize, bool) {
     match result {
         Err(Error::PreconditionFailed {
             collection: c,
@@ -457,7 +457,7 @@ fn concurrent_transfers_never_overdraw_and_keep_the_sum() {
                     let give = Update::new().inc("balance", amount);
                     batch.update_fields(&accounts, &to, &give).unwrap();
                     match batch.commit() {
-                        Ok(()) => {}
+                        Ok(_) => {}
                         Err(Error::PreconditionFailed { .. }) => {
                             refused.fetch_add(1, Ordering::Relaxed);
                         }
@@ -506,7 +506,7 @@ fn a_version_kept_by_the_program_loses_no_update() {
                             .unwrap();
                         batch.update(&counters, &id, written).unwrap();
                         match batch.commit() {
-                            Ok(()) => break,
+                            Ok(_) => break,
                             Err(Error::PreconditionFailed { .. }) => continue, // read again
                             Err(other) => panic!("{other}"),
                         }

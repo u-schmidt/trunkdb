@@ -225,7 +225,7 @@ let mut batch = db.batch();
 batch.require_none(&users, Filter::new().eq("email", "grace@example.com").eq("active", true))?;
 batch.insert(&users, grace)?;
 match batch.commit() {
-    Ok(()) => {}
+    Ok(_) => {}
     Err(Error::PreconditionFailed { op, .. }) => println!("op {op} no longer holds: nothing written"),
     Err(other) => return Err(other),
 }
@@ -240,6 +240,33 @@ let mut batch = db.batch();
 batch.require(&contacts, Filter::new().id(id).eq("version", read_version))?;
 batch.update(&contacts, &id, changed_with_the_next_version)?;
 batch.commit()?; // Error::PreconditionFailed if another write came first
+```
+
+A batch writes by a filter too (SPEC §168): `update_many` makes its
+operators to every document the filter finds at the commit, after the
+ops before it, and `delete_many` deletes them, so nothing writes
+between finding them and changing them. `commit` says how many
+documents each op wrote, and `dry_run` what it would, writing nothing:
+
+```rust
+let next = Filter::new().eq("state", "queued").sort_asc("at").limit(1);
+let mut batch = db.batch();
+batch.require(&jobs, Filter::new().eq("state", "queued"))?; // or nothing to take
+batch.update_many(&jobs, next, &Update::new().set("state", "taken"))?;
+batch.insert(&events, Event { user: grace, what: "took a job".into() })?;
+let written = batch.commit()?;
+assert_eq!(written.counts(), [0, 1, 1]);
+```
+
+From the command line, `trunkdb batch` commits a file of such ops, one
+JSON object a line, as one batch, and names the line a failure came
+from:
+
+```sh
+trunkdb batch app.trunkdb - --param now='date("2026-11-06T12:00:00Z")' <<'END'
+{"op": "update", "collection": "tasks", "filter": "due < :now and done = false", "update": {"$set": {"overdue": true}}}
+{"op": "insert", "collection": "log", "document": {"what": "marked overdue tasks"}}
+END
 ```
 
 ## Hearing about changes
