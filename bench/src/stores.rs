@@ -44,6 +44,9 @@ pub trait Store {
     fn by_id_after(&self, skip: usize, limit: usize) -> Vec<i64>;
     /// `created` of the tenant's first `limit` tasks in id order.
     fn tenant_by_id(&self, tenant: &str, limit: usize) -> Vec<i64>;
+    /// `created` of the tasks of either tenant in id order, after
+    /// skipping `skip`, at most `limit` (SPEC §167).
+    fn tenants_by_id(&self, tenants: [&str; 2], skip: usize, limit: usize) -> Vec<i64>;
     /// Bytes on disk.
     fn size(&self) -> u64;
     /// Rebuilds the file as small as it gets; `false` if the store
@@ -246,6 +249,16 @@ impl Store for Trunk {
         let f = Filter::new()
             .eq("tenant", tenant)
             .sort_asc("_id")
+            .limit(limit);
+        let found = self.tasks.find(f).unwrap();
+        found.iter().map(|t| t.created).collect()
+    }
+
+    fn tenants_by_id(&self, tenants: [&str; 2], skip: usize, limit: usize) -> Vec<i64> {
+        let f = Filter::new()
+            .is_in("tenant", tenants)
+            .sort_asc("_id")
+            .skip(skip)
             .limit(limit);
         let found = self.tasks.find(f).unwrap();
         found.iter().map(|t| t.created).collect()
@@ -467,6 +480,16 @@ impl Store for Sqlite {
         self.docs(
             "SELECT doc FROM tasks WHERE tenant = ? ORDER BY id LIMIT ?",
             params![tenant, limit as i64],
+        )
+        .iter()
+        .map(|t| t.created)
+        .collect()
+    }
+
+    fn tenants_by_id(&self, [a, b]: [&str; 2], skip: usize, limit: usize) -> Vec<i64> {
+        self.docs(
+            "SELECT doc FROM tasks WHERE tenant IN (?, ?) ORDER BY id LIMIT ? OFFSET ?",
+            params![a, b, limit as i64, skip as i64],
         )
         .iter()
         .map(|t| t.created)
@@ -745,6 +768,31 @@ impl Store for Redb {
             .collect()
     }
 
+    fn tenants_by_id(&self, tenants: [&str; 2], skip: usize, limit: usize) -> Vec<i64> {
+        // Each tenant's first `skip + limit` ids hold the first of both.
+        let tx = self.db.begin_read().unwrap();
+        let tasks = tx.open_table(TASKS).unwrap();
+        let index = tx.open_table(INDEXES[0]).unwrap();
+        let mut ids: Vec<Id> = Vec::new();
+        for tenant in tenants {
+            let lo = tenant_prefix(tenant);
+            let range = index.range(&lo[..]..&prefix_end(&lo)[..]).unwrap();
+            ids.extend(
+                range
+                    .take(skip + limit)
+                    .map(|entry| id_of(entry.unwrap().0.value())),
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        (ids.iter().skip(skip).take(limit))
+            .map(|id| {
+                let doc = tasks.get(&id[..]).unwrap().unwrap();
+                serde_json::from_slice::<Task>(doc.value()).unwrap().created
+            })
+            .collect()
+    }
+
     fn size(&self) -> u64 {
         file_size(&self.path)
     }
@@ -944,6 +992,24 @@ impl Store for Sled {
         self.through(0, &lo, &prefix_end(&lo), (0, limit), false)
             .iter()
             .map(|t| t.created)
+            .collect()
+    }
+
+    fn tenants_by_id(&self, tenants: [&str; 2], skip: usize, limit: usize) -> Vec<i64> {
+        // Each tenant's first `skip + limit` ids hold the first of both.
+        let mut ids: Vec<Id> = Vec::new();
+        for tenant in tenants {
+            let lo = tenant_prefix(tenant);
+            let range = self.indexes[0].range(lo.clone()..prefix_end(&lo));
+            ids.extend((range.take(skip + limit)).map(|entry| id_of(&entry.unwrap().0)));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        (ids.iter().skip(skip).take(limit))
+            .map(|id| {
+                let doc = self.tasks.get(id).unwrap().unwrap();
+                serde_json::from_slice::<Task>(&doc).unwrap().created
+            })
             .collect()
     }
 

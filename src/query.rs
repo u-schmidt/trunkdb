@@ -1486,6 +1486,12 @@ pub enum QueryPlan {
     IndexUnion {
         /// The indexes read, one per branch, named as for `Index`.
         fields: Vec<String>,
+        /// Whether the ranges are read in `_id` order side by side, and
+        /// merged by id until `limit` documents match, for a sort by
+        /// `_id` (SPEC §167): each is fixed whole by `Eq`s, so its keys
+        /// are in id order. Otherwise every document in them is read
+        /// and the matches sorted in memory.
+        in_order: bool,
     },
     /// The filter names its documents by id — `eq("_id", id)`, or an OR
     /// of such — and they are looked up in the primary index, as `get`
@@ -2099,21 +2105,11 @@ impl Filter {
     /// them by is walked instead, if `Eq`s fix every field of its index
     /// (SPEC §103): its keys then differ only in the id they end with, so
     /// they're in id order too. The `_id` comparisons narrow it the same
-    /// way, under the fixed values. Otherwise no walk, as for any sort.
+    /// way, under the fixed values. Several ranges, an OR's, are merged
+    /// instead (`merged_by_id`, SPEC §167). Otherwise no walk, as for any
+    /// sort.
     fn id_order<'a>(&self, indexes: &'a [IndexMeta]) -> Option<OrderedRead<'a>> {
-        let (ranges, mut by): (Vec<KeyRange>, Vec<Condition>) = self
-            .conditions
-            .iter()
-            .filter_map(|c| match c {
-                Condition::Compare {
-                    field,
-                    op,
-                    value: Document::Id(id),
-                } if field == ID_FIELD => Some((key::primary_range(op, *id)?, c.clone())),
-                _ => None,
-            })
-            .unzip();
-        let on_id = ranges.into_iter().reduce(KeyRange::intersect);
+        let (on_id, mut by) = self.on_id();
         if !self.found_by_value(ID_FIELD, indexes) {
             if !self.primary_offered() {
                 return None; // hinted to an index it can't walk (SPEC §132.2)
@@ -2141,6 +2137,73 @@ impl Filter {
         })
     }
 
+    /// The `_id` comparisons with an id, as one range of the primary
+    /// index (`key::primary_range`, exact for whole ids, SPEC §96.2),
+    /// and the comparisons: what narrows a walk by id.
+    fn on_id(&self) -> (Option<KeyRange>, Vec<Condition>) {
+        let (ranges, by): (Vec<KeyRange>, Vec<Condition>) = self
+            .conditions
+            .iter()
+            .filter_map(|c| match c {
+                Condition::Compare {
+                    field,
+                    op,
+                    value: Document::Id(id),
+                } if field == ID_FIELD => Some((key::primary_range(op, *id)?, c.clone())),
+                _ => None,
+            })
+            .unzip();
+        (ranges.into_iter().reduce(KeyRange::intersect), by)
+    }
+
+    /// The ranges a sort by `_id` merges (SPEC §167): where the range
+    /// read takes several, an OR's or an `in`'s, and `Eq`s fix every
+    /// field of each one's index. Each then holds its keys in id order
+    /// (§103.1), so they're walked side by side and merged by id, and
+    /// the walk stops at the limit. The `_id` comparisons with an id
+    /// narrow each under its fixed values (§103.3), and join its `by`.
+    ///
+    /// `None` where `index_order` walks, where the reads look up ids
+    /// beside the ranges (§164), or where any range is fixed only in
+    /// part: its keys are then in the order of the fields after, not of
+    /// the ids.
+    pub(crate) fn merged_by_id<'a>(&self, indexes: &'a [IndexMeta]) -> Option<Vec<IndexRange<'a>>> {
+        if self.by_key.is_some() || self.limit.is_none() || self.ids().is_some() {
+            return None;
+        }
+        if self.sort.first()?.field != ID_FIELD {
+            return None;
+        }
+        let ranges = self.index_ranges(indexes)?;
+        if ranges.len() < 2 {
+            return None; // one range: `index_order` walks it, or nothing
+        }
+        let (on_id, by_id) = self.on_id();
+        ranges
+            .into_iter()
+            .map(|read| {
+                let fields = read.index.fields.len();
+                // A range's `by` is what it comes from: where its `Eq`s
+                // fix every field, every key in it starts with `prefix`.
+                let (prefix, equal, _) = equal_prefix(read.index, &read.by, fields);
+                if equal != fields {
+                    return None;
+                }
+                let range = match &on_id {
+                    Some(on_id) => read.range.intersect(on_id.clone().under(&prefix)),
+                    None => read.range,
+                };
+                let mut by = read.by;
+                by.extend(by_id.iter().cloned());
+                Some(IndexRange {
+                    index: read.index,
+                    range,
+                    by,
+                })
+            })
+            .collect()
+    }
+
     /// The index the range read takes (`index_ranges`), if that is one
     /// range and an `Eq` fixes each of the index's fields (SPEC §103.2):
     /// walked, it reads what the range read would, in id order. Never
@@ -2148,7 +2211,7 @@ impl Filter {
     fn fixed_whole<'a>(&self, indexes: &'a [IndexMeta]) -> Option<&'a IndexMeta> {
         let ranges = self.index_ranges(indexes)?;
         let [read] = &ranges[..] else {
-            return None; // an OR: several ranges, each in id order
+            return None; // an OR: several ranges, merged (`merged_by_id`)
         };
         // A sparse one only where the conditions keep its nulls out
         // (§44): `index_ranges` checked.
@@ -2391,7 +2454,23 @@ pub(crate) struct Decider<'a> {
     decided: Option<bool>,
 }
 
+/// The last decision a `Decider` takes again (§101.2), kept apart: a
+/// merge of several ranges decides each range's entries with one decider
+/// and keeps one of these per range, swapped in while its entry is
+/// decided (SPEC §167), since the ranges' entries interleave.
+#[derive(Default)]
+pub(crate) struct LastDecision {
+    key: Vec<u8>,
+    decided: Option<bool>,
+}
+
 impl Decider<'_> {
+    /// Swaps the last decision this decider takes again with `other`.
+    pub fn swap_last(&mut self, other: &mut LastDecision) {
+        std::mem::swap(&mut self.last, &mut other.key);
+        std::mem::swap(&mut self.decided, &mut other.decided);
+    }
+
     /// `Covering::decide` on `key`, or the last decision where `key`
     /// agrees with it.
     pub fn decide(&mut self, key: &[u8]) -> Option<bool> {

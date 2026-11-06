@@ -114,6 +114,8 @@ struct Answers {
     page: Vec<i64>,
     by_id_after: Vec<i64>,
     tenant_by_id: Vec<i64>,
+    tenants_by_id: Vec<i64>,
+    tenants_page: Vec<i64>,
 }
 
 fn main() {
@@ -318,6 +320,42 @@ fn main() {
             "tenant == x by id, first 20",
             Unit::Micros,
             micros(tenants.len(), took),
+        );
+        let (took, first) = time(|| {
+            (0..100)
+                .map(|k| {
+                    let (a, b) = (
+                        format!("t{}", k * 37 % 100),
+                        format!("t{}", (k * 37 + 50) % 100),
+                    );
+                    store.tenants_by_id([&a, &b], 0, 20)
+                })
+                .last()
+                .unwrap_or_default()
+        });
+        answer.tenants_by_id = first;
+        record(
+            "tenant in (x, y) by id, first 20",
+            Unit::Micros,
+            micros(100, took),
+        );
+        let (took, page) = time(|| {
+            (0..100)
+                .map(|k| {
+                    let (a, b) = (
+                        format!("t{}", k * 37 % 100),
+                        format!("t{}", (k * 37 + 50) % 100),
+                    );
+                    store.tenants_by_id([&a, &b], 480, 20)
+                })
+                .last()
+                .unwrap_or_default()
+        });
+        answer.tenants_page = page;
+        record(
+            "tenant in (x, y) by id, page 25 of 20",
+            Unit::Micros,
+            micros(100, took),
         );
 
         let changed: Vec<(Id, Task)> = (0..10_000)

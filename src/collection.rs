@@ -9,8 +9,8 @@ use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::live::{LiveAggregate, LiveQuery};
 use crate::query::{
-    Condition, Covering, Decider, Explained, Filter, OrderedRead, QueryPlan, Rank, Ranking,
-    SortOrder, SortWork, Update, caught,
+    Condition, Covering, Decider, Explained, Filter, IndexRange, LastDecision, Matcher,
+    OrderedRead, QueryPlan, Rank, Ranking, SortOrder, SortWork, Update, caught,
 };
 use crate::select::{Answer, Selection};
 use crate::storage::{PageId, PageStore, RecordLocation};
@@ -576,7 +576,12 @@ impl<T> Collection<T> {
         let sort = match filter.sort.len() + usize::from(filter.by_key.is_some()) {
             0 => None,
             keys => {
-                let from_index = filter.index_order(indexes).map_or(0, |order| order.served);
+                let from_index = match filter.index_order(indexes) {
+                    Some(order) => order.served,
+                    // Merged by id, which no two documents share (§167).
+                    None if filter.merged_by_id(indexes).is_some() => filter.sort.len(),
+                    None => 0,
+                };
                 Some(SortWork {
                     from_index,
                     in_memory: keys - from_index,
@@ -1355,6 +1360,12 @@ fn plan_for(filter: &Filter, indexes: &[IndexMeta]) -> QueryPlan {
             field: order.name(),
         };
     }
+    if let Some(ranges) = filter.merged_by_id(indexes) {
+        return QueryPlan::IndexUnion {
+            fields: ranges.iter().map(|range| range.index.name()).collect(),
+            in_order: true,
+        };
+    }
     match filter.index_reads(indexes) {
         None => QueryPlan::Scan,
         Some(reads) => match (&reads.ids[..], &reads.ranges[..]) {
@@ -1369,6 +1380,7 @@ fn plan_for(filter: &Filter, indexes: &[IndexMeta]) -> QueryPlan {
                     .into_iter()
                     .chain(ranges.iter().map(|range| range.index.name()))
                     .collect(),
+                in_order: false,
             },
         },
     }
@@ -1472,9 +1484,15 @@ fn would_read(
             let all = vec![(meta.index_root, KeyRange::everything())];
             (counted(all)?, checks(None))
         }
-        QueryPlan::IndexOrder { .. } => {
-            let order = filter.index_order(indexes).expect("a walk's plan");
-            let reads = checks(order.index);
+        QueryPlan::IndexOrder { .. } | QueryPlan::IndexUnion { in_order: true, .. } => {
+            let reads = match filter.index_order(indexes) {
+                Some(order) => checks(order.index),
+                None => {
+                    let ranges = filter.merged_by_id(indexes).expect("a merge's plan");
+                    let first = ranges[0].index;
+                    !ranges.iter().all(|r| std::ptr::eq(r.index, first)) || checks(Some(first))
+                }
+            };
             let trace = Trace::with_budget(read);
             find_in(catalog, store, collection, filter, false, None, &trace)?;
             let entries = match trace.spent() {
@@ -1591,6 +1609,14 @@ fn find_in(
         // The skipped matches are passed over by the walk (SPEC §72),
         // unread where their entries decided (§100), and not kept (§101).
         let found = walk_in_index_order(catalog, store, collection, filter, order, select, trace)?;
+        return found
+            .into_iter()
+            .map(|(source, _fields)| Ok(source.found(&mut records, None, trace)?))
+            .collect();
+    }
+    if let Some(ranges) = filter.merged_by_id(indexes) {
+        // An OR's ranges, each in id order, merged by id (SPEC §167).
+        let found = walk_merged_by_id(store, filter, ranges, select, trace)?;
         return found
             .into_iter()
             .map(|(source, _fields)| Ok(source.found(&mut records, None, trace)?))
@@ -2114,45 +2140,19 @@ fn walk_in_index_order(
     // A match its entry decided, and kept for the page, is answered from
     // its entry where it can be (SPEC §106.5).
     let fields_of = order.index.map_or(&[][..], |index| &index.fields[..]);
-    let answer = select
-        .filter(|_| decider.is_some())
-        .and_then(|select| Answer::new(select, fields_of));
-    let matcher = filter.matcher();
+    let hand = HandOut {
+        answer: select
+            .filter(|_| decider.is_some())
+            .and_then(|select| Answer::new(select, fields_of)),
+        matcher: filter.matcher(),
+        trace,
+    };
     let mut records = data::Records::new(store);
     let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
         trace.examined();
         let stored = records.stored(*loc)?;
         let fields = stored.fields(names.as_deref())?;
         Ok((Source::Read(stored), fields))
-    };
-    // One entry of an exact group, handed out in order: decided by its
-    // entry where it can be, else read and checked. `true` once the page
-    // is full.
-    let one = |key: &[u8],
-               loc: RecordLocation,
-               decider: &mut Option<Decider>,
-               read: &mut dyn FnMut(&RecordLocation) -> std::io::Result<Candidate>,
-               page: &mut Page|
-     -> crate::Result<bool> {
-        let (source, doc) = match decider.as_mut().and_then(|d| d.decide(key)) {
-            Some(false) => return Ok(false),
-            Some(true) => {
-                let id = key::doc_id(key);
-                let answered = (answer.as_ref())
-                    .filter(|_| page.keeps())
-                    .and_then(|answer| answer.entry(key));
-                match answered {
-                    Some(selected) => (Source::Answered(id, selected), Document::Null),
-                    None => (Source::Entry(id, loc, None), Document::Null),
-                }
-            }
-            None => read(&loc)?,
-        };
-        if !source.decided() && !matcher.matches(&doc)? {
-            return Ok(false);
-        }
-        trace.matched(1);
-        Ok(page.push((source, doc)))
     };
     // Hands out one collected group's matches; `true` once the page is
     // full.
@@ -2166,7 +2166,7 @@ fn walk_in_index_order(
         group.sort_by_key(|(key, _)| key::doc_id(key));
         if spans.exact(&group[0].0) && !in_memory {
             for (key, loc) in group.iter() {
-                if one(key, *loc, decider, read, page)? {
+                if hand.one(key, *loc, decider, read, page)? {
                     return Ok(true);
                 }
             }
@@ -2248,7 +2248,7 @@ fn walk_in_index_order(
             break;
         };
         if direct && group.is_empty() && spans.exact(key) {
-            if one(key, loc, &mut decider, &mut read, &mut page)? {
+            if hand.one(key, loc, &mut decider, &mut read, &mut page)? {
                 return Ok(page.results);
             }
             continue;
@@ -2284,7 +2284,7 @@ fn walk_in_index_order(
         for (_key, loc) in primary {
             let (id, doc) = read(&loc)?;
             let value = crate::query::value_or_null(&doc, &first.field);
-            if crate::query::is_unordered(value) && matcher.matches(&doc)? {
+            if crate::query::is_unordered(value) && hand.matcher.matches(&doc)? {
                 trace.matched(1);
                 unordered.push((id, doc));
                 // Without keys after the first, id order is their order.
@@ -2306,6 +2306,198 @@ fn walk_in_index_order(
         }
     }
     Ok(page.results)
+}
+
+/// Hands out a walk's entries one by one, in order (SPEC §101.5): each
+/// decided by its entry where it can be, else read and checked; a match
+/// decided and kept answered from its entry where it can be (§106.5).
+struct HandOut<'a> {
+    answer: Option<Answer>,
+    matcher: Matcher<'a>,
+    trace: &'a Trace,
+}
+
+impl HandOut<'_> {
+    /// One entry of an exact group: `true` once the page is full.
+    fn one(
+        &self,
+        key: &[u8],
+        loc: RecordLocation,
+        decider: &mut Option<Decider>,
+        read: &mut dyn FnMut(&RecordLocation) -> std::io::Result<Candidate>,
+        page: &mut Page,
+    ) -> crate::Result<bool> {
+        let (source, doc) = match decider.as_mut().and_then(|d| d.decide(key)) {
+            Some(false) => return Ok(false),
+            Some(true) => {
+                let id = key::doc_id(key);
+                let answered = (self.answer.as_ref())
+                    .filter(|_| page.keeps())
+                    .and_then(|answer| answer.entry(key));
+                match answered {
+                    Some(selected) => (Source::Answered(id, selected), Document::Null),
+                    None => (Source::Entry(id, loc, None), Document::Null),
+                }
+            }
+            None => read(&loc)?,
+        };
+        if !source.decided() && !self.matcher.matches(&doc)? {
+            return Ok(false);
+        }
+        self.trace.matched(1);
+        Ok(page.push((source, doc)))
+    }
+}
+
+/// The ranges of an OR, or an `in`, each fixed whole by `Eq`s, walked
+/// side by side for a sort by `_id` (SPEC §167): each holds its keys in
+/// id order (§103.1), so the next document in the sort is the next
+/// entry of one of them. The walk takes the least id of their next
+/// entries (the greatest, backward), hands it out as a walk by id does
+/// (§103.4), and steps that range on, until `limit` documents match. A
+/// document in two ranges comes out of both at once, one after the
+/// other: handed out once.
+///
+/// Entries decide (§100) only where every range is of one index: a
+/// decider reads a key as its index lays it out. Each range keeps its
+/// own last decision, so that one decision covers a range's entries as
+/// it covers a walk's (§101.2). No leaf is passed whole
+/// (§101.3): the next entry may be in another range.
+fn walk_merged_by_id(
+    store: &dyn PageStore,
+    filter: &Filter,
+    ranges: Vec<IndexRange>,
+    select: Option<&Selection>,
+    trace: &Trace,
+) -> crate::Result<Vec<Candidate>> {
+    let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
+        unreachable!("merged_by_id needs a sort and a limit");
+    };
+    let mut page = Page {
+        results: Vec::new(),
+        skipped: 0,
+        skip: filter.skip,
+        limit,
+    };
+    if limit == 0 {
+        return Ok(page.results);
+    }
+    let backward = first.order == SortOrder::Desc;
+    let one_index = ranges
+        .iter()
+        .all(|read| std::ptr::eq(read.index, ranges[0].index))
+        .then(|| ranges[0].index);
+    let mut decider = one_index
+        .and_then(|index| Covering::new(filter, Some(index), false))
+        .map(|c| c.decider(filter));
+    let covering = decider.is_some();
+    // Each range's last decision: a decider takes it again where the
+    // next key's deciding bytes agree with it (§101.2), as they do within
+    // a range fixed by `Eq`s, not across two whose entries interleave.
+    // One decider for all, as building one compiles the whole filter.
+    let mut lasts: Vec<LastDecision> = (0..ranges.len()).map(|_| LastDecision::default()).collect();
+    let hand = HandOut {
+        answer: one_index
+            .zip(select)
+            .filter(|_| covering)
+            .and_then(|(index, select)| Answer::new(select, &index.fields)),
+        matcher: filter.matcher(),
+        trace,
+    };
+    let mut walks = Vec::with_capacity(ranges.len());
+    for read in ranges {
+        let at = trace.read(read.index.name(), read.by, backward);
+        if covering {
+            trace.covering(at);
+        }
+        walks.push((
+            BTreeIndex::new(read.index.root).walk(store, read.range, backward),
+            at,
+        ));
+    }
+    // A walk by id gives the whole order: only the conditions' fields
+    // are looked at (§103.4).
+    let names = filter.fields_with(false);
+    let mut records = data::Records::new(store);
+    let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
+        trace.examined();
+        let stored = records.stored(*loc)?;
+        let fields = stored.fields(names.as_deref())?;
+        Ok((Source::Read(stored), fields))
+    };
+    // Each range's next entry, and the ranges by it, the next in the sort
+    // on top.
+    let mut next: Vec<Option<(Vec<u8>, RecordLocation)>> = vec![None; walks.len()];
+    let mut heads = std::collections::BinaryHeap::with_capacity(walks.len());
+    let mut step = |source: usize,
+                    next: &mut [Option<(Vec<u8>, RecordLocation)>],
+                    heads: &mut std::collections::BinaryHeap<Head>|
+     -> std::io::Result<()> {
+        let (walk, at) = &mut walks[source];
+        if let Some((key, loc)) = walk.step().transpose()? {
+            trace.entries(*at, 1);
+            #[cfg(test)]
+            crate::index::KEYS_COPIED.with(|n| n.set(n.get() + 1));
+            heads.push(Head {
+                id: key::doc_id(key),
+                source,
+                backward,
+            });
+            next[source] = Some((key.to_vec(), loc));
+        }
+        Ok(())
+    };
+    for source in 0..next.len() {
+        step(source, &mut next, &mut heads)?;
+    }
+    let mut last: Option<DocId> = None;
+    while let Some(head) = heads.pop() {
+        if trace.spent() {
+            return Ok(page.results); // an alternative's budget (SPEC §133.4)
+        }
+        let (key, loc) = next[head.source].take().expect("a head has its entry");
+        if last != Some(head.id) {
+            last = Some(head.id);
+            if let Some(decider) = decider.as_mut() {
+                decider.swap_last(&mut lasts[head.source]);
+            }
+            let full = hand.one(&key, loc, &mut decider, &mut read, &mut page)?;
+            if let Some(decider) = decider.as_mut() {
+                decider.swap_last(&mut lasts[head.source]);
+            }
+            if full {
+                return Ok(page.results);
+            }
+        }
+        step(head.source, &mut next, &mut heads)?;
+    }
+    Ok(page.results)
+}
+
+/// A range's next entry in a merge by id (`walk_merged_by_id`): ordered
+/// so that the heap's top is the next in the walk's direction, the least
+/// id forward and the greatest backward.
+#[derive(PartialEq, Eq)]
+struct Head {
+    id: DocId,
+    source: usize,
+    backward: bool,
+}
+
+impl Ord for Head {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let order = self.id.cmp(&other.id).then(other.source.cmp(&self.source));
+        match self.backward {
+            true => order,
+            false => order.reverse(),
+        }
+    }
+}
+
+impl PartialOrd for Head {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// The page `walk_in_index_order` hands out (SPEC §101.5): matches in
@@ -5986,11 +6178,15 @@ mod tests {
                 field: field("group")
             }
         );
+        // Each branch's range in id order, merged (SPEC §167).
         let either = [Condition::eq("group", 1), Condition::eq("n", 2)];
         let fields = vec![field("group"), field("n")];
         assert_eq!(
             by_id(Filter::new().any_of(either)),
-            QueryPlan::IndexUnion { fields }
+            QueryPlan::IndexUnion {
+                fields,
+                in_order: true
+            }
         );
         let range = Filter::new().gt("n", 10);
         assert_eq!(
@@ -6387,7 +6583,7 @@ mod tests {
         let matching = docs.count(unlimited).unwrap() as u64;
         match plan {
             // Stops once it has skip plus limit.
-            QueryPlan::IndexOrder { .. } => {
+            QueryPlan::IndexOrder { .. } | QueryPlan::IndexUnion { in_order: true, .. } => {
                 let wanted = match f.limit.unwrap() {
                     0 => 0, // reads nothing at all
                     limit => (f.skip as u64).saturating_add(limit as u64),
@@ -6406,7 +6602,10 @@ mod tests {
                 assert!(names.is_empty() || names == ["_id"], "{f:?}: {run:?}");
             }
             QueryPlan::Index { field } => assert_eq!(names, [field.as_str()]),
-            QueryPlan::IndexUnion { fields } => assert_eq!(names, *fields),
+            QueryPlan::IndexUnion { in_order: true, .. } if f.limit == Some(0) => {
+                assert!(names.is_empty())
+            }
+            QueryPlan::IndexUnion { fields, .. } => assert_eq!(names, *fields),
             QueryPlan::IndexOrder { .. } if f.limit == Some(0) => assert!(names.is_empty()),
             QueryPlan::IndexOrder { field } => {
                 assert_eq!(names[0], field);
@@ -6436,7 +6635,10 @@ mod tests {
             None => assert!(f.sort.is_empty()),
             Some(sort) => {
                 assert_eq!(sort.from_index + sort.in_memory, f.sort.len());
-                let ordered = matches!(plan, QueryPlan::IndexOrder { .. });
+                let ordered = matches!(
+                    plan,
+                    QueryPlan::IndexOrder { .. } | QueryPlan::IndexUnion { in_order: true, .. }
+                );
                 assert_eq!(sort.from_index > 0, ordered, "{f:?}: {run:?}");
             }
         }
@@ -7997,6 +8199,383 @@ mod tests {
         assert_eq!(run.stats.documents_returned, 20);
     }
 
+    /// SPEC §167: a sort by `_id` after an OR or an `in` of `Eq`s, each
+    /// fixing its index whole — one field, compound or multikey, one
+    /// index or several — merges the ranges by id and gives what sorting
+    /// every match in memory gives: with values that share an encoding,
+    /// a document in several ranges, the same value twice, `_id`
+    /// comparisons, a second sort key and skips of every size, through
+    /// every kind of write.
+    #[test]
+    fn an_or_of_eqs_merged_by_id_gives_what_a_sort_in_memory_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("t").unwrap();
+        docs.ensure_index(["t", "u"]).unwrap();
+        docs.ensure_index("tags[*]").unwrap();
+        let long = |end: &str| Document::from("b".to_string() + &"x".repeat(3000) + end);
+        let values = [
+            "a".into(),
+            "b".into(),
+            long("1"),
+            long("2"),
+            Document::Int(1 << 60),
+            Document::Int((1 << 60) + 1),
+            Document::Int(5),
+            Document::Float(5.0),
+            Document::Null,
+        ];
+        let mut rng = XorShift(0x0167_3E3E_0167_3E3E);
+        let random_doc = |rng: &mut XorShift| {
+            let mut fields = Vec::new();
+            if rng.below(8) != 0 {
+                fields.push(("t", values[rng.below(values.len())].clone()));
+            }
+            if rng.below(5) != 0 {
+                fields.push(("u", Document::Int(rng.below(3) as i64)));
+            }
+            if rng.below(3) != 0 {
+                let tags = (0..rng.below(4))
+                    .map(|_| values[rng.below(values.len())].clone())
+                    .collect();
+                fields.push(("tags", Document::Array(tags)));
+            }
+            fields.push(("c", Document::Int(rng.below(3) as i64)));
+            object(fields)
+        };
+        let ops = (0..3000)
+            .map(|_| WriteOp::Insert("docs".into(), db.id_gen().generate(), random_doc(&mut rng)))
+            .collect();
+        db.write_batch(ops).unwrap();
+        let merged = std::cell::Cell::new(0);
+        let check = |docs: &Collection<Document>, rng: &mut XorShift| {
+            let mut all = docs.find_with_ids(Filter::default()).unwrap();
+            all.sort_by_key(|(id, _doc)| *id);
+            let ids: Vec<DocId> = all.iter().map(|(id, _)| *id).collect();
+            for _ in 0..150 {
+                let value = |rng: &mut XorShift| values[rng.below(values.len())].clone();
+                let branch = |rng: &mut XorShift| match rng.below(3) {
+                    0 => Condition::eq("t", value(rng)),
+                    1 => Condition::eq("t", value(rng)) & Condition::eq("u", rng.below(3) as i64),
+                    _ => Condition::eq("tags[*]", value(rng)),
+                };
+                let mut f = match rng.below(3) {
+                    0 => Filter::new().is_in("t", (0..2 + rng.below(3)).map(|_| value(rng))),
+                    1 => Filter::new().is_in("tags[*]", (0..2 + rng.below(3)).map(|_| value(rng))),
+                    _ => Filter::new().any_of((0..2 + rng.below(3)).map(|_| branch(rng))),
+                };
+                if rng.below(3) == 0 {
+                    let id = Document::Id(ids[rng.below(ids.len())]);
+                    let ops = [Op::Gt, Op::Gte, Op::Lt, Op::Lte, Op::Ne];
+                    f = f.and(Condition::Compare {
+                        field: "_id".into(),
+                        op: ops[rng.below(ops.len())].clone(),
+                        value: id,
+                    });
+                    if rng.below(3) == 0 {
+                        let other = Document::Id(ids[rng.below(ids.len())]);
+                        f = f.and(Condition::Compare {
+                            field: "_id".into(),
+                            op: ops[rng.below(4)].clone(),
+                            value: other,
+                        });
+                    }
+                }
+                if rng.below(4) == 0 {
+                    f = f.eq("c", rng.below(3) as i64);
+                }
+                f = f.then_by("_id", [SortOrder::Asc, SortOrder::Desc][rng.below(2)]);
+                if rng.below(4) == 0 {
+                    f = f.then_desc("u");
+                }
+                let skip = match rng.below(3) {
+                    0 => 0,
+                    1 => rng.below(10),
+                    _ => rng.below(400),
+                };
+                let f = f.skip(skip).limit([1, 7, 50][rng.below(3)]);
+                let expected: Vec<DocId> = f
+                    .apply_to(all.clone(), |(_, doc)| doc)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                let plan = explained(docs, &f);
+                if matches!(&plan, QueryPlan::IndexUnion { in_order: true, .. }) {
+                    merged.set(merged.get() + 1);
+                }
+                let found: Vec<DocId> = docs
+                    .find_with_ids(f.clone())
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                assert_eq!(found, expected, "{f:?} via {plan:?}");
+                assert_eq!(typed_ids(docs, &f), expected, "typed: {f:?}");
+                selection_agrees(docs, &f, rng);
+                aggregate_agrees(docs, &f, rng);
+            }
+        };
+        check(&docs, &mut rng);
+        for round in 0..4 {
+            let mut ids: Vec<DocId> = docs
+                .find_with_ids(Filter::default())
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort();
+            match round {
+                0 => {
+                    let ops = (0..500)
+                        .map(|_| {
+                            WriteOp::Insert(
+                                "docs".into(),
+                                db.id_gen().generate(),
+                                random_doc(&mut rng),
+                            )
+                        })
+                        .collect();
+                    db.write_batch(ops).unwrap();
+                }
+                1 => {
+                    let ops = (0..300)
+                        .map(|_| ids[rng.below(ids.len())])
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .map(|id| WriteOp::Update("docs".into(), id, random_doc(&mut rng)))
+                        .collect();
+                    db.write_batch(ops).unwrap();
+                }
+                2 => {
+                    let ops = (0..300)
+                        .map(|_| ids[rng.below(ids.len())])
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .map(|id| WriteOp::Delete("docs".into(), id));
+                    db.write_batch(ops.collect()).unwrap();
+                }
+                _ => {
+                    let update = crate::query::Update::new().set("t", "a").set("u", 2);
+                    docs.update_fields(Filter::new().eq("c", 1), &update)
+                        .unwrap();
+                }
+            }
+            check(&docs, &mut rng);
+        }
+        assert!(merged.get() > 500, "{}", merged.get());
+        assert_consistent(&db);
+        drop((docs, db));
+        let db = Database::open(&path).unwrap();
+        check(&db.collection("docs"), &mut rng);
+    }
+
+    /// SPEC §167: "the newest 20 of two tenants" merges the two ranges
+    /// by id from their ends and reads 20 entries and two more, and 20
+    /// documents; a deep page reads only its own documents; paging by
+    /// the last id starts each range after it; ranges of two indexes
+    /// merge too, without deciding; a compound index fixed in part, or
+    /// ids beside the ranges, still sort in memory.
+    #[test]
+    fn an_or_of_eqs_merged_by_id_reads_only_its_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("tasks");
+        let ops = (0..5000)
+            .map(|i| {
+                let doc = object(vec![
+                    ("tenant", format!("t{}", i % 5).into()),
+                    ("tries", Document::Int(i % 7)),
+                    ("status", ["open", "done"][i as usize % 2].into()),
+                ]);
+                WriteOp::Insert("tasks".into(), db.id_gen().generate(), doc)
+            })
+            .collect();
+        db.write_batch(ops).unwrap();
+        docs.ensure_index("tenant").unwrap();
+        docs.ensure_index("status").unwrap();
+        docs.ensure_index(["tenant", "tries"]).unwrap();
+        let ids_of = |f: &Filter| -> Vec<DocId> {
+            docs.find_with_ids(f.clone())
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let two = || Filter::new().is_in("tenant", ["t1", "t3"]);
+        let mut ids = ids_of(&two());
+        ids.sort();
+        assert_eq!(ids.len(), 2000);
+        let tenant = |name: &str| vec![Condition::eq("tenant", name)];
+
+        let newest = two().sort_desc("_id").limit(20);
+        let run = docs.explain_run(newest.clone()).unwrap();
+        assert_eq!(
+            run.plan,
+            QueryPlan::IndexUnion {
+                fields: vec!["tenant".into(), "tenant".into()],
+                in_order: true,
+            }
+        );
+        let sort = SortWork {
+            from_index: 1,
+            in_memory: 0,
+        };
+        assert_eq!(run.sort, Some(sort));
+        let reads: Vec<_> = (run.reads.iter())
+            .map(|r| (r.index.as_str(), r.bounds.clone(), r.backward, r.covering))
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                ("tenant", tenant("t1"), true, true),
+                ("tenant", tenant("t3"), true, true),
+            ]
+        );
+        // Each range's next entry is read before the one handed out
+        // before it: 20, and one more in each, at most.
+        assert!(run.stats.keys_examined <= 22, "{}", run.stats.keys_examined);
+        assert_eq!(run.stats.documents_examined, 20);
+        let expected: Vec<DocId> = ids.iter().rev().take(20).copied().collect();
+        assert_eq!(ids_of(&newest), expected);
+        // A second sort key: ids are unique, so the walk gives it too.
+        let two_keys = two().sort_desc("_id").then_asc("tries").limit(20);
+        let sort = SortWork {
+            from_index: 2,
+            in_memory: 0,
+        };
+        assert_eq!(docs.explain_run(two_keys).unwrap().sort, Some(sort));
+
+        // Page 25 of 20: the skip is decided on entries, only the page's
+        // documents are read.
+        let deep = two().sort_asc("_id").skip(480).limit(20);
+        let mut found = Vec::new();
+        let decided = crate::query::DECISIONS.with(|n| n.replace(0));
+        let read = records_read(|| found = ids_of(&deep));
+        let decided = crate::query::DECISIONS.with(|n| n.replace(decided));
+        assert_eq!((found, read), (ids[480..500].to_vec(), 20));
+        // One decision a range, each taken for the range's other entries.
+        assert!(decided <= 4, "{decided}");
+        let run = docs.explain_run(deep).unwrap();
+        assert!(
+            run.stats.keys_examined <= 502,
+            "{}",
+            run.stats.keys_examined
+        );
+
+        // The 20 after the last one shown: each range from right after it.
+        let after = two().gt("_id", ids[600]).sort_asc("_id").limit(20);
+        let run = docs.explain_run(after.clone()).unwrap();
+        for read in &run.reads {
+            assert_eq!(read.bounds[1], Condition::gt("_id", ids[600]));
+        }
+        assert!(run.stats.keys_examined <= 22, "{}", run.stats.keys_examined);
+        assert_eq!(run.stats.documents_examined, 20);
+        assert_eq!(ids_of(&after), ids[601..621]);
+        let before = two().lte("_id", ids[600]).sort_desc("_id").limit(3);
+        assert_eq!(ids_of(&before), [ids[600], ids[599], ids[598]]);
+
+        // Two indexes: merged, each document once, read to be checked.
+        let either = Filter::new()
+            .any_of([
+                Condition::eq("tenant", "t1"),
+                Condition::eq("status", "open"),
+            ])
+            .sort_asc("_id")
+            .limit(20);
+        let run = docs.explain_run(either.clone()).unwrap();
+        assert_eq!(
+            run.plan,
+            QueryPlan::IndexUnion {
+                fields: vec!["tenant".into(), "status".into()],
+                in_order: true,
+            }
+        );
+        assert!(run.reads.iter().all(|read| !read.covering));
+        assert_eq!(run.stats.documents_examined, 20);
+        let mut all = docs.find_with_ids(Filter::default()).unwrap();
+        all.sort_by_key(|(id, _)| *id);
+        let expected: Vec<DocId> = (either.apply_to(all, |(_, doc)| doc).into_iter())
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids_of(&either), expected);
+
+        // A compound index fixed whole merges; fixed in part, its keys
+        // are in the order of `tries`, and the matches sort in memory.
+        let fixed = Filter::new()
+            .any_of([
+                Condition::eq("tenant", "t1") & Condition::eq("tries", 2),
+                Condition::eq("tenant", "t3") & Condition::eq("tries", 4),
+            ])
+            .sort_desc("_id")
+            .limit(5);
+        assert!(matches!(
+            explained(&docs, &fixed),
+            QueryPlan::IndexUnion { in_order: true, ref fields } if fields[0] == "(tenant, tries)"
+        ));
+        let in_part = two()
+            .use_index(["tenant", "tries"])
+            .sort_asc("_id")
+            .limit(20);
+        let run = docs.explain_run(in_part.clone()).unwrap();
+        assert!(matches!(
+            run.plan,
+            QueryPlan::IndexUnion {
+                in_order: false,
+                ..
+            }
+        ));
+        assert_eq!(run.stats.keys_examined, 2000);
+        assert_eq!(ids_of(&in_part), ids[..20]);
+
+        // Without a limit, or sorted by another field first: no merge.
+        let unlimited = two().sort_asc("_id");
+        assert!(matches!(
+            explained(&docs, &unlimited),
+            QueryPlan::IndexUnion {
+                in_order: false,
+                ..
+            }
+        ));
+        assert_eq!(ids_of(&unlimited), ids);
+        let by_tries = two().sort_asc("tries").then_asc("_id").limit(5);
+        assert!(matches!(
+            explained(&docs, &by_tries),
+            QueryPlan::IndexUnion {
+                in_order: false,
+                ..
+            }
+        ));
+        let mut all = docs.find_with_ids(Filter::default()).unwrap();
+        all.sort_by_key(|(id, _)| *id);
+        let expected: Vec<DocId> = (by_tries.apply_to(all, |(_, doc)| doc).into_iter())
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids_of(&by_tries), expected);
+
+        // Ids beside the ranges (SPEC §164): looked up, and sorted.
+        let with_id = Filter::new()
+            .any_of([Condition::id(ids[7]), Condition::eq("tenant", "t1")])
+            .sort_asc("_id")
+            .limit(5);
+        assert!(matches!(
+            explained(&docs, &with_id),
+            QueryPlan::IndexUnion { in_order: false, ref fields } if fields[0] == "_id"
+        ));
+
+        // Hinted to walk the primary index, the merge is the alternative
+        // that pays, counted as the run would read it (SPEC §133).
+        let hinted = two().use_index("_id").sort_desc("_id").limit(20);
+        let run = docs.explain_run(hinted).unwrap();
+        let merge = (run.alternatives.iter())
+            .find(|a| matches!(a.plan, QueryPlan::IndexUnion { in_order: true, .. }))
+            .expect("the merge among the alternatives");
+        let n = docs.explain_run(newest).unwrap().stats.keys_examined;
+        assert_eq!(merge.entries, EntryCount::Exactly(n));
+        assert!(merge.fewer && !merge.reads_documents);
+    }
+
     /// SPEC §104: a count over a range of different values decides on
     /// the entries' bytes, filling no document, and counts the leaves
     /// inside the range whole; a deep page by such a range passes them;
@@ -9156,7 +9735,8 @@ mod tests {
         assert_eq!(
             runs.explain(&active).unwrap(),
             QueryPlan::IndexUnion {
-                fields: vec!["status".to_string(), "status".to_string()]
+                fields: vec!["status".to_string(), "status".to_string()],
+                in_order: false,
             }
         );
         let mut found = Vec::new();
@@ -9195,7 +9775,8 @@ mod tests {
         assert_eq!(
             runs.explain(&active).unwrap(),
             QueryPlan::IndexUnion {
-                fields: vec!["status".to_string(); 3]
+                fields: vec!["status".to_string(); 3],
+                in_order: false,
             }
         );
         let mut found = Vec::new();

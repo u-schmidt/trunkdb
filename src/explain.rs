@@ -370,7 +370,8 @@ mod tests {
         assert_eq!(
             run.plan,
             QueryPlan::IndexUnion {
-                fields: vec!["age".into(), "age".into()]
+                fields: vec!["age".into(), "age".into()],
+                in_order: false,
             }
         );
         assert_eq!(

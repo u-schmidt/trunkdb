@@ -181,3 +181,4 @@ say what changed, and DESIGN.md says what is true now.
 164. [An OR of ids and indexed conditions (`query.rs`, `collection.rs`)](164-an-or-of-ids-and-indexed-conditions.md)
 165. [Backups a user can trust (`export.rs`, `bin/trunkdb.rs`, `GUIDE.md`)](165-backups-a-user-can-trust.md)
 166. [Binary in indexes, in the order of its bytes (`index/key.rs`, `query.rs`, `collection.rs`, `select.rs`, `storage/file.rs`)](166-binary-in-indexes-in-the-order-of-its-bytes.md)
+167. [An OR of `Eq`s merged by id (`query.rs`, `collection.rs`)](167-an-or-of-eqs-merged-by-id.md)

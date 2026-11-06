@@ -386,6 +386,10 @@ what it picked (`QueryPlan`):
   it, as `=` would read it, and chosen as `=` is [§160](spec/160-an-in-on-a-compound-index-s-field.md). A branch that names
   ids is looked up in the primary index beside the others' ranges, `_id`
   first among the `fields`: "these ids, or what changed since" [§164](spec/164-an-or-of-ids-and-indexed-conditions.md).
+  With a sort by `_id` and a limit, where `Eq`s fix every field of each
+  range's index, the ranges are walked side by side and merged by id,
+  each in id order already, and the walk stops at the limit
+  (`in_order`): "the newest 20 of these tenants" [§167](spec/167-an-or-of-eqs-merged-by-id.md).
 - **`IndexOrder`:** with a sort and a limit, walk the index on the
   first sort key and stop at the limit, past any skip [§34.2](spec/34-sorting-through-an-index.md) [§49](spec/49-a-lazy-b-tree-walk.md) [§72](spec/72-skip-for-paging.md). A compound index
   whose leading fields an `Eq` fixes gives both the filter and the order
@@ -699,6 +703,8 @@ documents, the median of three runs (with §153):
 | first 50 by id | 33 µs | 36 µs | 27 µs | 30 µs |
 | 50 by id after skipping 5000 | 38 µs | 126 µs | 228 µs | 0.97 ms |
 | a tenant's first 20 by id | 22 µs | 1.2 ms | 20 µs | 27 µs |
+| two tenants' first 20 by id | 28 µs | 2.6 ms | 21 µs | 29 µs |
+| two tenants by id, page 25 of 20 | 66 µs | 3.0 ms | 67 µs | 291 µs |
 | scan, 100,000 for a fifth | 58 ms | 43 ms | 54 ms | 67 ms |
 | update, 1000 per commit | 15k/s | 14k/s | 18k/s | 23k/s |
 | delete, 1000 per commit | 31k/s | 19k/s | 25k/s | 36k/s |
@@ -710,7 +716,7 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
   counts a leaf at a time where its ends decide it (§100, §101, §104).
   A page by index reads only the page, and a deep one skips leaves
   whole. A sort by `_id` walks the primary index, or the range an `Eq`
-  fixes (§96, §103).
+  fixes, or merges the ranges of an `in` (§96, §103, §167).
 - **Still behind:**
   - the count of all documents, which trunkdb counts leaf by leaf where
     the others keep a total;
@@ -760,6 +766,7 @@ Each gap had a measured cause, fixed one at a time:
 | Count of all, of 1000 by index, page 50 of 20 | 7 ms, 0.17 ms, 0.35 ms | a walk that lends its entries and decides whole leaves [§101](spec/101-a-cheaper-walk-through-an-index.md) |
 | Count of a range, tenant's first 20 by id | 0.14 ms, 0.6 ms | paths parsed once per query, small objects searched without hashing, sort keys looked up once [§102](spec/102-paths-resolved-once-per-query.md) |
 | Tenant's first 20 by id | 0.38 ms | the `Eq`-fixed range walked in id order, which its keys are in [§103](spec/103-an-eq-fixed-index-walked-in-id-order.md) |
+| Two tenants' first 20 by id | 1.1 ms | the ranges of an `in`, each in id order, merged by id [§167](spec/167-an-or-of-eqs-merged-by-id.md) |
 | Count of a range | 0.07 ms | entries matched on their bytes, leaves inside the interval counted whole [§104](spec/104-index-entries-matched-on-their-bytes.md) |
 | Two fields of 1000 by index, untyped | 1.6 ms | a selection decoded alone, 1.05 ms, or answered from index entries, 0.7 ms [§106](spec/106-projection-a-select-of-fields.md) |
 

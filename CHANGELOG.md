@@ -1045,3 +1045,16 @@ limit, batches and a write-ahead log. Since then:
     format in memory, so it reports what the file says.
     Kept as binary instead of hex text, 100,000 file paths take a
     quarter less file and a third less index.
+139. **An OR of `Eq`s merged by id** (§167): a sort by `_id` with a
+    limit after an OR or an `in` whose ranges `Eq`s fix whole, "the
+    newest 20 of these tenants", walks the ranges side by side and
+    merges them by id, stopping at the limit, where it read every match
+    and sorted them in memory. The ranges may be of one index or
+    several, a multikey path or a compound index fixed whole; a
+    document in two of them comes out once, and where the entries
+    decide, each range is decided once, so a deep page by skip reads
+    only its own documents. `_id` comparisons narrow
+    each range, so paging by the last id works through `tenant in (…)`.
+    `QueryPlan::IndexUnion` gains `in_order`, `true` for such a merge.
+    A sort by `_id` through a compound index fixed only in part moved
+    to the ROADMAP's Not planned: its keys aren't in id order.
