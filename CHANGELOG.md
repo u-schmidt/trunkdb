@@ -1089,3 +1089,26 @@ limit, batches and a write-ahead log. Since then:
     `()`. `batch.commit()?;` compiles as before; a function returning
     `batch.commit()` as a `Result<()>` adds `.map(drop)`, and a `match`
     on `Ok(())` reads `Ok(_)`.
+141. **A regex** (§169): `Filter::regex(field, Regex::new(pattern)?)`,
+    and `notes matches "time-?out"` in a filter's text, the pattern a
+    `:name` parameter too; the `regex` crate's syntax, `(?i)` to ignore
+    case, matching anywhere in a string unless `^` or `$` anchor it, in
+    time linear in the string, whatever the pattern. `Regex` compiles
+    once, when made, refusing a pattern over 4,096 bytes or over 1 MiB
+    compiled with a `RegexError` in one line. A pattern beginning `^`
+    and fixed text, `^Fix`, reads an index on the field as `starts
+    with "Fix"` does; any other reads every document, as `contains`
+    does. Behind the `regex` feature, on by default, which brings the
+    `regex` and `regex-syntax` crates; `default-features = false`
+    leaves them out, and `matches` is then refused, saying why. A
+    filter's text error lists `matches` among the comparisons, and
+    `BindError` gains `NotAPattern`, for a value after `matches` that
+    isn't a string or a regex; it was `#[non_exhaustive]` already.
+142. **A sparse index for an AND group or an OR** (§169.9): a sparse
+    index is read only where the filter rules out null in its fields
+    (§44), and that was seen only among the filter's top-level
+    conditions. Inside an AND group, or an OR whose every branch rules
+    it out, an OR of one branch among them, it is seen now, so a filter
+    and its text, which reads back flat, plan alike, and a hint to use
+    the index is followed by both. The fuzz program found them planning
+    apart; the answers were the same.

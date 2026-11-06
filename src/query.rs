@@ -8,6 +8,8 @@ pub use crate::explain::{Alternative, EntryCount, ExecutionStats, Explained, Ind
 use crate::index::{KeyRange, key};
 use crate::map::Map;
 use crate::path::Path;
+#[cfg(feature = "regex")]
+pub use crate::pattern::{Regex, RegexError};
 pub use crate::query_text::{BindError, Params, ParseFilterError, Template};
 use crate::select::Selection;
 pub use crate::update::Update;
@@ -40,8 +42,8 @@ pub enum Op {
     /// ignoring case — like LiteDB, whose string comparisons ignore case
     /// by default. "Ignoring case" is Unicode lowercasing plus `ß` = `ss`
     /// (see `fold_case`). Anything that isn't a string on either side
-    /// doesn't match. Substring only, not a pattern language — no
-    /// wildcards, no regex.
+    /// doesn't match. Substring only, not a pattern: for one,
+    /// `Filter::regex` (SPEC §169).
     Contains,
     /// The field is a string beginning with the condition's string value
     /// (SPEC §158), byte for byte, so case counts, as it does for `<`:
@@ -211,6 +213,21 @@ pub enum Condition {
         field: String,
         /// The kind it holds.
         kind: Kind,
+    },
+    /// The field is a string the regex matches somewhere in (SPEC §169):
+    /// `notes matches "time-?out"`. Anything that isn't a string doesn't
+    /// match. On a path with `[*]`: some element is one it matches. An
+    /// index on the field serves a pattern that begins `^` and fixed
+    /// text, `^Fix`, as the range `starts with` reads; any other is
+    /// checked document by document, as `contains` is. With the `regex`
+    /// feature, on by default.
+    #[cfg(feature = "regex")]
+    #[non_exhaustive]
+    Regex {
+        /// The field, a path (SPEC §31).
+        field: String,
+        /// The pattern, compiled.
+        regex: Regex,
     },
 }
 
@@ -481,6 +498,15 @@ impl Condition {
     /// `Op::StartsWith`).
     pub fn starts_with(field: impl Into<String>, prefix: impl Into<String>) -> Self {
         Self::compare(field, Op::StartsWith, prefix.into())
+    }
+
+    /// The field is a string `regex` matches somewhere in (SPEC §169).
+    #[cfg(feature = "regex")]
+    pub fn regex(field: impl Into<String>, regex: Regex) -> Self {
+        Condition::Regex {
+            field: field.into(),
+            regex,
+        }
     }
 
     /// The field is null or missing (SPEC §32): `eq(field, Document::Null)`.
@@ -816,6 +842,16 @@ impl Filter {
     /// field reads only the strings that begin with it.
     pub fn starts_with(self, field: impl Into<String>, prefix: impl Into<String>) -> Self {
         self.condition(field, Op::StartsWith, prefix.into())
+    }
+
+    /// The field is a string `regex` matches somewhere in (SPEC §169):
+    /// `regex("notes", Regex::new("time-?out")?)`, `(?i)` in the pattern
+    /// to ignore case. An index on the field reads only the strings a
+    /// pattern like `^Fix` can match: those beginning with its fixed
+    /// text.
+    #[cfg(feature = "regex")]
+    pub fn regex(self, field: impl Into<String>, regex: Regex) -> Self {
+        self.and(Condition::regex(field, regex))
     }
 
     /// The field is null or missing (SPEC §32).
@@ -1229,6 +1265,8 @@ impl Filter {
                 | Condition::IsKind { field, .. }
                 | Condition::Size { field, .. }
                 | Condition::ElemMatch { field, .. } => add(field, names),
+                #[cfg(feature = "regex")]
+                Condition::Regex { field, .. } => add(field, names),
                 Condition::All(conditions) | Condition::Any(conditions) => {
                     conditions.iter().try_for_each(|c| of(c, names))
                 }
@@ -1302,7 +1340,10 @@ impl Filter {
                 }
                 Condition::Not(condition) => of(condition, name),
                 // A closure is called on a document, never on an entry
-                // (SPEC §136.4). A kind isn't decided on one (§159.2).
+                // (SPEC §136.4). A kind isn't decided on one (§159.2), nor
+                // a regex (§169.3).
+                #[cfg(feature = "regex")]
+                Condition::Regex { .. } => None,
                 Condition::Exists { .. }
                 | Condition::IsKind { .. }
                 | Condition::Size { .. }
@@ -1582,18 +1623,15 @@ fn bounds_for_all<'a>(
         }
     };
     for (i, condition) in conditions.iter().enumerate() {
-        match condition {
-            Condition::Compare { field, .. } => {
-                let Some(index) = indexes
-                    .iter()
-                    .find(|index| index.single() == Some(field.as_str()))
-                else {
+        match comparison(condition) {
+            Some((field, ..)) => {
+                let Some(index) = indexes.iter().find(|index| index.single() == Some(field)) else {
                     continue;
                 };
                 // Each field once, at its first comparison.
                 let seen = conditions[..i]
                     .iter()
-                    .any(|c| matches!(c, Condition::Compare { field: f, .. } if f == field));
+                    .any(|c| comparison(c).is_some_and(|(f, ..)| f == field));
                 if seen {
                     continue;
                 }
@@ -1601,15 +1639,12 @@ fn bounds_for_all<'a>(
                 // `Eq`, its range, and itself, for `explain_run` (§94.2).
                 let mut on_field: Vec<(bool, KeyRange, &Condition)> = conditions
                     .iter()
-                    .filter_map(|c| match c {
-                        Condition::Compare {
-                            field: f,
-                            op,
-                            value,
-                        } if f == field && (!index.sparse || rules_out_null(op, value)) => {
-                            Some((matches!(op, Op::Eq), key::range_for(op, value)?, c))
+                    .filter_map(|c| {
+                        let (f, op, value) = comparison(c)?;
+                        if f != field || (index.sparse && !rules_out_null(op, &value)) {
+                            return None;
                         }
-                        _ => None,
+                        Some((matches!(op, Op::Eq), key::range_for(op, &value)?, c))
                     })
                     .collect();
                 let by_value = on_field.iter().any(|(eq, ..)| *eq);
@@ -1639,8 +1674,8 @@ fn bounds_for_all<'a>(
                     });
                 }
             }
-            nested => {
-                if let Some(bounds) = bounds_for(nested, indexes, ids) {
+            None => {
+                if let Some(bounds) = bounds_for(condition, indexes, ids) {
                     consider(bounds);
                 }
             }
@@ -1669,6 +1704,13 @@ fn bounds_for<'a>(
 ) -> Option<Bounds<'a>> {
     match condition {
         Condition::Compare { .. } => bounds_for_all(std::slice::from_ref(condition), indexes, ids),
+        // As the `starts with` of its fixed text, if it has one (§169.3):
+        // then `bounds_for_all` reads it as a comparison, never back here.
+        #[cfg(feature = "regex")]
+        Condition::Regex { .. } => match comparison(condition) {
+            Some(_) => bounds_for_all(std::slice::from_ref(condition), indexes, ids),
+            None => None,
+        },
         Condition::All(conditions) => bounds_for_all(conditions, indexes, ids),
         Condition::Any(branches) => {
             let (mut ranges, mut found) = (Vec::new(), Vec::new());
@@ -1748,6 +1790,14 @@ fn within(field: &str, condition: &Condition) -> Condition {
             field: path(inner),
             condition: condition.clone(),
         },
+        #[cfg(feature = "regex")]
+        Condition::Regex {
+            field: inner,
+            regex,
+        } => Condition::Regex {
+            field: path(inner),
+            regex: regex.clone(),
+        },
         Condition::All(conditions) => Condition::All(all(conditions)),
         Condition::Any(branches) => Condition::Any(all(branches)),
         Condition::Not(condition) => Condition::Not(Box::new(within(field, condition))),
@@ -1763,14 +1813,42 @@ fn rules_out_null(op: &Op, value: &Document) -> bool {
     !value_matches(op, &Document::Null, value)
 }
 
+/// `condition` as a comparison an index can read, its field, its `Op`
+/// and its value: a `Compare` as it is, and a regex with a fixed prefix
+/// as the `starts with` it implies (SPEC §169.3), which every string it
+/// matches meets. The range read holds what the regex can match; the
+/// regex itself is still checked on every document found. `None` for
+/// anything else.
+fn comparison(condition: &Condition) -> Option<(&str, &Op, std::borrow::Cow<'_, Document>)> {
+    match condition {
+        Condition::Compare { field, op, value } => {
+            Some((field, op, std::borrow::Cow::Borrowed(value)))
+        }
+        #[cfg(feature = "regex")]
+        Condition::Regex { field, regex } => {
+            let prefix = Document::String(regex.prefix()?.to_string());
+            Some((field, &Op::StartsWith, std::borrow::Cow::Owned(prefix)))
+        }
+        _ => None,
+    }
+}
+
 /// Whether `conditions`, all holding, keep out every document a sparse
 /// `index` has no entry for: one of them compares one of its fields in a
 /// way null fails. On one field without `[*]`, that makes its value not
-/// null; on several, not null in all of them.
+/// null; on several, not null in all of them. An AND inside them holds
+/// whole, so its conditions count as theirs; an OR rules it out where
+/// every branch does, so an OR of one branch as that branch. So a filter
+/// and its text, read back flat, are offered the same indexes.
 fn excludes_null(index: &IndexMeta, conditions: &[Condition]) -> bool {
-    conditions.iter().any(|c| match c {
-        Condition::Compare { field, op, value } => {
-            index.fields.contains(field) && rules_out_null(op, value)
+    conditions.iter().any(|c| match (c, comparison(c)) {
+        (Condition::All(inner), _) => excludes_null(index, inner),
+        // An empty OR holds for nothing, so it keeps out every document.
+        (Condition::Any(branches), _) => {
+            (branches.iter()).all(|b| excludes_null(index, std::slice::from_ref(b)))
+        }
+        (_, Some((field, op, value))) => {
+            index.fields.iter().any(|f| f == field) && rules_out_null(op, &value)
         }
         _ => false,
     })
@@ -1943,13 +2021,10 @@ fn field_range(
 ) -> Option<(KeyRange, Vec<Condition>)> {
     let (ranges, by): (Vec<KeyRange>, Vec<Condition>) = conditions
         .iter()
-        .filter_map(|c| match c {
-            Condition::Compare {
-                field: f,
-                op,
-                value,
-            } if f == field => Some((key::range_for_in(op, value, index.fields.len())?, c.clone())),
-            _ => None,
+        .filter_map(|c| {
+            let (f, op, value) = comparison(c)?;
+            let range = key::range_for_in(op, &value, index.fields.len());
+            (f == field).then(|| Some((range?, c.clone())))?
         })
         .unzip();
     Some((ranges.into_iter().reduce(KeyRange::intersect)?, by))
@@ -2581,6 +2656,9 @@ impl<'f> EntryMatcher<'f> {
                 Condition::All(cs) => OnBytes::All(all(cs)?),
                 Condition::Any(cs) => OnBytes::Any(all(cs)?),
                 Condition::Not(c) => OnBytes::Not(Box::new(of(c, fields)?)),
+                // The regex needs the whole string (SPEC §169.3).
+                #[cfg(feature = "regex")]
+                Condition::Regex { .. } => return None,
                 Condition::Exists { .. }
                 | Condition::IsKind { .. }
                 | Condition::Size { .. }
@@ -2815,6 +2893,11 @@ pub(crate) enum Matcher<'f> {
         custom: &'f Custom,
         names: Option<Vec<&'f str>>,
     },
+    #[cfg(feature = "regex")]
+    Regex {
+        path: Path<'f>,
+        regex: &'f Regex,
+    },
 }
 
 impl<'f> Matcher<'f> {
@@ -2854,6 +2937,11 @@ impl<'f> Matcher<'f> {
                 custom,
                 names: custom.names(),
             },
+            #[cfg(feature = "regex")]
+            Condition::Regex { field, regex } => Matcher::Regex {
+                path: Path::new(field),
+                regex,
+            },
         }
     }
 
@@ -2880,6 +2968,15 @@ impl<'f> Matcher<'f> {
                         !(path.values(doc).into_iter()).any(|v| value_matches(&Op::Eq, v, value))
                     }
                     (true, _) => path.values(doc).into_iter().any(holds),
+                }
+            }
+            // A string it matches; on a path with `[*]`, any element one.
+            #[cfg(feature = "regex")]
+            Matcher::Regex { path, regex } => {
+                let holds = |v: &Document| matches!(v, Document::String(s) if regex.is_match(s));
+                match path.is_multi() {
+                    false => holds(path.value_or_null(doc)),
+                    true => path.values(doc).into_iter().any(holds),
                 }
             }
             Matcher::Exists(path) => !path.present(doc).is_empty(),
@@ -3303,6 +3400,16 @@ mod tests {
                 Condition::Any(conditions) => conditions.iter().any(|c| matches(c, doc)),
                 Condition::Not(condition) => !matches(condition, doc),
                 Condition::Custom(custom) => (custom.test)(doc),
+                // The `regex` crate itself, not the crate's own `Regex`.
+                #[cfg(feature = "regex")]
+                Condition::Regex { field, regex } => {
+                    let re = ::regex::Regex::new(regex.as_str()).unwrap();
+                    let holds = |v: &Document| matches!(v, Document::String(s) if re.is_match(s));
+                    match field.contains("[*]") {
+                        true => walk(doc, field, true).into_iter().any(holds),
+                        false => holds(value_or_null(doc, field)),
+                    }
+                }
             }
         }
 
@@ -4789,6 +4896,28 @@ mod tests {
             order(Filter::new().is_null("a").gt("b", 0).sort_asc("b")).as_deref(),
             Some("(a, b)")
         );
+        // Inside an AND, as its text read back flat would have it: found
+        // by the fuzz program, where the two planned apart.
+        let grouped = Filter::new().and(Condition::all([
+            Condition::starts_with("b", "s"),
+            Condition::exists("c"),
+        ]));
+        assert_eq!(
+            order(grouped.clone().sort_asc("a")).as_deref(),
+            Some("(a, b)")
+        );
+        let flat: Filter = grouped.to_string().parse().unwrap();
+        assert_eq!(order(flat.sort_asc("a")).as_deref(), Some("(a, b)"));
+        // An OR of one branch, which its text writes as the branch; one
+        // whose every branch rules out null; not one with a branch that
+        // doesn't.
+        let one = Filter::new().any_of([Condition::starts_with("b", "s")]);
+        assert_eq!(order(one.sort_asc("a")).as_deref(), Some("(a, b)"));
+        let both = Filter::new().any_of([Condition::starts_with("b", "s"), Condition::gt("a", 1)]);
+        assert_eq!(order(both.sort_asc("a")).as_deref(), Some("(a, b)"));
+        let either =
+            Filter::new().any_of([Condition::starts_with("b", "s"), Condition::exists("c")]);
+        assert_eq!(order(either.sort_asc("a")), None);
     }
 
     /// With several sort keys (SPEC §47): an index serves as many as its

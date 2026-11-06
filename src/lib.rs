@@ -80,6 +80,8 @@ mod json;
 mod live;
 pub mod map;
 mod path;
+#[cfg(feature = "regex")]
+mod pattern;
 pub mod query;
 mod query_text;
 mod release;

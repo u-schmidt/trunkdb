@@ -2021,3 +2021,42 @@ fn batch_makes_collections_only_with_create() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&trunkdb(&["count", &new, "notes"])), "1\n");
 }
+
+/// SPEC §169: `matches` in the command's filters, the pattern a
+/// parameter too, and a pattern that isn't a regex marked where it is.
+#[cfg(feature = "regex")]
+#[test]
+fn find_takes_a_regex() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = tasks_db(dir.path());
+    let output = trunkdb(&["count", &db, "tasks", r#"title matches "^[ab]$""#]);
+    assert_eq!(stdout(&output), "2\n", "{}", stderr(&output));
+    let output = trunkdb(&[
+        "count",
+        &db,
+        "tasks",
+        "title matches :p",
+        "--param",
+        "p=(?i)^C",
+    ]);
+    assert_eq!(stdout(&output), "1\n", "{}", stderr(&output));
+    let output = trunkdb(&["find", &db, "tasks", r#"title matches "(a""#]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("not a regex"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("\n                ^"),
+        "{}",
+        stderr(&output)
+    );
+    let output = trunkdb(&["find", &db, "tasks", "title matches :p", "--param", "p=(a"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("the parameter :p is a regex, after `matches`: not a regex"),
+        "{}",
+        stderr(&output)
+    );
+}

@@ -79,6 +79,7 @@ common forms:
 status = "open" and hours >= 4
 name contains "ann"                      (substring, any case)
 title starts with "Fix"                  (a prefix, case counting)
+notes matches "time-?out"                (a regex; "(?i)…" for any case)
 team in ("core", "web")
 due is null                              (null or missing)
 hours is string                          (a type: number, string, date, …)
@@ -126,9 +127,10 @@ There are no joins. A document refers to another by its id
 `--explain` after `find` (or `aggregate`) shows which index it read and
 how many entries, and its `instead:` lines what the others would have
 read. Which conditions an index can serve is in `references/filters.md`;
-in short, `=`, ranges, `in`, `starts with` and `is null` can, while
-`!=`, `not in`, `not`, `contains`, `exists` and a type (`is string`)
-read every document. To speed up a query:
+in short, `=`, ranges, `in`, `starts with`, `is null` and a regex
+beginning `^` and plain text (`matches "^Fix"`) can, while `!=`, `not
+in`, `not`, `contains`, any other regex, `exists` and a type (`is
+string`) read every document. To speed up a query:
 
 1. Run it with `--explain`. A `scan of every document` with many
    documents is what an index helps.

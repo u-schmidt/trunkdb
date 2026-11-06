@@ -96,6 +96,27 @@ assert_eq!(page.to_string(), r#"team = "core" order by name limit 20 offset 40"#
 `select` are there too; a mistake comes
 back as `ParseFilterError`, with its line and column.
 
+### A regex
+
+`matches` takes a regex, the `regex` crate's syntax, matching anywhere
+in a string unless `^` or `$` anchor it; `(?i)` ignores case (SPEC
+§169). In code it is `Filter::regex` with a `Regex`, compiled once:
+
+```rust
+use trunkdb::query::Regex;
+
+let timeouts: Filter = r#"notes matches "(?i)time-?out""#.parse()?;
+let fixes = Filter::new().regex("title", Regex::new("^Fix(es)? ")?);
+```
+
+Matching takes time linear in the string, whatever the pattern, so a
+pattern from a user can't make a query hang; there are no
+backreferences or look-arounds. A pattern that begins `^` and plain
+text, as `^Fix` does, reads an index on the field as `starts with` does;
+any other is checked on every document. The `regex` feature, on by
+default, brings it; `default-features = false` leaves it, and two
+dependencies, out.
+
 ### Parameters
 
 A value that comes from outside, a user's input or a setting, goes in

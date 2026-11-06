@@ -47,6 +47,7 @@ query returns.
 | `a in (1, 2, 3)`, `a not in (…)` | `a` is one of the list (or none of it) |
 | `a contains "x"` | the string `a` has `x` in it, any case |
 | `a starts with "x"` | the string `a` begins with `x`, case counting |
+| `a matches "^x\\d+"` | the regex matches somewhere in the string `a` |
 | `a is null`, `a is not null` | `a` is null or missing (or neither) |
 | `a is string`, `a is not number` | `a` holds a value of that type (or doesn't, missing too) |
 | `exists(a)`, `not exists(a)` | `a` is present, even as null (or absent) |
@@ -133,9 +134,15 @@ them the same way.
   every document.
 - `a starts with "x"` finds strings beginning with `x`, case counting:
   `title starts with "Fix"` finds "Fix login", not "fix typo". An index
-  on `title` serves it. For any case, use `contains` and check the
-  matches yourself, or an `or` of the spellings you expect.
-- There is no `like` or regex yet.
+  on `title` serves it.
+- `a matches "pattern"` is a regex, the Rust `regex` crate's syntax:
+  it matches anywhere in the string unless `^` or `$` anchor it, and
+  `(?i)` in front ignores case: `notes matches "(?i)time-?out"`. A
+  backslash is doubled inside the string, as in JSON: `code matches
+  "^\\d{4}$"`. There are no backreferences or look-arounds, and
+  matching never takes more than time linear in the string. A pattern
+  that begins `^` and plain text, `^Fix`, is read through an index on
+  the field as `starts with "Fix"` is; any other reads every document.
 
 ## Values of different types
 
@@ -194,7 +201,7 @@ with anything else; the rest of the filter is checked on what it reads:
 | Served by an index | Read every document |
 |---|---|
 | `=`, `<`, `<=`, `>`, `>=`, `is null` | `!=`, `not in (…)`, `not (…)` |
-| `in (…)`, `starts with` | `contains` |
+| `in (…)`, `starts with`, `matches "^text…"` | `contains`, any other `matches` |
 | an `or` whose every branch is served | an `or` with one branch that isn't |
 | `has (…)`, `[*]` paths, with an index on that path | `exists(…)`, `size(…)`, `is string` and the other types |
 

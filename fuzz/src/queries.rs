@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use trunkdb::query::{Aggregate, Condition, Filter, Kind, Op, SortOrder, Update};
+use trunkdb::query::{Aggregate, Condition, Filter, Kind, Op, Regex, SortOrder, Update};
 use trunkdb::{
     Change, Database, DocId, Document, Error, IndexOptions, Live, LiveAggregate, LiveQuery,
     LiveRow, Map, Upserted,
@@ -144,6 +144,8 @@ pub struct Ran {
     pub reported: u64,
     /// Conditions made a `Condition::custom` (SPEC §136).
     pub custom: u64,
+    /// Regex conditions made (SPEC §169).
+    pub regexes: u64,
     /// Aggregates given a window (SPEC §139).
     pub windows: u64,
     /// Aggregates with a window refused beside a filter's sort, skip or
@@ -382,6 +384,7 @@ fn paths(condition: &Condition, into: &mut Vec<String>) {
         Condition::All(all) | Condition::Any(all) => all.iter().for_each(|c| paths(c, into)),
         Condition::Not(inner) => paths(inner, into),
         Condition::Custom(custom) => into.extend(custom.fields().iter().cloned()),
+        Condition::Regex { field, .. } => into.push(field.clone()),
         _ => unreachable!("a condition the program doesn't make"),
     }
 }
@@ -739,8 +742,32 @@ impl Run<'_> {
 
     fn leaf(&mut self) -> Condition {
         {
-            match self.program.below(12) {
+            match self.program.below(13) {
                 0 => Condition::exists(PATHS[self.program.below(PATHS.len())]),
+                // A regex (SPEC §169): with a fixed prefix, which an
+                // index reads as a range (a long one past a key's
+                // budget too), and without one.
+                12 => {
+                    let patterns = [
+                        "^a",
+                        "^ab",
+                        "^a\\x00",
+                        "^Stra",
+                        "(?i)^stra",
+                        "ß",
+                        "^$",
+                        "",
+                        "1$",
+                        "^yyy",
+                        "^y{1100}2",
+                        "^a|^S",
+                        "^[a]b",
+                    ];
+                    let pattern = patterns[self.program.below(patterns.len())];
+                    let path = PATHS[self.program.below(PATHS.len())];
+                    self.ran.regexes += 1;
+                    Condition::regex(path, Regex::new(pattern).expect("a pattern of the menu"))
+                }
                 // A kind (SPEC §159), any of them, on any path.
                 11 => {
                     let kind = Kind::ALL[self.program.below(Kind::ALL.len())];

@@ -173,6 +173,9 @@ enum Place {
     List,
     /// `limit`, `offset`, `size`: a whole number from 0.
     Count,
+    /// After `matches` (SPEC §169): a string that is a regex.
+    #[cfg(feature = "regex")]
+    Pattern,
 }
 
 impl<T> Template<T> {
@@ -218,6 +221,16 @@ impl<T> Template<T> {
                 Place::List => return Err(BindError::NotAnArray { name, offset }),
                 Place::Count if count_of(value).is_some() => {}
                 Place::Count => return Err(BindError::NotACount { name, offset }),
+                #[cfg(feature = "regex")]
+                Place::Pattern => {
+                    if let Some(reason) = not_a_pattern(value) {
+                        return Err(BindError::NotAPattern {
+                            name,
+                            offset,
+                            reason,
+                        });
+                    }
+                }
             }
         }
         match (params.values.keys()).find(|name| !self.uses.iter().any(|u| &u.name == *name)) {
@@ -368,6 +381,17 @@ pub enum BindError {
         /// Where it first stands.
         offset: usize,
     },
+    /// `matches :pattern` with a value that isn't a string, or isn't a
+    /// regex (SPEC §169).
+    #[error("the parameter :{name} is a regex, after `matches`: {reason}")]
+    NotAPattern {
+        /// The parameter's name, without its `:`.
+        name: String,
+        /// Where it first stands.
+        offset: usize,
+        /// Why the value isn't one.
+        reason: String,
+    },
 }
 
 impl BindError {
@@ -377,7 +401,8 @@ impl BindError {
             BindError::Missing { name, .. }
             | BindError::Unused { name }
             | BindError::NotAnArray { name, .. }
-            | BindError::NotACount { name, .. } => name,
+            | BindError::NotACount { name, .. }
+            | BindError::NotAPattern { name, .. } => name,
         }
     }
 
@@ -387,9 +412,22 @@ impl BindError {
         match self {
             BindError::Missing { offset, .. }
             | BindError::NotAnArray { offset, .. }
-            | BindError::NotACount { offset, .. } => Some(*offset),
+            | BindError::NotACount { offset, .. }
+            | BindError::NotAPattern { offset, .. } => Some(*offset),
             BindError::Unused { .. } => None,
         }
+    }
+}
+
+/// Why `value` can't stand after `matches`, `None` if it can: a string
+/// that compiles as a regex (SPEC §169).
+#[cfg(feature = "regex")]
+fn not_a_pattern(value: &Document) -> Option<String> {
+    match value {
+        Document::String(pattern) => crate::query::Regex::new(pattern)
+            .err()
+            .map(|e| e.to_string()),
+        _ => Some("its value must be a string".to_string()),
     }
 }
 
@@ -958,13 +996,54 @@ impl<'t> Parser<'t> {
             self.expect(")")?;
             return Ok(Condition::ElemMatch { field, condition });
         }
+        if self.keyword("matches") {
+            return self.pattern(field);
+        }
         let Some(op) = self.op() else {
             return self.expected(
-                "a comparison (=, !=, <, <=, >, >=, contains, starts with, is null, in, has)",
+                "a comparison (=, !=, <, <=, >, >=, contains, starts with, matches, is null, in, has)",
             );
         };
         let value = self.value()?;
         Ok(Condition::Compare { field, op, value })
+    }
+
+    /// A regex after `matches` (SPEC §169): a string, or a parameter whose
+    /// value is one, compiled here; one that doesn't compile is a
+    /// mistake at the string.
+    #[cfg(feature = "regex")]
+    fn pattern(&mut self, field: String) -> Parsed<Condition> {
+        use crate::query::Regex;
+        if let Some(value) = self.parameter(Place::Pattern)? {
+            let regex = match (&self.mode, value) {
+                // Checked to compile before (`Template::check`).
+                (Mode::Bind(_), Document::String(pattern)) => {
+                    Regex::new(&pattern).expect("a pattern checked at bind")
+                }
+                // A stand-in, while a template is read.
+                _ => Regex::new("").expect("the empty pattern"),
+            };
+            return Ok(Condition::regex(field, regex));
+        }
+        self.skip_space();
+        let start = self.at;
+        let value = self.value_here()?;
+        self.literal(start, Place::Pattern, &value);
+        let Document::String(pattern) = value else {
+            return self.error_at(start, r#"a regex is a string, like "time-?out""#);
+        };
+        match Regex::new(&pattern) {
+            Ok(regex) => Ok(Condition::regex(field, regex)),
+            Err(e) => self.error_at(start, e.to_string()),
+        }
+    }
+
+    /// `matches` in a build without the `regex` feature (SPEC §169.5).
+    #[cfg(not(feature = "regex"))]
+    fn pattern(&mut self, _field: String) -> Parsed<Condition> {
+        self.error(
+            "`matches` takes a regex, and this build of trunkdb is without its `regex` feature",
+        )
     }
 
     /// `(value, …)` after `in` (SPEC §115): an `eq` of `field` per value,
@@ -1561,6 +1640,12 @@ fn write_condition(f: &mut Formatter<'_>, condition: &Condition, least: u8) -> f
             write_path(f, field)?;
             write!(f, " is {}", kind.name())?;
         }
+        #[cfg(feature = "regex")]
+        Condition::Regex { field, regex } => {
+            write_path(f, field)?;
+            f.write_str(" matches ")?;
+            write_value(f, &Document::String(regex.as_str().to_string()))?;
+        }
         Condition::Exists { field } => {
             f.write_str("exists(")?;
             write_path(f, field)?;
@@ -1710,6 +1795,18 @@ fn write_value(f: &mut Formatter<'_>, value: &Document) -> fmt::Result {
 
 #[cfg(test)]
 mod tests {
+    /// SPEC §169.5: without the `regex` feature, `matches` is refused,
+    /// saying what it would need.
+    #[cfg(not(feature = "regex"))]
+    #[test]
+    fn matches_needs_the_regex_feature() {
+        let error = r#"title matches "^Fix""#.parse::<Filter>().unwrap_err();
+        assert!(
+            error.to_string().contains("without its `regex` feature"),
+            "{error}"
+        );
+    }
+
     use super::*;
     use crate::testing::XorShift;
 
@@ -2080,7 +2177,7 @@ mod tests {
         );
         assert_eq!(
             error("a"),
-            "expected a comparison (=, !=, <, <=, >, >=, contains, starts with, is null, in, has), found the end at line 1 column 2"
+            "expected a comparison (=, !=, <, <=, >, >=, contains, starts with, matches, is null, in, has), found the end at line 1 column 2"
         );
         assert_eq!(
             error("select a b = 1"),

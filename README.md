@@ -65,6 +65,10 @@ trunkdb = { git = "https://github.com/u-schmidt/trunkdb" }
 serde = { version = "1", features = ["derive"] }
 ```
 
+`Filter::regex` and `matches` in a filter's text come with the
+`regex` feature, on by default; `default-features = false` builds
+without them and the `regex` crate.
+
 Pinning a commit with `rev = "…"` keeps updates in your hands;
 [CHANGELOG.md](CHANGELOG.md) lists what each release changes.
 

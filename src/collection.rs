@@ -4844,6 +4844,19 @@ mod tests {
     /// A value of a type an index handles, or doesn't — duplicates are
     /// likely, and so are values that share an encoding (large ints
     /// rounding to one f64, long strings agreeing past the key's cut).
+    /// A regex for the random conditions (SPEC §169): with a fixed
+    /// prefix an index reads as a range ("a", "ab", "x", the 1,200 x's a
+    /// key cuts), and without one; anchored at the end, ignoring case,
+    /// a class, the empty pattern.
+    #[cfg(feature = "regex")]
+    fn random_regex(rng: &mut XorShift) -> crate::query::Regex {
+        let patterns = [
+            "^a", "^ab", "^x", "^xxxx", "^x+b$", "^a\\x00", "^$", "^b|^a", "a$", "b", "(?i)^b",
+            "^[ab]", "", "x{1200}a",
+        ];
+        crate::query::Regex::new(patterns[rng.below(patterns.len())]).unwrap()
+    }
+
     fn random_value(rng: &mut XorShift) -> Document {
         let big = 1i64 << 53;
         match rng.below(14) {
@@ -7561,6 +7574,11 @@ mod tests {
     /// and NOTs.
     fn random_condition(rng: &mut XorShift, depth: usize) -> Condition {
         if depth == 0 || rng.below(3) == 0 {
+            #[cfg(feature = "regex")]
+            if rng.below(8) == 0 {
+                let field = ["v", "v", "v[*]", "pad", "nowhere"][rng.below(5)];
+                return Condition::regex(field, random_regex(rng));
+            }
             let ops = [
                 Op::Eq,
                 Op::Ne,
@@ -8705,6 +8723,11 @@ mod tests {
     /// and `_id` — now and then on `c`, which none holds.
     fn covered_condition(rng: &mut XorShift, depth: usize, ids: &[DocId]) -> Condition {
         if depth == 0 || rng.below(3) == 0 {
+            #[cfg(feature = "regex")]
+            if rng.below(8) == 0 {
+                let field = ["b", "b", "o.p", "c"][rng.below(4)];
+                return Condition::regex(field, random_regex(rng));
+            }
             let ops = [
                 Op::Eq,
                 Op::Ne,

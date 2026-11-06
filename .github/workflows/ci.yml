@@ -38,6 +38,10 @@ jobs:
       # The `fuzzing` feature's hooks (SPEC §55) and the macro crate
       # (SPEC §114) too.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Without the default `regex` feature (SPEC §169): it builds,
+      # lints and refuses `matches` in a filter's text, saying why.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo test --no-default-features --lib
 
   msrv:
     name: Minimum Rust version (rust-version in Cargo.toml)

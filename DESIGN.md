@@ -344,7 +344,10 @@ limit and a selection, applied in that order [§72](spec/72-skip-for-paging.md)
 
 - **comparisons** (`eq`, `ne`, `lt`, `lte`, `gt`, `gte`) and a
   case-insensitive `contains` [§25](spec/25-op-contains-case-insensitive-substring-match.md); `starts_with`, a prefix, case
-  counting, which an index reads as a range [§158](spec/158-starts-with.md); `is_in`, one of a list of
+  counting, which an index reads as a range [§158](spec/158-starts-with.md); `regex`, `matches` in the
+  text, a regex through the `regex` crate behind a default feature, a
+  pattern beginning `^` and fixed text read as `starts_with`'s range
+  [§169](spec/169-a-regex.md); `is_in`, one of a list of
   values, an OR of `eq`s read as a point of an index per value [§115](spec/115-a-list-of-values-in.md);
 - **`all`, `any_of` and `not`**, also as `&`, `|` and `!` [§36](spec/36-or-not-and-nesting.md);
 - **`exists` and `missing`**, telling a stored null from an absent field;

@@ -70,6 +70,7 @@ fn main() {
                 total.refused_duplicates += ran.refused_duplicates;
                 total.reported += ran.reported;
                 total.custom += ran.custom;
+                total.regexes += ran.regexes;
                 total.live_events += ran.live_events;
                 total.live_sorted += ran.live_sorted;
                 total.distinct_and_ends += ran.distinct_and_ends;
@@ -117,6 +118,7 @@ fn main() {
     );
     println!("  reported changed (§135): {}", total.reported);
     println!("  custom conditions (§136): {}", total.custom);
+    println!("  regex conditions (§169): {}", total.regexes);
     println!("  live query events (§138): {}", total.live_events);
     println!(
         "  sorted live queries (§145): {}, {} events",
