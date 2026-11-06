@@ -131,9 +131,27 @@ says where the need or the limit is described.
   readings of each server", SQL's `ROW_NUMBER() OVER (PARTITION BY …)`,
   for live aggregates too: where groups report at rates far apart
   (§139.6). After `first` and `last`, which give the last one of each.
-- **A pattern language:** regex or `LIKE`-style wildcards (§25.4);
-  `starts with` (§158) is the part an index serves, and a pattern
-  beginning with a fixed prefix can read the same range.
+- **A batch through the command:** `trunkdb batch <file> -`, one
+  operation a line as JSON, `insert`, `update` and `delete` by a
+  filter, `require` and `require_none`, committed whole or not at all,
+  with `--dry-run` and `--param`, and the line that failed named. For
+  it, `Batch` takes filters too: `update_many` and `delete_many` in a
+  batch, run at commit at their place in it, under the writer's lock,
+  as `require` is (§162), where its writes are by id alone today.
+  "Mark every overdue task and log that it was done" in one commit,
+  with no gap between reading and writing; each command is a batch of
+  its own today (§156).
+- **A regex:** `Filter::matches(field, pattern)`, `notes matches
+  "time-?out"` in the text, `(?i)` to ignore case, the pattern a
+  parameter too (§163); what a `LIKE` pattern says, a regex says, so
+  it is the pattern language §25.4 left open. The `regex` crate,
+  whose matching is linear in the text, so no pattern can make a
+  query hang, with a limit on a pattern's size; compiled once a query.
+  Behind a feature, on by default. A pattern beginning with fixed
+  text, `^Fix`, can read the range `starts with` (§158) reads; any
+  other reads the documents, as `contains` does. A search over long
+  text in milliseconds is not this, but an index of words, if a need
+  for it comes.
 - **A date without a time, and a time without a date,** as variants of
   their own; until then, noon UTC of the day serves (§69.1).
 - **A C ABI,** `trunkdb-ffi`, with a header made by cbindgen: the way
