@@ -74,3 +74,22 @@ help: add `..` at the end of the field list to ignore all other fields
    |
 15 |     if let QueryPlan::IndexUnion { fields , .. } = &plan { let _ = fields; }
    |                                           ++++
+
+error[E0027]: pattern does not mention field `in_order`
+  --> tests/ui/variant_matched_without_rest.rs:15:12
+   |
+15 |     if let QueryPlan::IndexUnion { fields } = &plan { let _ = fields; }
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing field `in_order`
+   |
+help: include the missing field in the pattern
+   |
+15 |     if let QueryPlan::IndexUnion { fields, in_order } = &plan { let _ = fields; }
+   |                                          ++++++++++
+help: if you don't care about this missing field, you can explicitly ignore it
+   |
+15 |     if let QueryPlan::IndexUnion { fields, in_order: _ } = &plan { let _ = fields; }
+   |                                          +++++++++++++
+help: or always ignore missing fields here
+   |
+15 |     if let QueryPlan::IndexUnion { fields, .. } = &plan { let _ = fields; }
+   |                                          ++++

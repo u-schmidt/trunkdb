@@ -1316,7 +1316,7 @@ impl Run<'_> {
         let result = batch.commit();
         if !earlier && !fields.is_empty() {
             match &result {
-                Ok(()) => {
+                Ok(_) => {
                     assert!(fails.is_none(), "{}: the model says {fails:?}", self.at());
                     self.ran.batch_fields_committed += 1;
                     self.model = after;
@@ -1347,7 +1347,7 @@ impl Run<'_> {
             return;
         }
         let as_said = match (&fails, &result) {
-            (None, Ok(())) => {
+            (None, Ok(_)) => {
                 self.model = after;
                 return;
             }
@@ -1622,8 +1622,9 @@ impl Run<'_> {
     /// `[*]`) is looked for with the database's own `Eq`, the AND of
     /// them for a compound index. A null — or a field missing, which a
     /// filter can't tell from null — collides with nothing; nor do
-    /// arrays, objects and binary, which `Eq` compares by content but a
-    /// unique index doesn't check (SPEC §124.5); `NaN` equals nothing.
+    /// arrays and objects, which `Eq` compares by content but a unique
+    /// index doesn't check (SPEC §124.5); `NaN` equals nothing. Binary
+    /// collides by its bytes, since it has an index key (SPEC §166).
     fn collisions_in(
         at: usize,
         model: &BTreeMap<DocId, Document>,
@@ -1649,7 +1650,7 @@ impl Run<'_> {
             if tuple.iter().any(|value| {
                 matches!(
                     value,
-                    Document::Null | Document::Array(_) | Document::Object(_) | Document::Binary(_)
+                    Document::Null | Document::Array(_) | Document::Object(_)
                 )
             }) {
                 continue;
