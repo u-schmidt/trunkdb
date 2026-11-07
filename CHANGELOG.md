@@ -1161,9 +1161,11 @@ limit, batches and a write-ahead log. Since then:
     delete on it panicked. Its check refuses it as damage now. Found by
     fuzzing; 0.33.0 and older have it too.
 
-    Items 143–147 → next release: file format 14, which 0.33.0 and
-    older refuse once this build has opened a file for writing; keep
-    an export or a copy from before to go back. Opening an older file converts nothing: its
-    documents and index leaves read as they are and are stored anew as
-    they are written, all of them by `compact`. Nothing to adapt in a
-    program. A fixture of format 14 comes with the release (§120.9).
+    Items 143–147 → 0.34.0: nothing to adapt in a program. **File
+    format 14,** which 0.33.0 and older refuse once 0.34.0 has opened
+    a file for writing; keep an export or a copy from before to go
+    back. Opening an older file converts nothing: its documents and
+    index leaves read as they are and are stored anew as they are
+    written, all of them by `compact`. With its fixture (§120.9),
+    which adds a key past 64 bytes to the generator, so the fixture
+    holds a key stored in full.

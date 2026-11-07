@@ -82,6 +82,14 @@ fn write_database(path: &Path) {
             r#"{{"kind": "id", "v": {{"$id": "{first}"}}}}"#
         )))
         .unwrap();
+    // A key past the 64 bytes a field name may have (SPEC §170), stored
+    // in full in its document instead of as a number.
+    kinds
+        .insert(doc(&format!(
+            r#"{{"kind": "long key", "v": {{"{}": 1}}}}"#,
+            "k".repeat(70)
+        )))
+        .unwrap();
     let long: String = (0..9_000)
         .map(|i| char::from(b'a' + (i % 26) as u8))
         .collect();
