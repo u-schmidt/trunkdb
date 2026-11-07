@@ -23,6 +23,7 @@ use crate::document::{
     TAG_FIELDS, TAG_FLOAT, TAG_ID, TAG_INT, TAG_LIST, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_TEXT,
     TAG_VARINT,
 };
+use crate::document::{TAG_DATE, TAG_TIME};
 use crate::names::FieldNames;
 use crate::serde_bridge::DocumentError;
 use crate::serde_bridge::Reader;
@@ -141,15 +142,20 @@ impl Value<'_, '_, '_> {
     }
 }
 
+/// The tags read through the bridge, decoded first: a date-time is a
+/// two-field map to `deserialize_any` and its text to `deserialize_str`;
+/// a date and a time are their text (SPEC §69, §173).
+const DECODED_FIRST: [u8; 3] = [TAG_DATETIME, TAG_DATE, TAG_TIME];
+
 impl<'de> Deserializer<'de> for Value<'_, '_, '_> {
     type Error = StoredError;
 
     /// As the bridge's `deserialize_any` for each kind of `Document`.
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, StoredError> {
         let tag = self.tag()?;
-        if tag == TAG_DATETIME || self.not_an_object()? {
-            // A date-time is a two-field map to `deserialize_any`; a
-            // document that isn't an object is only damage since §95.
+        if DECODED_FIRST.contains(&tag) || self.not_an_object()? {
+            // See `DECODED_FIRST`; a document that isn't an object is only
+            // damage since §95.
             return Reader(self.decoded()?)
                 .deserialize_any(visitor)
                 .map_err(StoredError::Message);
@@ -249,7 +255,7 @@ impl<'de> Deserializer<'de> for Value<'_, '_, '_> {
 
     /// A date-time as its text (SPEC §69), as the bridge reads it.
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, StoredError> {
-        if self.tag()? == TAG_DATETIME || self.not_an_object()? {
+        if DECODED_FIRST.contains(&self.tag()?) || self.not_an_object()? {
             return Reader(self.decoded()?)
                 .deserialize_str(visitor)
                 .map_err(StoredError::Message);
@@ -598,7 +604,19 @@ mod tests {
             ),
             5 => Document::Binary((0..rng.below(4)).map(|i| i as u8).collect()),
             6 => Document::Id(DocId([rng.below(256) as u8; 16])),
-            7 => Document::DateTime(DateTime::from_unix(rng.below(1 << 30) as i64, 5).unwrap()),
+            7 => match rng.below(3) {
+                0 => Document::DateTime(DateTime::from_unix(rng.below(1 << 30) as i64, 5).unwrap()),
+                1 => Document::Date(
+                    DateTime::from_unix(rng.below(1 << 30) as i64, 0)
+                        .unwrap()
+                        .date(),
+                ),
+                _ => Document::Time(
+                    DateTime::from_unix(rng.below(1 << 30) as i64, 7)
+                        .unwrap()
+                        .time(),
+                ),
+            },
             8 => Document::String("9".into()),
             9 => Document::Int(7),
             10 => Document::Array(

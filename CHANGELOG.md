@@ -1169,3 +1169,29 @@ limit, batches and a write-ahead log. Since then:
     written, all of them by `compact`. With its fixture (§120.9),
     which adds a key past 64 bytes to the generator, so the fixture
     holds a key stored in full.
+148. **A date, and a time of day** (§173): `Date`, a day in the
+    calendar without a time or a zone, and `Time`, a time of day
+    without a date, to the nanosecond, as `Document::Date` and
+    `Document::Time`. A struct's `Date` and `Time` fields are stored
+    as them; `DateTime::date()` and `time()` take a moment apart in
+    UTC, and `Date::at(time)` puts it back together. Each compares
+    only with its own kind, never with a date-time, midnight or not:
+    filters, sorts after binary, keys in an index, `min` and `max`.
+    In a filter's text `date("2026-11-07")` and `time("14:05")`, and
+    `datetime("…")` for a moment; `Kind::Date` and `Kind::Time`, `is
+    date` and `is time`; in JSON `{"$date": "2026-11-07"}` and
+    `{"$time": "14:05:00"}`.
+
+    Item 148 → next release: **changed answers:** `Kind::DateTime` is
+    named `datetime` in the text now, as `date` names dates, so
+    `hours is date` finds dates where it found date-times; `trunkdb
+    fields` prints `datetime` for them; and a filter prints a
+    date-time as `datetime("…")`. `date("…")` with a time in it still
+    reads as a date-time, so filters written so far mean what they
+    did. `Date`, `Time`, `Document::Date`, `Document::Time`,
+    `Kind::Date` and `Kind::Time` are additions, to enums that were
+    `#[non_exhaustive]` already. **File format 15,** which 0.34.0
+    refuses once this build has opened a file for writing; an older
+    file opens as it is, nothing rebuilt. **Export version 4,** which
+    0.34.0 and older refuse; an import reads 1 to 3 as before. A
+    fixture of format 15 comes with the release (§120.9).

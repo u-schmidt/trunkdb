@@ -78,11 +78,17 @@ pub fn base() -> &'static [u8] {
 
         let notes = db.collection::<Document>("notes");
         notes.ensure_index("n").unwrap();
+        // Dates and times of day, one indexed (SPEC §173).
+        notes.ensure_index("d").unwrap();
         for n in 0..20i64 {
+            let day = trunkdb::Date::from_days_since_epoch(n * 400 - 4000).unwrap();
+            let time = trunkdb::Time::from_nanos_since_midnight(n as u64 * 4_321_000_000_007);
             let doc = Document::Object(
                 [
                     ("n".to_string(), Document::Int(n)),
                     ("f".to_string(), Document::Float(n as f64 / 3.0)),
+                    ("d".to_string(), Document::Date(day)),
+                    ("t".to_string(), Document::Time(time.unwrap())),
                 ]
                 .into_iter()
                 .collect(),

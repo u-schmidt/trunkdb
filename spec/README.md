@@ -187,3 +187,4 @@ say what changed, and DESIGN.md says what is true now.
 170. [Field names stored once, numbers as varints (`names.rs`, `document.rs`, `catalog.rs`, `decode.rs`, `storage/file.rs`)](170-field-names-stored-once.md)
 171. [Index leaves stored after an anchor (`index/leaf.rs`, `index/btree.rs`, `storage/slotted.rs`, `storage/mod.rs`)](171-index-leaves-stored-after-an-anchor.md)
 172. [Walks that pass part of a leaf (`index/btree.rs`, `index/leaf.rs`, `collection.rs`, `decode.rs`, `storage/slotted.rs`)](172-walks-that-pass-part-of-a-leaf.md)
+173. [A date, and a time of day (`datetime.rs`, `document.rs`, `index/key.rs`, `query.rs`, `query_text.rs`, `json.rs`, `export.rs`, `serde_bridge.rs`, `serde_stored.rs`, `bin/trunkdb.rs`)](173-a-date-and-a-time-of-day.md)

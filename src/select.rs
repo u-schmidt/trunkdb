@@ -448,6 +448,8 @@ impl Answer {
                             | Document::Binary(_)
                             | Document::Id(_)
                             | Document::DateTime(_)
+                            | Document::Date(_)
+                            | Document::Time(_)
                     ) {
                         return None;
                     }

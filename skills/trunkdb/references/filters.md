@@ -81,7 +81,7 @@ bytes; an index serves both.
   in it doubled: `` `first name` ``, `` `a``b` ``.
 - These eleven words are reserved and need backticks as names: `and`,
   `or`, `not`, `true`, `false`, `null`, `select`, `where`, `order`,
-  `limit`, `offset`. Other keywords (`size`, `date`, `is`, `has`, …) are
+  `limit`, `offset`. Other keywords (`size`, `date`, `time`, `is`, `has`, …) are
   fine as bare names: `size > 3` compares a field named `size`.
 
 ## Values
@@ -92,10 +92,14 @@ double quotes with JSON escapes (single quotes are an error), `true`,
 
 - Ids: `id("0192f0c4-7d7a-7c43-9e0b-1f6d1b8f0a11")`, or the tagged
   `{"$id": "…"}`.
-- Points in time: `date("2026-05-01T12:00:00Z")` (RFC 3339, always
-  with a time, in UTC or with an offset: `date("2026-05-01")` is
-  refused), or `{"$date": "…"}`. A date never equals a string: compare
-  dates with `date(…)`.
+- Moments: `datetime("2026-05-01T12:00:00Z")` (RFC 3339, always with a
+  time, in UTC or with an offset), or `{"$date": "…"}` with a time.
+  `date("…")` with a time in it is a moment too.
+- Days: `date("2026-05-01")`, or `{"$date": "2026-05-01"}`. Times of
+  day: `time("14:05")` or `time("14:05:30.5")`, or `{"$time": "…"}`.
+- Each kind compares only with its own: a day never equals a moment,
+  midnight or not, nor a string. `trunkdb fields` says which a field
+  holds; compare it with that kind.
 - Binary: `{"$binary": "<base64>"}`; special floats: `{"$float":
   "NaN"}`.
 
@@ -106,7 +110,7 @@ name=value` (one per parameter, anywhere after the command):
 
 ```text
 trunkdb find app.trunkdb tasks 'status = :s and due < :d limit :n' \
-  --param s=open --param 'd=date("2026-12-01T00:00:00Z")' --param n=20
+  --param s=open --param 'd=datetime("2026-12-01T00:00:00Z")' --param n=20
 trunkdb count app.trunkdb tasks 'team in :teams' --param 'teams=["core", "web"]'
 ```
 
@@ -114,7 +118,8 @@ trunkdb count app.trunkdb tasks 'team in :teams' --param 'teams=["core", "web"]'
   list (a JSON array), and for `limit`, `offset` and `size(…) > n` (a
   whole number from 0). Never for a field, a sort key, an index, a
   duration, or inside `id(…)`/`date(…)`: give the id or date itself.
-- The value: JSON, `id("…")` or `date("…")`, else the string as
+- The value: JSON, `id("…")`, `datetime("…")`, `date("…")` or
+  `time("…")`, else the string as
   written: `s=open` is `"open"`, `n=20` is `20`, `code=007` is
   `"007"`. A string that reads as JSON is given as JSON: `n='"20"'`.
   Something that starts like JSON or `date(` and doesn't read is an
@@ -152,7 +157,7 @@ document whose `hours` is `"4"`, and `sum(hours)` and `avg(hours)`
 leave it out. `trunkdb fields` shows which paths hold several types;
 `is` finds the documents with each, by the names `fields` prints:
 `bool`, `int`, `float`, `number` (int or float), `string`, `binary`,
-`array`, `object`, `id`, `date`.
+`array`, `object`, `id`, `datetime`, `date`, `time`.
 
 ```text
 hours is string                                     -- the odd ones

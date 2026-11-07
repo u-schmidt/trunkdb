@@ -126,8 +126,8 @@ cell is long enough for its entry [§55](spec/55-fuzzing.md).
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
 shrink until a compaction [§41](spec/41-compaction.md).
 
-**The format version** is 14 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md) [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md) [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md). A build opens its own format and
-the older ones that are valid files of it (6 to 13), and stamps them
+**The format version** is 15 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md) [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md) [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md) [§173](spec/173-a-date-and-a-time-of-day.md). A build opens its own format and
+the older ones that are valid files of it (6 to 14), and stamps them
 with the current one at open; it refuses newer ones, and older ones
 that need converting. Opening a 6–9 file with secondary indexes checks
 them once and rebuilds any that a document holds an id in, since ids
@@ -236,7 +236,9 @@ by their canonical group values are compared with those before
 instant in UTC to the nanosecond, what a `SystemTime` or a
 `trunkdb::DateTime` field stores [§69](spec/69-a-date-time-type.md). It holds trunkdb's `DateTime`, not a
 `SystemTime`, which differs between platforms: the same everywhere,
-over the whole range of an `i64` of seconds [§70](spec/70-a-portable-date-time.md). It's what
+over the whole range of an `i64` of seconds [§70](spec/70-a-portable-date-time.md); and `Date`, a day
+without a time, and `Time`, a time of day without a date, each
+comparing only with its own kind [§173](spec/173-a-date-and-a-time-of-day.md). It's what
 everything below the API works in, like LiteDB's `BsonValue`.
 `Collection<T>` converts any `T: Serialize + DeserializeOwned` to and
 from it through serde, and delegates to `Collection<Document>`: one
@@ -346,7 +348,9 @@ compares values in [§34.1](spec/34-sorting-through-an-index.md). They cover:
 - **date-times:** a key in time order, sorting after ids [§69](spec/69-a-date-time-type.md);
 - **binary:** a key in the order of its bytes, as SQLite orders a BLOB,
   sorting after date-times; `<`, ranges and `starts with` read it
-  [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md).
+  [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md);
+- **dates and times of day:** a key each in their order, sorting after
+  binary [§173](spec/173-a-date-and-a-time-of-day.md).
 
 An index is built and kept up to date in the same batch as the
 documents it covers, so it can't disagree with them after a crash.
@@ -693,9 +697,10 @@ more than four.
   each index's keys while they are sorted [§90](spec/90-a-wal-record-written-from-the-pages.md) [§91](spec/91-a-batch-in-several-records.md) [§108](spec/108-compaction-built-in-a-file.md).
 - **Export and import** write and read JSON Lines, with the types JSON
   lacks kept by tags (`{"$id": ...}`, `{"$binary": ...}`, `{"$date":
-  "<RFC 3339>"}`), so an export is a readable backup and the path
-  between file formats [§30](spec/30-export-and-import-as-json-lines.md). Exports are format 2 since `$date`; an
-  import reads format 1 too [§69](spec/69-a-date-time-type.md).
+  "<RFC 3339>"}`, `{"$date": "2026-11-07"}`, `{"$time": "14:05:00"}`),
+  so an export is a readable backup and the path between file formats
+  [§30](spec/30-export-and-import-as-json-lines.md). Exports are format 4 since `$time`; an import reads
+  formats 1 to 3 too [§69](spec/69-a-date-time-type.md) [§165](spec/165-backups-a-user-can-trust.md) [§173](spec/173-a-date-and-a-time-of-day.md).
 
 ## 12. Performance
 
@@ -865,7 +870,7 @@ src/
 ├── stats.rs           Database::stats: where a file's space goes
 ├── update.rs          Update: operators on dotted paths
 ├── document.rs        Document and DocId: the schema-less value type
-├── datetime.rs        DateTime, what Document::DateTime holds
+├── datetime.rs        DateTime, Date and Time, what their Document variants hold
 ├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document
 ├── serde_stored.rs    a stored document straight into T, for typed reads
 ├── json.rs            tagged JSON <-> Document, lossless

@@ -64,16 +64,19 @@ narrow questions:
 `documents`, `kinds`). Use it when you go on with `jq` or code; the
 text is shorter to read.
 
-There is no `now()`: for "today" or "overdue", write the date
-yourself, in UTC, `due < date("2026-11-02T00:00:00Z")`, and say in
-your answer which point in time you used.
+There is no `now()`: for "today" or "overdue", write the moment
+yourself, in UTC, `due < datetime("2026-11-02T00:00:00Z")`, or the day,
+`due < date("2026-11-02")`, as the field holds, and say in your answer
+which you used.
 
 The filter language is SQL's `WHERE` with a few additions for nested
 documents and arrays. Wrap the whole filter in single quotes for the
 shell; strings inside it take double quotes (`'name = "Ada"'`, never
-`"name = 'Ada'"`), and a date is a full timestamp with a time and a
-zone (`date("2026-10-01T00:00:00Z")`, not `date("2026-10-01")`). The
-common forms:
+`"name = 'Ada'"`). Times come in three kinds, and each matches only
+its own: a moment, `datetime("2026-10-01T12:00:00Z")`; a day,
+`date("2026-10-01")`; a time of day, `time("14:05")`. `trunkdb fields`
+says which a field holds (`datetime`, `date`, `time`): `date(…)` on a
+field of moments finds nothing. The common forms:
 
 ```text
 status = "open" and hours >= 4
@@ -82,12 +85,13 @@ title starts with "Fix"                  (a prefix, case counting)
 notes matches "time-?out"                (a regex; "(?i)…" for any case)
 team in ("core", "web")
 due is null                              (null or missing)
-hours is string                          (a type: number, string, date, …)
+hours is string                          (a type: number, string, datetime, date, …)
 exists(address.city)                     (present, null included)
 tags[*] = "urgent"                       (any element of the array)
 items has (sku = "A1" and qty > 2)       (one element meets all of it)
 size(tags) > 2
-created >= date("2026-01-01T00:00:00Z")
+created >= datetime("2026-01-01T00:00:00Z")
+due < date("2026-12-01") and opens < time("09:30")
 owner = id("0192f0c4-…")
 select name, address.city where age > 30 order by name desc limit 10 offset 20
 ```
@@ -97,7 +101,8 @@ text**: `trunkdb find app.trunkdb users 'name = :name' --param
 "name=$NAME"`. `:name` stands where a value does, after a comparison,
 in `in (…)` or for the whole list (`team in :teams`, a JSON array), and
 for a count (`limit :n`). The value is JSON (`20`, `true`, `"20"` for
-the string), `id("…")` or `date("…")`, or else the string as written,
+the string), `id("…")`, `datetime("…")`, `date("…")` or `time("…")`,
+or else the string as written,
 quotes and all, and nothing in it can change the filter. A parameter
 without a value, or a value without a parameter, is exit code 2.
 
@@ -149,9 +154,11 @@ string`) read every document. To speed up a query:
 
 Documents are compact JSON with tags for what JSON has no type for:
 `{"$id": "…"}` (a document id, a UUIDv7, so ids sort by creation
-time), `{"$date": "…"}` (a UTC point in time), `{"$binary": "<base64>"}`,
-`{"$float": "NaN"}`. In a filter, ids and dates are written `id("…")`
-and `date("…")`. `5` is an int and `5.0` a float; they compare equal.
+time), `{"$date": "2026-10-01T12:00:00Z"}` (a moment, in UTC), `{"$date":
+"2026-10-01"}` (a day), `{"$time": "14:05:00"}` (a time of day),
+`{"$binary": "<base64>"}`, `{"$float": "NaN"}`. In a filter they are
+written `id("…")`, `datetime("…")`, `date("…")` and `time("…")`. `5` is
+an int and `5.0` a float; they compare equal.
 
 A filter that doesn't parse exits with code 2 and shows the line with a
 `^` under the mistake: fix that spot and run it again. A misspelled
@@ -199,17 +206,18 @@ like this:
 ```text
 trunkdb insert app.trunkdb tasks '{"title": "Write docs", "status": "open"}'
 printf '%s\n' '{"title": "a"}' '{"title": "b"}' | trunkdb insert app.trunkdb tasks -
-trunkdb update app.trunkdb tasks 'status = "open" and due < date("2026-01-01T00:00:00Z")' \
+trunkdb update app.trunkdb tasks 'status = "open" and due < datetime("2026-01-01T00:00:00Z")' \
   '{"$set": {"status": "late"}, "$inc": {"reminders": 1}}'
 trunkdb update app.trunkdb counters 'name = "visits"' '{"$inc": {"n": 1}}' --upsert
-trunkdb delete app.trunkdb tasks 'status = "done" and closed < date("2025-01-01T00:00:00Z")'
+trunkdb delete app.trunkdb tasks 'status = "done" and closed < datetime("2025-01-01T00:00:00Z")'
 trunkdb index app.trunkdb tasks add status due      # one index on both, in that order
 trunkdb index app.trunkdb users add email --unique
 ```
 
 - **`insert`** takes one JSON object, or `-` and one per line on stdin;
-  it prints each new id. Ids and dates are written `{"$id": "…"}` and
-  `{"$date": "…"}` inside JSON. A collection that doesn't exist is an
+  it prints each new id. Ids, moments, days and times of day are
+  written `{"$id": "…"}`, `{"$date": "…"}` and `{"$time": "…"}` inside
+  JSON. A collection that doesn't exist is an
   error, so a typo can't create one; add `--create` only when the user
   wants a new collection.
 - **`update`** takes MongoDB's operators: `$set`, `$unset` (a list of
@@ -230,7 +238,7 @@ trunkdb index app.trunkdb users add email --unique
   one must only happen if something still holds:
 
   ```text
-  trunkdb batch app.trunkdb - --dry-run --param now='date("2026-11-06T12:00:00Z")' <<'END'
+  trunkdb batch app.trunkdb - --dry-run --param now='datetime("2026-11-06T12:00:00Z")' <<'END'
   {"op": "require", "collection": "tasks", "filter": "due < :now and done = false"}
   {"op": "update", "collection": "tasks", "filter": "due < :now and done = false", "update": {"$set": {"overdue": true}}}
   {"op": "insert", "collection": "log", "document": {"what": "marked overdue tasks"}}

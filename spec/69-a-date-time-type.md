@@ -37,7 +37,7 @@ nanosecond. Asked of the application that needed it:
 - **A date without a time, or a time without a date**, isn't a type of
   its own yet: an application can store noon, UTC, of the day, and
   ignore the time. A variant for each can come later; `Document` is
-  `#[non_exhaustive]` (§60).
+  `#[non_exhaustive]` (§60). They came with §173.
 
 ## 69.2 Stored, compared, indexed
 - **In a document**: tag 9, the whole seconds since 1970-01-01T00:00:00Z

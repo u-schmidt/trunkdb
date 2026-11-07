@@ -7,7 +7,7 @@
 //! (§163).
 
 use crate::aggregate::{Column, Kind, Window};
-use crate::datetime::DateTime;
+use crate::datetime::{Date, DateTime, Time};
 use crate::document::{DocId, Document};
 use crate::query::{Aggregate, Condition, Filter, Hint, Kind as ValueKind, Op, Sort, SortOrder};
 use std::collections::BTreeMap;
@@ -19,7 +19,8 @@ use std::time::Duration;
 /// Words that are never a bare field name: written in backticks, a field
 /// may have any of them as its name (`` `order` ``). The other keywords
 /// (`is`, `has`, `contains`, `by`, `asc`, `desc`, and `exists`, `size`,
-/// `id`, `date` before a `(`) only mean something where a field can't
+/// `id`, `datetime`, `date`, `time` before a `(`) only mean something
+/// where a field can't
 /// be, so `size > 3` compares a field named `size`.
 const RESERVED: [&str; 11] = [
     "and", "or", "not", "true", "false", "null", "select", "where", "order", "limit", "offset",
@@ -146,7 +147,8 @@ impl FromStr for Condition {
 /// list, for the whole list (`in :list`, an array), and where a count
 /// does (`limit :n`, `offset :n`, `size(p) > :n`, a whole number from
 /// 0). Never for a field, a sort key, an index, a duration, or inside
-/// `id(…)` or `date(…)`: a value passed for `:id` is an id already.
+/// `id(…)`, `datetime(…)`, `date(…)` or `time(…)`: a value passed for
+/// `:id` is an id already.
 /// Binding a value means what writing it there would mean, with its
 /// type: the string `"5"` stays a string.
 pub struct Template<T> {
@@ -974,7 +976,7 @@ impl<'t> Parser<'t> {
             // A kind (SPEC §159.3), `is not` its NOT.
             let Some(kind) = self.kind() else {
                 return self.expected(
-                    "`null` or a kind (bool, int, float, number, string, binary, array, object, id, date)",
+                    "`null` or a kind (bool, int, float, number, string, binary, array, object, id, datetime, date, time)",
                 );
             };
             let is = Condition::IsKind { field, kind };
@@ -1171,7 +1173,8 @@ impl<'t> Parser<'t> {
     }
 
     /// A value (SPEC §111.4): JSON, tags and all, as `Document` reads it
-    /// (§71), or `id("…")` or `date("…")`.
+    /// (§71), or `id("…")`, `datetime("…")`, `date("…")` or `time("…")`
+    /// (§173).
     fn value(&mut self) -> Parsed<Document> {
         self.skip_space();
         let start = self.at;
@@ -1222,12 +1225,36 @@ impl<'t> Parser<'t> {
                 Err(e) => self.error_at(start, format!("not an id: {e}")),
             };
         }
-        if self.at_function("date") {
-            self.keyword("date");
+        if self.at_function("datetime") {
+            self.keyword("datetime");
             let (start, text) = self.argument()?;
             return match text.parse::<DateTime>() {
                 Ok(time) => Ok(Document::DateTime(time)),
                 Err(e) => self.error_at(start, format!("not a date-time: {e}")),
+            };
+        }
+        // A date alone, or a date and a time as `date` read them before
+        // `datetime` (SPEC §173): the text says which.
+        if self.at_function("date") {
+            self.keyword("date");
+            let (start, text) = self.argument()?;
+            if let Ok(day) = text.parse::<Date>() {
+                return Ok(Document::Date(day));
+            }
+            return match text.parse::<DateTime>() {
+                Ok(time) => Ok(Document::DateTime(time)),
+                Err(_) => self.error_at(
+                    start,
+                    format!("not a date: {text:?} is neither a date like \"2026-09-27\" nor a date and time"),
+                ),
+            };
+        }
+        if self.at_function("time") {
+            self.keyword("time");
+            let (start, text) = self.argument()?;
+            return match text.parse::<Time>() {
+                Ok(time) => Ok(Document::Time(time)),
+                Err(e) => self.error_at(start, format!("not a time of day: {e}")),
             };
         }
         self.expected("a value")
@@ -1236,7 +1263,7 @@ impl<'t> Parser<'t> {
     /// `("…")`, the string inside, and where it starts.
     fn argument(&mut self) -> Parsed<(usize, String)> {
         self.expect("(")?;
-        self.no_parameter("the text inside `id(…)` or `date(…)`: its value is the id or date-time itself, `_id = :id`")?;
+        self.no_parameter("the text inside `id(…)`, `date(…)` and the like: its value is the id or date itself, `_id = :id`")?;
         self.skip_space();
         let start = self.at;
         let Some(len) = self
@@ -1783,12 +1810,14 @@ fn write_path(f: &mut Formatter<'_>, path: &str) -> fmt::Result {
     Ok(())
 }
 
-/// `value` as `value` reads it: tagged JSON (§71), but ids and
-/// date-times by name.
+/// `value` as `value` reads it: tagged JSON (§71), but ids, date-times,
+/// dates and times by name.
 fn write_value(f: &mut Formatter<'_>, value: &Document) -> fmt::Result {
     match value {
         Document::Id(id) => write!(f, "id(\"{id}\")"),
-        Document::DateTime(time) => write!(f, "date(\"{time}\")"),
+        Document::DateTime(time) => write!(f, "datetime(\"{time}\")"),
+        Document::Date(day) => write!(f, "date(\"{day}\")"),
+        Document::Time(time) => write!(f, "time(\"{time}\")"),
         other => write!(f, "{other}"),
     }
 }
@@ -1985,12 +2014,49 @@ mod tests {
     fn ids_and_date_times_have_their_own_literals() {
         let id = DocId::NIL;
         let time = DateTime::from_unix(1_714_564_800, 5).unwrap();
-        let text = format!(r#"_id = id("{id}") and at < date("{time}")"#);
+        let text = format!(r#"_id = id("{id}") and at < datetime("{time}")"#);
         same(&text, Filter::new().id(id).lt("at", time));
+        // `date` with a time in it is a date-time, as before `datetime`.
+        same(
+            &format!(r#"_id = id("{id}") and at < date("{time}")"#),
+            Filter::new().id(id).lt("at", time),
+        );
         // The tags of §71 are values too.
         let tagged = format!(r#"_id = {{"$id": "{id}"}} and at < {{"$date": "{time}"}}"#);
         same(&tagged, Filter::new().id(id).lt("at", time));
         assert_eq!(parse(&tagged).to_string(), text);
+    }
+
+    /// SPEC §173: `date("…")` a day, `time("…")` a time of day,
+    /// `datetime("…")` a moment, each written back by its name; the
+    /// tags read as the same values.
+    #[test]
+    fn dates_and_times_have_their_own_literals() {
+        let day: crate::Date = "2026-11-07".parse().unwrap();
+        let opens: crate::Time = "09:30".parse().unwrap();
+        let text = r#"due = date("2026-11-07") and opens < time("09:30:00")"#;
+        same(text, Filter::new().eq("due", day).lt("opens", opens));
+        same(
+            r#"due = {"$date": "2026-11-07"} and opens < {"$time": "09:30"}"#,
+            Filter::new().eq("due", day).lt("opens", opens),
+        );
+        same(
+            r#"opens in (time("09:30"), time("10:00"))"#,
+            Filter::new().is_in("opens", [opens, "10:00".parse::<crate::Time>().unwrap()]),
+        );
+        assert!(error(r#"a = datetime("2026-11-07")"#).contains("not a date-time"));
+        assert!(error(r#"a = date("2026-13-01")"#).contains("not a date: \"2026-13-01\""));
+        assert!(error(r#"a = time("9:30")"#).contains("not a time of day"));
+        assert!(error(r#"a = time(:t)"#).contains("its value is the id or date itself"));
+        // A field may be named after them.
+        same(
+            "date = 1 and time = 2",
+            Filter::new().eq("date", 1).eq("time", 2),
+        );
+        same(
+            "datetime is date",
+            Filter::new().is_kind("datetime", crate::query::Kind::Date),
+        );
     }
 
     #[test]
@@ -2643,9 +2709,13 @@ mod tests {
                 ["", "u", "t1", "v2", "q\"uo\\te", "Ünï\n", "]}\"[{"][rng.below(7)].into(),
             ),
             5 => Document::Id(DocId([rng.below(3) as u8; 16])),
-            6 => Document::DateTime(
-                DateTime::from_unix(rng.below(3) as i64, rng.below(2) as u32).unwrap(),
-            ),
+            6 => match rng.below(3) {
+                0 => Document::DateTime(
+                    DateTime::from_unix(rng.below(3) as i64, rng.below(2) as u32).unwrap(),
+                ),
+                1 => Document::Date(Date::from_days_since_epoch(rng.below(3) as i64 - 1).unwrap()),
+                _ => Document::Time(Time::from_nanos_since_midnight(rng.below(3) as u64).unwrap()),
+            },
             7 => Document::Binary(vec![rng.below(256) as u8; rng.below(3)]),
             8 => Document::Int(i64::MIN),
             9 => Document::Array(

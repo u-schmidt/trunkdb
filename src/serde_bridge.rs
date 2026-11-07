@@ -221,6 +221,15 @@ impl Serializer for DocumentSerializer {
                 .parse::<crate::DateTime>()
                 .map(Document::DateTime)
                 .map_err(DocumentError::custom),
+            // And a `Date` or `Time` as what it is (SPEC §173).
+            (crate::datetime::DATE_NEWTYPE, Document::String(s)) => s
+                .parse::<crate::Date>()
+                .map(Document::Date)
+                .map_err(DocumentError::custom),
+            (crate::datetime::TIME_NEWTYPE, Document::String(s)) => s
+                .parse::<crate::Time>()
+                .map(Document::Time)
+                .map_err(DocumentError::custom),
             (_, inner) => Ok(inner),
         }
     }
@@ -545,6 +554,11 @@ impl<'de> Deserializer<'de> for Reader {
                         .map(|(name, value)| (name, Reader(value))),
                 ))
             }
+            // As their text (SPEC §173): what a `Date` or `Time` field
+            // parses, and what a `String` field or a `serde_json::Value`
+            // gets.
+            Document::Date(day) => visitor.visit_string(day.to_string()),
+            Document::Time(time) => visitor.visit_string(time.to_string()),
             Document::Array(items) => visitor.visit_seq(read_each(items)),
             Document::Object(map) => visitor.visit_map(read_fields(map)),
         }
@@ -819,6 +833,57 @@ mod tests {
         let json = serde_json::to_string(&early).unwrap();
         assert_eq!(json, r#""1969-12-31T23:59:59Z""#);
         assert_eq!(serde_json::from_str::<DateTime>(&json).unwrap(), early);
+    }
+
+    /// SPEC §173: a `Date` or `Time` field is stored as one, and reads
+    /// back; a `String` field or a `serde_json::Value` reads its text;
+    /// other formats see the text; a string field stays a string.
+    #[test]
+    fn date_and_time_fields_are_stored_as_what_they_are() {
+        use crate::{Date, Time};
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Shift {
+            day: Date,
+            starts: Time,
+            ends: Option<Time>,
+            note: String,
+        }
+        let shift = Shift {
+            day: "2026-11-07".parse().unwrap(),
+            starts: "09:30".parse().unwrap(),
+            ends: Some("17:00:00.5".parse().unwrap()),
+            note: "2026-11-07".into(),
+        };
+        let doc = to_document(&shift).unwrap();
+        assert_eq!(doc.get("day"), Some(&Document::Date(shift.day)));
+        assert_eq!(doc.get("starts"), Some(&Document::Time(shift.starts)));
+        assert_eq!(doc.get("ends"), Some(&Document::Time(shift.ends.unwrap())));
+        assert_eq!(
+            doc.get("note"),
+            Some(&Document::String("2026-11-07".into()))
+        );
+        roundtrip(shift);
+
+        let text: String = from_document(Document::Date("1969-12-31".parse().unwrap())).unwrap();
+        assert_eq!(text, "1969-12-31");
+        let value: serde_json::Value =
+            from_document(Document::Time("09:30".parse().unwrap())).unwrap();
+        assert_eq!(value, serde_json::json!("09:30:00"));
+        // Text that is one reads into the field too, as a `DateTime`'s does.
+        let day: Date = from_document(Document::String("2026-11-07".into())).unwrap();
+        assert_eq!(day.to_string(), "2026-11-07");
+        assert!(from_document::<Date>(Document::Time(Time::MIDNIGHT)).is_err());
+        assert!(from_document::<Time>(Document::Int(5)).is_err());
+
+        let json = serde_json::to_string(&Time::from_hms(9, 5, 0).unwrap()).unwrap();
+        assert_eq!(json, r#""09:05:00""#);
+        assert_eq!(
+            serde_json::from_str::<Date>(r#""2026-11-07""#)
+                .unwrap()
+                .day(),
+            7
+        );
     }
 
     #[test]

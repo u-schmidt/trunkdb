@@ -103,7 +103,7 @@ pub use collection::{Collection, IndexFields, Upserted};
 pub use compact::Compacted;
 pub use cursor::Cursor;
 pub use database::{Database, OpenOptions};
-pub use datetime::{DateTime, ParseDateTimeError};
+pub use datetime::{Date, DateTime, ParseDateTimeError, Time};
 pub use document::{DocId, Document, ParseIdError};
 pub use export::{ImportOptions, Summary, Verified, verify_export};
 pub use json::ParseDocumentError;

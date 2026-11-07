@@ -40,6 +40,13 @@ const TAG_DATETIME: u8 = 5;
 /// and cut to the same budget. After date-times, as the sort puts them;
 /// since file format 13, the first that can hold one.
 const TAG_BINARY: u8 = 6;
+/// A `Date` (SPEC §173): its days since 1970-01-01 as a big-endian `i64`
+/// with the sign bit flipped. After binary, as the sort puts it; since
+/// file format 15, the first that can hold one, so no older key moves.
+const TAG_DATE: u8 = 7;
+/// A `Time` (SPEC §173): its nanoseconds since midnight as a big-endian
+/// `u64`. After dates.
+const TAG_TIME: u8 = 8;
 /// A value only compound keys hold (SPEC §43.2): arrays, objects, NaN —
 /// everything `encode_value` leaves out. Last, as such
 /// values sort after everything (§34.1). No bytes after the tag: they're
@@ -201,6 +208,14 @@ pub fn decode_part_into(part: &[u8], fields: usize, value: &mut Document) -> Opt
             let nanos = u32::from_be_bytes(rest[8..].try_into().ok()?);
             Document::DateTime(crate::DateTime::from_unix(seconds as i64, nanos)?)
         }
+        (TAG_DATE, rest) => {
+            let days = u64::from_be_bytes(rest.try_into().ok()?) ^ (1 << 63);
+            Document::Date(crate::Date::from_days_since_epoch(days as i64)?)
+        }
+        (TAG_TIME, rest) => {
+            let nanos = u64::from_be_bytes(rest.try_into().ok()?);
+            Document::Time(crate::Time::from_nanos_since_midnight(nanos)?)
+        }
         _ => return None,
     };
     Some(())
@@ -288,7 +303,7 @@ pub fn each_part(value_part: &[u8]) -> impl Iterator<Item = &[u8]> {
         let len = match tag {
             TAG_NULL | TAG_OTHER => 1,
             TAG_BOOL => 2,
-            TAG_NUMBER => 9,
+            TAG_NUMBER | TAG_DATE | TAG_TIME => 9,
             TAG_ID => 17,
             TAG_DATETIME => 13,
             _ => string_len(rest).unwrap_or(rest.len()),
@@ -350,7 +365,7 @@ pub fn secondary(value: &Document, id: DocId) -> Option<Vec<u8>> {
 /// the full filter again (SPEC §28.3). Only the types a comparison can
 /// match are indexed — `Null` (which also stands for a missing field,
 /// SPEC §32), `Bool`, `Int`/`Float`, `String`, ids (SPEC §62),
-/// date-times (SPEC §69) and binary (SPEC §166).
+/// date-times (SPEC §69), binary (SPEC §166), dates and times (§173).
 /// Anything else (arrays, objects, `NaN`) is `None`: no
 /// `Eq`/`Lt`/`Lte`/`Gt`/`Gte` condition can match it, so leaving it out
 /// of the index loses nothing.
@@ -381,6 +396,16 @@ fn encode_value_in(value: &Document, fields: usize) -> Option<Vec<u8>> {
             let mut out = vec![TAG_DATETIME];
             out.extend_from_slice(&((time.unix_seconds() as u64) ^ (1 << 63)).to_be_bytes());
             out.extend_from_slice(&time.subsec_nanos().to_be_bytes());
+            Some(out)
+        }
+        Document::Date(day) => {
+            let mut out = vec![TAG_DATE];
+            out.extend_from_slice(&((day.days_since_epoch() as u64) ^ (1 << 63)).to_be_bytes());
+            Some(out)
+        }
+        Document::Time(time) => {
+            let mut out = vec![TAG_TIME];
+            out.extend_from_slice(&time.nanos_since_midnight().to_be_bytes());
             Some(out)
         }
         _ => None,
@@ -857,6 +882,62 @@ mod tests {
             [&keys[4][..], &key(Document::String("x".into()))[..]]
         );
         assert!(part_is_exact(parts[0], 2));
+    }
+
+    /// SPEC §173: dates in calendar order, before 1970 too, and times of
+    /// day in the day's, each after the kinds before them, read back
+    /// whole; a compound key's parts split them.
+    #[test]
+    fn dates_and_times_are_keyed_in_their_order() {
+        let date = |days| Document::Date(crate::Date::from_days_since_epoch(days).unwrap());
+        let time = |nanos| Document::Time(crate::Time::from_nanos_since_midnight(nanos).unwrap());
+        let first = crate::DateTime::EARLIEST.date().days_since_epoch();
+        let last = crate::DateTime::from_unix(i64::MAX, 0)
+            .unwrap()
+            .date()
+            .days_since_epoch();
+        let values = [
+            date(first),
+            date(-256),
+            date(-1),
+            date(0),
+            date(1),
+            date(256),
+            date(65_536),
+            date(last),
+            time(0),
+            time(1),
+            time(256),
+            time(1 << 32),
+            time(86_400_000_000_000 - 1),
+        ];
+        let keys: Vec<_> = values.iter().map(|v| key(v.clone())).collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+        for (value, key) in values.iter().zip(&keys) {
+            assert_eq!(key.len(), 9);
+            assert!(part_is_exact(key, 1));
+            assert_eq!(decode_part(key, 1).as_ref(), Some(value));
+        }
+        let binary = Document::Binary(vec![0xFF; 50]);
+        assert!(key(binary) < keys[0], "after binary, as the sort puts them");
+        assert!(*keys.last().unwrap() < [TAG_OTHER].to_vec());
+
+        let two = encode_values(&[&values[3], &values[9], &Document::String("x".into())]);
+        assert_eq!(
+            parts(&two),
+            [
+                &keys[3][..],
+                &keys[9][..],
+                &key(Document::String("x".into()))[..]
+            ]
+        );
+        // A key past the range is damage: read back as nothing.
+        let mut past = keys[12].clone();
+        past[1..].copy_from_slice(&86_400_000_000_000u64.to_be_bytes());
+        assert_eq!(decode_part(&past, 1), None);
+        let mut past = keys[7].clone();
+        past[1..].copy_from_slice(&(((last + 1) as u64) ^ (1 << 63)).to_be_bytes());
+        assert_eq!(decode_part(&past, 1), None);
     }
 
     /// SPEC §96: an id comparison as a range of the primary index holds

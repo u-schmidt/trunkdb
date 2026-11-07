@@ -125,14 +125,14 @@ fn a_file_it_cannot_read_is_reported_as_before() {
     std::fs::write(&input, EXPORT).unwrap();
     assert!(trunkdb(&["import", &newer, &input]).status.success());
     let mut bytes = std::fs::read(&newer).unwrap();
-    bytes[28..32].copy_from_slice(&15u32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&16u32.to_le_bytes());
     std::fs::write(&newer, &bytes).unwrap();
 
     for (file, message) in [
         (&notes, "not a trunkdb file (bad magic)".to_string()),
         (
             &newer,
-            "file has format 15, newer than this build's 14 — open it with a newer trunkdb"
+            "file has format 16, newer than this build's 15 — open it with a newer trunkdb"
                 .to_string(),
         ),
     ] {
@@ -167,7 +167,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["info", &db]);
     assert!(output.status.success());
     let info = stdout(&output);
-    assert!(info.contains("format 14"), "{info}");
+    assert!(info.contains("format 15"), "{info}");
     // The releases (SPEC §125), beside the format.
     let release = trunkdb::RELEASE;
     assert!(
@@ -204,7 +204,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["export", &db]);
     assert_eq!(stdout(&output), exported);
     assert!(
-        exported.starts_with("{\"$trunkdb_export\":3}\n"),
+        exported.starts_with("{\"$trunkdb_export\":4}\n"),
         "{exported}"
     );
     assert!(exported.contains(r#"{"field":"email","unique":true}"#));
@@ -820,7 +820,7 @@ grid[*][*]                     1  int 1
 größe                          1  int 1
 name                           3  string 3
 `order`                        1  int 1
-seen                           1  date 1
+seen                           1  datetime 1
 tags                           3  array 3
 tags[*]                        2  string 2, object 1
 tags[*].k                      1  int 1
@@ -1021,7 +1021,7 @@ fn info_and_fields_print_json_for_a_program() {
     let output = trunkdb(&["info", &db, "--json"]);
     assert!(output.status.success());
     let info: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
-    assert_eq!(info["format"], 14);
+    assert_eq!(info["format"], 15);
     assert_eq!(info["written_by"], trunkdb::RELEASE.to_string());
     let collections = info["collections"].as_array().unwrap();
     let users = collections.iter().find(|c| c["name"] == "users").unwrap();
@@ -1489,7 +1489,7 @@ fn parameters_are_given_apart_from_the_text() {
     let (db, input) = (path(dir.path(), "db.trunkdb"), path(dir.path(), "in.jsonl"));
     std::fs::write(&input, EXPORT).unwrap();
     assert!(trunkdb(&["import", &db, &input]).status.success());
-    let sneaky = r#"{"name": "x\" or age > 0 or name = \"y", "age": 7, "code": "20", "when": {"$date": "2026-11-03T00:00:00Z"}}"#;
+    let sneaky = r#"{"name": "x\" or age > 0 or name = \"y", "age": 7, "code": "20", "when": {"$date": "2026-11-03T00:00:00Z"}, "day": {"$date": "2026-11-03"}, "at": {"$time": "09:30:00"}}"#;
     assert!(trunkdb(&["insert", &db, "users", sneaky]).status.success());
     let ok = |args: &[&str]| -> String {
         let output = trunkdb(args);
@@ -1532,11 +1532,29 @@ fn parameters_are_given_apart_from_the_text() {
         count(&["count", &db, "users", "code = :c", "--param", r#"c="20""#]),
         "1"
     );
-    let when = r#"w=date("2026-11-03T00:00:00Z")"#;
-    assert_eq!(
-        count(&["count", &db, "users", "when = :w", "--param", when]),
-        "1"
-    );
+    // A moment, written either way; a day; a time of day (SPEC §173),
+    // each matching only its own kind.
+    for (filter, value, n) in [
+        ("when = :w", r#"w=date("2026-11-03T00:00:00Z")"#, "1"),
+        ("when = :w", r#"w=datetime("2026-11-03T00:00:00Z")"#, "1"),
+        ("when = :w", r#"w=date("2026-11-03")"#, "0"),
+        ("day = :w", r#"w=date("2026-11-03")"#, "1"),
+        ("day = :w", r#"w=datetime("2026-11-03T00:00:00Z")"#, "0"),
+        ("at < :w", r#"w=time("10:00")"#, "1"),
+        ("at < :w", r#"w=time("09:30")"#, "0"),
+    ] {
+        let found = count(&["count", &db, "users", filter, "--param", value]);
+        assert_eq!(found, n, "{filter} {value}");
+    }
+    let fields = ok(&["fields", &db, "users"]);
+    for (path, kind) in [
+        ("at ", "time 1"),
+        ("day ", "date 1"),
+        ("when ", "datetime 1"),
+    ] {
+        let line = fields.lines().find(|l| l.starts_with(path)).unwrap();
+        assert!(line.ends_with(kind), "{line}");
+    }
     let list = r#"l=["Ada", "Bob", "Zed"]"#;
     assert_eq!(
         count(&["count", &db, "users", "name in :l", "--param", list]),
@@ -1638,7 +1656,9 @@ fn parameters_are_given_apart_from_the_text() {
     for (value, says) in [
         ("a=[1, 2", "starts as JSON and isn't"),
         (r#"a="open"#, "starts as JSON and isn't"),
-        (r#"a=date("2026-13-01")"#, "is not a date-time"),
+        (r#"a=date("2026-13-01")"#, "is not a date like"),
+        (r#"a=datetime("2026-11-03")"#, "is not a date-time"),
+        (r#"a=time("25:00")"#, "is not a time of day"),
         (r#"a=id("nope")"#, "is not an id"),
     ] {
         let e = refused(&["find", &db, "users", "age > :a", "--param", value]);

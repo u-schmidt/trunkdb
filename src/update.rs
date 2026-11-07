@@ -417,7 +417,9 @@ fn orders(value: &Document) -> bool {
         | Document::String(_)
         | Document::Bool(_)
         | Document::Id(_)
-        | Document::DateTime(_) => true,
+        | Document::DateTime(_)
+        | Document::Date(_)
+        | Document::Time(_) => true,
         _ => false,
     }
 }
@@ -602,6 +604,8 @@ fn kind(value: &Document) -> &'static str {
         Document::Object(_) => "an object",
         Document::Id(_) => "an id",
         Document::DateTime(_) => "a date-time",
+        Document::Date(_) => "a date",
+        Document::Time(_) => "a time of day",
     }
 }
 

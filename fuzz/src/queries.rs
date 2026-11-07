@@ -357,6 +357,12 @@ fn pool() -> Vec<Document> {
             object([("x", Document::Array(vec![Document::Float(1.0)]))]),
         )]),
         Document::Binary(vec![1, 2]),
+        // Dates and times of day (SPEC §173): equal to no date-time,
+        // keyed after binary.
+        Document::Date(trunkdb::Date::from_days_since_epoch(-1).unwrap()),
+        Document::Date(trunkdb::Date::UNIX_EPOCH),
+        Document::Time(trunkdb::Time::MIDNIGHT),
+        Document::Time(trunkdb::Time::from_nanos_since_midnight(1).unwrap()),
     ]
 }
 

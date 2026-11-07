@@ -30,8 +30,13 @@ fn values() -> Vec<(Option<Document>, &'static [&'static str])> {
         (Some(Document::Id(DocId([7; 16]))), &["id"]),
         (
             Some(Document::DateTime(DateTime::from_unix(0, 0).unwrap())),
+            &["datetime"],
+        ),
+        (
+            Some(Document::Date("2026-11-07".parse().unwrap())),
             &["date"],
         ),
+        (Some(Document::Time("14:05:00".parse().unwrap())), &["time"]),
         (Some(Document::Null), &[]),
         (None, &[]),
     ]
@@ -141,10 +146,10 @@ fn the_odd_values_of_a_field_are_found_as_an_agent_wants_them() {
     let odd: Filter = "exists(hours) and hours is not number and hours is not null"
         .parse()
         .unwrap();
-    assert_eq!(ns(&tasks, odd), [3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(ns(&tasks, odd), [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     // A stored null, where `is null` also finds missing fields.
     let null: Filter = "exists(hours) and hours is null".parse().unwrap();
-    assert_eq!(ns(&tasks, null), [12]);
+    assert_eq!(ns(&tasks, null), [14]);
     // In an aggregate's column condition, which reads the same text.
     let aggregate: Aggregate = "count() filter (where hours is string) as strings, count() as n"
         .parse()
@@ -152,7 +157,7 @@ fn the_odd_values_of_a_field_are_found_as_an_agent_wants_them() {
     let rows = tasks.aggregate(Filter::new(), &aggregate).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("strings"), Some(&Document::Int(4)));
-    assert_eq!(rows[0].get("n"), Some(&Document::Int(28)));
+    assert_eq!(rows[0].get("n"), Some(&Document::Int(32)));
 }
 
 #[test]
@@ -189,15 +194,20 @@ fn the_names_are_trunkdb_fields_names() {
     assert_eq!(
         names,
         [
-            "bool", "int", "float", "number", "string", "binary", "array", "object", "id", "date"
+            "bool", "int", "float", "number", "string", "binary", "array", "object", "id",
+            "datetime", "date", "time"
         ]
     );
     // A slice, so a kind added later doesn't change its type (SPEC §161.1).
     let all: &'static [Kind] = Kind::ALL;
     assert_eq!(all.len(), names.len());
-    // Named for the variant it tests; written `date`, as its values are.
+    // Named for the variant it tests; written `datetime` since dates
+    // without a time took `date` (SPEC §173).
     let now = Document::DateTime(DateTime::from_unix(0, 0).unwrap());
-    assert!(Kind::DateTime.of(&now) && Kind::DateTime.name() == "date");
+    assert!(Kind::DateTime.of(&now) && Kind::DateTime.name() == "datetime");
+    let day = Document::Date(trunkdb::Date::UNIX_EPOCH);
+    assert!(Kind::Date.of(&day) && !Kind::DateTime.of(&day) && !Kind::Date.of(&now));
+    assert!(Kind::Time.of(&Document::Time(trunkdb::Time::MIDNIGHT)) && !Kind::Time.of(&day));
     assert!(Kind::Number.of(&Document::Int(1)) && Kind::Number.of(&Document::Float(1.0)));
     assert!(!Kind::Number.of(&Document::String("1".into())));
     assert!(Kind::ALL.iter().all(|kind| !kind.of(&Document::Null)));

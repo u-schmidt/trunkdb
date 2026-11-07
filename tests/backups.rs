@@ -58,11 +58,11 @@ fn an_export_ends_with_what_it_holds() {
     let db = open(dir.path(), "db.trunkdb");
     assert_eq!(
         export(&db),
-        "{\"$trunkdb_export\":3}\n{\"$end\":{\"collections\":0,\"documents\":0}}\n"
+        "{\"$trunkdb_export\":4}\n{\"$end\":{\"collections\":0,\"documents\":0}}\n"
     );
     sample(&db);
     let text = export(&db);
-    assert!(text.starts_with("{\"$trunkdb_export\":3}\n"), "{text}");
+    assert!(text.starts_with("{\"$trunkdb_export\":4}\n"), "{text}");
     assert!(
         text.ends_with("\n{\"$end\":{\"collections\":3,\"documents\":8}}\n"),
         "{text}"

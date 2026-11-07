@@ -23,7 +23,7 @@ In this order, each one optional:
 
 | Clause | What |
 |---|---|
-| `window <path> <duration>` | only the documents whose date at `<path>` is within the duration of the newest one's: `window at 5m` |
+| `window <path> <duration>` | only the documents whose date-time at `<path>` is within the duration of the newest one's: `window at 5m` |
 | `unwind <path>, …` | each document once per element of the array at `<path>`, the element in its place, MongoDB's `$unwind` |
 | columns | `<function> as <name>`, between commas |
 | `group by <path>, …` | one row per different value (or values) |
