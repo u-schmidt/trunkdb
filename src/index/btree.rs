@@ -621,7 +621,7 @@ impl Walk<'_> {
     /// Reads the next leaf if the current one is used up. Found by binary
     /// searches, no entry between them decoded, so a count or a skip
     /// passes them at once where it would step through them (SPEC
-    /// §101.3). `None` for no such entry, for `most` 0, and once a run
+    /// §172.4). `None` for no such entry, for `most` 0, and once a run
     /// offered on this leaf has been stepped into instead of passed: a
     /// walk going entry by entry isn't offered one at every step.
     pub fn run(&mut self, most: usize) -> std::io::Result<Option<WholeLeaf<'_>>> {
@@ -743,7 +743,7 @@ impl Walk<'_> {
         // The first leaf is entered where the range begins in the walk's
         // direction, found by a binary search: forward the first key from
         // `start` on, backward the first from `end` on, the walk taking the
-        // keys before it.
+        // keys before it (SPEC §172.1).
         let first = self.leaves == 1;
         self.at = match (self.backward, &self.range.end) {
             (false, _) if first => view.first_from(&self.range.start),

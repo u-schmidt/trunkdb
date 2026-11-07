@@ -1,4 +1,4 @@
-//! Field names stored once (SPEC §171): the file's dictionary of names,
+//! Field names stored once (SPEC §170): the file's dictionary of names,
 //! kept in the catalog, written with the batch that brings a name, and
 //! read back at every open, by every read.
 

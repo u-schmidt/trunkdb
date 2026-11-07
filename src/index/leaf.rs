@@ -29,7 +29,7 @@ pub(super) fn decode_index_entry(bytes: &[u8]) -> (&[u8], RecordLocation) {
     (key, RecordLocation { page, slot })
 }
 
-// A packed leaf (`PageType::IndexLeafPacked`, file format 14): its first
+// A packed leaf (`PageType::IndexLeafPacked`, file format 14, SPEC §171): its first
 // cell is the page's anchor, `[0][anchor key]`, any key, chosen when the
 // page is built; every other cell is an entry, `[varint shared][varint
 // page][varint slot][rest]`, whose key is the anchor's first `shared`

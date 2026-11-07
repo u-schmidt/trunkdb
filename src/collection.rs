@@ -4985,7 +4985,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
         // In batches of 100, each one commit: one flush, not one per document.
-        // Numbers of one width as varints (§171), so every document is
+        // Numbers of one width as varints (§170), so every document is
         // the size of every other.
         let mut ids = Vec::new();
         for chunk in (1000..3000).collect::<Vec<i64>>().chunks(100) {

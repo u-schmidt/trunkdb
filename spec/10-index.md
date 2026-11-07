@@ -18,6 +18,9 @@ A leaf entry is still `[DocId: 16 bytes][RecordLocation: 8-byte page +
 2-byte slot]`, exactly as `LinearIndex` used it. §7.4 predicted this
 format would survive a real B-tree unchanged, since only the node
 hierarchy above leaves was expected to change — that held.
+(Since §28 keys vary in length, and since §171 a leaf stores each key
+after the bytes it shares with the leaf's anchor, and the location as
+varints.)
 
 ## 10.2 Branch pages: a new page type, no changes to `SlottedPage`
 `PageType::IndexBranch` is new; branch cells (`branch.rs`) are

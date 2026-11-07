@@ -108,7 +108,7 @@ pub enum PageType {
     /// `SlottedPage`: `data.rs` owns the layout.
     Overflow = 6,
     /// An index leaf whose keys are stored after an anchor's (file
-    /// format 14, `index/leaf.rs`).
+    /// format 14, SPEC §171, `index/leaf.rs`).
     IndexLeafPacked = 7,
 }
 

@@ -1,4 +1,4 @@
-//! Field names stored once: the file's dictionary of the names its
+//! Field names stored once (SPEC §170): the file's dictionary of the names its
 //! documents use, each a small number, so a stored document's keys are
 //! numbers into it instead of the names themselves.
 //!

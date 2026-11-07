@@ -766,7 +766,13 @@ keep a copy of the file, or an export, from before the upgrade to go
 back. The first open after 0.31.0 rebuilds the indexes that hold
 binary values, which had no key before (SPEC §166); a unique one in
 which two documents share the same bytes fails that open, so drop it
-or change one of them with 0.31.0 first. Export and import move data across releases either way, as far as
+or change one of them with 0.31.0 first. The release after 0.33 stores
+field names once and index keys after a shared anchor, file format 14
+(SPEC §170, §171): an older file opens with nothing converted, its
+documents and index pages rewritten smaller as they are written, and
+all of them by `db.compact()`, which is worth running once. 0.33.0
+and older refuse a file once it has been opened for writing.
+Export and import move data across releases either way, as far as
 the export allows: releases after 0.31.0 write exports of version 3,
 which 0.31.0 and older refuse. To take one there, make its first line
 `{"$trunkdb_export":2}` and drop its last, the `$end` line:
