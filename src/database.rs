@@ -1839,21 +1839,21 @@ mod tests {
                  development build), which this build can't read",
             ),
             (
-                15,
+                16,
                 crate::FormatError::Newer {
-                    found: 15,
-                    current: 14,
+                    found: 16,
+                    current: 15,
                 },
-                "file has format 15, newer than this build's 14 — open it with a newer trunkdb",
+                "file has format 16, newer than this build's 15 — open it with a newer trunkdb",
             ),
             (
                 5,
                 crate::FormatError::Older {
                     found: 5,
                     oldest: 6,
-                    current: 14,
+                    current: 15,
                 },
-                "file has format 5, older than this build's 14: export it with the trunkdb \
+                "file has format 5, older than this build's 15: export it with the trunkdb \
                  version that wrote it (`trunkdb export`), and import the export into a new \
                  file with this one",
             ),

@@ -30,9 +30,10 @@ use std::path::{Path, PathBuf};
 
 /// The version of the export format itself — not the file format
 /// (SPEC §21.2), which an export deliberately doesn't depend on. 2 since
-/// `$date` (SPEC §69), 3 since the end line (§165); an import reads 1
-/// and 2 too, without them.
-const EXPORT_VERSION: u64 = 3;
+/// `$date` (SPEC §69), 3 since the end line (§165), 4 since `$time` and
+/// `$date` holding a date alone (§173); an import reads 1 to 3 too,
+/// without them.
+const EXPORT_VERSION: u64 = 4;
 /// The first version with an end line (SPEC §165.1).
 const ENDED_VERSION: u64 = 3;
 const OLDEST_EXPORT_VERSION: u64 = 1;
@@ -214,6 +215,7 @@ impl Database {
                 version = check_header(&value).map_err(fail)?;
                 tags = Some(crate::json::Tags {
                     dates: version >= 2,
+                    times: version >= 4,
                 });
                 continue;
             };
@@ -802,6 +804,18 @@ mod tests {
                 rng.next().to_le_bytes().repeat(2).try_into().unwrap(),
             )),
             7 if rng.below(2) == 0 => Document::Float(rng.next() as f64 / 3.0),
+            // A date or a time of day (SPEC §173), anywhere in its range.
+            7 if rng.below(2) == 0 => match rng.below(2) {
+                0 => Document::Date(
+                    crate::DateTime::from_unix(rng.next() as i64, 0)
+                        .unwrap()
+                        .date(),
+                ),
+                _ => Document::Time(
+                    crate::Time::from_nanos_since_midnight(rng.next() % 86_400_000_000_000)
+                        .unwrap(),
+                ),
+            },
             // Anywhere within ±3,000 years of 1970, to the nanosecond.
             7 => Document::DateTime(
                 crate::DateTime::from_unix(
@@ -1075,7 +1089,7 @@ mod tests {
         let collection = "{\"$collection\":\"c\"}\n";
         let cases: Vec<(String, usize, &str)> = vec![
             (String::new(), 1, "empty input"),
-            ("{\"$trunkdb_export\":4}\n".into(), 1, "version 4"),
+            ("{\"$trunkdb_export\":5}\n".into(), 1, "version 5"),
             ("{\"a\":1}\n".into(), 1, "first line must be"),
             (format!("{header}{{\"a\":1}}\n"), 2, "before the first"),
             (format!("{header}{collection}not json\n"), 3, "not JSON"),

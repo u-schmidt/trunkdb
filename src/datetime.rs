@@ -3,11 +3,16 @@
 //! before) and nanoseconds past that second. The same on every platform,
 //! unlike `SystemTime`, which it converts from and to. And its text, RFC
 //! 3339 in UTC, for the export, `Display` and reading it as a string.
+//!
+//! `Date` and `Time`, a day in the calendar and a time of day, each
+//! without the other (SPEC §173), with the same calendar and texts.
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
+const SECONDS_PER_DAY: i64 = 86_400;
+const NANOS_PER_DAY: u64 = SECONDS_PER_DAY as u64 * NANOS_PER_SECOND as u64;
 
 /// A point in time, in UTC, to the nanosecond (SPEC §69, §70): what a
 /// `SystemTime` field is stored as, and what a filter compares it with.
@@ -85,6 +90,22 @@ impl DateTime {
         self.nanos
     }
 
+    /// The day this time falls on, in UTC (SPEC §173):
+    /// `DateTime::now().date()` is today there.
+    pub fn date(&self) -> Date {
+        Date {
+            days: self.secs.div_euclid(SECONDS_PER_DAY),
+        }
+    }
+
+    /// The time of day this time is at, in UTC (SPEC §173).
+    pub fn time(&self) -> Time {
+        Time {
+            nanos: self.secs.rem_euclid(SECONDS_PER_DAY) as u64 * u64::from(NANOS_PER_SECOND)
+                + u64::from(self.nanos),
+        }
+    }
+
     /// This time as a `SystemTime`, if this platform's holds it: not a
     /// time before 1601 on Windows, and there rounded down to 100 ns.
     pub fn to_system_time(&self) -> Option<SystemTime> {
@@ -131,24 +152,7 @@ impl From<SystemTime> for DateTime {
 /// years), so every `DateTime` has a text.
 impl fmt::Display for DateTime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (days, second_of_day) = (self.secs.div_euclid(86_400), self.secs.rem_euclid(86_400));
-        let (year, month, day) = civil_from_days(days);
-        if (0..=9999).contains(&year) {
-            write!(f, "{year:04}")?;
-        } else {
-            write!(f, "{year:+05}")?;
-        }
-        let (hour, minute, second) = (
-            second_of_day / 3600,
-            second_of_day / 60 % 60,
-            second_of_day % 60,
-        );
-        write!(f, "-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")?;
-        if self.nanos != 0 {
-            let fraction = format!("{:09}", self.nanos);
-            write!(f, ".{}", fraction.trim_end_matches('0'))?;
-        }
-        f.write_str("Z")
+        write!(f, "{}T{}Z", self.date(), self.time())
     }
 }
 
@@ -166,26 +170,43 @@ impl std::str::FromStr for DateTime {
     type Err = ParseDateTimeError;
 
     fn from_str(text: &str) -> Result<Self, ParseDateTimeError> {
-        parse_rfc3339(text).ok_or_else(|| ParseDateTimeError {
-            input: text.to_string(),
-        })
+        parse_rfc3339(text).ok_or_else(|| ParseDateTimeError::new(text, Expected::DateTime))
     }
 }
 
-/// A string that isn't an RFC 3339 date and time: what
-/// `str::parse::<DateTime>` returns (SPEC §70).
+/// A string that isn't a date and time, a date or a time of day as
+/// their `FromStr` reads them: what `str::parse` returns for a
+/// `DateTime` (SPEC §70), a `Date` or a `Time` (§173).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseDateTimeError {
     input: String,
+    expected: Expected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expected {
+    DateTime,
+    Date,
+    Time,
+}
+
+impl ParseDateTimeError {
+    fn new(input: &str, expected: Expected) -> Self {
+        ParseDateTimeError {
+            input: input.to_string(),
+            expected,
+        }
+    }
 }
 
 impl fmt::Display for ParseDateTimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?} is not an RFC 3339 date and time (like \"2026-09-27T14:05:00Z\")",
-            self.input
-        )
+        let what = match self.expected {
+            Expected::DateTime => "an RFC 3339 date and time (like \"2026-09-27T14:05:00Z\")",
+            Expected::Date => "a date (like \"2026-09-27\")",
+            Expected::Time => "a time of day (like \"14:05:00\")",
+        };
+        write!(f, "{:?} is not {what}", self.input)
     }
 }
 
@@ -229,27 +250,301 @@ impl<'de> serde::Deserialize<'de> for DateTime {
     }
 }
 
+/// A day in the calendar, without a time or a zone (SPEC §173): a
+/// birthday, a due date, the day a report covers. What a
+/// `Document::Date` holds, written `2026-11-07`; `date("2026-11-07")`
+/// in a filter's text. A date compares with dates only, never with a
+/// `DateTime`, which is a moment.
+///
+/// ```
+/// use trunkdb::{Date, DateTime, Time};
+///
+/// let due = Date::from_ymd(2026, 11, 30).unwrap();
+/// assert_eq!(due.to_string(), "2026-11-30");
+/// assert_eq!("2026-11-30".parse::<Date>().unwrap(), due);
+/// let today = DateTime::now().date();          // in UTC
+/// let start = due.at(Time::MIDNIGHT).unwrap(); // 2026-11-30T00:00:00Z
+/// assert_eq!(start.date(), due);
+/// # let _ = today;
+/// ```
+///
+/// Any day a `DateTime` falls on, 292 billion years either side of
+/// 1970, in the proleptic Gregorian calendar.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Date {
+    days: i64,
+}
+
+impl Date {
+    /// 1970-01-01.
+    pub const UNIX_EPOCH: Date = Date { days: 0 };
+
+    /// The day `DateTime`'s earliest time falls on, and its latest.
+    const FIRST: i64 = i64::MIN.div_euclid(SECONDS_PER_DAY);
+    const LAST: i64 = i64::MAX.div_euclid(SECONDS_PER_DAY);
+
+    /// The day `day` of `month` (1 to 12) of `year`; `None` for a day that
+    /// month doesn't have. Year 0 is 1 BC, as in ISO 8601.
+    pub fn from_ymd(year: i64, month: u32, day: u32) -> Option<Date> {
+        if !(1..=days_in_month(year, month)?).contains(&day) {
+            return None;
+        }
+        // A year far enough out that the arithmetic would overflow is
+        // past `LAST` anyway.
+        if year.unsigned_abs() > 300_000_000_000 {
+            return None;
+        }
+        Date::from_days_since_epoch(days_from_civil(year, month, day))
+    }
+
+    /// The day `days` days after 1970-01-01 (before, if negative), as
+    /// `days_since_epoch` counts them: `Date + n days` is
+    /// `Date::from_days_since_epoch(date.days_since_epoch() + n)`.
+    /// `None` past the days a `DateTime` falls on.
+    pub fn from_days_since_epoch(days: i64) -> Option<Date> {
+        (Date::FIRST..=Date::LAST)
+            .contains(&days)
+            .then_some(Date { days })
+    }
+
+    /// Days since 1970-01-01: negative before it.
+    pub fn days_since_epoch(&self) -> i64 {
+        self.days
+    }
+
+    /// The year, 0 for 1 BC and negative before it.
+    pub fn year(&self) -> i64 {
+        civil_from_days(self.days).0
+    }
+
+    /// The month, 1 to 12.
+    pub fn month(&self) -> u32 {
+        civil_from_days(self.days).1
+    }
+
+    /// The day of the month, from 1.
+    pub fn day(&self) -> u32 {
+        civil_from_days(self.days).2
+    }
+
+    /// This day at `time`, in UTC. `None` only at the ends of
+    /// `DateTime`'s range, where the day is cut short.
+    pub fn at(self, time: Time) -> Option<DateTime> {
+        let secs = i128::from(self.days) * i128::from(SECONDS_PER_DAY)
+            + i128::from(time.nanos / u64::from(NANOS_PER_SECOND));
+        DateTime::from_unix(
+            i64::try_from(secs).ok()?,
+            (time.nanos % u64::from(NANOS_PER_SECOND)) as u32,
+        )
+    }
+}
+
+/// `YYYY-MM-DD`. A year before 0 or after 9999 gets a sign and as many
+/// digits as it has, as in a `DateTime`'s text.
+impl fmt::Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (year, month, day) = civil_from_days(self.days);
+        if (0..=9999).contains(&year) {
+            write!(f, "{year:04}")?;
+        } else {
+            write!(f, "{year:+05}")?;
+        }
+        write!(f, "-{month:02}-{day:02}")
+    }
+}
+
+/// The text, as `Display` writes it.
+impl fmt::Debug for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Date({self})")
+    }
+}
+
+/// What `Display` writes: `YYYY-MM-DD`, or a signed year of more digits.
+impl std::str::FromStr for Date {
+    type Err = ParseDateTimeError;
+
+    fn from_str(text: &str) -> Result<Self, ParseDateTimeError> {
+        parse_date(text)
+            .and_then(|(year, month, day)| Date::from_ymd(year, month, day))
+            .ok_or_else(|| ParseDateTimeError::new(text, Expected::Date))
+    }
+}
+
+/// A time of day, without a date or a zone (SPEC §173), to the
+/// nanosecond: opening hours, a daily alarm. What a `Document::Time`
+/// holds, written `14:05:00`; `time("14:05")` in a filter's text. A time
+/// compares with times only.
+///
+/// ```
+/// use trunkdb::Time;
+///
+/// let opens = Time::from_hms(9, 30, 0).unwrap();
+/// assert_eq!(opens.to_string(), "09:30:00");
+/// assert_eq!("09:30".parse::<Time>().unwrap(), opens);
+/// assert!(opens < "17:00:00.5".parse().unwrap());
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Time {
+    nanos: u64,
+}
+
+impl Time {
+    /// 00:00:00, the start of a day.
+    pub const MIDNIGHT: Time = Time { nanos: 0 };
+
+    /// `hour`:`minute`:`second`; `None` past 23:59:59. No leap second.
+    pub fn from_hms(hour: u32, minute: u32, second: u32) -> Option<Time> {
+        Time::from_hms_nano(hour, minute, second, 0)
+    }
+
+    /// `from_hms`, and `nano` nanoseconds after that second, below a
+    /// second.
+    pub fn from_hms_nano(hour: u32, minute: u32, second: u32, nano: u32) -> Option<Time> {
+        if hour > 23 || minute > 59 || second > 59 || nano >= NANOS_PER_SECOND {
+            return None;
+        }
+        let seconds = u64::from(hour) * 3600 + u64::from(minute) * 60 + u64::from(second);
+        Some(Time {
+            nanos: seconds * u64::from(NANOS_PER_SECOND) + u64::from(nano),
+        })
+    }
+
+    /// The time `nanos` nanoseconds after midnight; `None` for a day or
+    /// more.
+    pub fn from_nanos_since_midnight(nanos: u64) -> Option<Time> {
+        (nanos < NANOS_PER_DAY).then_some(Time { nanos })
+    }
+
+    /// Nanoseconds since midnight, below a day's.
+    pub fn nanos_since_midnight(&self) -> u64 {
+        self.nanos
+    }
+
+    /// The hour, 0 to 23.
+    pub fn hour(&self) -> u32 {
+        (self.seconds() / 3600) as u32
+    }
+
+    /// The minute, 0 to 59.
+    pub fn minute(&self) -> u32 {
+        (self.seconds() / 60 % 60) as u32
+    }
+
+    /// The second, 0 to 59.
+    pub fn second(&self) -> u32 {
+        (self.seconds() % 60) as u32
+    }
+
+    /// Nanoseconds after `second`, below a second.
+    pub fn nanosecond(&self) -> u32 {
+        (self.nanos % u64::from(NANOS_PER_SECOND)) as u32
+    }
+
+    fn seconds(&self) -> u64 {
+        self.nanos / u64::from(NANOS_PER_SECOND)
+    }
+}
+
+/// `HH:MM:SS`, with as many fractional digits as the nanoseconds need,
+/// up to nine, as in a `DateTime`'s text.
+impl fmt::Display for Time {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:02}:{:02}:{:02}",
+            self.hour(),
+            self.minute(),
+            self.second()
+        )?;
+        if self.nanosecond() != 0 {
+            let fraction = format!("{:09}", self.nanosecond());
+            write!(f, ".{}", fraction.trim_end_matches('0'))?;
+        }
+        Ok(())
+    }
+}
+
+/// The text, as `Display` writes it.
+impl fmt::Debug for Time {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Time({self})")
+    }
+}
+
+/// `HH:MM:SS` with a fraction of one to nine digits or none, as
+/// `Display` writes it, or `HH:MM`. No offset: a time of day has no
+/// zone.
+impl std::str::FromStr for Time {
+    type Err = ParseDateTimeError;
+
+    fn from_str(text: &str) -> Result<Self, ParseDateTimeError> {
+        parse_clock(text, true)
+            .and_then(|(hour, minute, second, nanos)| {
+                Time::from_hms_nano(hour as u32, minute as u32, second as u32, nanos)
+            })
+            .ok_or_else(|| ParseDateTimeError::new(text, Expected::Time))
+    }
+}
+
+/// The names `Date`'s and `Time`'s serde impls give their newtypes, as
+/// `DateTime`'s does (SPEC §70, §173).
+pub(crate) const DATE_NEWTYPE: &str = "$trunkdb::Date";
+pub(crate) const TIME_NEWTYPE: &str = "$trunkdb::Time";
+
+/// Serde impls for a type whose text is its `Display` and `FromStr`, as
+/// a newtype of `name` around it.
+macro_rules! serde_as_text {
+    ($type:ty, $name:expr, $expecting:literal) => {
+        impl serde::Serialize for $type {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_newtype_struct($name, &self.to_string())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $type {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct TextVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for TextVisitor {
+                    type Value = $type;
+
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str($expecting)
+                    }
+
+                    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<$type, E> {
+                        s.parse().map_err(E::custom)
+                    }
+
+                    fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                        self,
+                        deserializer: D,
+                    ) -> Result<$type, D::Error> {
+                        deserializer.deserialize_str(self)
+                    }
+                }
+
+                deserializer.deserialize_newtype_struct($name, TextVisitor)
+            }
+        }
+    };
+}
+
+serde_as_text!(Date, DATE_NEWTYPE, "a date, as text like \"2026-09-27\"");
+serde_as_text!(
+    Time,
+    TIME_NEWTYPE,
+    "a time of day, as text like \"14:05:00\""
+);
+
 /// `Display` backwards (see `FromStr`). `None` for anything else.
 fn parse_rfc3339(text: &str) -> Option<DateTime> {
     let (date, rest) = text.split_at(text.find(['T', 't', ' '])?);
     let rest = &rest[1..];
     let (year, month, day) = parse_date(date)?;
     let (clock, offset) = rest.split_at(rest.find(['Z', 'z', '+', '-'])?);
-    let (hms, fraction) = match clock.split_once('.') {
-        Some((hms, fraction)) => (hms, Some(fraction)),
-        None => (clock, None),
-    };
-    let [hour, minute, second] = two_digit_fields(hms, ':')?;
-    if hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let nanos = match fraction {
-        None => 0,
-        Some(f) if (1..=9).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("{f:0<9}").parse().ok()?
-        }
-        Some(_) => return None,
-    };
+    let (hour, minute, second, nanos) = parse_clock(clock, false)?;
     let offset_secs = match offset {
         "Z" | "z" => 0,
         _ => {
@@ -268,6 +563,35 @@ fn parse_rfc3339(text: &str) -> Option<DateTime> {
     let secs = i128::from(days) * 86_400 + i128::from(hour * 3600 + minute * 60 + second)
         - i128::from(offset_secs);
     DateTime::from_unix(i64::try_from(secs).ok()?, nanos)
+}
+
+/// `HH:MM:SS`, with a fraction of one to nine digits after a `.`, or
+/// `HH:MM` too if `minutes_alone`: the hour, minute, second and
+/// nanoseconds. No leap second.
+fn parse_clock(clock: &str, minutes_alone: bool) -> Option<(i64, i64, i64, u32)> {
+    let (hms, fraction) = match clock.split_once('.') {
+        Some((hms, fraction)) => (hms, Some(fraction)),
+        None => (clock, None),
+    };
+    let [hour, minute, second] = match two_digit_fields(hms, ':') {
+        Some(fields) => fields,
+        None if minutes_alone && fraction.is_none() => {
+            let [hour, minute] = two_digit_fields(hms, ':')?;
+            [hour, minute, 0]
+        }
+        None => return None,
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let nanos = match fraction {
+        None => 0,
+        Some(f) if (1..=9).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{f:0<9}").parse().ok()?
+        }
+        Some(_) => return None,
+    };
+    Some((hour, minute, second, nanos))
 }
 
 /// `YYYY-MM-DD`, or a signed year of more digits (`+12345-01-01`), a day
@@ -296,16 +620,21 @@ fn parse_date(date: &str) -> Option<(i64, u32, u32)> {
         year.parse().ok()?
     };
     let (month, day): (u32, u32) = (month.parse().ok()?, day.parse().ok()?);
-    let days_in_month = match month {
+    (1..=days_in_month(year, month)?)
+        .contains(&day)
+        .then_some((year, month, day))
+}
+
+/// How many days `month` of `year` has; `None` for a month that isn't
+/// 1 to 12.
+fn days_in_month(year: i64, month: u32) -> Option<u32> {
+    Some(match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
         2 => 28,
         _ => return None,
-    };
-    (1..=days_in_month)
-        .contains(&day)
-        .then_some((year, month, day))
+    })
 }
 
 /// `N` two-digit numbers separated by `separator`: `14:05:00`.
@@ -507,5 +836,175 @@ mod tests {
         );
         let error = "soon".parse::<DateTime>().unwrap_err().to_string();
         assert!(error.starts_with("\"soon\" is not an RFC 3339"), "{error}");
+    }
+    fn day(year: i64, month: u32, day: u32) -> Date {
+        Date::from_ymd(year, month, day).unwrap()
+    }
+
+    /// SPEC §173: a date is its day, written `YYYY-MM-DD`, read back as
+    /// written, in calendar order; the days a `DateTime` falls on and no
+    /// more.
+    #[test]
+    fn dates_are_days_written_and_read_as_iso_8601() {
+        assert_eq!(day(1970, 1, 1), Date::UNIX_EPOCH);
+        assert_eq!(day(1970, 1, 2).days_since_epoch(), 1);
+        assert_eq!(day(1969, 12, 31).days_since_epoch(), -1);
+        assert_eq!(day(2026, 11, 7).days_since_epoch(), 20_764);
+        for (date, text) in [
+            (day(2026, 11, 7), "2026-11-07"),
+            (day(1969, 12, 31), "1969-12-31"),
+            (day(2024, 2, 29), "2024-02-29"),
+            (day(1, 1, 1), "0001-01-01"),
+            (day(0, 12, 31), "0000-12-31"),
+            (day(-1, 3, 1), "-0001-03-01"),
+            (day(9999, 12, 31), "9999-12-31"),
+            (day(10_000, 1, 1), "+10000-01-01"),
+        ] {
+            assert_eq!(date.to_string(), text);
+            assert_eq!(format!("{date:?}"), format!("Date({text})"));
+            assert_eq!(text.parse::<Date>(), Ok(date), "{text}");
+            let (y, m, d) = (date.year(), date.month(), date.day());
+            assert_eq!(Date::from_ymd(y, m, d), Some(date), "{text}");
+        }
+        // Every 37th day across eight hundred years reads back.
+        for days in (-150_000..150_000).step_by(37) {
+            let date = Date::from_days_since_epoch(days).unwrap();
+            assert_eq!(date.to_string().parse::<Date>(), Ok(date), "{days}");
+        }
+        assert!(day(1969, 12, 31) < day(1970, 1, 1));
+        assert!(day(2026, 1, 31) < day(2026, 2, 1));
+
+        // The days of `DateTime`'s first and last moments, and no further.
+        let first = DateTime::EARLIEST.date();
+        let last = at(i64::MAX, 999_999_999).date();
+        assert_eq!(
+            Date::from_days_since_epoch(first.days_since_epoch() - 1),
+            None
+        );
+        assert_eq!(
+            Date::from_days_since_epoch(last.days_since_epoch() + 1),
+            None
+        );
+        assert_eq!(first.to_string().parse::<Date>(), Ok(first));
+        assert_eq!(last.to_string().parse::<Date>(), Ok(last));
+        assert_eq!(Date::from_ymd(i64::MAX, 1, 1), None);
+        assert_eq!(Date::from_ymd(-300_000_000_000, 1, 1), None);
+
+        for bad in [
+            "",
+            "2026-11-7",
+            "2026-11-07T00:00:00Z",
+            "2026-02-29",
+            "1900-02-29",
+            "2026-13-01",
+            "2026-00-01",
+            "2026-11-00",
+            "12026-11-07",
+            "+1000000000000-01-01",
+            "+292277026597-01-01",
+            "2026/11/07",
+        ] {
+            assert!(bad.parse::<Date>().is_err(), "{bad}");
+        }
+        assert_eq!(Date::from_ymd(2026, 2, 29), None);
+        assert_eq!(Date::from_ymd(2026, 13, 1), None);
+        let error = "soon".parse::<Date>().unwrap_err().to_string();
+        assert_eq!(error, r#""soon" is not a date (like "2026-09-27")"#);
+    }
+
+    /// SPEC §173: a time of day to the nanosecond, written with the
+    /// digits it needs; `HH:MM` read too; no zone, no leap second.
+    #[test]
+    fn times_of_day_are_written_and_read_to_the_nanosecond() {
+        let time = |h, m, s, n| Time::from_hms_nano(h, m, s, n).unwrap();
+        for (t, text) in [
+            (Time::MIDNIGHT, "00:00:00"),
+            (time(9, 30, 0, 0), "09:30:00"),
+            (time(23, 59, 59, 999_999_999), "23:59:59.999999999"),
+            (time(14, 5, 0, 500_000_000), "14:05:00.5"),
+            (time(0, 0, 0, 1), "00:00:00.000000001"),
+        ] {
+            assert_eq!(t.to_string(), text);
+            assert_eq!(format!("{t:?}"), format!("Time({text})"));
+            assert_eq!(text.parse::<Time>(), Ok(t), "{text}");
+            let parts = (t.hour(), t.minute(), t.second(), t.nanosecond());
+            assert_eq!(
+                Time::from_hms_nano(parts.0, parts.1, parts.2, parts.3),
+                Some(t)
+            );
+            assert_eq!(
+                Time::from_nanos_since_midnight(t.nanos_since_midnight()),
+                Some(t)
+            );
+        }
+        assert_eq!("09:30".parse::<Time>(), Ok(time(9, 30, 0, 0)));
+        assert_eq!(time(1, 2, 3, 4).nanos_since_midnight(), 3_723_000_000_004);
+        assert!(time(9, 59, 59, 999_999_999) < time(10, 0, 0, 0));
+        let last = NANOS_PER_DAY - 1;
+        assert_eq!(
+            Time::from_nanos_since_midnight(last),
+            Some(time(23, 59, 59, 999_999_999))
+        );
+        assert_eq!(Time::from_nanos_since_midnight(NANOS_PER_DAY), None);
+        for (h, m, s, n) in [
+            (24, 0, 0, 0),
+            (0, 60, 0, 0),
+            (0, 0, 60, 0),
+            (0, 0, 0, NANOS_PER_SECOND),
+        ] {
+            assert_eq!(Time::from_hms_nano(h, m, s, n), None, "{h}:{m}:{s}.{n}");
+        }
+        for bad in [
+            "",
+            "9:30",
+            "09:30:0",
+            "24:00",
+            "23:60",
+            "23:59:60",
+            "09:30.5",
+            "09:30:00.",
+            "09:30:00.1234567890",
+            "09:30:00Z",
+            "09:30:00+02:00",
+            "09",
+            "09:30:00:00",
+        ] {
+            assert!(bad.parse::<Time>().is_err(), "{bad}");
+        }
+        let error = "noon".parse::<Time>().unwrap_err().to_string();
+        assert_eq!(error, r#""noon" is not a time of day (like "14:05:00")"#);
+    }
+
+    /// SPEC §173: a date-time's day and time of day in UTC, and a day at
+    /// a time back to the date-time.
+    #[test]
+    fn a_date_time_is_a_day_at_a_time_of_day() {
+        for (secs, nanos) in [
+            (0, 0),
+            (1_790_000_000, 120_000_000),
+            (-1, 999_999_999),
+            (-86_400, 0),
+            (-86_401, 5),
+            (i64::MAX, 999_999_999),
+            (i64::MAX - 86_400, 0),
+        ] {
+            let moment = at(secs, nanos);
+            let (date, time) = (moment.date(), moment.time());
+            assert_eq!(date.at(time), Some(moment), "{moment}");
+            assert_eq!(moment.to_string(), format!("{date}T{time}Z"));
+        }
+        assert_eq!(at(-1, 0).date(), day(1969, 12, 31));
+        assert_eq!(at(-1, 0).time().to_string(), "23:59:59");
+        // The first day is cut short before `EARLIEST`: midnight there
+        // is no date-time.
+        let first = DateTime::EARLIEST.date();
+        assert_eq!(first.at(Time::MIDNIGHT), None);
+        assert_eq!(
+            first.at(DateTime::EARLIEST.time()),
+            Some(DateTime::EARLIEST)
+        );
+        // And the last ends at the last second.
+        let last = at(i64::MAX, 0).date();
+        assert_eq!(last.at(Time::from_hms(23, 59, 59).unwrap()), None);
     }
 }

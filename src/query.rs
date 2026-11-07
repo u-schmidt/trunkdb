@@ -59,7 +59,7 @@ pub enum Op {
 /// `Number`, either kind of number. There is no null kind: `is null`
 /// finds null and missing fields alike (SPEC §32), and `exists(x) and x
 /// is null` a stored null. `#[non_exhaustive]`, so a kind added later,
-/// a date without a time, isn't a breaking change.
+/// like `Date` and `Time` were (SPEC §173), isn't a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Kind {
@@ -84,10 +84,13 @@ pub enum Kind {
     Object,
     /// A document id, `Document::Id`.
     Id,
-    /// A date-time, `Document::DateTime`: `date` in a filter's text, as
-    /// its values are written `date("…")`. Named for the variant it
-    /// tests, so a date without a time can be `Date` (SPEC §161.1).
+    /// A date-time, `Document::DateTime`: `datetime` in a filter's text
+    /// (SPEC §173; `date` before it, §161.1).
     DateTime,
+    /// A day without a time, `Document::Date`: `date` in a filter's text.
+    Date,
+    /// A time of day, `Document::Time`: `time` in a filter's text.
+    Time,
 }
 
 impl Kind {
@@ -105,10 +108,13 @@ impl Kind {
         Kind::Object,
         Kind::Id,
         Kind::DateTime,
+        Kind::Date,
+        Kind::Time,
     ];
 
     /// Its name in a filter's text: `bool`, `int`, `float`, `number`,
-    /// `string`, `binary`, `array`, `object`, `id` or `date`.
+    /// `string`, `binary`, `array`, `object`, `id`, `datetime`, `date` or
+    /// `time`.
     pub fn name(self) -> &'static str {
         match self {
             Kind::Bool => "bool",
@@ -120,7 +126,9 @@ impl Kind {
             Kind::Array => "array",
             Kind::Object => "object",
             Kind::Id => "id",
-            Kind::DateTime => "date",
+            Kind::DateTime => "datetime",
+            Kind::Date => "date",
+            Kind::Time => "time",
         }
     }
 
@@ -137,6 +145,8 @@ impl Kind {
                 | (Kind::Object, Document::Object(_))
                 | (Kind::Id, Document::Id(_))
                 | (Kind::DateTime, Document::DateTime(_))
+                | (Kind::Date, Document::Date(_))
+                | (Kind::Time, Document::Time(_))
         )
     }
 }
@@ -3205,6 +3215,10 @@ pub(crate) fn compare(a: &Document, b: &Document) -> Option<std::cmp::Ordering> 
         (Id(x), Id(y)) => Some(x.cmp(y)),
         // In time order (SPEC §69); never equal to a string or number.
         (DateTime(x), DateTime(y)) => Some(x.cmp(y)),
+        // In calendar order, and in the day's; a date never with a
+        // date-time, which is a moment (SPEC §173).
+        (Date(x), Date(y)) => Some(x.cmp(y)),
+        (Time(x), Time(y)) => Some(x.cmp(y)),
         // Byte by byte, as SQLite compares BLOBs (SPEC §166).
         (Binary(x), Binary(y)) => Some(x.cmp(y)),
         _ => None,
@@ -3248,11 +3262,13 @@ fn sort_rank(value: &Document) -> u8 {
         Document::Id(_) => 4,
         Document::DateTime(_) => 5,
         Document::Binary(_) => 6,
+        Document::Date(_) => 7,
+        Document::Time(_) => 8,
         _ => UNORDERED,
     }
 }
 
-const UNORDERED: u8 = 7;
+const UNORDERED: u8 = 9;
 
 /// Whether `sort_order` puts `value` among the values nothing orders —
 /// arrays, objects, NaN. No index holds them.
@@ -3331,7 +3347,9 @@ mod tests {
                 Document::Array(_) => "array",
                 Document::Object(_) => "object",
                 Document::Id(_) => "id",
-                Document::DateTime(_) => "date",
+                Document::DateTime(_) => "datetime",
+                Document::Date(_) => "date",
+                Document::Time(_) => "time",
                 _ => return false,
             };
             match kind {
@@ -3770,6 +3788,66 @@ mod tests {
             Less
         );
         assert!(!is_unordered(&after));
+    }
+
+    /// SPEC §173: dates compare with dates and times with times, in
+    /// their order; never with a date-time, a string or each other.
+    /// Sorted after binary, dates before times.
+    #[test]
+    fn dates_and_times_compare_only_with_their_own_kind() {
+        use std::cmp::Ordering::{Greater, Less};
+        let date = |text: &str| Document::Date(text.parse().unwrap());
+        let time = |text: &str| Document::Time(text.parse().unwrap());
+        let item = doc(&[("due", date("2026-11-07")), ("opens", time("09:30"))]);
+        assert!(Filter::new().eq("due", date("2026-11-07")).matches(&item));
+        assert!(Filter::new().lt("due", date("2026-11-08")).matches(&item));
+        assert!(Filter::new().gt("due", date("1969-12-31")).matches(&item));
+        assert!(Filter::new().gte("opens", time("09:30:00")).matches(&item));
+        assert!(
+            Filter::new()
+                .lt("opens", time("09:30:00.000000001"))
+                .matches(&item)
+        );
+        let midnight = Document::DateTime("2026-11-07T00:00:00Z".parse().unwrap());
+        for other in [
+            midnight,
+            "2026-11-07".into(),
+            Document::Int(20_764),
+            time("00:00"),
+        ] {
+            assert!(
+                !Filter::new().eq("due", other.clone()).matches(&item),
+                "{other:?}"
+            );
+            assert!(
+                !Filter::new().lte("due", other.clone()).matches(&item),
+                "{other:?}"
+            );
+            assert!(
+                !Filter::new().gte("due", other.clone()).matches(&item),
+                "{other:?}"
+            );
+            assert!(
+                Filter::new().ne("due", other.clone()).matches(&item),
+                "{other:?}"
+            );
+        }
+        assert!(!Filter::new().eq("opens", "09:30:00").matches(&item));
+        assert!(!Filter::new().eq("opens", date("2026-11-07")).matches(&item));
+
+        let binary = Document::Binary(vec![0xFF; 3]);
+        let (day, clock) = (date("2026-11-07"), time("09:30"));
+        assert_eq!(sort_order(&binary, &day, SortOrder::Asc), Less);
+        assert_eq!(sort_order(&day, &clock, SortOrder::Asc), Less);
+        assert_eq!(
+            sort_order(&date("2026-11-08"), &day, SortOrder::Asc),
+            Greater
+        );
+        assert_eq!(
+            sort_order(&clock, &Document::Array(vec![]), SortOrder::Desc),
+            Less
+        );
+        assert!(!is_unordered(&day) && !is_unordered(&clock));
     }
 
     /// Which filters name their documents by id (SPEC §61): an `Eq` on

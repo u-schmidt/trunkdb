@@ -9,6 +9,8 @@
 //! | `Binary`               | `{"$binary": "<base64>"}`             |
 //! | `Float` NaN / ±inf     | `{"$float": "NaN"}`, `"Infinity"`, `"-Infinity"` |
 //! | `DateTime`             | `{"$date": "2026-09-27T14:05:00Z"}` (RFC 3339, UTC) |
+//! | `Date`                 | `{"$date": "2026-09-27"}`             |
+//! | `Time`                 | `{"$time": "14:05:00"}`               |
 //! | `Object` that looks like a tag | `{"$object": {...}}`          |
 //!
 //! Everything else is plain JSON: `Int` is an integer, `Float` a number
@@ -24,7 +26,10 @@
 //!
 //! `$date` is a tag since export format 2 (SPEC §69). An export of
 //! format 1 is read without it, so a `{"$date": ...}` object in it stays
-//! the object it was.
+//! the object it was. `$time` is a tag since export format 4 (SPEC
+//! §173), and read the same way: an export before it keeps a `{"$time":
+//! ...}` object an object. `$date` holding a date alone came with it
+//! too, but no earlier export has one: it was refused.
 
 use crate::document::{DocId, Document};
 use serde_json::{Map, Number, Value};
@@ -33,26 +38,32 @@ const TAG_ID: &str = "$id";
 const TAG_BINARY: &str = "$binary";
 const TAG_FLOAT: &str = "$float";
 const TAG_DATE: &str = "$date";
+const TAG_TIME: &str = "$time";
 const TAG_OBJECT: &str = "$object";
 /// Only at the top of an export line: a document that isn't an `Object`
 /// (see `document_line`).
 const TAG_VALUE: &str = "$value";
-const TAGS: [&str; 6] = [
-    TAG_ID, TAG_BINARY, TAG_FLOAT, TAG_DATE, TAG_OBJECT, TAG_VALUE,
+const TAGS: [&str; 7] = [
+    TAG_ID, TAG_BINARY, TAG_FLOAT, TAG_DATE, TAG_TIME, TAG_OBJECT, TAG_VALUE,
 ];
 
-/// Which tags a reader knows: `$date` came with export format 2.
+/// Which tags a reader knows: `$date` came with export format 2, `$time`
+/// with 4.
 #[derive(Clone, Copy)]
 pub(crate) struct Tags {
     pub(crate) dates: bool,
+    pub(crate) times: bool,
 }
 
 impl Tags {
     /// What this build writes.
-    pub(crate) const CURRENT: Tags = Tags { dates: true };
+    pub(crate) const CURRENT: Tags = Tags {
+        dates: true,
+        times: true,
+    };
 
     fn has(self, key: &str) -> bool {
-        TAGS.contains(&key) && (self.dates || key != TAG_DATE)
+        TAGS.contains(&key) && (self.dates || key != TAG_DATE) && (self.times || key != TAG_TIME)
     }
 }
 
@@ -81,6 +92,8 @@ pub(crate) fn to_json(doc: &Document) -> Value {
         Document::Binary(bytes) => tagged(TAG_BINARY, Value::String(base64_encode(bytes))),
         Document::Id(id) => tagged(TAG_ID, Value::String(id.to_string())),
         Document::DateTime(time) => tagged(TAG_DATE, Value::String(time.to_string())),
+        Document::Date(day) => tagged(TAG_DATE, Value::String(day.to_string())),
+        Document::Time(time) => tagged(TAG_TIME, Value::String(time.to_string())),
         Document::Array(items) => Value::Array(items.iter().map(to_json).collect()),
         Document::Object(map) => {
             let object = object_to_json(map);
@@ -243,9 +256,25 @@ fn from_tag(tag: String, value: Value, tags: Tags) -> Result<Document, ParseDocu
                 )));
             }
         },
+        // A date and a time, or a date alone (SPEC §173): a date-time's
+        // text always has a time, so the text says which.
         TAG_DATE => {
             let s = text(value)?;
-            Document::DateTime(s.parse().map_err(|e| error(format!("`$date`: {e}")))?)
+            match s.parse() {
+                Ok(time) => Document::DateTime(time),
+                Err(e) => match s.parse() {
+                    Ok(day) => Document::Date(day),
+                    Err(_) => {
+                        return Err(error(format!(
+                            "`$date`: {e}, nor a date alone (like \"2026-09-27\")"
+                        )));
+                    }
+                },
+            }
+        }
+        TAG_TIME => {
+            let s = text(value)?;
+            Document::Time(s.parse().map_err(|e| error(format!("`$time`: {e}")))?)
         }
         TAG_OBJECT => match value {
             Value::Object(inner) => Document::Object(object_from_json(inner, tags)?),
@@ -451,7 +480,10 @@ mod tests {
         assert_eq!(roundtrip(&lookalike), lookalike);
 
         let line: Value = serde_json::from_str(r#"{"at":{"$date":"soon"}}"#).unwrap();
-        let old = Tags { dates: false };
+        let old = Tags {
+            dates: false,
+            times: false,
+        };
         let (_, doc) = parse_document_line(line.clone(), old).unwrap();
         assert_eq!(doc, object(&[("at", lookalike)]));
         let error = parse_document_line(line, Tags::CURRENT).unwrap_err();
@@ -459,6 +491,50 @@ mod tests {
         let offset: Value =
             serde_json::from_str(r#"{"$date":"2026-09-21T16:13:20.12+02:00"}"#).unwrap();
         assert_eq!(from_json(offset).unwrap(), Document::DateTime(time));
+    }
+
+    /// SPEC §173: a date is `{"$date": "2026-11-07"}`, the text saying
+    /// it has no time, and a time of day `{"$time": "14:05:00"}`; an
+    /// export before version 4 knew no `$time`, and keeps its object.
+    #[test]
+    fn dates_and_times_are_tagged_and_older_exports_keep_their_time_objects() {
+        let day = Document::Date("2026-11-07".parse().unwrap());
+        let clock = Document::Time("14:05:00.25".parse().unwrap());
+        assert_eq!(to_json(&day).to_string(), r#"{"$date":"2026-11-07"}"#);
+        assert_eq!(to_json(&clock).to_string(), r#"{"$time":"14:05:00.25"}"#);
+        assert_eq!(roundtrip(&day), day);
+        assert_eq!(roundtrip(&clock), clock);
+        let midnight = parse(r#"{"$date": "2026-11-07T00:00:00Z"}"#).unwrap();
+        assert!(matches!(midnight, Document::DateTime(_)), "{midnight:?}");
+
+        let lookalike = object(&[("$time", Document::String("soon".into()))]);
+        assert_eq!(
+            to_json(&lookalike).to_string(),
+            r#"{"$object":{"$time":"soon"}}"#
+        );
+        assert_eq!(roundtrip(&lookalike), lookalike);
+        let line: Value = serde_json::from_str(r#"{"at":{"$time":"soon"}}"#).unwrap();
+        let before = Tags {
+            dates: true,
+            times: false,
+        };
+        let read_before = read(line.clone(), before).unwrap();
+        assert_eq!(read_before.get("at"), Some(&lookalike));
+        assert!(
+            read(line, Tags::CURRENT).is_err(),
+            "`$time` needs a time now"
+        );
+
+        for (bad, says) in [
+            (r#"{"$date": "2026-13-01"}"#, "nor a date alone"),
+            (r#"{"$date": "soon"}"#, "nor a date alone"),
+            (r#"{"$time": "25:00"}"#, "`$time`"),
+            (r#"{"$time": "14:05:00Z"}"#, "`$time`"),
+            (r#"{"$time": 5}"#, "must hold a string"),
+        ] {
+            let error = parse(bad).unwrap_err().to_string();
+            assert!(error.contains(says), "{bad}: {error}");
+        }
     }
 
     #[test]

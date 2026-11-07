@@ -1,4 +1,4 @@
-use crate::datetime::DateTime;
+use crate::datetime::{Date, DateTime, Time};
 use crate::decode::{corrupt, put_varint, take, take_array, take_u8, take_u32, take_varint};
 use crate::map::Map;
 use crate::names::FieldNames;
@@ -41,6 +41,12 @@ pub enum Document {
     /// `SystemTime` or `DateTime` field stores. Filters compare, sort and
     /// index it in time order; it equals no string or number.
     DateTime(DateTime),
+    /// A day in the calendar, without a time (SPEC §173): what a `Date`
+    /// field stores. Compares with dates only, in calendar order.
+    Date(Date),
+    /// A time of day, without a date (SPEC §173): what a `Time` field
+    /// stores. Compares with times only.
+    Time(Time),
 }
 
 impl Document {
@@ -162,6 +168,22 @@ impl Document {
     pub fn as_datetime(&self) -> Option<DateTime> {
         match self {
             Document::DateTime(at) => Some(*at),
+            _ => None,
+        }
+    }
+
+    /// A `Date`'s day.
+    pub fn as_date(&self) -> Option<Date> {
+        match self {
+            Document::Date(day) => Some(*day),
+            _ => None,
+        }
+    }
+
+    /// A `Time`'s time of day.
+    pub fn as_time(&self) -> Option<Time> {
+        match self {
+            Document::Time(time) => Some(*time),
             _ => None,
         }
     }
@@ -347,6 +369,8 @@ document_from! {
     DocId => Id as DocId,
     SystemTime => DateTime as DateTime,
     DateTime => DateTime as DateTime,
+    Date => Date as Date,
+    Time => Time as Time,
 }
 
 /// `None` is `Null`, so an `Option` field's value can go into a filter
@@ -388,6 +412,13 @@ pub(crate) const TAG_TEXT: u8 = 12;
 pub(crate) const TAG_BYTES: u8 = 13;
 /// An array: `[varint count]`, then the items.
 pub(crate) const TAG_LIST: u8 = 14;
+
+// Since file format 15 (SPEC §173), in both encodings.
+
+/// A `Date`: its days since 1970-01-01, zigzag-encoded as a varint.
+pub(crate) const TAG_DATE: u8 = 15;
+/// A `Time`: its nanoseconds since midnight as a varint.
+pub(crate) const TAG_TIME: u8 = 16;
 
 /// Whether `tag` is an object's, either encoding.
 pub(crate) fn is_object_tag(tag: u8) -> bool {
@@ -606,6 +637,15 @@ fn write_document(doc: &Document, buffer: &mut Vec<u8>) {
             buffer.extend_from_slice(&time.unix_seconds().to_le_bytes());
             buffer.extend_from_slice(&time.subsec_nanos().to_le_bytes());
         }
+        Document::Date(day) => {
+            let days = day.days_since_epoch();
+            buffer.push(TAG_DATE);
+            put_varint(((days << 1) ^ (days >> 63)) as u64, buffer);
+        }
+        Document::Time(time) => {
+            buffer.push(TAG_TIME);
+            put_varint(time.nanos_since_midnight(), buffer);
+        }
     }
 }
 
@@ -679,6 +719,8 @@ pub(crate) fn decode_value(
         }
         TAG_ID => Document::Id(DocId(take_array(bytes, "an id")?)),
         TAG_DATETIME => Document::DateTime(take_datetime(bytes)?),
+        TAG_DATE => Document::Date(take_date(bytes)?),
+        TAG_TIME => Document::Time(take_time(bytes)?),
         other => return Err(corrupt(format_args!("unknown document type tag {other}"))),
     })
 }
@@ -709,6 +751,24 @@ pub(crate) fn take_datetime(bytes: &mut &[u8]) -> std::io::Result<DateTime> {
     let nanos = u32::from_le_bytes(take_array(bytes, "a date-time")?);
     DateTime::from_unix(secs, nanos)
         .ok_or_else(|| corrupt(format_args!("a date-time with {nanos} ns past its second")))
+}
+
+/// A date's encoding, after its tag: a day a `DateTime` falls on.
+fn take_date(bytes: &mut &[u8]) -> std::io::Result<Date> {
+    let zigzag = take_varint(bytes, "a date")?;
+    let days = (zigzag >> 1) as i64 ^ -((zigzag & 1) as i64);
+    Date::from_days_since_epoch(days)
+        .ok_or_else(|| corrupt(format_args!("a date {days} days from 1970, past the last")))
+}
+
+/// A time of day's encoding, after its tag: below a day.
+fn take_time(bytes: &mut &[u8]) -> std::io::Result<Time> {
+    let nanos = take_varint(bytes, "a time of day")?;
+    Time::from_nanos_since_midnight(nanos).ok_or_else(|| {
+        corrupt(format_args!(
+            "a time of day {nanos} ns after midnight, a day or more"
+        ))
+    })
 }
 
 /// Moves past one encoded value without building it (SPEC §99), checking
@@ -758,6 +818,12 @@ pub(crate) fn skip_value(
         }
         TAG_DATETIME => {
             take_datetime(bytes)?;
+        }
+        TAG_DATE => {
+            take_date(bytes)?;
+        }
+        TAG_TIME => {
+            take_time(bytes)?;
         }
         other => return Err(corrupt(format_args!("unknown document type tag {other}"))),
     }
@@ -1058,6 +1124,55 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("date-time"), "{error}");
         assert!(decode_document(&bytes[..12]).is_err(), "cut short");
+    }
+
+    /// SPEC §173: dates and times of day keep their value, as varints,
+    /// in both encodings and through a skip; one past its range is
+    /// damage, and so is one cut short.
+    #[test]
+    fn dates_and_times_roundtrip_and_out_of_range_is_damage() {
+        const NANOS_PER_DAY: u64 = 86_400 * 1_000_000_000;
+        let first = crate::DateTime::EARLIEST.date();
+        let last = crate::DateTime::from_unix(i64::MAX, 0).unwrap().date();
+        for date in [
+            Date::UNIX_EPOCH,
+            "2026-11-07".parse().unwrap(),
+            "1969-12-31".parse().unwrap(),
+            first,
+            last,
+        ] {
+            roundtrip(Document::Date(date));
+        }
+        for nanos in [0, 1, 52_200_000_000_000, NANOS_PER_DAY - 1] {
+            roundtrip(Document::Time(
+                Time::from_nanos_since_midnight(nanos).unwrap(),
+            ));
+        }
+        // 1970-01-02 is two bytes: the tag and a zigzag of 1.
+        let today = Document::Date(Date::from_days_since_epoch(1).unwrap());
+        assert_eq!(encode_document(&today), [TAG_DATE, 2]);
+        assert_eq!(
+            encode_document(&Document::Date(Date::from_days_since_epoch(-1).unwrap())),
+            [TAG_DATE, 1]
+        );
+
+        let damaged = |tag: u8, value: u64, what: &str| {
+            let mut bytes = vec![tag];
+            put_varint(value, &mut bytes);
+            let error = decode_document(&bytes).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains(what), "{error}");
+            let mut rest = &bytes[..];
+            let names = FieldNames::default();
+            assert!(skip_value(&mut rest, 1, &names).is_err(), "skipped: {what}");
+        };
+        let past = |days: i64| ((days << 1) ^ (days >> 63)) as u64;
+        damaged(TAG_DATE, past(last.days_since_epoch() + 1), "a date");
+        damaged(TAG_DATE, past(first.days_since_epoch() - 1), "a date");
+        damaged(TAG_TIME, NANOS_PER_DAY, "a time of day");
+        damaged(TAG_TIME, u64::MAX, "a time of day");
+        assert!(decode_document(&[TAG_DATE]).is_err(), "cut short");
+        assert!(decode_document(&[TAG_TIME, 0x80]).is_err(), "cut short");
     }
 
     #[test]

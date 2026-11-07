@@ -143,6 +143,40 @@ parameter for, or one that doesn't fit (`limit :n` with `-1`) is a
 `BindError`. `Template<Condition>` and `Template<Aggregate>` work the
 same way, and `trunkdb` takes the values as `--param team=core`.
 
+## Moments, days and times of day
+
+Three types hold time, each stored, compared and indexed as itself
+(SPEC §69, §173), as C# has `DateTime`, `DateOnly` and `TimeOnly`:
+
+- `DateTime` (or a `SystemTime` field): a moment, in UTC, to the
+  nanosecond. `datetime("2026-11-07T14:05:00Z")` in a filter's text.
+- `Date`: a day in the calendar, no time and no zone: a birthday, a due
+  date. `date("2026-11-07")`.
+- `Time`: a time of day, no date: opening hours. `time("14:05")`.
+
+```rust
+use trunkdb::{Date, DateTime, Time};
+
+#[derive(Serialize, Deserialize)]
+struct Shift {
+    day: Date,
+    starts: Time,
+    logged: DateTime,
+}
+
+shifts.ensure_index("day")?;
+let this_week: Filter = r#"day >= date("2026-11-02") and day < date("2026-11-09")"#.parse()?;
+let today = DateTime::now().date(); // in UTC
+let nine = today.at(Time::from_hms(9, 0, 0).unwrap()); // Some(DateTime), in UTC
+```
+
+Each compares only with its own kind: `date("2026-11-07")` never
+equals a moment, not even its midnight, and a filter on a field of
+moments writes a moment. `trunkdb fields` says which a field holds:
+`datetime`, `date` or `time`. A date adds days by its count since
+1970, `Date::from_days_since_epoch(day.days_since_epoch() + 7)`; for
+months, zones and the rest, convert to `jiff` or `chrono`.
+
 ## A condition of your own
 
 For a test no operator covers, a closure: name the fields it reads, and
@@ -284,7 +318,7 @@ JSON object a line, as one batch, and names the line a failure came
 from:
 
 ```sh
-trunkdb batch app.trunkdb - --param now='date("2026-11-06T12:00:00Z")' <<'END'
+trunkdb batch app.trunkdb - --param now='datetime("2026-11-06T12:00:00Z")' <<'END'
 {"op": "update", "collection": "tasks", "filter": "due < :now and done = false", "update": {"$set": {"overdue": true}}}
 {"op": "insert", "collection": "log", "document": {"what": "marked overdue tasks"}}
 END
@@ -448,8 +482,8 @@ The fields not selected are skipped, not decoded. Where an index holds
 the filter's fields and every selected one, a match comes from its index
 entry and the document isn't read at all: `(status, created)` answers
 "the queued, newest first, their status and creation" from the index
-alone, if `created` is a date-time. Booleans, strings, ids and
-date-times can come from an entry. Numbers and nulls are read from the
+alone, if `created` is a date-time. Booleans, strings, ids,
+date-times, dates and times of day can come from an entry. Numbers and nulls are read from the
 document, because the key keeps neither a number's type nor whether a
 null field is there.
 
@@ -766,16 +800,22 @@ keep a copy of the file, or an export, from before the upgrade to go
 back. The first open after 0.31.0 rebuilds the indexes that hold
 binary values, which had no key before (SPEC §166); a unique one in
 which two documents share the same bytes fails that open, so drop it
-or change one of them with 0.31.0 first. The release after 0.33 stores
-field names once and index keys after a shared anchor, file format 14
-(SPEC §170, §171): an older file opens with nothing converted, its
-documents and index pages rewritten smaller as they are written, and
-all of them by `db.compact()`, which is worth running once. 0.33.0
-and older refuse a file once it has been opened for writing.
+or change one of them with 0.31.0 first. 0.34.0 stores field names
+once and index keys after a shared anchor, file format 14 (SPEC §170,
+§171): an older file opens with nothing converted, its documents and
+index pages rewritten smaller as they are written, and all of them by
+`db.compact()`, which is worth running once. 0.33.0 and older refuse a
+file once it has been opened for writing. The release after 0.34 adds
+dates and times of day, file format 15 (SPEC §173), which 0.34.0
+refuses in the same way.
 Export and import move data across releases either way, as far as
 the export allows: releases after 0.31.0 write exports of version 3,
-which 0.31.0 and older refuse. To take one there, make its first line
-`{"$trunkdb_export":2}` and drop its last, the `$end` line:
+which 0.31.0 and older refuse, and releases after 0.34 version 4,
+which 0.34.0 and older refuse. An export without dates or times of
+day in it reads the same as version 3: make its first line
+`{"$trunkdb_export":3}` to take it to 0.32.0 to 0.34.0. To take one to
+0.31.0 or older, make its first line `{"$trunkdb_export":2}` and drop
+its last, the `$end` line:
 
 ```
 sed -e '1s/.*/{"$trunkdb_export":2}/' -e '$d' backup.jsonl > for-older.jsonl

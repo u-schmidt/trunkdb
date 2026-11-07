@@ -874,9 +874,10 @@ fn given_params<'a>(args: &[&'a str]) -> Result<(Vec<&'a str>, Given), String> {
 }
 
 /// A `--param`'s value (SPEC §163.6): a value as a filter writes one,
-/// JSON, `id("…")` or `date("…")`; what doesn't start as one of those is
-/// a string as written. One that starts as one and doesn't read is a
-/// mistake, not a string: `[1, 2` or `date("2026-13-01")`.
+/// JSON, `id("…")`, `datetime("…")`, `date("…")` or `time("…")`; what
+/// doesn't start as one of those is a string as written. One that starts
+/// as one and doesn't read is a mistake, not a string: `[1, 2` or
+/// `date("2026-13-01")`.
 fn param_value(text: &str) -> Result<Document, String> {
     if let Ok(value) = text.parse::<Document>() {
         return Ok(value);
@@ -892,11 +893,25 @@ fn param_value(text: &str) -> Result<Document, String> {
             .map(Document::Id)
             .ok_or_else(|| format!("{text} is not an id"));
     }
-    if let Some(inner) = call("date") {
+    if let Some(inner) = call("datetime") {
         let time = inner.and_then(|inner| inner.parse::<trunkdb::DateTime>().ok());
         return (time.map(Document::DateTime)).ok_or_else(|| {
-            format!("{text} is not a date-time like date(\"2026-11-03T12:00:00Z\")")
+            format!("{text} is not a date-time like datetime(\"2026-11-03T12:00:00Z\")")
         });
+    }
+    // A date, or a date and time as before `datetime` (SPEC §173).
+    if let Some(inner) = call("date") {
+        let value = inner.and_then(|inner| {
+            (inner.parse().map(Document::Date))
+                .or_else(|_| inner.parse().map(Document::DateTime))
+                .ok()
+        });
+        return value.ok_or_else(|| format!("{text} is not a date like date(\"2026-11-03\")"));
+    }
+    if let Some(inner) = call("time") {
+        let time = inner.and_then(|inner| inner.parse::<trunkdb::Time>().ok());
+        return (time.map(Document::Time))
+            .ok_or_else(|| format!("{text} is not a time of day like time(\"14:05:00\")"));
     }
     match text.trim_start().starts_with(['[', '{', '"']) {
         true => Err(format!(
@@ -1111,8 +1126,9 @@ const MAX_PATHS: usize = 10_000;
 /// The kinds of value a path can hold, in the order a tie between two
 /// counts is printed; the names are the ones the filter language and
 /// `Display` use for them.
-const KINDS: [&str; 10] = [
-    "null", "bool", "int", "float", "string", "binary", "array", "object", "id", "date",
+const KINDS: [&str; 12] = [
+    "null", "bool", "int", "float", "string", "binary", "array", "object", "id", "datetime",
+    "date", "time",
 ];
 
 fn kind(value: &Document) -> usize {
@@ -1127,6 +1143,8 @@ fn kind(value: &Document) -> usize {
         Document::Object(_) => 7,
         Document::Id(_) => 8,
         Document::DateTime(_) => 9,
+        Document::Date(_) => 10,
+        Document::Time(_) => 11,
         _ => 0,
     }
 }

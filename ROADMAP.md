@@ -53,6 +53,7 @@ All of it is done:
 | 0.32.0 | **Backups a user can trust:** an export ends with a line of its counts, export version 3, which an import checks, so one cut short fails instead of restoring in part; `Summary::ended`; `verify_export` and `trunkdb verify`, a restore into a file of its own, `check`ed, counted and deleted, a `Verified` report; a section of the guide on backups while running, restores, copying the file and its WAL, and moving between releases; 0.31.0 and older refuse version 3 **Binary in indexes, in the order of its bytes:** compared byte by byte as SQLite compares a BLOB, `<`, ranges and `starts with` a binary prefix, in the text as `{"$binary": …}`; sorted after date-times, where it came last with arrays and objects; an index key, so `=`, ranges, prefixes and sorts read just their entries, a count and a selection none, a unique index refusing the same bytes twice; file format 13, an older file's indexes holding binary rebuilt at its first open; on 100,000 file paths, binary instead of hex text a quarter of the file and a third of the index smaller **An OR of `Eq`s merged by id:** a sort by `_id` with a limit after an OR or an `in` whose ranges `Eq`s fix whole, one index or several, walks the ranges side by side and merges them by id, stopping at the limit, where it read every match and sorted them; `_id` comparisons narrow each range, so paging by the last id works through `tenant in (…)`; `QueryPlan::IndexUnion` says so in `in_order` | §165–§167 |
 | 0.33.0 | **Writes by a filter in a batch:** `Batch::update_many(&collection, filter, &update)`, the operators made to what the filter finds at `commit`, and `Batch::delete_many`, at their place among the ops, under the writer's lock, sort, skip and limit counting; `commit` returns a `Written`, how many documents each op wrote; `Batch::dry_run`, every op run and rolled back, the counts or the error `commit` would give. **`trunkdb batch <file> <ops.jsonl \| ->`:** one op a line as JSON, `insert`, `update`, `delete`, `require` and `require_none`, committed whole or not at all, with `--param`, `--create` and `--dry-run`, each new id printed, what each line wrote, and the line a failure came from. **A regex:** `Filter::regex(field, Regex)`, `notes matches "time-?out"` in the text, the pattern a parameter too, through the `regex` crate, whose matching is linear in the text, behind the `regex` feature, on by default; a `Regex` is compiled once, when made, at most 4,096 bytes and 1 MiB compiled; a pattern beginning `^` and fixed text, `^Fix`, reads an index as `starts with` does, any other every document | §168–§169 |
 | 0.34.0 | **Field names stored once, numbers as varints:** one dictionary of field names for the file, kept in the catalog, and a stored document's keys as numbers into it; ints, lengths and counts as varints; a name of at most 64 bytes, among the first 4,096, joins, any other key stays inline; schemaless still; `compact` keeps only the names in use; older documents read as they are and are stored anew when written. **Index leaves stored after an anchor:** each leaf keeps one anchor key, its middle one when built, and each entry the bytes it shares with it, then the rest, the location as varints; every entry reads on its own, so the binary search, walks, inserts and removes work as they did; older leaves packed at their first insert or by `compact`. File format 14, which 0.33.0 refuses; on the bench's 100,000 tasks the file 42% smaller, on 150,000 file paths 37%. **Walks that pass part of a leaf:** into the first leaf by a binary search, the range's end checked once a leaf, a key copied only where it differs; a count, and a skip through an index, pass the part of a leaf inside the range at once, so paging, skips and counts got faster than before | §170–§172 |
+| next | **A date, and a time of day:** `Date`, a day in the calendar, and `Time`, a time of day to the nanosecond, as `Document::Date` and `Document::Time`, a struct's fields of those types stored as them; each compares only with its own kind, never with a date-time; keys in an index in their order, sorted after binary; `date("2026-11-07")`, `time("14:05")` and `datetime("…")` in a filter's text, `is date` and `is time`, `date` naming dates now where it named date-times; `{"$date": "2026-11-07"}` and `{"$time": …}` in JSON, export version 4; `DateTime::date()`, `time()` and `Date::at`; file format 15 | §173 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -112,7 +113,7 @@ only a checkpoint before upgrading.
   the indexes of older files then; nothing need be in today's files for
   it. What a read-only open does then, and how a long first open shows
   its progress, is decided with that change.
-- New types — a date without a time, a time without a date, a decimal:
+- New types — a decimal, as dates and times of day came (§173):
   `Document` is `#[non_exhaustive]`, and a file holding one is refused
   by an older build, as above.
 - Everything **Planned** or **Deferred** below: new operators, `serde_json` behind a feature, repairing what
@@ -133,8 +134,6 @@ says where the need or the limit is described.
   readings of each server", SQL's `ROW_NUMBER() OVER (PARTITION BY …)`,
   for live aggregates too: where groups report at rates far apart
   (§139.6). After `first` and `last`, which give the last one of each.
-- **A date without a time, and a time without a date,** as variants of
-  their own; until then, noon UTC of the day serves (§69.1).
 - **A C ABI,** `trunkdb-ffi`, with a header made by cbindgen: the way
   in for every language that calls C, C# through P/Invoke, Swift, Go,
   Java, Node, Dart. Handles for a database, a cursor and a snapshot;
@@ -158,8 +157,9 @@ uses trunkdb asking for it.
 
 **Data types**
 - `chrono`, `time` and `jiff` recognized on the way in, behind a
-  feature each, as date-times rather than the strings they serialize to
-  (§69.5); conversions between their types and `trunkdb::DateTime`.
+  feature each, as date-times, dates and times of day rather than the
+  strings they serialize to (§69.5, §173.5); conversions between their
+  types and trunkdb's `DateTime`, `Date` and `Time`.
 
 **Queries**
 - Rules are enough while every plan is bounded by one pass over one
