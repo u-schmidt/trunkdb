@@ -81,6 +81,9 @@ pub struct Aggregate {
     pub(crate) rows: Filter,
     /// `window`: only the documents this close to the newest (SPEC §139).
     pub(crate) window: Option<Window>,
+    /// `window_per_group`, `newest_per_group`: each group's own window
+    /// (SPEC §174).
+    pub(crate) per_group: Option<GroupWindow>,
     /// `unwind`: the arrays each document is made one per element of,
     /// in order (SPEC §147).
     pub(crate) unwind: Vec<String>,
@@ -111,6 +114,88 @@ impl Window {
             .filter_map(|doc| doc.get(&self.path).and_then(Document::as_datetime))
             .max()
     }
+}
+
+/// `Aggregate::window_per_group` and `newest_per_group`: of each
+/// group's documents, those its own newest keeps (SPEC §174).
+#[derive(Debug, Clone)]
+pub(crate) struct GroupWindow {
+    pub path: String,
+    pub size: Size,
+}
+
+/// How much of each group a `GroupWindow` keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Size {
+    /// The documents whose date-time is within this of the group's
+    /// newest.
+    Time(Duration),
+    /// The documents with the largest values, this many.
+    Count(usize),
+}
+
+impl GroupWindow {
+    /// The indices of `docs` it keeps, in order: each document's group
+    /// read at `group_by` as `Groups` reads it, before any unwind.
+    fn keep(&self, group_by: &[String], docs: &[(Document, Order)]) -> Vec<usize> {
+        let group_paths: Vec<Path<'_>> = group_by.iter().map(|p| Path::new(p)).collect();
+        let path = Path::new(&self.path);
+        let mut groups: BTreeMap<GroupKey, Vec<usize>> = BTreeMap::new();
+        for (i, (doc, _)) in docs.iter().enumerate() {
+            let key = GroupKey(
+                (group_paths.iter())
+                    .map(|p| p.value_or_null(doc))
+                    .map(|value| match is_unordered(value) {
+                        true => canonical(value),
+                        false => value.clone(),
+                    })
+                    .collect(),
+            );
+            groups.entry(key).or_default().push(i);
+        }
+        let value = |i: usize| path.field_value(&docs[i].0);
+        let mut kept = Vec::new();
+        for members in groups.into_values() {
+            match self.size {
+                Size::Time(duration) => {
+                    let at = |i: usize| value(i).and_then(Document::as_datetime);
+                    let Some(newest) = members.iter().filter_map(|&i| at(i)).max() else {
+                        continue;
+                    };
+                    let earliest = newest.back(duration);
+                    kept.extend(members.into_iter().filter(|&i| at(i) >= Some(earliest)));
+                }
+                Size::Count(n) => {
+                    let mut ranked: Vec<(usize, &Document)> = (members.into_iter())
+                        .filter_map(|i| value(i).filter(|v| !v.is_null()).map(|v| (i, v)))
+                        .collect();
+                    // Newest first: the largest value, then the latest id.
+                    ranked.sort_by(|(i, a), (j, b)| {
+                        sort_order(a, b, SortOrder::Desc).then(docs[*j].1.cmp(&docs[*i].1))
+                    });
+                    kept.extend(ranked.into_iter().take(n).map(|(i, _)| i));
+                }
+            }
+        }
+        kept.sort_unstable();
+        kept
+    }
+}
+
+/// `docs` cut to what `window` keeps of each group, in their order;
+/// all of them without one.
+pub(crate) fn per_group(
+    aggregate: &Aggregate,
+    docs: Vec<(Document, Order)>,
+) -> Vec<(Document, Order)> {
+    let Some(window) = &aggregate.per_group else {
+        return docs;
+    };
+    let kept = window.keep(&aggregate.group_by, &docs);
+    let mut docs: Vec<Option<(Document, Order)>> = docs.into_iter().map(Some).collect();
+    kept.into_iter()
+        .map(|i| docs[i].take().expect("each kept once"))
+        .collect()
 }
 
 /// One column of a row.
@@ -259,6 +344,63 @@ impl Aggregate {
         self.window = Some(Window {
             path: path.into(),
             duration,
+        });
+        self
+    }
+
+    /// Of each group, only the documents whose date-time at `path` is
+    /// within `duration` of that group's own newest (SPEC §174): "each
+    /// server's last five minutes", however long ago it last reported.
+    /// The group's newest is in, and so is one exactly `duration` before
+    /// it; a document whose value there isn't a `DateTime`, or is
+    /// missing, is out. Replaces an earlier `newest_per_group`.
+    ///
+    /// Unlike `window`, a group whose documents stopped coming keeps its
+    /// last ones. Every document the filter finds is read: a condition
+    /// on `path` in the filter bounds the read. Refused beside a filter
+    /// with a sort, a skip or a limit, as `window` is, and where a group
+    /// field or `path` is inside an unwound array.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use trunkdb::query::Aggregate;
+    ///
+    /// let load = Aggregate::new()
+    ///     .group_by("server")
+    ///     .avg("load").named("mean")
+    ///     .window_per_group("at", Duration::from_secs(300));
+    /// # let _ = load;
+    /// ```
+    pub fn window_per_group(mut self, path: impl Into<String>, duration: Duration) -> Self {
+        self.per_group = Some(GroupWindow {
+            path: path.into(),
+            size: Size::Time(duration),
+        });
+        self
+    }
+
+    /// Of each group, only the `n` documents with the largest values at
+    /// `path` (SPEC §174): "the last ten readings of each server",
+    /// SQL's `row_number() over (partition by server order by at desc)
+    /// <= 10`. Values in the order a sort uses (SPEC §34.1), so `path`
+    /// may hold date-times, numbers or anything else that orders; of
+    /// equal ones, the later id is newer. A document whose value there
+    /// is `null` or missing is out. Replaces an earlier
+    /// `window_per_group`; refused where that is.
+    ///
+    /// ```
+    /// use trunkdb::query::Aggregate;
+    ///
+    /// let recent = Aggregate::new()
+    ///     .group_by("server")
+    ///     .avg("load").named("mean")
+    ///     .newest_per_group("at", 10);
+    /// # let _ = recent;
+    /// ```
+    pub fn newest_per_group(mut self, path: impl Into<String>, n: usize) -> Self {
+        self.per_group = Some(GroupWindow {
+            path: path.into(),
+            size: Size::Count(n),
         });
         self
     }
@@ -417,17 +559,22 @@ impl Aggregate {
         let docs: Vec<Document> = docs.into_iter().collect();
         let window =
             (self.window.as_ref()).map(|w| Filter::new().and(w.condition(w.newest(&docs))));
-        let docs = docs
+        let docs: Vec<(Document, Order)> = docs
             .into_iter()
-            .filter(|doc| window.as_ref().is_none_or(|w| w.matches(doc)));
-        for (seq, doc) in docs.enumerate() {
-            let order = match &doc {
-                Document::Object(map) => match map.get(ID_FIELD) {
-                    Some(Document::Id(id)) => Order::id(*id),
+            .filter(|doc| window.as_ref().is_none_or(|w| w.matches(doc)))
+            .enumerate()
+            .map(|(seq, doc)| {
+                let order = match &doc {
+                    Document::Object(map) => match map.get(ID_FIELD) {
+                        Some(Document::Id(id)) => Order::id(*id),
+                        _ => Order::after(seq as u64),
+                    },
                     _ => Order::after(seq as u64),
-                },
-                _ => Order::after(seq as u64),
-            };
+                };
+                (doc, order)
+            })
+            .collect();
+        for (doc, order) in per_group(self, docs) {
             // In memory, a `custom` condition's panic goes on (SPEC §136.2).
             (groups.add_document(&doc, order, None)).unwrap_or_else(|panicked| panicked.resume());
         }
@@ -451,11 +598,28 @@ impl Aggregate {
                 ));
             }
         }
+        if let Some(window) = &self.per_group {
+            let path = window.path.as_str();
+            if path.is_empty() || path.contains("[*]") || path == ID_FIELD {
+                return refuse(format!(
+                    "a window per group's path must name a field, without `[*]`: `{path}`"
+                ));
+            }
+        }
         for path in &self.unwind {
             if path.is_empty() || path.contains("[*]") || path == ID_FIELD {
                 return refuse(format!(
                     "`unwind` must name a field of arrays, without `[*]`: `{path}`"
                 ));
+            }
+            if let Some(window) = &self.per_group {
+                let keyed = (self.group_by.iter()).chain([&window.path]);
+                if let Some(inner) = keyed.into_iter().find(|p| inside(p, path)) {
+                    return refuse(format!(
+                        "a window per group keeps documents, each in one group: \
+                         `{inner}` is inside unwound `{path}`"
+                    ));
+                }
             }
             if let Some(window) = &self.window
                 && inside(&window.path, path)
@@ -532,6 +696,7 @@ impl Aggregate {
     /// out, exact, as `min` and `max` do.
     pub(crate) fn needs_documents(&self) -> bool {
         !self.unwind.is_empty()
+            || self.per_group.is_some()
             || (self.columns.iter()).any(|c| matches!(c.kind, Kind::Sum | Kind::First | Kind::Last))
     }
 
@@ -541,7 +706,8 @@ impl Aggregate {
     }
 
     /// Every path it reads: the group fields', then the columns', then
-    /// what orders `first` and `last`, then the arrays unwound, whole.
+    /// what orders `first` and `last`, then the arrays unwound, whole,
+    /// then a window per group's.
     pub(crate) fn paths(&self) -> Vec<&str> {
         let columns = (self.columns.iter())
             .filter_map(|c| c.path.as_deref())
@@ -551,6 +717,7 @@ impl Aggregate {
             .map(String::as_str)
             .chain(columns)
             .chain(self.unwind.iter().map(String::as_str))
+            .chain(self.per_group.iter().map(|w| w.path.as_str()))
             .collect()
     }
 }

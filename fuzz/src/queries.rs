@@ -148,8 +148,11 @@ pub struct Ran {
     pub regexes: u64,
     /// Aggregates given a window (SPEC §139).
     pub windows: u64,
+    /// Aggregates given a window per group, by time or by count (SPEC
+    /// §174).
+    pub group_windows: u64,
     /// Aggregates with a window refused beside a filter's sort, skip or
-    /// limit (SPEC §139.2).
+    /// limit (SPEC §139.2, §174).
     pub windows_refused: u64,
     /// Events live aggregates reported (SPEC §139), each as the model
     /// says.
@@ -449,10 +452,11 @@ struct WatchedAggregate {
     rows: Vec<(String, Document)>,
 }
 
-/// Whether `aggregate` has a window: its `Debug` says so, as the field
-/// isn't public.
+/// Whether `aggregate` has a window, of all or per group: its `Debug`
+/// says so, as the fields aren't public.
 fn aggregate_has_window(aggregate: &Aggregate) -> bool {
-    format!("{aggregate:?}").contains("window: Some")
+    let debug = format!("{aggregate:?}");
+    debug.contains("window: Some") || debug.contains("per_group: Some")
 }
 
 /// Runs the program `input` (SPEC §105.2), panicking where the database
@@ -1152,6 +1156,22 @@ impl Run<'_> {
             ][self.program.below(5)];
             aggregate = aggregate.window(path, duration);
             self.ran.windows += 1;
+        }
+        // A window per group (SPEC §174), on a field of documents: not
+        // where a group field or its path is in the array unwound.
+        let path = fields[self.program.below(fields.len())];
+        let in_tags = |f: &str| f.split('.').next() == Some("tags");
+        let keyed = grouped.iter().any(|g| in_tags(g)) || in_tags(path);
+        if self.program.one_in(4) && !(unwinds && keyed) {
+            aggregate = match self.program.one_in(2) {
+                true => aggregate.newest_per_group(path, self.program.below(4)),
+                false => {
+                    let duration = [Duration::ZERO, Duration::from_secs(5), Duration::MAX]
+                        [self.program.below(3)];
+                    aggregate.window_per_group(path, duration)
+                }
+            };
+            self.ran.group_windows += 1;
         }
         aggregate
     }

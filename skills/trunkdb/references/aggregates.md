@@ -24,6 +24,8 @@ In this order, each one optional:
 | Clause | What |
 |---|---|
 | `window <path> <duration>` | only the documents whose date-time at `<path>` is within the duration of the newest one's: `window at 5m` |
+| `window <path> <n> per group` | of each group, the `n` documents with the largest values at `<path>`: `window at 10 per group` |
+| `window <path> <duration> per group` | of each group, those within the duration of that group's own newest: `window at 5m per group` |
 | `unwind <path>, …` | each document once per element of the array at `<path>`, the element in its place, MongoDB's `$unwind` |
 | columns | `<function> as <name>`, between commas |
 | `group by <path>, …` | one row per different value (or values) |
@@ -33,7 +35,11 @@ In this order, each one optional:
 
 A duration is a whole number and a unit: `ns`, `us`, `ms`, `s`, `m`,
 `h`, `d` (`90s`, `5m`, `2d`). A window counts back from the newest
-document, not the clock.
+document, not the clock. A window of all leaves out a group that
+stopped reporting; a window per group keeps its last documents. Both
+may be given, the one of all first. A window per group reads every
+match: bound the filter on the path where there are many. Neither
+goes with a filter's sort, skip or limit.
 
 ## Columns
 
@@ -62,10 +68,11 @@ unwind items sum(items.qty) as sold group by items.sku        -- per element
 count() as n, count() filter (where late = true) as late
   group by team having late > 0                               -- teams with late tasks
 window at 5m avg(load) as mean group by server                -- the last five minutes
+window at 10 per group avg(load) as mean group by server      -- each one's last ten
 last(status order by changed) as now group by ticket          -- each one's newest
 ```
 
 Words here (`group`, `having`, `as`, `filter`, `distinct`, `unwind`,
-`window`) are keywords only where the aggregate expects them; a field
+`window`, `per`) are keywords only where the aggregate expects them; a field
 with such a name is written in backticks if it would be read as one.
 A mistake prints the aggregate with a `^` under it, exit code 2.

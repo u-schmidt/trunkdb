@@ -1195,3 +1195,13 @@ limit, batches and a write-ahead log. Since then:
     file opens as it is, nothing rebuilt. **Export version 4,** which
     0.34.0 and older refuse; an import reads 1 to 3 as before. A
     fixture of format 15 comes with the release (§120.9).
+149. **A window for each group** (§174):
+    `Aggregate::newest_per_group(path, n)`, each group's `n` documents
+    with the largest values at `path`, and `window_per_group(path,
+    duration)`, each group's documents within `duration` of its own
+    newest date-time: "the last ten readings of each server", SQL's
+    `row_number() over (partition by …)`. A group that stops reporting
+    keeps its last documents. Beside `window`, which comes first; for
+    `aggregate`, `apply`, snapshots and live aggregates; refused
+    beside a filter's sort, skip or limit, as `window` is. In the
+    text, `window at 10 per group` and `window at 5m per group`.

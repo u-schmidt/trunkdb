@@ -6,7 +6,7 @@
 //! parameters, `:name` where a value stands, and binds values to them
 //! (§163).
 
-use crate::aggregate::{Column, Kind, Window};
+use crate::aggregate::{Column, GroupWindow, Kind, Size, Window};
 use crate::datetime::{Date, DateTime, Time};
 use crate::document::{DocId, Document};
 use crate::query::{Aggregate, Condition, Filter, Hint, Kind as ValueKind, Op, Sort, SortOrder};
@@ -726,10 +726,41 @@ impl<'t> Parser<'t> {
     /// An aggregate's text (SPEC §157), as `FromStr for Aggregate` says.
     fn aggregate(&mut self) -> Parsed<Aggregate> {
         let mut aggregate = Aggregate::new();
-        if self.keyword("window") {
+        // One window of all, one per group, either first (SPEC §174).
+        while self.keyword("window") {
+            let start = self.at;
             let path = self.path()?;
-            let duration = self.duration()?;
-            aggregate.window = Some(Window { path, duration });
+            self.skip_space();
+            let size_at = self.at;
+            let size = self.window_size()?;
+            if self.keyword("per") {
+                self.expect_keyword("group")?;
+                if aggregate.per_group.is_some() {
+                    return self.error_at(start, "two windows per group");
+                }
+                aggregate.per_group = Some(GroupWindow { path, size });
+                continue;
+            }
+            match size {
+                // The newest ten of all are the filter's sort and limit.
+                Size::Count(_) if self.text[size_at..].starts_with(':') => {
+                    return self.error_at(
+                        size_at,
+                        "a parameter can't stand for a duration: only for a value or a \
+                         count, as a window per group's",
+                    );
+                }
+                Size::Count(_) => {
+                    return self.expected(
+                        "a unit after the number: ns, us, ms, s, m, h or d; or `per group` \
+                         after a count",
+                    );
+                }
+                Size::Time(_) if aggregate.window.is_some() => {
+                    return self.error_at(start, "two windows of all");
+                }
+                Size::Time(duration) => aggregate.window = Some(Window { path, duration }),
+            }
         }
         if self.keyword("unwind") {
             aggregate.unwind = self.paths()?;
@@ -829,24 +860,37 @@ impl<'t> Parser<'t> {
         })
     }
 
-    /// A duration: a whole number and its unit, `5m` (SPEC §157).
-    fn duration(&mut self) -> Parsed<Duration> {
-        self.no_parameter("a duration")?;
+    /// A window's size (SPEC §174): a duration, or a count, a number
+    /// without a unit or a parameter.
+    fn window_size(&mut self) -> Parsed<Size> {
+        self.skip_space();
+        if self.rest().starts_with(':') {
+            return Ok(Size::Count(self.count()?));
+        }
         let start = self.at;
         let n = self.count()?;
+        match self.unit_after(start, n)? {
+            Some(duration) => Ok(Size::Time(duration)),
+            None => Ok(Size::Count(n)),
+        }
+    }
+
+    /// The duration of `n` and the unit next, if one is: `5m` (SPEC
+    /// §157).
+    fn unit_after(&mut self, start: usize, n: usize) -> Parsed<Option<Duration>> {
         let rest = self.rest();
         let Some(&(unit, nanos)) = (UNITS.iter())
             .filter(|(unit, _)| rest.starts_with(unit))
             .max_by_key(|(unit, _)| unit.len())
             .filter(|(unit, _)| !rest[unit.len()..].starts_with(in_word))
         else {
-            return self.expected("a unit after the number: ns, us, ms, s, m, h or d");
+            return Ok(None);
         };
         self.at += unit.len();
         match (n as u128).checked_mul(nanos) {
             Some(total) if total <= u64::MAX as u128 * 1_000_000_000 => {
                 let secs = (total / 1_000_000_000) as u64;
-                Ok(Duration::new(secs, (total % 1_000_000_000) as u32))
+                Ok(Some(Duration::new(secs, (total % 1_000_000_000) as u32)))
             }
             _ => self.error_at(start, "the duration is too long"),
         }
@@ -1315,6 +1359,15 @@ impl fmt::Display for Aggregate {
             f.write_str("window ")?;
             write_path(f, &window.path)?;
             write!(f, " {}", DurationText(window.duration))?;
+            gap = " ";
+        }
+        if let Some(window) = &self.per_group {
+            write!(f, "{gap}window ")?;
+            write_path(f, &window.path)?;
+            match window.size {
+                Size::Time(duration) => write!(f, " {} per group", DurationText(duration))?,
+                Size::Count(n) => write!(f, " {n} per group")?,
+            }
             gap = " ";
         }
         if !self.unwind.is_empty() {
@@ -2480,9 +2533,9 @@ mod tests {
 
     /// A path, or one of the aggregate's words, as a name.
     fn random_aggregate_path(rng: &mut XorShift) -> String {
-        const WORDS: [&str; 12] = [
+        const WORDS: [&str; 13] = [
             "count", "group", "by", "having", "as", "filter", "window", "unwind", "distinct",
-            "last", "order", "limit",
+            "last", "order", "limit", "per",
         ];
         match rng.below(3) {
             0 => WORDS[rng.below(WORDS.len())].to_string(),
@@ -2501,6 +2554,15 @@ mod tests {
                 Duration::ZERO,
             ][rng.below(5)];
             aggregate = aggregate.window(random_aggregate_path(rng), duration);
+        }
+        // A window per group (SPEC §174), by time or by count.
+        match rng.below(8) {
+            0 => {
+                let duration = [Duration::from_secs(60), Duration::ZERO][rng.below(2)];
+                aggregate = aggregate.window_per_group(random_aggregate_path(rng), duration);
+            }
+            1 => aggregate = aggregate.newest_per_group(random_aggregate_path(rng), rng.below(4)),
+            _ => {}
         }
         for _ in 0..rng.below(3) {
             aggregate = aggregate.unwind(random_aggregate_path(rng));

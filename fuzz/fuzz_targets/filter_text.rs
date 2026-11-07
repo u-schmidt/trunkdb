@@ -38,11 +38,17 @@ fuzz_target!(|input: &[u8]| {
     for name in template.params() {
         params = params.set(name, 1);
     }
+    let mut lists = Vec::new();
     let bound = loop {
         match template.bind(&params) {
             Ok(bound) => break bound,
             Err(BindError::NotAnArray { name, .. }) => {
+                lists.push(name.clone());
                 params = params.set(name, Document::Array(vec![Document::Int(1)]));
+            }
+            // One name both a list and a count: no value is both.
+            Err(BindError::NotACount { name, .. }) if lists.contains(&name) => {
+                return;
             }
             Err(e) => panic!("{text:?}: {e}"),
         }
