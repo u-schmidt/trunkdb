@@ -2239,25 +2239,36 @@ fn walk_in_index_order(
             return Ok(page.results); // an alternative's budget (SPEC §133.4)
         }
         if direct && group.is_empty() {
-            // A leaf passed whole: its entries all rejected, or all
-            // matches the skip passes over — where the group its last
-            // entry is in, which may go on past it, is exact.
-            let whole = entries.whole_leaf()?.map(|leaf| {
-                let decided = decider
-                    .as_mut()
-                    .and_then(|d| d.decide_all(leaf.lowest, leaf.highest));
-                (decided, leaf.entries, spans.exact(leaf.highest))
-            });
-            let passed = match whole {
-                Some((Some(false), n, _)) => Some(n),
-                Some((Some(true), n, true)) if page.skipped + n <= page.skip => {
-                    trace.matched(n);
-                    page.skipped += n;
-                    Some(n)
-                }
+            // A run of a leaf passed at once (`Walk::run`): its entries
+            // all rejected, or all matches the skip passes over — where
+            // the group its last entry is in, which may go on past it, is
+            // exact.
+            let mut run = |most: usize| -> std::io::Result<_> {
+                Ok(entries.run(most)?.map(|leaf| {
+                    let decided = decider
+                        .as_mut()
+                        .and_then(|d| d.decide_all(leaf.lowest, leaf.highest));
+                    (decided, leaf.entries, spans.exact(leaf.highest))
+                }))
+            };
+            // How many it passes, and whether they are matches the skip
+            // passes over.
+            let budget = page.skip.saturating_sub(page.skipped);
+            let passed = match run(usize::MAX)? {
+                Some((Some(false), n, _)) => Some((n, false)),
+                Some((Some(true), n, true)) if n <= budget => Some((n, true)),
+                // The skip ends inside it: the part it passes over.
+                Some((Some(true), _, _)) => match run(budget)? {
+                    Some((Some(true), n, true)) => Some((n, true)),
+                    _ => None,
+                },
                 _ => None,
             };
-            if let Some(n) = passed {
+            if let Some((n, matched)) = passed {
+                if matched {
+                    trace.matched(n);
+                    page.skipped += n;
+                }
                 trace.entries(walk, n);
                 entries.pass_leaf();
                 continue;
@@ -3339,7 +3350,7 @@ fn index_entries(store: &dyn PageStore, root: PageId) -> std::io::Result<usize> 
     let mut walk = BTreeIndex::new(root).walk(store, KeyRange::everything(), false);
     let mut n = 0;
     loop {
-        if let Some(leaf) = walk.whole_leaf()? {
+        if let Some(leaf) = walk.run(usize::MAX)? {
             n += leaf.entries;
             walk.pass_leaf();
             continue;
@@ -3400,7 +3411,7 @@ fn count_in(
     let mut count = 0;
     loop {
         let whole = walk
-            .whole_leaf()?
+            .run(usize::MAX)?
             .map(|leaf| (decider.decide_all(leaf.lowest, leaf.highest), leaf.entries));
         if let Some((Some(matches), entries)) = whole {
             count += if matches { entries } else { 0 };

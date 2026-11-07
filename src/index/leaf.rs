@@ -159,6 +159,20 @@ impl<'a> KeyParts<'a> {
         buffer.extend_from_slice(self.tail);
     }
 
+    /// The key, written over `buffer`, whose first `kept` bytes are
+    /// already the anchor's: only what differs is copied. `kept` is then
+    /// how many of the new key's first bytes are the anchor's. A plain
+    /// leaf's key, with no head, is copied whole.
+    pub fn write_over(&self, buffer: &mut Vec<u8>, kept: &mut usize) {
+        let shared = self.head.len();
+        buffer.truncate(shared.min(*kept));
+        if shared > *kept {
+            buffer.extend_from_slice(&self.head[*kept..]);
+        }
+        buffer.extend_from_slice(self.tail);
+        *kept = shared;
+    }
+
     pub fn to_vec(self) -> Vec<u8> {
         let mut key = Vec::with_capacity(self.len());
         self.write_to(&mut key);

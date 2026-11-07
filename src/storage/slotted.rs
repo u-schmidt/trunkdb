@@ -506,6 +506,15 @@ impl SlottedPage {
         slots.iter().filter(|slot| slot[2..4] != [0, 0]).count()
     }
 
+    /// How many of the slots in `slots` are live, by the directory alone.
+    pub fn live_in(&self, slots: std::ops::Range<u16>) -> usize {
+        let end = slots.end.min(self.slot_count());
+        let start = slots.start.min(end);
+        let directory = &self.buf[Self::slot_offset(start)..Self::slot_offset(end)];
+        let (slots, _) = directory.as_chunks::<SLOT_LEN>();
+        slots.iter().filter(|slot| slot[2..4] != [0, 0]).count()
+    }
+
     pub fn get_cell(&self, slot: u16) -> Option<&[u8]> {
         if slot >= self.slot_count() {
             return None;

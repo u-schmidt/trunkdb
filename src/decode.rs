@@ -50,6 +50,13 @@ pub(crate) fn take_u64(bytes: &mut &[u8], what: &str) -> io::Result<u64> {
 /// bit set on every byte but the last. At most ten bytes, the tenth
 /// holding only the top bit of a `u64`.
 pub(crate) fn take_varint(bytes: &mut &[u8], what: &str) -> io::Result<u64> {
+    // Most varints are one byte.
+    if let Some((&byte, rest)) = bytes.split_first()
+        && byte < 0x80
+    {
+        *bytes = rest;
+        return Ok(u64::from(byte));
+    }
     let mut value = 0u64;
     for (n, &byte) in bytes.iter().enumerate().take(10) {
         let bits = u64::from(byte & 0x7F);

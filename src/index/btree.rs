@@ -266,7 +266,12 @@ impl<'p> Leaf<'p> {
 
     /// The first live slot whose key is at least `key`, by a binary search.
     fn first_from(&self, key: &[u8]) -> Option<u16> {
-        first_slot_where(self.page, self.first(), |cell| {
+        self.first_from_slot(self.first(), key)
+    }
+
+    /// `first_from`, from slot `from` on.
+    fn first_from_slot(&self, from: u16, key: &[u8]) -> Option<u16> {
+        first_slot_where(self.page, from, |cell| {
             self.entry(cell).0.cmp(key) != std::cmp::Ordering::Less
         })
     }
@@ -375,6 +380,10 @@ impl BTreeIndex {
             seen: std::collections::HashSet::new(),
             leaves: 0,
             key: Vec::new(),
+            kept: 0,
+            clear: false,
+            offered: None,
+            run_end: 0,
             lowest: Vec::new(),
             highest: Vec::new(),
         }
@@ -416,7 +425,7 @@ impl BTreeIndex {
                     leaves: walk.leaves,
                 });
             }
-            if let Some(leaf) = walk.whole_leaf()? {
+            if let Some(leaf) = walk.run(usize::MAX)? {
                 entries += leaf.entries;
                 walk.pass_leaf();
                 continue;
@@ -482,71 +491,45 @@ pub struct Walk<'s> {
     leaves: usize,
     /// The key `step` hands out, put together from its leaf.
     key: Vec<u8>,
+    /// How many of `key`'s first bytes are the current leaf's anchor's,
+    /// which the next key needn't copy again.
+    kept: usize,
+    /// Whether every key of the current leaf left in the walk's direction
+    /// lies inside the range's far end, so no step need check it.
+    clear: bool,
+    /// The cursor a run of the current leaf was described at (`run`),
+    /// until it's passed.
+    offered: Option<u16>,
+    /// Where `pass_leaf` puts the cursor: past the run, or the whole
+    /// leaf, just described.
+    run_end: u16,
     /// The keys `whole_leaf` hands out.
     lowest: Vec<u8>,
     highest: Vec<u8>,
 }
 
 impl Walk<'_> {
-    /// The slot of the next entry of the current leaf in the walk's
-    /// direction and in the range — `None` when the leaf is used up, or
-    /// the range is, which sets `done`. Keys before the range are skipped
-    /// (forward, before `start`; backward, from `end` on): they can only
-    /// be on the first leaf. A tombstoned slot, which a leaf written
-    /// before §52 may hold, is skipped too.
-    fn next_in_leaf(&mut self) -> Option<u16> {
-        let Walk {
-            leaf,
-            at,
-            range,
-            backward,
-            done,
-            ..
-        } = self;
-        let page = leaf.as_ref().filter(|_| !*done)?;
-        let leaf = Leaf::of(page);
-        let (start, end) = (range.start.as_slice(), range.end.as_deref());
-        loop {
-            let slot = match backward {
-                true if *at <= leaf.first() => return None,
-                true => {
-                    *at -= 1;
-                    *at
-                }
-                false if *at < page.slot_count() => {
-                    *at += 1;
-                    *at - 1
-                }
-                false => return None,
-            };
-            let Some((key, _loc)) = leaf.entry_at(slot) else {
-                continue;
-            };
-            if end.is_some_and(|end| key.cmp(end) != std::cmp::Ordering::Less) {
-                if !*backward {
-                    *done = true; // every later key is past the end too
-                    return None;
-                }
-                continue;
-            }
-            if key.cmp(start) == std::cmp::Ordering::Less {
-                if *backward {
-                    *done = true; // every earlier key is before the start too
-                    return None;
-                }
-                continue;
-            }
-            return Some(slot);
-        }
-    }
-
-    /// The next entry, its key lent from the leaf, not copied (SPEC
+    /// The next entry, its key lent from the walk, not copied out (SPEC
     /// §101.1): it lives until the next step. An I/O error ends the
     /// walk, after it's been handed out.
     pub fn step(&mut self) -> Option<std::io::Result<(&[u8], RecordLocation)>> {
-        let slot = loop {
-            if let Some(slot) = self.next_in_leaf() {
-                break slot;
+        let loc = loop {
+            let Walk {
+                leaf,
+                at,
+                range,
+                backward,
+                done,
+                clear,
+                key,
+                kept,
+                ..
+            } = &mut *self;
+            if let Some(page) = leaf.as_ref().filter(|_| !*done)
+                && let Some((parts, loc)) = next_in_leaf(page, at, range, *backward, done, *clear)
+            {
+                parts.write_over(key, kept);
+                break loc;
             }
             if self.done {
                 return None;
@@ -556,9 +539,6 @@ impl Walk<'_> {
                 return Some(Err(e));
             }
         };
-        let page = self.leaf.as_ref().expect("an entry came from it");
-        let (key, loc) = Leaf::of(page).entry_at(slot).expect("a live slot");
-        key.write_to(&mut self.key);
         Some(Ok((&self.key, loc)))
     }
 
@@ -600,6 +580,10 @@ impl Walk<'_> {
         let entries = leaf.len();
         lowest.0.write_to(&mut self.lowest);
         highest.0.write_to(&mut self.highest);
+        self.run_end = match self.backward {
+            true => leaf.first(),
+            false => page.slot_count(),
+        };
         let inside = self.lowest >= self.range.start
             && self
                 .range
@@ -623,14 +607,87 @@ impl Walk<'_> {
         }
     }
 
-    /// Passes over the leaf `whole_leaf` just described, all of it.
+    /// Passes over what `whole_leaf` or `run` just described.
     pub fn pass_leaf(&mut self) {
-        if let Some(page) = &self.leaf {
-            self.at = match self.backward {
-                true => Leaf::of(page).first(),
-                false => page.slot_count(),
-            };
+        if self.leaf.is_some() {
+            self.at = self.run_end;
+            self.offered = None;
         }
+    }
+
+    /// The live entries of the current leaf from the cursor on, in the
+    /// walk's direction, that lie inside the range — at most `most` of
+    /// them, the nearest: their lowest and highest keys and how many.
+    /// Reads the next leaf if the current one is used up. Found by binary
+    /// searches, no entry between them decoded, so a count or a skip
+    /// passes them at once where it would step through them (SPEC
+    /// §101.3). `None` for no such entry, for `most` 0, and once a run
+    /// offered on this leaf has been stepped into instead of passed: a
+    /// walk going entry by entry isn't offered one at every step.
+    pub fn run(&mut self, most: usize) -> std::io::Result<Option<WholeLeaf<'_>>> {
+        if self.done || most == 0 {
+            return Ok(None);
+        }
+        if self.used_up() {
+            if let Err(e) = self.read_next_leaf() {
+                self.done = true;
+                return Err(e);
+            }
+            if self.done {
+                return Ok(None);
+            }
+        }
+        let Some(page) = &self.leaf else {
+            return Ok(None);
+        };
+        if self.offered.is_some_and(|at| at != self.at) {
+            return Ok(None);
+        }
+        self.offered = Some(self.at);
+        let leaf = Leaf::of(page);
+        let (mut lo, mut hi) = match (self.backward, self.clear) {
+            (false, true) => (self.at, page.slot_count()),
+            (false, false) => {
+                let end = self.range.end.as_deref().unwrap_or_default();
+                let to = leaf.first_from_slot(self.at, end);
+                (self.at, to.unwrap_or(page.slot_count()))
+            }
+            (true, true) => (leaf.first(), self.at),
+            (true, false) => {
+                let from = leaf.first_from(&self.range.start).unwrap_or(self.at);
+                (from.min(self.at), self.at)
+            }
+        };
+        let live = |slot: &u16| page.get_cell(*slot).is_some();
+        let mut entries = page.live_in(lo..hi);
+        if entries == 0 {
+            return Ok(None);
+        }
+        if entries > most {
+            // The nearest `most`: arithmetic where no slot is a tombstone.
+            let whole = entries == usize::from(hi - lo);
+            let most_ = most as u16; // < entries <= u16::MAX
+            match self.backward {
+                false if whole => hi = lo + most_,
+                true if whole => lo = hi - most_,
+                false => hi = (lo..hi).filter(live).nth(most - 1).expect("live") + 1,
+                true => lo = (lo..hi).rev().filter(live).nth(most - 1).expect("live"),
+            }
+            entries = most;
+        }
+        let lowest = (lo..hi).find(live).expect("live");
+        let highest = (lo..hi).rev().find(live).expect("live");
+        (leaf.entry_at(lowest).expect("live").0).write_to(&mut self.lowest);
+        (leaf.entry_at(highest).expect("live").0).write_to(&mut self.highest);
+        self.run_end = match self.backward {
+            false => hi,
+            true => lo,
+        };
+        Ok(Some(WholeLeaf {
+            lowest: &self.lowest,
+            highest: &self.highest,
+            entries,
+        }))
     }
 
     /// Makes the next leaf in the walk's direction the current one; sets
@@ -682,10 +739,29 @@ impl Walk<'_> {
         };
         self.leaves += 1;
         self.next_leaf = leaf.next_page();
-        self.at = match self.backward {
-            true => leaf.slot_count(),
-            false => Leaf::of(&leaf).first(),
+        let view = Leaf::of(&leaf);
+        // The first leaf is entered where the range begins in the walk's
+        // direction, found by a binary search: forward the first key from
+        // `start` on, backward the first from `end` on, the walk taking the
+        // keys before it.
+        let first = self.leaves == 1;
+        self.at = match (self.backward, &self.range.end) {
+            (false, _) if first => view.first_from(&self.range.start),
+            (true, Some(end)) if first => view.first_from(end),
+            (true, _) => None,
+            (false, _) => Some(view.first()),
+        }
+        .unwrap_or(leaf.slot_count());
+        self.clear = {
+            let mut live = (view.first()..leaf.slot_count()).filter_map(|slot| view.entry_at(slot));
+            let last = match self.backward {
+                true => live.next(),
+                false => live.next_back(),
+            };
+            last.is_none_or(|(key, _)| holds_far_end(&self.range, &key, self.backward))
         };
+        self.kept = 0;
+        self.offered = None;
         self.leaf = Some(leaf);
         Ok(())
     }
@@ -720,6 +796,59 @@ impl Walk<'_> {
             }
         }
         Err(too_deep(page_id))
+    }
+}
+
+/// The next entry of `page`, a walk's current leaf, from the cursor `at`
+/// in the walk's direction and in `range` — `None` when the leaf is used
+/// up, or the range is, which sets `done`. Keys before the range are
+/// never stepped over: the first leaf's cursor starts at the range, by a
+/// binary search (`Walk::read_next_leaf`). Only the far end is checked,
+/// and only on a leaf whose last key in the walk's direction lies past it
+/// (`clear` says it doesn't). A tombstoned slot, which a leaf written
+/// before §52 may hold, is skipped.
+fn next_in_leaf<'p>(
+    page: &'p SlottedPage,
+    at: &mut u16,
+    range: &KeyRange,
+    backward: bool,
+    done: &mut bool,
+    clear: bool,
+) -> Option<(KeyParts<'p>, RecordLocation)> {
+    let leaf = Leaf::of(page);
+    loop {
+        let slot = match backward {
+            true if *at <= leaf.first() => return None,
+            true => {
+                *at -= 1;
+                *at
+            }
+            false if *at < page.slot_count() => {
+                *at += 1;
+                *at - 1
+            }
+            false => return None,
+        };
+        let Some((key, loc)) = leaf.entry_at(slot) else {
+            continue;
+        };
+        if !clear && !holds_far_end(range, &key, backward) {
+            *done = true; // every later key in this direction is past it too
+            return None;
+        }
+        return Some((key, loc));
+    }
+}
+
+/// Whether `key` lies inside `range` at the end a walk goes towards:
+/// before `end` forward, from `start` on backward.
+fn holds_far_end(range: &KeyRange, key: &KeyParts<'_>, backward: bool) -> bool {
+    match backward {
+        false => range
+            .end
+            .as_deref()
+            .is_none_or(|end| key.cmp(end) == std::cmp::Ordering::Less),
+        true => key.cmp(&range.start) != std::cmp::Ordering::Less,
     }
 }
 
@@ -1357,7 +1486,49 @@ mod tests {
                 .collect();
             assert_eq!(got, want[..stop.min(want.len())], "{range:?} {backward}");
             assert_eq!(KEYS_COPIED.with(|n| n.get()), got.len(), "{range:?}");
+            by_runs(&index, &store, &range, backward, &want, &mut rng);
         }
+    }
+
+    /// A walk that passes runs of at most a random number of entries
+    /// (`Walk::run`), declines some to step instead, and steps between:
+    /// each run the next `want` entries in the walk's direction, `want`
+    /// all of them in all.
+    fn by_runs(
+        index: &BTreeIndex,
+        store: &FileStore,
+        range: &KeyRange,
+        backward: bool,
+        want: &[(Vec<u8>, RecordLocation)],
+        rng: &mut XorShift,
+    ) {
+        let mut walk = index.walk(store, range.clone(), backward);
+        let mut at = 0;
+        loop {
+            let most = [1, 2, 7, usize::MAX][rng.below(4)];
+            let decline = rng.below(4) == 0;
+            if let Some(run) = walk.run(most).unwrap() {
+                let n = run.entries;
+                assert!(n >= 1 && n <= most, "{n} of {most}");
+                let (near, far) = (&want[at].0, &want[at + n - 1].0);
+                let (lowest, highest) = if backward { (far, near) } else { (near, far) };
+                assert_eq!((run.lowest, run.highest), (&lowest[..], &highest[..]));
+                if !decline {
+                    walk.pass_leaf();
+                    at += n;
+                    continue;
+                }
+            }
+            match walk.step() {
+                Some(entry) => {
+                    let (key, loc) = entry.unwrap();
+                    assert_eq!((key, loc), (&want[at].0[..], want[at].1), "{range:?}");
+                    at += 1;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(at, want.len(), "{range:?} {backward}");
     }
 
     /// Random keys in, a third taken out again — whole leaves of them
