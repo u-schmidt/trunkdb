@@ -135,12 +135,14 @@ impl SlottedPage {
         }
 
         // Every slot:
+        let mut live = 0;
         for slot in 0..slot_count {
             let at = Self::slot_offset(slot);
             let (offset, length) = (field(at) as usize, field(at + 2) as usize); // usize, no overflow
             if length == 0 {
                 continue; // a tombstone has no cell to check
             }
+            live += length;
             if offset < data_start || offset + length > USABLE_PAGE_SIZE {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -149,6 +151,20 @@ impl SlottedPage {
                     ),
                 ));
             }
+        }
+        // The cells fit below the directory, packed. Cells that share
+        // bytes may pass (§54.2, `check` finds them, §141), but not so
+        // many that they add up to more than the page: found by fuzzing
+        // (SPEC §55), `reclaimable_space` underflowed, and `compact`
+        // could place them nowhere.
+        if live > USABLE_PAGE_SIZE - directory_end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the cells take {live} bytes, more than the {} the page holds below its directory",
+                    USABLE_PAGE_SIZE - directory_end
+                ),
+            ));
         }
 
         // An index page's cells are each long enough for an entry, which
@@ -1246,6 +1262,30 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             error.to_string().contains("past the page's end"),
+            "wrong error: {error}"
+        );
+    }
+
+    /// Found by fuzzing (SPEC §55): two slots on the same bytes, each
+    /// inside the page, added up to more than it holds, and
+    /// `reclaimable_space` underflowed on the next delete.
+    #[test]
+    fn from_bytes_rejects_cells_adding_up_to_more_than_the_page() {
+        // Two slots on the same 4,100 bytes, which fit once, not twice.
+        let (offset, length) = ((USABLE_PAGE_SIZE - 4100) as u16, 4100u16);
+        let mut buf = page_bytes_with_slot(offset, length);
+        buf[9..11].copy_from_slice(&2u16.to_le_bytes());
+        buf[17..19].copy_from_slice(&offset.to_le_bytes());
+        buf[19..21].copy_from_slice(&length.to_le_bytes());
+        // One of them alone is a valid page.
+        assert!(SlottedPage::from_bytes(page_bytes_with_slot(offset, length)).is_ok());
+
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("cells adding up to more than the page must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("the page holds"),
             "wrong error: {error}"
         );
     }

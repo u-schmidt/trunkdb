@@ -89,6 +89,18 @@ pub fn base() -> &'static [u8] {
             );
             notes.insert(doc).unwrap();
         }
+        // A key too long for the field-name dictionary, stored inline,
+        // and ints whose varints take one byte and all ten (SPEC §170).
+        let long = Document::Object(
+            [
+                ("k".repeat(70), Document::Int(i64::MIN)),
+                ("n".to_string(), Document::Int(-1)),
+                ("big".to_string(), Document::Int(i64::MAX)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        notes.insert(long).unwrap();
         // Every document an object since SPEC §95: a plain number here
         // made every target that starts from this database panic, which
         // building and linting the fuzz crate in CI couldn't show (§105).

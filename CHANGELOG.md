@@ -1151,8 +1151,17 @@ limit, batches and a write-ahead log. Since then:
     at once, where they stepped through the leaves at the range's
     ends. Page 50 of 20 by an index takes 21 µs where it took 26, a
     skip of 5,000 by id 35 µs where it took 38.
+146. **A header counting pages the file lacks is refused** (§55.2):
+    a file whose header counts more pages than it holds opened, and
+    `check` sized a map by the count, so a damaged count ran it out
+    of memory. Open now refuses it as damage, after the WAL's
+    recovery. Found by fuzzing; 0.33.0 and older have it too.
+147. **A page whose cells add up to more than it holds is refused**
+    (§55.2): slots on the same bytes could add up past the page, and a
+    delete on it panicked. Its check refuses it as damage now. Found by
+    fuzzing; 0.33.0 and older have it too.
 
-    Items 143–145 → next release: file format 14, which 0.33.0 and
+    Items 143–147 → next release: file format 14, which 0.33.0 and
     older refuse once this build has opened a file for writing; keep
     an export or a copy from before to go back. Opening an older file converts nothing: its
     documents and index leaves read as they are and are stored anew as

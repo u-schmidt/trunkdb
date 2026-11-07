@@ -419,6 +419,21 @@ impl FileStore {
             ) {
                 return Err(damaged(HEADER_PAGE));
             }
+            // The file holds every page its own header counts: an
+            // allocation writes its page, and a write-back a crash cut
+            // short is the WAL's to finish, before this. A count past the
+            // file's end is damage (SPEC §55): `check` and every walk over
+            // the pages would otherwise go through billions of them.
+            let on_disk = self.pages.file().metadata()?.len() / PAGE_SIZE as u64;
+            if self.header.page_count > on_disk {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "header counts {} pages, but the file holds {on_disk} — file may be corrupt",
+                        self.header.page_count
+                    ),
+                ));
+            }
             self.header_checked = true;
         }
         Ok(())
@@ -1629,15 +1644,18 @@ mod tests {
         assert_eq!(store.read_page(2).unwrap(), vec![9u8; USABLE_PAGE_SIZE]);
     }
 
-    /// Found by fuzzing (SPEC §55): a header whose page count is 0 or
-    /// overflows an offset, or whose free list starts past the end, is
-    /// refused at open.
+    /// Found by fuzzing (SPEC §55): a header whose page count is 0,
+    /// overflows an offset or runs past the file's end, or whose free
+    /// list starts past the end, is refused at open.
     #[test]
     fn a_header_that_cannot_be_right_is_refused() {
         for (page_count, free_list_head, says) in [
             (0, NO_FREE_PAGE, "counts 0 pages"),
             (u64::MAX / 2, NO_FREE_PAGE, "pages — file may be corrupt"),
             (3, 3, "free list starts at page 3"),
+            // A file of one page counting a million: `check` sized its
+            // map of owners by the count and ran out of memory.
+            (1_000_000, NO_FREE_PAGE, "but the file holds 1"),
         ] {
             let (_dir, path) = open_temp();
             let header = Header {
