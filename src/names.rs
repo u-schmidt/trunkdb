@@ -133,6 +133,15 @@ mod tests {
     #[test]
     fn long_names_and_names_past_the_limit_stay_out() {
         let mut names = FieldNames::default();
+        // `unknown` takes what `add` takes: a key of `MAX_LEN` bytes, not
+        // one more.
+        let edge = Document::Object(
+            [MAX_LEN, MAX_LEN + 1]
+                .map(|len| ("y".repeat(len), Document::Null))
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(names.unknown(&edge), ["y".repeat(MAX_LEN)]);
         assert!(!names.add(&"x".repeat(MAX_LEN + 1)));
         assert!(names.add(&"x".repeat(MAX_LEN)));
         for n in 1..MAX_NAMES {

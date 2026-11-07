@@ -151,7 +151,10 @@ fewer bytes to write and to fit. Reads are the same or a little faster.
 - `decode.rs`: varints of every width read back; one cut short, one of
   eleven bytes and one past 64 bits are refused.
 - `names.rs`: names numbered in the order first seen, at every level,
-  each once; a long name and names past the limit stay out.
+  each once; a long name and names past the limit stay out, a key of
+  exactly 64 bytes in.
+- `catalog.rs`: name cells that overlap, leave a gap or repeat a name
+  are damage at load; cells that follow on load.
 - `document.rs`: every kind of value stored and read back, with keys
   numbered and inline, and a count or length past the bytes refused; the
   example above, 106 bytes before, 50 now, 69 inline; a key numbered past

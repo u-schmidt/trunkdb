@@ -133,8 +133,9 @@ than before.
   the anchor, among keys that share nothing, part or all of it, at the
   extremes of a location, and compares with every other key as the key
   itself does; a shared run isn't stored; a leaf with no anchor first,
-  an entry sharing more than the anchor has, a varint cut short and a
-  slot past `u16` are refused.
+  an entry sharing more than the anchor has, even by one byte, a
+  varint cut short and a slot of 65,536 are refused, an entry sharing
+  all of the anchor and a slot of 65,535 not.
 - `index/btree.rs`: every test of the tree runs on packed leaves:
   random keys against a `BTreeMap` both ways, splits, removes, walks
   stopped anywhere, counts by leaf, keys in order filling their leaves.

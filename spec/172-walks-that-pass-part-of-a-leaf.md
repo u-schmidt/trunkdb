@@ -115,3 +115,23 @@ walks faster too: part of the gain is theirs, not the format's.
 - `collection.rs`: the tests of counts, skips and pages through indexes
   (§101, §133) answer as before, with the same reads.
 - `decode.rs`: varints of one byte and longer read back (§170.9).
+
+## 172.8 Fuzzed and mutated, with §170 and §171
+**Fuzzing** (§55), 15 minutes per target on format 14, with a key
+stored inline added to the base: `import`, `recover_wal` and `queries`
+found nothing. `open_file` and `open_raw` found two bugs that 0.33.0
+has too (§55.2, 15 and 16): a header counting pages the file lacks ran
+`check` out of memory, and cells adding up to more than their page made
+a delete panic. Both fixed, then 15 minutes more of each, clean.
+
+**Mutations,** 34 by hand over the three sections: 30 caught, 4 of
+them by a test that no longer ends. The tests added for those that
+weren't: a key of exactly 64 bytes joins the dictionary; name cells
+overlapping, with a gap or a name twice are damage (§170.9); an entry
+sharing one byte more than its anchor and a slot of 65,536 are refused
+(§171.8). Left standing:
+- a varint read for 11 bytes: the tenth may be only 0 or 1 and never
+  continues, so no input tells it apart;
+- the anchor at a leaf's first key, no split at the entry count's
+  midpoint, a run offered again after a decline: they cost size or
+  speed (§171.5, §172.5), not an answer.

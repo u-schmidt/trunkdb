@@ -239,17 +239,25 @@ mod tests {
             check_packed([&good[..]].into_iter()).is_err(),
             "no anchor first"
         );
-        let mut sharing_too_much = good.clone();
-        sharing_too_much[0] = 9;
-        assert!(check_packed([&anchor[..], &sharing_too_much[..]].into_iter()).is_err());
+        // Sharing all 3 bytes of the anchor is fine, a 4th is too many.
+        for (shared, ok) in [(3, true), (4, false), (9, false)] {
+            let mut cell = good.clone();
+            cell[0] = shared;
+            let checked = check_packed([&anchor[..], &cell[..]].into_iter());
+            assert_eq!(checked.is_ok(), ok, "sharing {shared}");
+        }
         assert!(
             check_packed([&anchor[..], &[0x80][..]].into_iter()).is_err(),
             "cut short"
         );
-        let mut big_slot = Vec::new();
-        for v in [0, 1, 70_000] {
-            put_varint(v, &mut big_slot);
+        // A slot is a `u16`: its largest is fine, one more isn't.
+        for (slot, ok) in [(65_535, true), (65_536, false), (70_000, false)] {
+            let mut cell = Vec::new();
+            for v in [0, 1, slot] {
+                put_varint(v, &mut cell);
+            }
+            let checked = check_packed([&anchor[..], &cell[..]].into_iter());
+            assert_eq!(checked.is_ok(), ok, "slot {slot}");
         }
-        assert!(check_packed([&anchor[..], &big_slot[..]].into_iter()).is_err());
     }
 }

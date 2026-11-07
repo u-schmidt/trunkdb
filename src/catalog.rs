@@ -1055,6 +1055,50 @@ mod tests {
         );
     }
 
+    /// The field names' cells must number the names from 0, without a
+    /// gap or an overlap, each name once (SPEC §170.3): anything else
+    /// is damage at load, not names renumbered.
+    #[test]
+    fn field_name_cells_that_dont_follow_on_are_an_error() {
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        for (cells, says) in [
+            (
+                vec![(0, names(&["a", "b"])), (1, names(&["c"]))],
+                "numbered from 1 follow 2",
+            ),
+            (
+                vec![(0, names(&["a"])), (2, names(&["c"]))],
+                "numbered from 2 follow 1",
+            ),
+            (vec![(0, names(&["a", "a"]))], "comes twice"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = FileStore::open(dir.path().join("test.trunkdb")).unwrap();
+            Catalog::load(&mut store).unwrap();
+            for (first, list) in &cells {
+                for cell in encode_names(*first, list) {
+                    append_cell(&mut store, &cell).unwrap();
+                }
+            }
+            let Err(err) = Catalog::load(&mut store) else {
+                panic!("{cells:?} loaded");
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains(says), "{err}");
+        }
+        // Following on, they load.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = FileStore::open(dir.path().join("test.trunkdb")).unwrap();
+        Catalog::load(&mut store).unwrap();
+        for (first, list) in [(0, names(&["a", "b"])), (2, names(&["c"]))] {
+            for cell in encode_names(first, &list) {
+                append_cell(&mut store, &cell).unwrap();
+            }
+        }
+        let loaded = Catalog::load(&mut store).unwrap();
+        assert_eq!(loaded.names().iter().collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
     /// Found by fuzzing (SPEC §55): a catalog page linking back to one
     /// before it is an error at load, not a load that never ends.
     #[test]
