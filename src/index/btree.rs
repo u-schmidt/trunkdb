@@ -2040,6 +2040,50 @@ mod tests {
         }
     }
 
+    /// Found in review: a packed leaf whose slot 0, the anchor, is a
+    /// tombstone is damage. Its next entry, sharing nothing, would pass
+    /// for an anchor, while reads took an empty one and lost the bytes
+    /// every other entry shares.
+    #[test]
+    fn a_packed_leaf_without_its_anchor_is_an_error() {
+        let loc = RecordLocation { page: 1, slot: 0 };
+        let (_dir, mut store, mut index) = fresh();
+        for i in 0..400u16 {
+            index.insert(&mut store, &id_from(i), loc).unwrap();
+        }
+        let root = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        let target = decode_branch_entry(root.get_cell(0).unwrap()).1;
+        let page = SlottedPage::from_bytes(store.read_page(target).unwrap()).unwrap();
+        assert_eq!(page.page_type(), PageType::IndexLeafPacked);
+        let mut bytes = page.into_page();
+        let raw = bytes.make_mut();
+        // Slot 0's length to 0, a tombstone; slot 1's entry to share
+        // nothing, so its cell starts with 0 as an anchor's does.
+        raw[13 + 2..13 + 4].fill(0);
+        let offset = u16::from_le_bytes([raw[17], raw[18]]) as usize;
+        raw[offset] = 0;
+        store.write_page(target, bytes).unwrap();
+
+        let invalid = |e: std::io::Error| {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+            assert!(e.to_string().contains("anchor"), "{e}");
+        };
+        invalid(index.lookup(&store, &id_from(0)).unwrap_err());
+        invalid(index.scan(&store).unwrap_err());
+        invalid(index.insert(&mut store, &id_from(0), loc).unwrap_err());
+        let walked: std::io::Result<Vec<_>> = index
+            .walk(
+                &store,
+                KeyRange {
+                    start: Vec::new(),
+                    end: None,
+                },
+                true,
+            )
+            .collect();
+        invalid(walked.unwrap_err());
+    }
+
     /// Found by fuzzing (SPEC §55): a child pointer back to the root, or
     /// a leaf linked back to an earlier one, is an error from every path
     /// that follows it, not a loop that never ends.

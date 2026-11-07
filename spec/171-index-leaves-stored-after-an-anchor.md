@@ -68,8 +68,9 @@ release, and a build before it refuses a file with packed leaves.
 
 ## 171.4 Damage
 A packed leaf is checked once, as the page's layout is (§66,
-`check_packed` in `SlottedPage::check_layout`): its first cell must be
-the anchor, and every entry's varints must end, its slot fit a `u16`,
+`check_packed` in `SlottedPage::check_layout`): slot 0 must hold the
+anchor, not a tombstone, since every read takes the anchor from slot 0,
+and every entry's varints must end, its slot fit a `u16`,
 and its `shared` be no longer than the anchor. A page that fails is
 `InvalidData` from every read: "index page N: a packed index entry's
 varint doesn't end". A cell may be as short as one byte on a packed
@@ -141,7 +142,9 @@ than before.
   among packed ones: they take lookups, removes and inserts, the first
   insert rewriting them packed, and walks and counts over them give
   what a `BTreeMap` gives. A packed leaf whose first entry's varints
-  never end is an error from every read.
+  never end is an error from every read, and so is one whose slot 0,
+  its anchor, is a tombstone, with an entry sharing nothing after it
+  that would pass for one (found in review).
 - `stats.rs`, `compact.rs`: the size a `compact` estimates for an index
   is the size it builds, within one page in a hundred.
 - The old-file fixtures (§120) open, check, read and write their plain

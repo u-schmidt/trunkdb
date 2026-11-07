@@ -165,8 +165,16 @@ impl SlottedPage {
                 ));
             }
         }
-        // A packed leaf's entries, against its anchor.
+        // A packed leaf's entries, against its anchor. The anchor is read
+        // from slot 0 (SPEC §171.4), so slot 0 must hold it: a tombstone
+        // there would let the next live entry pass as the anchor.
         if buf[0] == PageType::IndexLeafPacked as u8 {
+            if slot_count > 0 && field(Self::slot_offset(0) + 2) == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "a packed index leaf's slot 0, its anchor, is empty",
+                ));
+            }
             let cells = (0..slot_count).filter_map(|slot| {
                 let at = Self::slot_offset(slot);
                 let (offset, length) = (field(at) as usize, field(at + 2) as usize);
