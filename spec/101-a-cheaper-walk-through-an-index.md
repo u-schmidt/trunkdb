@@ -97,6 +97,11 @@ ends, which are walked entry by entry as before, and an empty leaf.
 anything: each inner leaf is counted by its slot directory, and only
 the two leaves at the range's ends are stepped through.
 
+(Since §172, counts and the walk in index order pass a run of a leaf
+instead, `Walk::run`: the entries from the cursor to the range's end
+or the skip's, so the leaves at a range's ends are passed in part too.
+The aggregate still passes whole leaves only.)
+
 **Index cells are checked once (`storage/slotted.rs`).** `read_node`
 checked every cell of every node it read for the minimum entry length
 (§55). That check was most of the cost of a counted leaf. It now lives
@@ -195,7 +200,9 @@ finds such a leaf.
 - **An arena for the copied keys:** it makes the copies cheaper but
   keeps them. 101.1 removes them.
 - **Prefix compression in leaves:** more entries per leaf, but a new
-  file format, and the walk is not limited by leaves read.
+  file format, and the walk is not limited by leaves read. (Built in
+  §171 after all, for the file's size, and §172 made walks over the
+  fuller leaves faster.)
 - **Whole leaves on backward walks of secondary indexes:** correct only
   with care at every straddling group. It would gain little, since
   backward deep pages are rarer and still walk entry by entry at the

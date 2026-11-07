@@ -2,6 +2,11 @@
 
 *Updated by §26: lengths and counts are `u32` now, and the cell format is
 `[u8 flags][DocId][payload]` (§20.5) with overflow cells (§26.2).*
+*Updated by §170: a stored document's lengths, counts and ints are
+varints now, and its keys numbers into the file's dictionary of field
+names, under tags of their own; the encoding below stays what
+`encode_document` writes, and what a document stored before format 14
+holds.*
 Real and tested: `document::encode_document`/`decode_document` convert a
 `Document` to and from bytes — one type tag, then a tag-shaped payload
 (fixed-width for scalars, `u16` length + bytes for `String`/`Binary`, `u16`

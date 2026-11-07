@@ -1,6 +1,7 @@
 use crate::datetime::DateTime;
-use crate::decode::{corrupt, take, take_array, take_u8, take_u32};
+use crate::decode::{corrupt, put_varint, take, take_array, take_u8, take_u32, take_varint};
 use crate::map::Map;
+use crate::names::FieldNames;
 use std::time::SystemTime;
 
 /// The schema-less value every document is made of — this DB's equivalent
@@ -369,43 +370,162 @@ pub(crate) const TAG_ID: u8 = 8;
 /// `i64`, then the nanoseconds as a `u32`, both little-endian.
 pub(crate) const TAG_DATETIME: u8 = 9;
 
-/// Whether `encoded`, a document as `encode_document` wrote it, is an
-/// object: its first byte, without decoding the rest (SPEC §95).
-pub(crate) fn encodes_object(encoded: &[u8]) -> bool {
-    encoded.first() == Some(&TAG_OBJECT)
+// Since file format 14, in stored documents only (`encode_stored`):
+// lengths and counts as varints, and an object's keys as numbers into
+// the file's dictionary of field names (`names.rs`). The tags above stay
+// what `encode_document` writes, and what a document stored before 14
+// holds, which reads go on decoding.
+
+/// An object: `[varint count]`, then each entry's key and value. A key
+/// is a varint: a name's number in the dictionary times two, or a name
+/// not in it, its length times two plus one, then its UTF-8 bytes.
+pub(crate) const TAG_FIELDS: u8 = 10;
+/// An int, zigzag-encoded as a varint: `-1` is `1`, `1` is `2`.
+pub(crate) const TAG_VARINT: u8 = 11;
+/// A string: `[varint length][UTF-8 bytes]`.
+pub(crate) const TAG_TEXT: u8 = 12;
+/// Binary: `[varint length][bytes]`.
+pub(crate) const TAG_BYTES: u8 = 13;
+/// An array: `[varint count]`, then the items.
+pub(crate) const TAG_LIST: u8 = 14;
+
+/// Whether `tag` is an object's, either encoding.
+pub(crate) fn is_object_tag(tag: u8) -> bool {
+    tag == TAG_OBJECT || tag == TAG_FIELDS
 }
 
-/// Encodes a `Document` into bytes: one type tag, then a payload whose
-/// shape depends on the tag — fixed-width for scalars, a `u32` length
-/// prefix + raw bytes for `String`/`Binary`, a `u32` count prefix followed
-/// by that many encoded elements for `Array`, and a count prefix followed
-/// by (key length, key bytes, encoded value) tuples for `Object`. All
-/// lengths and counts are `u32` (SPEC §26.1): a document is no longer
-/// capped at one page, so `u16`'s 64 KB would be a real limit — and one
-/// that `as u16` used to enforce by silently truncating. `u32` casts here
-/// can't truncate for the same reason one level up: every inner length
-/// is at most the whole encoding's length, which `data.rs` rejects past
-/// `u32::MAX`. `Array`/`Object` recurse into this same function for
-/// their elements/values, which is also how a nested `_id` field
-/// (`Document::Id`) round-trips — there's nothing document-shape-specific
-/// about it, it's just another tagged value.
-/// A document as a data cell stores it (SPEC §59): `encode_document`,
-/// except that an object's own `_id` is left out. The cell holds the id
-/// already, and reads put it back (`with_id`), so there's one id, not a
-/// copy that could say something else.
-pub(crate) fn encode_stored(doc: &Document) -> Vec<u8> {
-    let Document::Object(entries) = doc else {
-        return encode_document(doc);
-    };
-    let fields = entries.iter().filter(|(key, _)| *key != ID_FIELD);
+/// Whether `encoded`, a document as `encode_document` or `encode_stored`
+/// wrote it, is an object: its first byte, without decoding the rest
+/// (SPEC §95).
+pub(crate) fn encodes_object(encoded: &[u8]) -> bool {
+    encoded.first().is_some_and(|tag| is_object_tag(*tag))
+}
+
+/// After an array's or an object's tag: how many items or entries.
+pub(crate) fn take_count(bytes: &mut &[u8], tag: u8, what: &str) -> std::io::Result<u64> {
+    match tag {
+        TAG_ARRAY | TAG_OBJECT => take_u32(bytes, what).map(u64::from),
+        _ => take_varint(bytes, what),
+    }
+}
+
+/// One of an object's keys, after its tag: a name of `names`, or one
+/// stored as it is.
+pub(crate) fn take_key<'k, 'b: 'k, 'n: 'k>(
+    bytes: &mut &'b [u8],
+    tag: u8,
+    names: &'n FieldNames,
+) -> std::io::Result<&'k str> {
+    if tag == TAG_OBJECT {
+        return take_str(bytes, "a key");
+    }
+    let key = take_varint(bytes, "a key")?;
+    if key & 1 == 0 {
+        return names.name(key >> 1).ok_or_else(|| {
+            corrupt(format_args!(
+                "a key is field name {}, of {} there are",
+                key >> 1,
+                names.len()
+            ))
+        });
+    }
+    let raw = take(
+        bytes,
+        usize::try_from(key >> 1).unwrap_or(usize::MAX),
+        "a key",
+    )?;
+    std::str::from_utf8(raw).map_err(|_| corrupt("bad UTF-8 in a key"))
+}
+
+/// An int, after its tag.
+pub(crate) fn take_int(bytes: &mut &[u8], tag: u8) -> std::io::Result<i64> {
+    if tag == TAG_INT {
+        return Ok(i64::from_le_bytes(take_array(bytes, "an int")?));
+    }
+    let zigzag = take_varint(bytes, "an int")?;
+    Ok((zigzag >> 1) as i64 ^ -((zigzag & 1) as i64))
+}
+
+/// A string's or binary's bytes, after its tag.
+pub(crate) fn take_run<'a>(bytes: &mut &'a [u8], tag: u8, what: &str) -> std::io::Result<&'a [u8]> {
+    match tag {
+        TAG_STRING | TAG_BINARY => take_len_prefixed(bytes, what),
+        _ => {
+            let len = take_varint(bytes, what)?;
+            take(bytes, usize::try_from(len).unwrap_or(usize::MAX), what)
+        }
+    }
+}
+
+/// A string, after its tag.
+pub(crate) fn take_text<'a>(bytes: &mut &'a [u8], tag: u8) -> std::io::Result<&'a str> {
+    let raw = take_run(bytes, tag, "a string")?;
+    std::str::from_utf8(raw).map_err(|_| corrupt("bad UTF-8 in a string"))
+}
+
+/// A document as a data cell stores it (SPEC §59): the varint encoding
+/// above, its keys numbered by `names` where it has them, and an
+/// object's own `_id` left out. The cell holds the id already, and reads
+/// put it back (`with_id`), so there's one id, not a copy that could say
+/// something else.
+pub(crate) fn encode_stored(doc: &Document, names: &FieldNames) -> Vec<u8> {
     let mut buffer = Vec::new();
-    buffer.push(TAG_OBJECT);
-    buffer.extend_from_slice(&(fields.clone().count() as u32).to_le_bytes());
-    for (key, value) in fields {
-        write_len_prefixed(key.as_bytes(), &mut buffer);
-        write_document(value, &mut buffer);
+    match doc {
+        Document::Object(entries) => {
+            let fields = entries.iter().filter(|(key, _)| *key != ID_FIELD);
+            write_fields(fields.clone().count(), fields, names, &mut buffer);
+        }
+        other => write_stored(other, names, &mut buffer),
     }
     buffer
+}
+
+fn write_fields<'d>(
+    count: usize,
+    fields: impl Iterator<Item = (&'d String, &'d Document)>,
+    names: &FieldNames,
+    buffer: &mut Vec<u8>,
+) {
+    buffer.push(TAG_FIELDS);
+    put_varint(count as u64, buffer);
+    for (key, value) in fields {
+        match names.number(key) {
+            Some(number) => put_varint(u64::from(number) << 1, buffer),
+            None => {
+                put_varint(((key.len() as u64) << 1) | 1, buffer);
+                buffer.extend_from_slice(key.as_bytes());
+            }
+        }
+        write_stored(value, names, buffer);
+    }
+}
+
+fn write_stored(doc: &Document, names: &FieldNames, buffer: &mut Vec<u8>) {
+    match doc {
+        Document::Int(value) => {
+            buffer.push(TAG_VARINT);
+            put_varint(((value << 1) ^ (value >> 63)) as u64, buffer);
+        }
+        Document::String(value) => {
+            buffer.push(TAG_TEXT);
+            put_varint(value.len() as u64, buffer);
+            buffer.extend_from_slice(value.as_bytes());
+        }
+        Document::Binary(value) => {
+            buffer.push(TAG_BYTES);
+            put_varint(value.len() as u64, buffer);
+            buffer.extend_from_slice(value);
+        }
+        Document::Array(items) => {
+            buffer.push(TAG_LIST);
+            put_varint(items.len() as u64, buffer);
+            for item in items {
+                write_stored(item, names, buffer);
+            }
+        }
+        Document::Object(entries) => write_fields(entries.len(), entries.iter(), names, buffer),
+        other => write_document(other, buffer),
+    }
 }
 
 /// The field a document's id appears in: `_id`, as in MongoDB.
@@ -425,6 +545,14 @@ pub(crate) fn with_id(doc: Document, id: DocId) -> Document {
     }
 }
 
+/// Encodes a `Document` into bytes: one type tag, then a payload whose
+/// shape depends on the tag — fixed-width for scalars, a `u32` length
+/// prefix + raw bytes for `String`/`Binary`, a `u32` count prefix followed
+/// by that many encoded elements for `Array`, and a count prefix followed
+/// by (key length, key bytes, encoded value) tuples for `Object`. All
+/// lengths and counts are `u32` (SPEC §26.1). The canonical form, which
+/// needs no dictionary: what comparisons, keys of values and the files
+/// before format 14 use. A data cell stores `encode_stored`'s.
 pub fn encode_document(doc: &Document) -> Vec<u8> {
     let mut buffer = Vec::new();
     write_document(doc, &mut buffer);
@@ -486,58 +614,66 @@ fn write_len_prefixed(bytes: &[u8], buffer: &mut Vec<u8>) {
     buffer.extend_from_slice(bytes);
 }
 
-/// Decodes one `Document` from the front of `bytes`, returning it along
-/// with whatever bytes follow it. Returning the remainder rather than just
-/// the value is what makes the recursion work: `Array`/`Object` don't know
-/// ahead of time how many bytes one of their elements occupies, so each
-/// nested call has to report back where it stopped, so the next
-/// element/entry can be decoded starting there.
+/// Decodes one `Document` from the front of `bytes`, as `encode_document`
+/// wrote it, returning it along with whatever bytes follow it.
 ///
 /// Fails, with `InvalidData`, on an unknown type tag, invalid UTF-8, or
 /// bytes that run out before the document does: cells come from the file,
 /// and a length or count in them may be wrong (SPEC §55).
+#[cfg(test)]
 pub fn decode_document(bytes: &[u8]) -> std::io::Result<(Document, &[u8])> {
     let mut rest = bytes;
-    let doc = decode_value(&mut rest, Document::MAX_NESTING)?;
+    let doc = decode_value(&mut rest, Document::MAX_NESTING, &FieldNames::default())?;
     Ok((doc, rest))
+}
+
+/// A stored document, as `encode_stored` wrote it with `names`, or an
+/// older release with `encode_document`: the whole cell is the document.
+pub(crate) fn decode_stored(encoded: &[u8], names: &FieldNames) -> std::io::Result<Document> {
+    let mut rest = encoded;
+    decode_value(&mut rest, Document::MAX_NESTING, names)
 }
 
 /// `levels`: how many more objects or arrays may open, this one included
 /// (SPEC §56). A document nested deeper was never written by a trunkdb
-/// with the limit, and decoding it could overflow the stack.
-pub(crate) fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<Document> {
+/// with the limit, and decoding it could overflow the stack. `names`:
+/// the dictionary its keys are numbers into, if it was stored.
+pub(crate) fn decode_value(
+    bytes: &mut &[u8],
+    levels: usize,
+    names: &FieldNames,
+) -> std::io::Result<Document> {
     Ok(match take_u8(bytes, "a document's type tag")? {
         TAG_NULL => Document::Null,
         TAG_BOOL => Document::Bool(take_u8(bytes, "a bool")? != 0),
-        TAG_INT => Document::Int(i64::from_le_bytes(take_array(bytes, "an int")?)),
+        tag @ (TAG_INT | TAG_VARINT) => Document::Int(take_int(bytes, tag)?),
         TAG_FLOAT => Document::Float(f64::from_le_bytes(take_array(bytes, "a float")?)),
-        TAG_STRING => Document::String(decode_string(bytes, "a string")?),
-        TAG_BINARY => Document::Binary(take_len_prefixed(bytes, "binary")?.to_vec()),
-        TAG_ARRAY | TAG_OBJECT if levels == 0 => {
-            return Err(corrupt(format_args!(
-                "a document nests deeper than {} levels",
-                Document::MAX_NESTING
-            )));
+        tag @ (TAG_STRING | TAG_TEXT) => Document::String(take_text(bytes, tag)?.to_string()),
+        tag @ (TAG_BINARY | TAG_BYTES) => {
+            Document::Binary(take_run(bytes, tag, "binary")?.to_vec())
         }
-        TAG_ARRAY => {
-            let count = take_u32(bytes, "an array's length")? as usize;
+        TAG_ARRAY | TAG_OBJECT | TAG_LIST | TAG_FIELDS if levels == 0 => {
+            return Err(too_deep());
+        }
+        tag @ (TAG_ARRAY | TAG_LIST) => {
+            let count = take_count(bytes, tag, "an array's length")?;
             // Each item is at least a byte: a count past what's left is
             // damage, and must not size the allocation.
-            let mut items = Vec::with_capacity(count.min(bytes.len()));
+            let mut items = Vec::with_capacity(bytes.len().min(count as usize));
             for _ in 0..count {
-                items.push(decode_value(bytes, levels - 1)?);
+                items.push(decode_value(bytes, levels - 1, names)?);
             }
             Document::Array(items)
         }
-        TAG_OBJECT => {
-            let count = take_u32(bytes, "an object's length")? as usize;
+        tag @ (TAG_OBJECT | TAG_FIELDS) => {
+            let count = take_count(bytes, tag, "an object's length")?;
             // At the top, room for the `_id` a read adds (SPEC §59):
             // without it, adding one reallocates the map on every read.
             let top = usize::from(levels == Document::MAX_NESTING);
-            let mut entries = Map::with_capacity(count.min(bytes.len()) + top);
+            let mut entries = Map::with_capacity(bytes.len().min(count as usize) + top);
             for _ in 0..count {
-                let key = decode_string(bytes, "a key")?;
-                entries.insert(key, decode_value(bytes, levels - 1)?);
+                let key = take_key(bytes, tag, names)?.to_string();
+                entries.insert(key, decode_value(bytes, levels - 1, names)?);
             }
             Document::Object(entries)
         }
@@ -547,14 +683,17 @@ pub(crate) fn decode_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<
     })
 }
 
+fn too_deep() -> std::io::Error {
+    corrupt(format_args!(
+        "a document nests deeper than {} levels",
+        Document::MAX_NESTING
+    ))
+}
+
 /// `[u32 length][bytes]`.
 pub(crate) fn take_len_prefixed<'a>(bytes: &mut &'a [u8], what: &str) -> std::io::Result<&'a [u8]> {
     let len = take_u32(bytes, what)? as usize;
     take(bytes, len, what)
-}
-
-fn decode_string(bytes: &mut &[u8], what: &str) -> std::io::Result<String> {
-    take_str(bytes, what).map(str::to_string)
 }
 
 /// `[u32 length][UTF-8 bytes]`, borrowed.
@@ -573,44 +712,45 @@ pub(crate) fn take_datetime(bytes: &mut &[u8]) -> std::io::Result<DateTime> {
 }
 
 /// Moves past one encoded value without building it (SPEC §99), checking
-/// what `decode_value` checks — tags, lengths, UTF-8, date-times, the
-/// nesting limit — so a value is damaged for a read that skips it
-/// exactly when it is for one that decodes it.
-pub(crate) fn skip_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<()> {
+/// what `decode_value` checks — tags, lengths, UTF-8, key numbers,
+/// date-times, the nesting limit — so a value is damaged for a read that
+/// skips it exactly when it is for one that decodes it.
+pub(crate) fn skip_value(
+    bytes: &mut &[u8],
+    levels: usize,
+    names: &FieldNames,
+) -> std::io::Result<()> {
     match take_u8(bytes, "a document's type tag")? {
         TAG_NULL => {}
         TAG_BOOL => {
             take_u8(bytes, "a bool")?;
         }
-        TAG_INT => {
-            take_array::<8>(bytes, "an int")?;
+        tag @ (TAG_INT | TAG_VARINT) => {
+            take_int(bytes, tag)?;
         }
         TAG_FLOAT => {
             take_array::<8>(bytes, "a float")?;
         }
-        TAG_STRING => {
-            take_str(bytes, "a string")?;
+        tag @ (TAG_STRING | TAG_TEXT) => {
+            take_text(bytes, tag)?;
         }
-        TAG_BINARY => {
-            take_len_prefixed(bytes, "binary")?;
+        tag @ (TAG_BINARY | TAG_BYTES) => {
+            take_run(bytes, tag, "binary")?;
         }
-        TAG_ARRAY | TAG_OBJECT if levels == 0 => {
-            return Err(corrupt(format_args!(
-                "a document nests deeper than {} levels",
-                Document::MAX_NESTING
-            )));
+        TAG_ARRAY | TAG_OBJECT | TAG_LIST | TAG_FIELDS if levels == 0 => {
+            return Err(too_deep());
         }
-        TAG_ARRAY => {
-            let count = take_u32(bytes, "an array's length")?;
+        tag @ (TAG_ARRAY | TAG_LIST) => {
+            let count = take_count(bytes, tag, "an array's length")?;
             for _ in 0..count {
-                skip_value(bytes, levels - 1)?;
+                skip_value(bytes, levels - 1, names)?;
             }
         }
-        TAG_OBJECT => {
-            let count = take_u32(bytes, "an object's length")?;
+        tag @ (TAG_OBJECT | TAG_FIELDS) => {
+            let count = take_count(bytes, tag, "an object's length")?;
             for _ in 0..count {
-                take_str(bytes, "a key")?;
-                skip_value(bytes, levels - 1)?;
+                take_key(bytes, tag, names)?;
+                skip_value(bytes, levels - 1, names)?;
             }
         }
         TAG_ID => {
@@ -624,37 +764,40 @@ pub(crate) fn skip_value(bytes: &mut &[u8], levels: usize) -> std::io::Result<()
     Ok(())
 }
 
-/// A stored document's top-level fields among `names` only, as an object,
-/// with `id` as `_id` if `names` has it (SPEC §99.2); every other field
-/// is skipped without being built. A path's value depends only on its
-/// top-level field, so a filter or sort that names no other field sees
-/// the same values here as in the whole document. A stored document that
-/// isn't an object (only damage since §95) is decoded whole.
+/// A stored document's top-level fields among `fields` only, as an
+/// object, with `id` as `_id` if `fields` has it (SPEC §99.2); every
+/// other field is skipped without being built. A path's value depends
+/// only on its top-level field, so a filter or sort that names no other
+/// field sees the same values here as in the whole document. A stored
+/// document that isn't an object (only damage since §95) is decoded
+/// whole.
 pub(crate) fn decode_fields(
     encoded: &[u8],
     id: DocId,
-    names: &[&str],
+    fields: &[&str],
+    names: &FieldNames,
 ) -> std::io::Result<Document> {
     if !encodes_object(encoded) {
-        return Ok(with_id(decode_document(encoded)?.0, id));
+        return Ok(with_id(decode_stored(encoded, names)?, id));
     }
     let mut entries = Map::new();
-    if names.contains(&ID_FIELD) {
+    if fields.contains(&ID_FIELD) {
         entries.insert(ID_FIELD.to_string(), Document::Id(id));
     }
-    if names.iter().all(|name| *name == ID_FIELD) {
+    if fields.iter().all(|name| *name == ID_FIELD) {
         // No stored field named: nothing to read (SPEC §99.2).
         return Ok(Document::Object(entries));
     }
+    let tag = encoded[0];
     let mut bytes = &encoded[1..];
     let levels = Document::MAX_NESTING - 1;
-    let count = take_u32(&mut bytes, "an object's length")?;
+    let count = take_count(&mut bytes, tag, "an object's length")?;
     for _ in 0..count {
-        let key = take_str(&mut bytes, "a key")?;
-        if key != ID_FIELD && names.contains(&key) {
-            entries.insert(key.to_string(), decode_value(&mut bytes, levels)?);
+        let key = take_key(&mut bytes, tag, names)?;
+        if key != ID_FIELD && fields.contains(&key) {
+            entries.insert(key.to_string(), decode_value(&mut bytes, levels, names)?);
         } else {
-            skip_value(&mut bytes, levels)?;
+            skip_value(&mut bytes, levels, names)?;
         }
     }
     Ok(Document::Object(entries))
@@ -663,6 +806,7 @@ pub(crate) fn decode_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::sample as some_names;
 
     /// SPEC §136.3: each reader gives its type's value, and `None` for
     /// every other type.
@@ -743,6 +887,69 @@ mod tests {
         let (decoded, rest) = decode_document(&bytes).unwrap();
         assert_eq!(decoded, doc);
         assert!(rest.is_empty(), "decode must consume every encoded byte");
+        // A stored document's own `_id` is left out: the cell holds it.
+        let without_id = match &doc {
+            Document::Object(map) => Document::Object(Map::from_iter(
+                map.iter()
+                    .filter(|(key, _)| *key != ID_FIELD)
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            )),
+            other => other.clone(),
+        };
+        for names in [FieldNames::default(), some_names()] {
+            let stored = encode_stored(&doc, &names);
+            assert_eq!(decode_stored(&stored, &names).unwrap(), without_id);
+            let mut rest = &stored[..];
+            skip_value(&mut rest, Document::MAX_NESTING, &names).unwrap();
+            assert!(rest.is_empty(), "skip must pass every stored byte");
+        }
+    }
+
+    /// File format 14: a stored document's keys are numbers where the
+    /// dictionary has them, its ints, lengths and counts varints; every
+    /// int, at both ends of its range, and keys past a byte's numbers,
+    /// read back.
+    #[test]
+    fn a_stored_document_reads_back_and_is_smaller() {
+        let mut names = FieldNames::default();
+        for n in 0..300 {
+            names.add(&format!("f{n}"));
+        }
+        let ints = [0, 1, -1, 63, -64, 64, -65, i64::MAX, i64::MIN, 1 << 40];
+        let doc = Document::Object(Map::from_iter(
+            ints.iter()
+                .enumerate()
+                .map(|(n, v)| (format!("f{}", n * 33), Document::Int(*v)))
+                .chain([
+                    ("not named".to_string(), Document::String("x".repeat(200))),
+                    ("f299".to_string(), Document::Binary(vec![7; 130])),
+                    ("f1".to_string(), Document::Array(vec![Document::Null; 128])),
+                ]),
+        ));
+        let stored = encode_stored(&doc, &names);
+        assert_eq!(decode_stored(&stored, &names).unwrap(), doc);
+        assert!(stored.len() < encode_document(&doc).len());
+        // The example in the plan: 106 bytes before, 50 after.
+        let example: Document = r#"{"server": "web-1", "cpu": 42, "load": 0.7,
+            "tags": ["prod", "eu"], "at": {"$date": "2026-11-06T22:15:36Z"}}"#
+            .parse()
+            .unwrap();
+        let mut learned = FieldNames::default();
+        for name in learned.unknown(&example) {
+            learned.add(&name);
+        }
+        assert_eq!(encode_stored(&example, &FieldNames::default()).len(), 69);
+        assert_eq!(encode_stored(&example, &learned).len(), 50);
+        assert_eq!(encode_document(&example).len(), 106);
+    }
+
+    /// A key numbered past the dictionary is damage, not a panic.
+    #[test]
+    fn a_key_past_the_dictionary_is_damage() {
+        let doc: Document = r#"{"n": 1}"#.parse().unwrap();
+        let stored = encode_stored(&doc, &some_names());
+        let err = decode_stored(&stored, &FieldNames::default()).unwrap_err();
+        assert!(err.to_string().contains("field name 1, of 0"), "{err}");
     }
 
     /// SPEC §99.2: decoding some fields is damaged exactly when decoding
@@ -751,28 +958,32 @@ mod tests {
     #[test]
     fn some_fields_are_damaged_when_the_whole_is() {
         let doc: Document =
-            r#"{"a":1,"s":"héllo","n":[1,{"x":"y"}],"b":true,"t":"txt","bin":null}"#
+            r#"{"a":-1,"s":"héllo","n":[1,{"x":"y"}],"b":true,"t":"txt","bin":null}"#
                 .parse()
                 .unwrap();
-        let encoded = encode_stored(&doc);
+        // Some keys numbered, some inline; and the encoding before 14.
+        let names = some_names();
         let id = DocId([3; 16]);
-        let mut cases: Vec<Vec<u8>> = (0..encoded.len()).map(|n| encoded[..n].to_vec()).collect();
-        for at in 0..encoded.len() {
-            for byte in [0xFF, 0x80, 0x0A, 0x00] {
-                let mut altered = encoded.clone();
-                altered[at] = byte;
-                cases.push(altered);
+        let mut cases = Vec::new();
+        for encoded in [encode_stored(&doc, &names), encode_document(&doc)] {
+            cases.extend((0..encoded.len()).map(|n| encoded[..n].to_vec()));
+            for at in 0..encoded.len() {
+                for byte in [0xFF, 0x80, 0x0A, 0x00, 0x02, 0x01] {
+                    let mut altered = encoded.clone();
+                    altered[at] = byte;
+                    cases.push(altered);
+                }
             }
         }
         for bytes in cases {
-            let whole = decode_document(&bytes)
+            let whole = decode_stored(&bytes, &names)
                 .map(|_| ())
                 .map_err(|e| e.to_string());
-            for names in [&["a"][..], &["t"], &["n", "_id"], &["missing"]] {
-                let some = decode_fields(&bytes, id, names)
+            for fields in [&["a"][..], &["t"], &["n", "_id"], &["missing"]] {
+                let some = decode_fields(&bytes, id, fields, &names)
                     .map(|_| ())
                     .map_err(|e| e.to_string());
-                assert_eq!(some, whole, "{names:?} of {bytes:?}");
+                assert_eq!(some, whole, "{fields:?} of {bytes:?}");
             }
         }
     }
@@ -1023,6 +1234,16 @@ mod tests {
             bytes.extend_from_slice(&u32::MAX.to_le_bytes());
             bytes.push(TAG_NULL);
             assert!(decode_document(&bytes).is_err(), "{tag}");
+        }
+        // And a varint count or length past what's there, to the top of
+        // a u64.
+        for tag in [TAG_LIST, TAG_FIELDS, TAG_TEXT, TAG_BYTES] {
+            let mut bytes = vec![tag];
+            crate::decode::put_varint(u64::MAX, &mut bytes);
+            bytes.push(TAG_NULL);
+            assert!(decode_stored(&bytes, &some_names()).is_err(), "{tag}");
+            let mut rest = &bytes[..];
+            assert!(skip_value(&mut rest, 3, &some_names()).is_err(), "{tag}");
         }
     }
 }

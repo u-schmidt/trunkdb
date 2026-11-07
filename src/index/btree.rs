@@ -1,7 +1,9 @@
 use super::Index;
 use super::branch::{MIN_BRANCH_ENTRY_LEN, decode_branch_entry, encode_branch_entry};
 use super::key::{KeyRange, MAX_KEY_LEN};
-use super::leaf::{MIN_INDEX_ENTRY_LEN, decode_index_entry, encode_index_entry};
+use super::leaf::{
+    KeyParts, decode_anchor, decode_index_entry, decode_packed, encode_anchor, encode_packed,
+};
 use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage};
 
 /// The real, disk-backed `Index` implementation — a B-tree with linked
@@ -46,7 +48,10 @@ impl BTreeIndex {
         for &page_id in &pages[1..] {
             store.free_page(page_id)?;
         }
-        store.write_page(self.root, SlottedPage::new(PageType::IndexLeaf).into_page())
+        store.write_page(
+            self.root,
+            SlottedPage::new(PageType::IndexLeafPacked).into_page(),
+        )
     }
 
     /// Every page of the tree, root first. A page reached twice is an
@@ -64,7 +69,7 @@ impl BTreeIndex {
             }
             let page = read_node(store, page_id)?;
             match page.page_type() {
-                PageType::IndexLeaf => {}
+                PageType::IndexLeaf | PageType::IndexLeafPacked => {}
                 PageType::IndexBranch => {
                     pending.extend(page.iter_cells().map(|(_slot, c)| decode_branch_entry(c).1));
                     pending.push(page.next_page());
@@ -85,7 +90,7 @@ impl BTreeIndex {
         for depth in 1..=MAX_DEPTH as u32 + 1 {
             let page = read_node(store, page_id)?;
             match page.page_type() {
-                PageType::IndexLeaf => return Ok(depth),
+                PageType::IndexLeaf | PageType::IndexLeafPacked => return Ok(depth),
                 PageType::IndexBranch => {
                     page_id = page
                         .iter_cells()
@@ -103,15 +108,19 @@ impl BTreeIndex {
 
 /// The tree `insert` builds from keys handed to it in ascending order —
 /// as `compact` rebuilds every index (SPEC §41) — counted instead of
-/// built (SPEC §93.4): only the keys' lengths decide its shape. A full
-/// rightmost leaf stays full and the new key starts the next one; a full
-/// branch splits by bytes and promotes its middle entry, as
-/// `insert_into_branch` does. It holds one page's worth of lengths per
-/// level, whatever the number of keys.
+/// built (SPEC §93.4). A full rightmost leaf is rebuilt with a better
+/// anchor if that makes room, or stays full and the new key starts the
+/// next one; a full branch splits by bytes and promotes its middle
+/// entry, as `insert_into_branch` does. It holds one page's worth of
+/// entries per level, whatever the number of keys. The locations are the
+/// entries' own, where a rebuild's differ a little: an estimate.
 #[derive(Default)]
 pub(crate) struct SortedBuild {
     /// Leaves finished or begun; 0 before the first key.
     leaves: u64,
+    /// The last leaf's entries, and its anchor.
+    leaf: Vec<(Vec<u8>, RecordLocation)>,
+    anchor: Vec<u8>,
     /// Room left in the last leaf.
     leaf_room: usize,
     /// Above the leaves, lowest first: each level's rightmost branch.
@@ -127,21 +136,30 @@ struct BranchLevel {
 }
 
 impl SortedBuild {
-    /// The next key, by its length: at or above every key before it.
-    pub(crate) fn push(&mut self, key_len: usize) {
-        let needed = SlottedPage::space_needed(key_len + MIN_INDEX_ENTRY_LEN);
+    /// The next entry: its key at or above every key before it.
+    pub(crate) fn push(&mut self, key: &[u8], loc: RecordLocation) {
         if self.leaves == 0 {
             self.leaves = 1;
-            self.leaf_room = empty_room(PageType::IndexLeaf);
+            self.leaf_room = 0;
         }
-        if self.leaf_room >= needed {
+        let needed = SlottedPage::space_needed(encode_packed(&self.anchor, key, loc).len());
+        if !self.leaf.is_empty() && self.leaf_room >= needed {
             self.leaf_room -= needed;
+            self.leaf.push((key.to_vec(), loc));
             return;
         }
+        self.leaf.push((key.to_vec(), loc));
+        if let Some((anchor, room)) = packed_room(&self.leaf) {
+            (self.anchor, self.leaf_room) = (anchor, room);
+            return;
+        }
+        // Full: the new key starts the next leaf, and is the separator
+        // above it.
+        self.leaf = vec![(key.to_vec(), loc)];
+        let (anchor, room) = packed_room(&self.leaf).expect("one entry fits");
+        (self.anchor, self.leaf_room) = (anchor, room);
         self.leaves += 1;
-        self.leaf_room = empty_room(PageType::IndexLeaf) - needed;
-        // The new leaf's first key is the separator above it.
-        self.separate(0, key_len);
+        self.separate(0, key.len());
     }
 
     fn separate(&mut self, level: usize, key_len: usize) {
@@ -187,6 +205,93 @@ fn empty_room(page_type: PageType) -> usize {
     SlottedPage::new(page_type).free_space()
 }
 
+/// The anchor a packed leaf of `entries` gets, and the room it leaves;
+/// `None` if they don't fit.
+fn packed_room(entries: &[(Vec<u8>, RecordLocation)]) -> Option<(Vec<u8>, usize)> {
+    let anchor = anchor_of(entries).to_vec();
+    let mut needed = SlottedPage::space_needed(encode_anchor(&anchor).len());
+    for (key, loc) in entries {
+        needed += SlottedPage::space_needed(encode_packed(&anchor, key, *loc).len());
+    }
+    let room = empty_room(PageType::IndexLeafPacked);
+    (needed <= room).then(|| (anchor, room - needed))
+}
+
+/// The anchor of a leaf of `entries`: the middle one's key, which
+/// shares the most with the others in the middle of a sorted run.
+fn anchor_of(entries: &[(Vec<u8>, RecordLocation)]) -> &[u8] {
+    entries.get(entries.len() / 2).map_or(&[], |(key, _)| key)
+}
+
+/// A leaf page read for its entries, either layout: a plain leaf's
+/// cells are whole entries; a packed one's first cell is its anchor, and
+/// its entries follow, each after the anchor's first bytes (`leaf.rs`).
+#[derive(Clone, Copy)]
+struct Leaf<'p> {
+    page: &'p SlottedPage,
+    /// The anchor of a packed leaf.
+    anchor: Option<&'p [u8]>,
+}
+
+impl<'p> Leaf<'p> {
+    fn of(page: &'p SlottedPage) -> Self {
+        let anchor = (page.page_type() == PageType::IndexLeafPacked)
+            .then(|| page.get_cell(0).map_or(&[][..], decode_anchor));
+        Leaf { page, anchor }
+    }
+
+    /// The first slot that can hold an entry: past a packed leaf's anchor.
+    fn first(&self) -> u16 {
+        u16::from(self.anchor.is_some() && self.page.slot_count() > 0)
+    }
+
+    /// Its live entries.
+    fn len(&self) -> usize {
+        self.page.live_cells() - usize::from(self.first())
+    }
+
+    fn entry(&self, cell: &'p [u8]) -> (KeyParts<'p>, RecordLocation) {
+        match self.anchor {
+            Some(anchor) => decode_packed(cell, anchor),
+            None => {
+                let (key, loc) = decode_index_entry(cell);
+                (KeyParts::whole(key), loc)
+            }
+        }
+    }
+
+    fn entry_at(&self, slot: u16) -> Option<(KeyParts<'p>, RecordLocation)> {
+        self.page.get_cell(slot).map(|cell| self.entry(cell))
+    }
+
+    /// The first live slot whose key is at least `key`, by a binary search.
+    fn first_from(&self, key: &[u8]) -> Option<u16> {
+        self.first_from_slot(self.first(), key)
+    }
+
+    /// `first_from`, from slot `from` on.
+    fn first_from_slot(&self, from: u16, key: &[u8]) -> Option<u16> {
+        first_slot_where(self.page, from, |cell| {
+            self.entry(cell).0.cmp(key) != std::cmp::Ordering::Less
+        })
+    }
+
+    /// The slot of `key`, if the leaf holds it.
+    fn slot_of(&self, key: &[u8]) -> Option<u16> {
+        self.first_from(key).filter(|&slot| {
+            self.entry_at(slot).expect("a live slot").0.cmp(key) == std::cmp::Ordering::Equal
+        })
+    }
+
+    /// Every entry, copied out, in key order.
+    fn entries(&self) -> Vec<(Vec<u8>, RecordLocation)> {
+        (self.first()..self.page.slot_count())
+            .filter_map(|slot| self.entry_at(slot))
+            .map(|(key, loc)| (key.to_vec(), loc))
+            .collect()
+    }
+}
+
 /// What happened after inserting into a page: either it fit, or the page
 /// split and the caller (the parent branch, or `insert` itself for a root
 /// split) needs to route around the new sibling.
@@ -225,7 +330,7 @@ impl Index for BTreeIndex {
 
     fn remove(&mut self, store: &mut dyn PageStore, key: &[u8]) -> std::io::Result<()> {
         let (page_id, page) = find_leaf(store, self.root, key)?;
-        if let Some(slot) = slot_of(&page, key) {
+        if let Some(slot) = Leaf::of(&page).slot_of(key) {
             store.change_page(page_id, page, &mut |page| page.remove_cell_at(slot))?;
         }
         Ok(()) // not found anywhere is a no-op, matching InMemoryIndex
@@ -233,8 +338,10 @@ impl Index for BTreeIndex {
 
     fn lookup(&self, store: &dyn PageStore, key: &[u8]) -> std::io::Result<Option<RecordLocation>> {
         let (_page_id, page) = find_leaf(store, self.root, key)?;
-        Ok(slot_of(&page, key)
-            .map(|slot| decode_index_entry(page.get_cell(slot).expect("a live slot")).1))
+        let leaf = Leaf::of(&page);
+        Ok(leaf
+            .slot_of(key)
+            .map(|slot| leaf.entry_at(slot).expect("a live slot").1))
     }
 
     /// Every entry of the walk forward, collected (`walk`).
@@ -272,6 +379,13 @@ impl BTreeIndex {
             done: false,
             seen: std::collections::HashSet::new(),
             leaves: 0,
+            key: Vec::new(),
+            kept: 0,
+            clear: false,
+            offered: None,
+            run_end: 0,
+            lowest: Vec::new(),
+            highest: Vec::new(),
         }
     }
 }
@@ -311,7 +425,7 @@ impl BTreeIndex {
                     leaves: walk.leaves,
                 });
             }
-            if let Some(leaf) = walk.whole_leaf()? {
+            if let Some(leaf) = walk.run(usize::MAX)? {
                 entries += leaf.entries;
                 walk.pass_leaf();
                 continue;
@@ -375,67 +489,47 @@ pub struct Walk<'s> {
     seen: std::collections::HashSet<PageId>,
     /// How many leaves it has entered.
     leaves: usize,
+    /// The key `step` hands out, put together from its leaf.
+    key: Vec<u8>,
+    /// How many of `key`'s first bytes are the current leaf's anchor's,
+    /// which the next key needn't copy again.
+    kept: usize,
+    /// Whether every key of the current leaf left in the walk's direction
+    /// lies inside the range's far end, so no step need check it.
+    clear: bool,
+    /// The cursor a run of the current leaf was described at (`run`),
+    /// until it's passed.
+    offered: Option<u16>,
+    /// Where `pass_leaf` puts the cursor: past the run, or the whole
+    /// leaf, just described.
+    run_end: u16,
+    /// The keys `whole_leaf` hands out.
+    lowest: Vec<u8>,
+    highest: Vec<u8>,
 }
 
 impl Walk<'_> {
-    /// The slot of the next entry of the current leaf in the walk's
-    /// direction and in the range — `None` when the leaf is used up, or
-    /// the range is, which sets `done`. Keys before the range are skipped
-    /// (forward, before `start`; backward, from `end` on): they can only
-    /// be on the first leaf. A tombstoned slot, which a leaf written
-    /// before §52 may hold, is skipped too.
-    fn next_in_leaf(&mut self) -> Option<u16> {
-        let Walk {
-            leaf,
-            at,
-            range,
-            backward,
-            done,
-            ..
-        } = self;
-        let leaf = leaf.as_ref().filter(|_| !*done)?;
-        let (start, end) = (range.start.as_slice(), range.end.as_deref());
-        loop {
-            let slot = match backward {
-                true => {
-                    *at = at.checked_sub(1)?;
-                    *at
-                }
-                false if *at < leaf.slot_count() => {
-                    *at += 1;
-                    *at - 1
-                }
-                false => return None,
-            };
-            let Some(cell) = leaf.get_cell(slot) else {
-                continue;
-            };
-            let (key, _loc) = decode_index_entry(cell);
-            if end.is_some_and(|end| key >= end) {
-                if !*backward {
-                    *done = true; // every later key is past the end too
-                    return None;
-                }
-                continue;
-            }
-            if key < start {
-                if *backward {
-                    *done = true; // every earlier key is before the start too
-                    return None;
-                }
-                continue;
-            }
-            return Some(slot);
-        }
-    }
-
-    /// The next entry, its key lent from the leaf, not copied (SPEC
+    /// The next entry, its key lent from the walk, not copied out (SPEC
     /// §101.1): it lives until the next step. An I/O error ends the
     /// walk, after it's been handed out.
     pub fn step(&mut self) -> Option<std::io::Result<(&[u8], RecordLocation)>> {
-        let slot = loop {
-            if let Some(slot) = self.next_in_leaf() {
-                break slot;
+        let loc = loop {
+            let Walk {
+                leaf,
+                at,
+                range,
+                backward,
+                done,
+                clear,
+                key,
+                kept,
+                ..
+            } = &mut *self;
+            if let Some(page) = leaf.as_ref().filter(|_| !*done)
+                && let Some((parts, loc)) = next_in_leaf(page, at, range, *backward, done, *clear)
+            {
+                parts.write_over(key, kept);
+                break loc;
             }
             if self.done {
                 return None;
@@ -445,9 +539,7 @@ impl Walk<'_> {
                 return Some(Err(e));
             }
         };
-        let leaf = self.leaf.as_ref().expect("an entry came from it");
-        let cell = leaf.get_cell(slot).expect("a live slot");
-        Some(Ok(decode_index_entry(cell)))
+        Some(Ok((&self.key, loc)))
     }
 
     /// The leaf the walk is about to enter, if all of it lies inside the
@@ -460,12 +552,7 @@ impl Walk<'_> {
         if self.done {
             return Ok(None);
         }
-        let used_up = |walk: &Self| match (&walk.leaf, walk.backward) {
-            (None, _) => true,
-            (Some(_), true) => walk.at == 0,
-            (Some(leaf), false) => walk.at >= leaf.slot_count(),
-        };
-        if used_up(self) {
+        if self.used_up() {
             if let Err(e) = self.read_next_leaf() {
                 self.done = true;
                 return Err(e);
@@ -474,29 +561,38 @@ impl Walk<'_> {
                 return Ok(None);
             }
         }
-        let Some(leaf) = &self.leaf else {
+        let Some(page) = &self.leaf else {
             return Ok(None);
         };
+        let leaf = Leaf::of(page);
         let untouched = match self.backward {
-            true => self.at == leaf.slot_count(),
-            false => self.at == 0,
+            true => self.at == page.slot_count(),
+            false => self.at == leaf.first(),
         };
         if !untouched {
             return Ok(None);
         }
-        let mut live = (0..leaf.slot_count()).filter_map(|slot| leaf.get_cell(slot));
+        let mut live = (leaf.first()..page.slot_count()).filter_map(|slot| leaf.entry_at(slot));
         let Some(lowest) = live.next() else {
             return Ok(None);
         };
         let highest = live.next_back().unwrap_or(lowest);
-        let entries = leaf.live_cells();
-        let (lowest, _) = decode_index_entry(lowest);
-        let (highest, _) = decode_index_entry(highest);
-        let inside = lowest >= self.range.start.as_slice()
-            && self.range.end.as_deref().is_none_or(|end| highest < end);
+        let entries = leaf.len();
+        lowest.0.write_to(&mut self.lowest);
+        highest.0.write_to(&mut self.highest);
+        self.run_end = match self.backward {
+            true => leaf.first(),
+            false => page.slot_count(),
+        };
+        let inside = self.lowest >= self.range.start
+            && self
+                .range
+                .end
+                .as_deref()
+                .is_none_or(|end| self.highest.as_slice() < end);
         Ok(inside.then_some(WholeLeaf {
-            lowest,
-            highest,
+            lowest: &self.lowest,
+            highest: &self.highest,
             entries,
         }))
     }
@@ -506,19 +602,92 @@ impl Walk<'_> {
     fn used_up(&self) -> bool {
         match (&self.leaf, self.backward) {
             (None, _) => true,
-            (Some(_), true) => self.at == 0,
-            (Some(leaf), false) => self.at >= leaf.slot_count(),
+            (Some(page), true) => self.at <= Leaf::of(page).first(),
+            (Some(page), false) => self.at >= page.slot_count(),
         }
     }
 
-    /// Passes over the leaf `whole_leaf` just described, all of it.
+    /// Passes over what `whole_leaf` or `run` just described.
     pub fn pass_leaf(&mut self) {
-        if let Some(leaf) = &self.leaf {
-            self.at = match self.backward {
-                true => 0,
-                false => leaf.slot_count(),
-            };
+        if self.leaf.is_some() {
+            self.at = self.run_end;
+            self.offered = None;
         }
+    }
+
+    /// The live entries of the current leaf from the cursor on, in the
+    /// walk's direction, that lie inside the range — at most `most` of
+    /// them, the nearest: their lowest and highest keys and how many.
+    /// Reads the next leaf if the current one is used up. Found by binary
+    /// searches, no entry between them decoded, so a count or a skip
+    /// passes them at once where it would step through them (SPEC
+    /// §172.4). `None` for no such entry, for `most` 0, and once a run
+    /// offered on this leaf has been stepped into instead of passed: a
+    /// walk going entry by entry isn't offered one at every step.
+    pub fn run(&mut self, most: usize) -> std::io::Result<Option<WholeLeaf<'_>>> {
+        if self.done || most == 0 {
+            return Ok(None);
+        }
+        if self.used_up() {
+            if let Err(e) = self.read_next_leaf() {
+                self.done = true;
+                return Err(e);
+            }
+            if self.done {
+                return Ok(None);
+            }
+        }
+        let Some(page) = &self.leaf else {
+            return Ok(None);
+        };
+        if self.offered.is_some_and(|at| at != self.at) {
+            return Ok(None);
+        }
+        self.offered = Some(self.at);
+        let leaf = Leaf::of(page);
+        let (mut lo, mut hi) = match (self.backward, self.clear) {
+            (false, true) => (self.at, page.slot_count()),
+            (false, false) => {
+                let end = self.range.end.as_deref().unwrap_or_default();
+                let to = leaf.first_from_slot(self.at, end);
+                (self.at, to.unwrap_or(page.slot_count()))
+            }
+            (true, true) => (leaf.first(), self.at),
+            (true, false) => {
+                let from = leaf.first_from(&self.range.start).unwrap_or(self.at);
+                (from.min(self.at), self.at)
+            }
+        };
+        let live = |slot: &u16| page.get_cell(*slot).is_some();
+        let mut entries = page.live_in(lo..hi);
+        if entries == 0 {
+            return Ok(None);
+        }
+        if entries > most {
+            // The nearest `most`: arithmetic where no slot is a tombstone.
+            let whole = entries == usize::from(hi - lo);
+            let most_ = most as u16; // < entries <= u16::MAX
+            match self.backward {
+                false if whole => hi = lo + most_,
+                true if whole => lo = hi - most_,
+                false => hi = (lo..hi).filter(live).nth(most - 1).expect("live") + 1,
+                true => lo = (lo..hi).rev().filter(live).nth(most - 1).expect("live"),
+            }
+            entries = most;
+        }
+        let lowest = (lo..hi).find(live).expect("live");
+        let highest = (lo..hi).rev().find(live).expect("live");
+        (leaf.entry_at(lowest).expect("live").0).write_to(&mut self.lowest);
+        (leaf.entry_at(highest).expect("live").0).write_to(&mut self.highest);
+        self.run_end = match self.backward {
+            false => hi,
+            true => lo,
+        };
+        Ok(Some(WholeLeaf {
+            lowest: &self.lowest,
+            highest: &self.highest,
+            entries,
+        }))
     }
 
     /// Makes the next leaf in the walk's direction the current one; sets
@@ -570,10 +739,29 @@ impl Walk<'_> {
         };
         self.leaves += 1;
         self.next_leaf = leaf.next_page();
-        self.at = match self.backward {
-            true => leaf.slot_count(),
-            false => 0,
+        let view = Leaf::of(&leaf);
+        // The first leaf is entered where the range begins in the walk's
+        // direction, found by a binary search: forward the first key from
+        // `start` on, backward the first from `end` on, the walk taking the
+        // keys before it (SPEC §172.1).
+        let first = self.leaves == 1;
+        self.at = match (self.backward, &self.range.end) {
+            (false, _) if first => view.first_from(&self.range.start),
+            (true, Some(end)) if first => view.first_from(end),
+            (true, _) => None,
+            (false, _) => Some(view.first()),
+        }
+        .unwrap_or(leaf.slot_count());
+        self.clear = {
+            let mut live = (view.first()..leaf.slot_count()).filter_map(|slot| view.entry_at(slot));
+            let last = match self.backward {
+                true => live.next(),
+                false => live.next_back(),
+            };
+            last.is_none_or(|(key, _)| holds_far_end(&self.range, &key, self.backward))
         };
+        self.kept = 0;
+        self.offered = None;
         self.leaf = Some(leaf);
         Ok(())
     }
@@ -585,7 +773,7 @@ impl Walk<'_> {
         for _ in self.path.len()..=MAX_DEPTH {
             let page = read_node(self.store, page_id)?;
             match page.page_type() {
-                PageType::IndexLeaf => return Ok(page),
+                PageType::IndexLeaf | PageType::IndexLeafPacked => return Ok(page),
                 PageType::IndexBranch => {
                     let mut children: Vec<PageId> = page
                         .iter_cells()
@@ -608,6 +796,59 @@ impl Walk<'_> {
             }
         }
         Err(too_deep(page_id))
+    }
+}
+
+/// The next entry of `page`, a walk's current leaf, from the cursor `at`
+/// in the walk's direction and in `range` — `None` when the leaf is used
+/// up, or the range is, which sets `done`. Keys before the range are
+/// never stepped over: the first leaf's cursor starts at the range, by a
+/// binary search (`Walk::read_next_leaf`). Only the far end is checked,
+/// and only on a leaf whose last key in the walk's direction lies past it
+/// (`clear` says it doesn't). A tombstoned slot, which a leaf written
+/// before §52 may hold, is skipped.
+fn next_in_leaf<'p>(
+    page: &'p SlottedPage,
+    at: &mut u16,
+    range: &KeyRange,
+    backward: bool,
+    done: &mut bool,
+    clear: bool,
+) -> Option<(KeyParts<'p>, RecordLocation)> {
+    let leaf = Leaf::of(page);
+    loop {
+        let slot = match backward {
+            true if *at <= leaf.first() => return None,
+            true => {
+                *at -= 1;
+                *at
+            }
+            false if *at < page.slot_count() => {
+                *at += 1;
+                *at - 1
+            }
+            false => return None,
+        };
+        let Some((key, loc)) = leaf.entry_at(slot) else {
+            continue;
+        };
+        if !clear && !holds_far_end(range, &key, backward) {
+            *done = true; // every later key in this direction is past it too
+            return None;
+        }
+        return Some((key, loc));
+    }
+}
+
+/// Whether `key` lies inside `range` at the end a walk goes towards:
+/// before `end` forward, from `start` on backward.
+fn holds_far_end(range: &KeyRange, key: &KeyParts<'_>, backward: bool) -> bool {
+    match backward {
+        false => range
+            .end
+            .as_deref()
+            .is_none_or(|end| key.cmp(end) == std::cmp::Ordering::Less),
+        true => key.cmp(&range.start) != std::cmp::Ordering::Less,
     }
 }
 
@@ -669,7 +910,7 @@ fn read_node(store: &dyn PageStore, page_id: PageId) -> std::io::Result<SlottedP
         )
     })?;
     match page.page_type() {
-        PageType::IndexLeaf | PageType::IndexBranch => Ok(page),
+        PageType::IndexLeaf | PageType::IndexLeafPacked | PageType::IndexBranch => Ok(page),
         other => Err(corrupt_page_type(page_id, other)),
     }
 }
@@ -684,7 +925,7 @@ fn find_leaf(
     for _ in 0..=MAX_DEPTH {
         let page = read_node(store, page_id)?;
         match page.page_type() {
-            PageType::IndexLeaf => return Ok((page_id, page)),
+            PageType::IndexLeaf | PageType::IndexLeafPacked => return Ok((page_id, page)),
             PageType::IndexBranch => page_id = find_child(&page, key),
             other => return Err(corrupt_page_type(page_id, other)),
         }
@@ -706,7 +947,9 @@ fn insert_into(
     }
     let page = read_node(store, page_id)?;
     match page.page_type() {
-        PageType::IndexLeaf => insert_into_leaf(store, page_id, page, key, loc),
+        PageType::IndexLeaf | PageType::IndexLeafPacked => {
+            insert_into_leaf(store, page_id, page, key, loc)
+        }
         PageType::IndexBranch => insert_into_branch(store, page_id, page, key, loc, depth),
         other => Err(corrupt_page_type(page_id, other)),
     }
@@ -721,26 +964,23 @@ fn insert_into_leaf(
 ) -> std::io::Result<InsertOutcome> {
     // In place if it fits: before the first key not below it (SPEC §52).
     // Changed in place, not copied, if the batch changed it already
-    // (SPEC §151).
-    let slot = first_slot_where(&page, |cell| decode_index_entry(cell).0 >= key)
-        .unwrap_or(page.slot_count());
-    let entry = encode_index_entry(key, loc);
-    if page.fits(entry.len()) {
-        store.change_page(page_id, page, &mut |page| {
-            assert!(page.insert_cell_at(slot, &entry))
-        })?;
-        return Ok(InsertOutcome::Done);
+    // (SPEC §151). Only into a packed leaf with its anchor: a plain one,
+    // as files before format 14 have, is rewritten packed below.
+    let leaf = Leaf::of(&page);
+    let slot = leaf.first_from(key).unwrap_or(page.slot_count());
+    if let (Some(anchor), true) = (leaf.anchor, page.slot_count() > 0) {
+        let entry = encode_packed(anchor, key, loc);
+        if page.fits(entry.len()) {
+            store.change_page(page_id, page, &mut |page| {
+                assert!(page.insert_cell_at(slot, &entry))
+            })?;
+            return Ok(InsertOutcome::Done);
+        }
     }
 
-    // Full: rebuild it from its entries, which drops any tombstones an
-    // older version left, or split it.
-    let mut entries: Vec<(Vec<u8>, RecordLocation)> = page
-        .iter_cells()
-        .map(|(_slot, c)| {
-            let (k, l) = decode_index_entry(c);
-            (k.to_vec(), l)
-        })
-        .collect();
+    // Full: rebuild it from its entries, with an anchor in their middle,
+    // which drops any tombstones an older version left, or split it.
+    let mut entries = leaf.entries();
     let next_page = page.next_page(); // this leaf's sibling link, preserved either way
 
     let pos = entries.partition_point(|(k, _)| k.as_slice() < key);
@@ -756,26 +996,46 @@ fn insert_into_leaf(
     // the new page, and this one stays full: keys arriving in order (ids
     // in time order, a compaction's sorted rebuild) would otherwise leave
     // every leaf half empty, since nothing lands left of them again
-    // (SPEC §41).
+    // (SPEC §41). Each half gets an anchor of its own, so the byte count
+    // is only a guide: where a half doesn't fit, other points are tried.
     let appends = pos == entries.len() - 1 && next_page == 0;
-    let mid = match appends {
-        true => pos,
-        false => byte_midpoint(entries.iter().map(|(k, _)| k.len() + 10)),
-    };
-    let right_entries = entries.split_off(mid);
-    // Smallest key of the right half, copied up (leaves keep it too).
-    let separator = right_entries[0].0.clone();
-
+    let n = entries.len();
+    let by_bytes = byte_midpoint(entries.iter().map(|(k, _)| k.len() + 10));
+    let candidates = appends
+        .then_some(pos)
+        .into_iter()
+        .chain([by_bytes, n / 2])
+        .chain(1..n);
     let new_right_id = store.allocate_page()?;
-    let left = build_leaf_page(&entries, new_right_id).expect("each half of a split fits");
-    let right = build_leaf_page(&right_entries, next_page).expect("each half of a split fits");
-    store.write_page(page_id, left.into_page())?;
-    store.write_page(new_right_id, right.into_page())?;
-
-    Ok(InsertOutcome::Split {
-        separator,
-        new_right: new_right_id,
-    })
+    // Appending to a packed leaf, it stays as it is but for its link.
+    let kept = (appends && leaf.anchor.is_some()).then(|| {
+        let mut kept = page.clone();
+        kept.set_next_page(new_right_id);
+        kept
+    });
+    for mid in candidates.filter(|&mid| 0 < mid && mid < n) {
+        let left = match &kept {
+            Some(kept) if mid == pos => Some(kept.clone()),
+            _ => build_leaf_page(&entries[..mid], new_right_id),
+        };
+        let Some(left) = left else {
+            continue;
+        };
+        let Some(right) = build_leaf_page(&entries[mid..], next_page) else {
+            continue;
+        };
+        // Smallest key of the right half, copied up (leaves keep it too).
+        let separator = entries[mid].0.clone();
+        store.write_page(page_id, left.into_page())?;
+        store.write_page(new_right_id, right.into_page())?;
+        return Ok(InsertOutcome::Split {
+            separator,
+            new_right: new_right_id,
+        });
+    }
+    Err(std::io::Error::other(format!(
+        "index leaf {page_id} can't be split so that each half fits"
+    )))
 }
 
 fn insert_into_branch(
@@ -788,14 +1048,15 @@ fn insert_into_branch(
 ) -> std::io::Result<InsertOutcome> {
     // The first separator above `key` routes it, as in `find_child`;
     // `None` is the rightmost child.
-    let (slot, child_id) = match first_slot_where(&page, |cell| decode_branch_entry(cell).0 > key) {
-        Some(slot) => {
-            let (_separator, child) =
-                decode_branch_entry(page.get_cell(slot).expect("a live slot"));
-            (Some(slot), child)
-        }
-        None => (None, page.next_page()),
-    };
+    let (slot, child_id) =
+        match first_slot_where(&page, 0, |cell| decode_branch_entry(cell).0 > key) {
+            Some(slot) => {
+                let (_separator, child) =
+                    decode_branch_entry(page.get_cell(slot).expect("a live slot"));
+                (Some(slot), child)
+            }
+            None => (None, page.next_page()),
+        };
 
     let outcome = insert_into(store, child_id, key, loc, depth + 1)?;
     let InsertOutcome::Split {
@@ -924,14 +1185,18 @@ fn grow_new_root(
     store.write_page(root, new_root.into_page())
 }
 
+/// A packed leaf of `entries`, its anchor the middle one's key; `None`
+/// if they don't fit.
 fn build_leaf_page(
     entries: &[(Vec<u8>, RecordLocation)],
     next_page: PageId,
 ) -> Option<SlottedPage> {
-    let mut page = SlottedPage::new(PageType::IndexLeaf);
+    let mut page = SlottedPage::new(PageType::IndexLeafPacked);
     page.set_next_page(next_page);
+    let anchor = anchor_of(entries);
+    page.insert_cell(&encode_anchor(anchor))?;
     for (key, loc) in entries {
-        page.insert_cell(&encode_index_entry(key, *loc))?;
+        page.insert_cell(&encode_packed(anchor, key, *loc))?;
     }
     Some(page)
 }
@@ -956,16 +1221,10 @@ fn build_branch_page(entries: &[(Vec<u8>, PageId)], rightmost: PageId) -> Option
 /// Relies on cells being stored in sorted order, which every branch page
 /// is: `insert_into_branch` puts each separator in at its place.
 fn find_child(page: &SlottedPage, target: &[u8]) -> PageId {
-    match first_slot_where(page, |cell| decode_branch_entry(cell).0 > target) {
+    match first_slot_where(page, 0, |cell| decode_branch_entry(cell).0 > target) {
         Some(slot) => decode_branch_entry(page.get_cell(slot).expect("a live slot")).1,
         None => page.next_page(),
     }
-}
-
-/// The slot of `key` in leaf `page`, if the leaf holds it.
-fn slot_of(page: &SlottedPage, key: &[u8]) -> Option<u16> {
-    first_slot_where(page, |cell| decode_index_entry(cell).0 >= key)
-        .filter(|&slot| decode_index_entry(page.get_cell(slot).expect("a live slot")).0 == key)
 }
 
 /// The first live slot of a B-tree page whose cell meets `meets`, by a
@@ -974,8 +1233,8 @@ fn slot_of(page: &SlottedPage, key: &[u8]) -> Option<u16> {
 /// before that slot and holds from it on. A probe that lands on a
 /// tombstone, which a leaf written before §52 may hold, steps on to the
 /// next live slot; a stretch of them is passed over one by one.
-fn first_slot_where(page: &SlottedPage, meets: impl Fn(&[u8]) -> bool) -> Option<u16> {
-    let (mut lo, mut hi) = (0, page.slot_count());
+fn first_slot_where(page: &SlottedPage, from: u16, meets: impl Fn(&[u8]) -> bool) -> Option<u16> {
+    let (mut lo, mut hi) = (from, page.slot_count());
     let mut found = None;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -994,6 +1253,27 @@ fn first_slot_where(page: &SlottedPage, meets: impl Fn(&[u8]) -> bool) -> Option
         }
     }
     found
+}
+
+/// For tests that need a damaged index: the entry with key `was`, in
+/// the tree at `root`, given the key `now` where it is, out of order if
+/// that's where `now` goes.
+#[cfg(test)]
+pub(crate) fn rewrite_key_in_place(
+    store: &mut dyn PageStore,
+    root: PageId,
+    was: &[u8],
+    now: &[u8],
+) -> std::io::Result<()> {
+    let (page_id, page) = find_leaf(store, root, was)?;
+    let mut entries = Leaf::of(&page).entries();
+    for (key, _) in &mut entries {
+        if key == was {
+            *key = now.to_vec();
+        }
+    }
+    let rebuilt = build_leaf_page(&entries, page.next_page()).expect("it fit before");
+    store.write_page(page_id, rebuilt.into_page())
 }
 
 fn corrupt_page_type(page_id: PageId, found: PageType) -> std::io::Error {
@@ -1016,9 +1296,25 @@ mod tests {
     fn fresh_index_root(store: &mut dyn PageStore) -> PageId {
         let root = store.allocate_page().unwrap();
         store
-            .write_page(root, SlottedPage::new(PageType::IndexLeaf).into_page())
+            .write_page(
+                root,
+                SlottedPage::new(PageType::IndexLeafPacked).into_page(),
+            )
             .unwrap();
         root
+    }
+
+    /// A leaf as files before format 14 hold them: every key whole.
+    fn build_plain_leaf_page(
+        entries: &[(Vec<u8>, RecordLocation)],
+        next_page: PageId,
+    ) -> Option<SlottedPage> {
+        let mut page = SlottedPage::new(PageType::IndexLeaf);
+        page.set_next_page(next_page);
+        for (key, loc) in entries {
+            page.insert_cell(&super::super::leaf::encode_index_entry(key, *loc))?;
+        }
+        Some(page)
     }
 
     fn fresh() -> (tempfile::TempDir, FileStore, BTreeIndex) {
@@ -1031,10 +1327,10 @@ mod tests {
     /// The leaves of `index`, in key order, each with its entry count.
     fn leaf_sizes(store: &FileStore, index: &BTreeIndex) -> Vec<usize> {
         let (_id, mut page) = find_leaf(store, index.root, &[]).unwrap();
-        let mut sizes = vec![page.iter_cells().count()];
+        let mut sizes = vec![Leaf::of(&page).len()];
         while page.next_page() != 0 {
             page = SlottedPage::from_bytes(store.read_page(page.next_page()).unwrap()).unwrap();
-            sizes.push(page.iter_cells().count());
+            sizes.push(Leaf::of(&page).len());
         }
         sizes
     }
@@ -1133,16 +1429,19 @@ mod tests {
             index.remove(&mut store, key).unwrap();
             expected.remove(key);
         }
-        // Every third leaf with every fourth slot tombstoned.
+        // Every third leaf as a version before §52 left it: plain, with
+        // every fourth slot tombstoned.
         let leaves: Vec<PageId> = (index.pages(&store).unwrap().into_iter())
             .filter(|id| {
                 let page = SlottedPage::from_bytes(store.read_page(*id).unwrap()).unwrap();
-                page.page_type() == PageType::IndexLeaf
+                page.page_type() != PageType::IndexBranch
             })
             .collect();
         let mut tombstoned = 0;
         for id in leaves.iter().step_by(3) {
-            let mut page = SlottedPage::from_bytes(store.read_page(*id).unwrap()).unwrap();
+            let page = SlottedPage::from_bytes(store.read_page(*id).unwrap()).unwrap();
+            let mut page =
+                build_plain_leaf_page(&Leaf::of(&page).entries(), page.next_page()).unwrap();
             for slot in (0..page.slot_count()).step_by(4) {
                 let (key, _) = decode_index_entry(page.get_cell(slot).unwrap());
                 expected.remove(key);
@@ -1187,7 +1486,49 @@ mod tests {
                 .collect();
             assert_eq!(got, want[..stop.min(want.len())], "{range:?} {backward}");
             assert_eq!(KEYS_COPIED.with(|n| n.get()), got.len(), "{range:?}");
+            by_runs(&index, &store, &range, backward, &want, &mut rng);
         }
+    }
+
+    /// A walk that passes runs of at most a random number of entries
+    /// (`Walk::run`), declines some to step instead, and steps between:
+    /// each run the next `want` entries in the walk's direction, `want`
+    /// all of them in all.
+    fn by_runs(
+        index: &BTreeIndex,
+        store: &FileStore,
+        range: &KeyRange,
+        backward: bool,
+        want: &[(Vec<u8>, RecordLocation)],
+        rng: &mut XorShift,
+    ) {
+        let mut walk = index.walk(store, range.clone(), backward);
+        let mut at = 0;
+        loop {
+            let most = [1, 2, 7, usize::MAX][rng.below(4)];
+            let decline = rng.below(4) == 0;
+            if let Some(run) = walk.run(most).unwrap() {
+                let n = run.entries;
+                assert!(n >= 1 && n <= most, "{n} of {most}");
+                let (near, far) = (&want[at].0, &want[at + n - 1].0);
+                let (lowest, highest) = if backward { (far, near) } else { (near, far) };
+                assert_eq!((run.lowest, run.highest), (&lowest[..], &highest[..]));
+                if !decline {
+                    walk.pass_leaf();
+                    at += n;
+                    continue;
+                }
+            }
+            match walk.step() {
+                Some(entry) => {
+                    let (key, loc) = entry.unwrap();
+                    assert_eq!((key, loc), (&want[at].0[..], want[at].1), "{range:?}");
+                    at += 1;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(at, want.len(), "{range:?} {backward}");
     }
 
     /// Random keys in, a third taken out again — whole leaves of them
@@ -1490,10 +1831,11 @@ mod tests {
             index.insert(&mut store, key, loc).unwrap();
         }
         let sizes = leaf_sizes(&store, &index);
-        let full = sizes[0];
+        // Full, give or take what the keys share with each leaf's anchor.
+        let full = *sizes.iter().max().unwrap();
         assert!(sizes.len() > 5, "{sizes:?}");
         assert!(
-            sizes[..sizes.len() - 1].iter().all(|&n| n == full),
+            sizes[..sizes.len() - 1].iter().all(|&n| n * 10 >= full * 9),
             "{sizes:?}"
         );
         assert_eq!(sizes.iter().sum::<usize>(), keys.len());
@@ -1503,7 +1845,8 @@ mod tests {
             index.insert(&mut store, key, loc).unwrap();
         }
         let sizes = leaf_sizes(&store, &index);
-        assert!(sizes.iter().all(|&n| n < full * 2 / 3), "{sizes:?}");
+        // The first leaf, still filling, aside.
+        assert!(sizes[1..].iter().all(|&n| n < full * 2 / 3), "{sizes:?}");
         for key in &keys {
             assert_eq!(index.lookup(&store, key).unwrap(), Some(loc));
         }
@@ -1655,13 +1998,29 @@ mod tests {
                 false => index.root,
             };
             let mut page = SlottedPage::from_bytes(store.read_page(target).unwrap()).unwrap();
-            page.remove_cell_at(0);
-            assert!(page.insert_cell_at(0, &[1, 2, 3]));
-            store.write_page(target, page.into_page()).unwrap();
+            let message = match leaf {
+                // A packed leaf's first entry, its varints never ending.
+                true => {
+                    assert_eq!(page.page_type(), PageType::IndexLeafPacked);
+                    let mut bytes = page.into_page();
+                    let at = 13 + 4;
+                    let offset = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+                    let length = u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+                    bytes.make_mut()[offset..offset + length].fill(0x80);
+                    store.write_page(target, bytes).unwrap();
+                    "varint"
+                }
+                false => {
+                    page.remove_cell_at(0);
+                    assert!(page.insert_cell_at(0, &[1, 2, 3]));
+                    store.write_page(target, page.into_page()).unwrap();
+                    "shorter than any entry"
+                }
+            };
 
             let invalid = |e: std::io::Error| {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
-                assert!(e.to_string().contains("shorter than any entry"), "{e}");
+                assert!(e.to_string().contains(message), "{e}");
             };
             invalid(index.lookup(&store, &id_from(0)).unwrap_err());
             invalid(index.scan(&store).unwrap_err());
@@ -1679,6 +2038,50 @@ mod tests {
                 .collect();
             invalid(walked.unwrap_err());
         }
+    }
+
+    /// Found in review: a packed leaf whose slot 0, the anchor, is a
+    /// tombstone is damage. Its next entry, sharing nothing, would pass
+    /// for an anchor, while reads took an empty one and lost the bytes
+    /// every other entry shares.
+    #[test]
+    fn a_packed_leaf_without_its_anchor_is_an_error() {
+        let loc = RecordLocation { page: 1, slot: 0 };
+        let (_dir, mut store, mut index) = fresh();
+        for i in 0..400u16 {
+            index.insert(&mut store, &id_from(i), loc).unwrap();
+        }
+        let root = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        let target = decode_branch_entry(root.get_cell(0).unwrap()).1;
+        let page = SlottedPage::from_bytes(store.read_page(target).unwrap()).unwrap();
+        assert_eq!(page.page_type(), PageType::IndexLeafPacked);
+        let mut bytes = page.into_page();
+        let raw = bytes.make_mut();
+        // Slot 0's length to 0, a tombstone; slot 1's entry to share
+        // nothing, so its cell starts with 0 as an anchor's does.
+        raw[13 + 2..13 + 4].fill(0);
+        let offset = u16::from_le_bytes([raw[17], raw[18]]) as usize;
+        raw[offset] = 0;
+        store.write_page(target, bytes).unwrap();
+
+        let invalid = |e: std::io::Error| {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+            assert!(e.to_string().contains("anchor"), "{e}");
+        };
+        invalid(index.lookup(&store, &id_from(0)).unwrap_err());
+        invalid(index.scan(&store).unwrap_err());
+        invalid(index.insert(&mut store, &id_from(0), loc).unwrap_err());
+        let walked: std::io::Result<Vec<_>> = index
+            .walk(
+                &store,
+                KeyRange {
+                    start: Vec::new(),
+                    end: None,
+                },
+                true,
+            )
+            .collect();
+        invalid(walked.unwrap_err());
     }
 
     /// Found by fuzzing (SPEC §55): a child pointer back to the root, or
@@ -1776,8 +2179,9 @@ mod tests {
             index.insert(&mut store, &key(i), loc).unwrap();
         }
         // As a remove used to leave it: every third slot tombstoned.
-        let mut page = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
-        assert_eq!(page.page_type(), PageType::IndexLeaf);
+        // As an older version wrote it: plain, then with tombstones.
+        let page = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        let mut page = build_plain_leaf_page(&Leaf::of(&page).entries(), 0).unwrap();
         for slot in (0..page.slot_count()).step_by(3) {
             page.delete_cell(slot);
         }
@@ -1834,7 +2238,7 @@ mod tests {
         let branch_entries: Vec<(Vec<u8>, PageId)> =
             (0..n as usize).map(|i| (key(i), 100 + i as u64)).collect();
         for (name, deleted) in &patterns {
-            let mut leaf = build_leaf_page(&leaf_entries, 0).unwrap();
+            let mut leaf = build_plain_leaf_page(&leaf_entries, 0).unwrap();
             let mut branch = build_branch_page(&branch_entries, 999).unwrap();
             for &slot in deleted {
                 leaf.delete_cell(slot);
@@ -1850,13 +2254,13 @@ mod tests {
                 };
                 let at_least = |cell: &[u8]| decode_index_entry(cell).0 >= probe;
                 assert_eq!(
-                    first_slot_where(&leaf, at_least),
+                    first_slot_where(&leaf, 0, at_least),
                     scan(&leaf, &at_least),
                     "{name}, leaf, >= {probe:?}"
                 );
                 let above = |cell: &[u8]| decode_branch_entry(cell).0 > probe;
                 assert_eq!(
-                    first_slot_where(&branch, above),
+                    first_slot_where(&branch, 0, above),
                     scan(&branch, &above),
                     "{name}, branch, > {probe:?}"
                 );
@@ -1864,7 +2268,11 @@ mod tests {
                     .iter_cells()
                     .find(|(_slot, cell)| decode_index_entry(cell).0 == probe)
                     .map(|(slot, _)| slot);
-                assert_eq!(slot_of(&leaf, probe), found, "{name}, leaf, == {probe:?}");
+                assert_eq!(
+                    Leaf::of(&leaf).slot_of(probe),
+                    found,
+                    "{name}, leaf, == {probe:?}"
+                );
             }
         }
     }
@@ -1888,8 +2296,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut page = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
-        assert_eq!(page.page_type(), PageType::IndexLeaf);
+        // As an older version wrote it: plain, then with tombstones.
+        let page = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        let mut page = build_plain_leaf_page(&Leaf::of(&page).entries(), 0).unwrap();
         for slot in (0..page.slot_count()).step_by(3) {
             page.delete_cell(slot);
         }

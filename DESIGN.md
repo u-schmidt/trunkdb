@@ -96,9 +96,9 @@ catches a page written to the wrong place. Above `FileStore`, a page is
 | Page | Layout |
 |---|---|
 | 0: header | magic `TRUNKDB1`, page size, page count, head of the free list, format version; the releases that created the file and last wrote it [§125](spec/125-the-release-that-wrote-a-file.md) |
-| 1: catalog | slotted: one cell per collection and per index |
+| 1: catalog | slotted: one cell per collection and per index, and cells of the field-name dictionary [§170](spec/170-field-names-stored-once.md) |
 | data | slotted: documents of one collection |
-| index leaf, index branch | slotted: B-tree entries, in key order |
+| index leaf, index branch | slotted: B-tree entries, in key order; a leaf's keys after its anchor's bytes [§171](spec/171-index-leaves-stored-after-an-anchor.md) |
 | overflow | one run of a large document's bytes, and the next page |
 | free | the next free page |
 
@@ -126,14 +126,17 @@ cell is long enough for its entry [§55](spec/55-fuzzing.md).
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
 shrink until a compaction [§41](spec/41-compaction.md).
 
-**The format version** is 12 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md). A build opens its own format and
-the older ones that are valid files of it (6 to 11), and stamps them
+**The format version** is 14 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md) [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md) [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md). A build opens its own format and
+the older ones that are valid files of it (6 to 13), and stamps them
 with the current one at open; it refuses newer ones, and older ones
 that need converting. Opening a 6–9 file with secondary indexes checks
 them once and rebuilds any that a document holds an id in, since ids
 had no key before 10 [§62](spec/62-an-index-key-for-ids.md). Opening a 6–11 file checks that every document
 is an object, by its type byte, and refuses the file, unchanged, if one
-isn't [§95](spec/95-only-objects.md). Moving between formats is
+isn't [§95](spec/95-only-objects.md). Opening a 6–12 file rebuilds the indexes a document holds binary in [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md).
+A 6–13 file's documents and index leaves read in their older encoding,
+and are stored in the new one as they are written, all of them by a
+compaction [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md). Moving between formats is
 export and import [§30](spec/30-export-and-import-as-json-lines.md). The history is in the comment on
 `FORMAT_VERSION` in `storage/file.rs`.
 
@@ -268,7 +271,13 @@ ids made in sequence land at the end of the primary index instead of
 all over it [§4.2](spec/04-key-decisions-and-rationale.md).
 
 **Data pages** hold one collection's documents, several per page, each
-cell being `[flags][id][encoded document]` [§20](spec/20-several-documents-per-data-page.md). The id is stored in
+cell being `[flags][id][encoded document]` [§20](spec/20-several-documents-per-data-page.md). A stored document's keys
+are numbers into the file's one dictionary of field names, kept in the
+catalog and written with the batch that brings a name; ints, lengths
+and counts are varints. A name over 64 bytes, and any past the first
+4,096, is stored inline, so keys that are data can't grow the
+dictionary without end. Documents stay schemaless: a new name just
+joins [§170](spec/170-field-names-stored-once.md). The id is stored in
 the cell because nothing else maps a location back to its document, and
 a scan or a rebuild needs that. A collection's next insert tries its
 current data page first, then the fullest of its older pages with room
@@ -286,8 +295,9 @@ it holds nothing [§105](spec/105-a-differential-fuzz-target-for-queries.md).
 the first of a chain of overflow pages [§26](spec/26-overflow-pages-and-u32-lengths.md). Lengths are `u32`.
 
 **The catalog** (page 1) holds a cell per collection (its primary
-index root, its current data page, its name) and one per index (its
-fields, root and flags: unique, sparse) [§9](spec/09-catalog.md) [§28](spec/28-secondary-indexes.md) [§44](spec/44-sparse-indexes.md). It's read at
+index root, its current data page, its name), one per index (its
+fields, root and flags: unique, sparse) [§9](spec/09-catalog.md) [§28](spec/28-secondary-indexes.md) [§44](spec/44-sparse-indexes.md), and the
+field-name dictionary's cells [§170](spec/170-field-names-stored-once.md). It's read at
 open and kept in memory, one per commit: a batch works on a copy of
 its own, which becomes the readers' at commit and is dropped if the
 batch fails [§78](spec/78-reads-through-a-snapshot.md).
@@ -304,7 +314,13 @@ in length [§28.2](spec/28-secondary-indexes.md) [§52](spec/52-b-tree-pages-cha
 instead of leaving them half empty [§41](spec/41-compaction.md). A key is at most a quarter
 page, so every page holds at least four. Within a page, a key is found
 by a binary search over the slots, stepping past the tombstones a leaf
-from before §52 may hold [§150](spec/150-a-binary-search-within-b-tree-pages.md).
+from before §52 may hold [§150](spec/150-a-binary-search-within-b-tree-pages.md). A leaf keeps one anchor key, its middle
+entry's when built, and each entry stores the bytes it shares with
+the anchor, then the rest, and its location as varints: neighbouring
+keys share long beginnings, so leaves hold two to three times the
+entries, and each entry still reads on its own [§171](spec/171-index-leaves-stored-after-an-anchor.md). A walk enters
+its first leaf by a binary search, and a count or a skip passes the
+part of a leaf inside its range at once [§172](spec/172-walks-that-pass-part-of-a-leaf.md).
 
 **The primary index** maps each id, 16 bytes, to its document's
 location (page and slot).
@@ -688,31 +704,32 @@ the same documents and indexes and a durable commit everywhere, and
 checks that all four give the same answers [§48](spec/48-benchmarks-against-sqlite-redb-and-sled.md).
 
 Reads are level with SQLite, redb and sled or ahead of them, and so
-are batched inserts and updates in these runs; a full scan and
-compaction are still behind. On an M1 Pro with 100,000
-documents, the median of three runs (with §153):
+are batched inserts and updates in these runs, and the file is the
+smallest; compaction is still behind. On an M1 Pro with 100,000
+documents, the median of three runs (trunkdb with §172, the others as
+of §153):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 42k/s | 40k/s | 41k/s | 27k/s |
-| one commit | 4.5 ms | 4.7 ms | 5.0 ms | 10.1 ms |
-| get by id | 2.0 µs | 16 µs | 2.0 µs | 2.3 µs |
-| 1000 documents by index | 0.94 ms | 1.8 ms | 1.0 ms | 1.9 ms |
+| insert, 1000 per commit | 48k/s | 40k/s | 41k/s | 27k/s |
+| one commit | 4.8 ms | 4.7 ms | 5.0 ms | 10.1 ms |
+| get by id | 2–4 µs | 16 µs | 2.0 µs | 2.3 µs |
+| 1000 documents by index | 0.92 ms | 1.8 ms | 1.0 ms | 1.9 ms |
 | count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
 | count of a range of 1000 | 0.01 ms | 0.02 ms | 0.04 ms | 0.34 ms |
-| count of all 100,000 | 0.09 ms | 0.01 ms | 0.00 ms | 24 ms |
-| oldest 20 of a status | 18.1 µs | 23.4 µs | 16.5 µs | 21.7 µs |
-| page 50 of 20 of a status | 26 µs | 54 µs | 45 µs | 252 µs |
+| count of all 100,000 | 0.07 ms | 0.01 ms | 0.00 ms | 24 ms |
+| oldest 20 of a status | 19.1 µs | 23.4 µs | 16.5 µs | 21.7 µs |
+| page 50 of 20 of a status | 21 µs | 54 µs | 45 µs | 252 µs |
 | first 50 by id | 33 µs | 36 µs | 27 µs | 30 µs |
-| 50 by id after skipping 5000 | 38 µs | 126 µs | 228 µs | 0.97 ms |
-| a tenant's first 20 by id | 22 µs | 1.2 ms | 20 µs | 27 µs |
+| 50 by id after skipping 5000 | 35 µs | 126 µs | 228 µs | 0.97 ms |
+| a tenant's first 20 by id | 23 µs | 1.2 ms | 20 µs | 27 µs |
 | two tenants' first 20 by id | 28 µs | 2.6 ms | 21 µs | 29 µs |
-| two tenants by id, page 25 of 20 | 66 µs | 3.0 ms | 67 µs | 291 µs |
-| scan, 100,000 for a fifth | 58 ms | 43 ms | 54 ms | 67 ms |
-| update, 1000 per commit | 15k/s | 14k/s | 18k/s | 23k/s |
-| delete, 1000 per commit | 31k/s | 19k/s | 25k/s | 36k/s |
+| two tenants by id, page 25 of 20 | 69 µs | 3.0 ms | 67 µs | 291 µs |
+| scan, 100,000 for a fifth | 41 ms | 43 ms | 54 ms | 67 ms |
+| update, 1000 per commit | 22k/s | 14k/s | 18k/s | 23k/s |
+| delete, 1000 per commit | 36k/s | 19k/s | 25k/s | 36k/s |
 | compact | 0.62 s | 0.20 s | 0.41 s | — |
-| file size after compact | 31 MB | 22 MB | 30 MB | — |
+| file size after compact | 18 MB | 22 MB | 30 MB | — |
 
 Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
 - **Through an index, reads are fast:** a count reads no document, and
@@ -723,14 +740,15 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
 - **Still behind:**
   - the count of all documents, which trunkdb counts leaf by leaf where
     the others keep a total;
-  - a scan, 1.3× SQLite: each document's filtered fields are decoded
-    into a small object to be checked;
-  - "first 50 by id", 1.3× redb.
-- **Writes:** inserts 1.05× SQLite's in these runs (0.88× before §151,
-  and SQLite's own runs vary by a tenth from day to day), updates
-  1.07× since a grown document is made room for in place
-  ([§153](spec/153-a-grown-cell-made-room-for-in-place.md)), deletes ahead; redb's and sled's updates are still
-  faster. A batch of updates writes 2.7× the pages of one of inserts,
+  - "first 50 by id", 1.2× redb.
+
+  A scan, 41 ms, is level with SQLite's 43.
+- **Writes:** inserts 1.2× SQLite's in these runs (0.88× before §151,
+  1.05× before §170, and SQLite's own runs vary by a tenth from day to
+  day), updates 1.6×: 1.07× once a grown document was made room for
+  in place ([§153](spec/153-a-grown-cell-made-room-for-in-place.md)), and more since a document stores less (§170);
+  deletes ahead. redb's updates are behind now, sled's a little ahead.
+  A batch of updates writes 2.7× the pages of one of inserts,
   each whole in the WAL (§153).
   The checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
   batches of 1,000 in 100 paid a checkpoint. Most of what is left of a
@@ -739,8 +757,9 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
   a page changed again in its batch is no longer copied ([§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md)), and
   a page changed through `SlottedPage` isn't checked again on every
   read ([§152](spec/152-a-page-changed-through-slottedpage-keeps-its-mark.md)).
-  Compaction inserts its entries one by one (§48.4), and its file is
-  1.4× SQLite's.
+  Compaction inserts its entries one by one (§48.4); its file, 1.4×
+  SQLite's before, is 0.8× since field names are stored once and index
+  leaves after an anchor (§170, §171).
 
 ```
 cd bench && cargo run --release
@@ -772,6 +791,8 @@ Each gap had a measured cause, fixed one at a time:
 | Two tenants' first 20 by id | 1.1 ms | the ranges of an `in`, each in id order, merged by id [§167](spec/167-an-or-of-eqs-merged-by-id.md) |
 | Count of a range | 0.07 ms | entries matched on their bytes, leaves inside the interval counted whole [§104](spec/104-index-entries-matched-on-their-bytes.md) |
 | Two fields of 1000 by index, untyped | 1.6 ms | a selection decoded alone, 1.05 ms, or answered from index entries, 0.7 ms [§106](spec/106-projection-a-select-of-fields.md) |
+| File size after compact, updates | 31 MB, 16k/s | field names stored once, numbers as varints [§170](spec/170-field-names-stored-once.md), index leaves stored after an anchor [§171](spec/171-index-leaves-stored-after-an-anchor.md) |
+| Page 50 of 20, skip 5000, count of 1000, with packed leaves | 43 µs, 46 µs, 0.03 ms | walks that pass part of a leaf [§172](spec/172-walks-that-pass-part-of-a-leaf.md) |
 
 Still behind: in a scan, the small object each document's filtered
 fields are decoded into; in a batched commit, the CPU (§150). The copy
@@ -849,7 +870,8 @@ src/
 ├── serde_stored.rs    a stored document straight into T, for typed reads
 ├── json.rs            tagged JSON <-> Document, lossless
 ├── id.rs              IdGenerator + UuidV7Generator
-├── catalog.rs         collections and their indexes (page 1)
+├── catalog.rs         collections, their indexes and the field names (page 1)
+├── names.rs           the dictionary of field names stored documents number
 ├── data.rs            documents on data pages, overflow chains
 ├── free_space.rs      FreeSpace: data pages with room, by free bytes
 ├── storage/
@@ -867,7 +889,7 @@ src/
 │   ├── mod.rs         Index trait
 │   ├── btree.rs       BTreeIndex: every index, primary and secondary
 │   ├── key.rs         index key encoding, KeyRange
-│   ├── leaf.rs        leaf entry encoding
+│   ├── leaf.rs        leaf entries, stored after the leaf's anchor
 │   ├── branch.rs      branch entry encoding
 │   └── in_memory.rs   InMemoryIndex: a fake, for tests
 ├── durability/

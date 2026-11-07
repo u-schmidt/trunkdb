@@ -41,22 +41,27 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// before it can't decode; 12 = every document an object (SPEC §95): a
 /// build before it could write one that isn't, which reads of 12 rely on
 /// there being none; 13 = binary in index keys (SPEC §166): a build
-/// before it would leave their entries behind when it deletes.
-const FORMAT_VERSION: u32 = 13;
+/// before it would leave their entries behind when it deletes; 14 =
+/// field names stored once and varints in documents (SPEC §170), and
+/// index leaves stored after an anchor (SPEC §171): a build before it
+/// can't decode their tags, nor read the leaves.
+const FORMAT_VERSION: u32 = 14;
 /// Older formats this build opens as they are, because such a file *is*
 /// a valid `FORMAT_VERSION` file — one that uses none of what came since
 /// (for 4: unique indexes; for 8: a document's `_id` stored in it too,
 /// which reads replace with the cell's; for 9: no index holding an id,
 /// which `Database::open` makes sure of first; for 11: no document that
 /// isn't an object, which `Database::open` makes sure of too, SPEC §95;
-/// for 12: no index holding binary, made sure of as for 9, SPEC §166).
+/// for 12: no index holding binary, made sure of as for 9, SPEC §166;
+/// for 13: documents in the encoding before §170 and plain index
+/// leaves, which reads decode, §171).
 /// Every header write stamps
 /// `FORMAT_VERSION`, and the first page written in a batch writes the
 /// header too if it's older (SPEC §59) — so a file that uses something
 /// newer always says so, and an older build refuses it instead of
 /// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
 /// the checksum (6), and uses the bytes where it now goes.
-const COMPATIBLE_OLDER_FORMATS: [u32; 7] = [6, 7, 8, 9, 10, 11, 12];
+const COMPATIBLE_OLDER_FORMATS: [u32; 8] = [6, 7, 8, 9, 10, 11, 12, 13];
 /// The oldest format an open reads, for `FormatError::Older`.
 const OLDEST_READABLE_FORMAT: u32 = COMPATIBLE_OLDER_FORMATS[0];
 pub(crate) const HEADER_PAGE: PageId = 0;

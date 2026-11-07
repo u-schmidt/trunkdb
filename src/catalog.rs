@@ -2,8 +2,10 @@ use crate::Result;
 use crate::changes::ChangeLog;
 use crate::decode::{take, take_u8, take_u64};
 use crate::free_space::FreeSpace;
+use crate::names::FieldNames;
 use crate::storage::{PageId, PageStore, PageType, SlottedPage};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const CATALOG_PAGE_ID: PageId = 1;
 /// Longest collection name, in UTF-8 bytes. A catalog cell has to fit in
@@ -24,6 +26,12 @@ const KIND_UNIQUE_INDEX: u8 = 2;
 const KIND_INDEX_WITH_FLAGS: u8 = 3;
 const FLAG_UNIQUE: u8 = 1;
 const FLAG_SPARSE: u8 = 2;
+/// Field names of the file's dictionary (`names.rs`, file format 14):
+/// `[u8 kind = 4][u32 first number]`, then each name as `[u8
+/// length][name]`, numbered on from the first.
+const KIND_FIELD_NAMES: u8 = 4;
+/// Most bytes of names in one cell: a batch adding more writes several.
+const NAMES_PER_CELL: usize = 1024;
 
 #[derive(Clone, Copy)]
 pub struct CollectionMeta {
@@ -195,6 +203,9 @@ pub struct Catalog {
     /// (SPEC §135): the batch's own, like the rest of its catalog, and
     /// taken out before the catalog is published. `None` otherwise.
     changes: Option<ChangeLog>,
+    /// The file's dictionary of field names, shared with the snapshots
+    /// and reads that have it: a batch adding names copies it first.
+    names: Arc<FieldNames>,
 }
 
 impl Catalog {
@@ -236,6 +247,7 @@ impl Catalog {
     /// `&mut`, not `&`.
     pub fn load(store: &mut dyn PageStore) -> std::io::Result<Self> {
         let mut collections = HashMap::new();
+        let mut name_cells = std::collections::BTreeMap::new();
         let mut indexes: HashMap<String, Vec<IndexMeta>> = HashMap::new();
         let mut page_id = CATALOG_PAGE_ID;
         // Catalog pages link to the next; one seen twice is a loop, which
@@ -287,6 +299,13 @@ impl Catalog {
                     Entry::Index(collection, index) => {
                         indexes.entry(collection).or_default().push(index);
                     }
+                    Entry::Names(first, list) => {
+                        if name_cells.insert(first, list).is_some() {
+                            return Err(corrupt(format!(
+                                "two catalog cells number field names from {first}"
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -302,12 +321,58 @@ impl Catalog {
                 "an index belongs to collection {orphan:?}, which doesn't exist"
             )));
         }
+        let mut names = FieldNames::default();
+        for (first, list) in name_cells {
+            if first as usize != names.len() {
+                return Err(corrupt(format!(
+                    "field names numbered from {first} follow {} names",
+                    names.len()
+                )));
+            }
+            for name in list {
+                if !names.add(&name) {
+                    return Err(corrupt(format!(
+                        "field name {name:?} can't be in the dictionary, or comes twice"
+                    )));
+                }
+            }
+        }
         Ok(Catalog {
             collections,
             indexes,
             free_space: HashMap::new(),
             changes: None,
+            names: Arc::new(names),
         })
+    }
+
+    /// The file's dictionary of field names.
+    pub fn names(&self) -> &Arc<FieldNames> {
+        &self.names
+    }
+
+    /// Adds the names of `doc` the dictionary doesn't have yet and can
+    /// take, and writes them to the catalog's pages: before `doc` is
+    /// stored, so it is stored with them. Nothing to write, nearly
+    /// always.
+    pub fn learn(
+        &mut self,
+        store: &mut dyn PageStore,
+        doc: &crate::Document,
+    ) -> std::io::Result<()> {
+        let unknown = self.names.unknown(doc);
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let first = self.names.len() as u32;
+        let names = Arc::make_mut(&mut self.names);
+        for name in &unknown {
+            names.add(name);
+        }
+        for cell in encode_names(first, &unknown) {
+            append_cell(store, &cell)?;
+        }
+        Ok(())
     }
 
     /// The catalog's own pages: the chain from page 1.
@@ -331,7 +396,7 @@ impl Catalog {
     }
 
     /// Every collection's name, in no particular order.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
+    pub fn collection_names(&self) -> impl Iterator<Item = &str> {
         self.collections.keys().map(String::as_str)
     }
 
@@ -346,10 +411,18 @@ impl Catalog {
     /// each collection by name, then its indexes — each on the first page
     /// with room, as `append_cell` puts them.
     pub(crate) fn rebuilt_pages(&self) -> u64 {
-        let mut names: Vec<&str> = self.names().collect();
+        let mut names: Vec<&str> = self.collection_names().collect();
         names.sort();
         let empty = SlottedPage::new(PageType::Catalog).free_space();
         let mut rooms = vec![empty];
+        let all: Vec<String> = self.names.iter().map(str::to_string).collect();
+        for cell in encode_names(0, &all) {
+            let needed = SlottedPage::space_needed(cell.len());
+            match rooms.iter_mut().find(|room| **room >= needed) {
+                Some(room) => *room -= needed,
+                None => rooms.push(empty - needed),
+            }
+        }
         for name in names {
             let meta = self.collections[name];
             let cells = std::iter::once(encode_collection(name, &meta).len()).chain(
@@ -527,7 +600,10 @@ impl Catalog {
 /// (SPEC §10.7).
 fn allocate_index_root(store: &mut dyn PageStore) -> std::io::Result<PageId> {
     let root = store.allocate_page()?;
-    store.write_page(root, SlottedPage::new(PageType::IndexLeaf).into_page())?;
+    store.write_page(
+        root,
+        SlottedPage::new(PageType::IndexLeafPacked).into_page(),
+    )?;
     Ok(root)
 }
 
@@ -596,6 +672,29 @@ fn check_len(what: &str, name: &str, max: usize) -> Result<()> {
 enum Entry {
     Collection(String, CollectionMeta),
     Index(String, IndexMeta),
+    /// Field names, numbered from the first.
+    Names(u32, Vec<String>),
+}
+
+/// `names`, numbered from `first`, in cells of `KIND_FIELD_NAMES`.
+fn encode_names(first: u32, names: &[String]) -> Vec<Vec<u8>> {
+    let mut cells = Vec::new();
+    let mut cell = Vec::new();
+    for (number, name) in (first..).zip(names) {
+        if cell.is_empty() {
+            cell.push(KIND_FIELD_NAMES);
+            cell.extend_from_slice(&number.to_le_bytes());
+        }
+        cell.push(name.len() as u8);
+        cell.extend_from_slice(name.as_bytes());
+        if cell.len() >= NAMES_PER_CELL {
+            cells.push(std::mem::take(&mut cell));
+        }
+    }
+    if !cell.is_empty() {
+        cells.push(cell);
+    }
+    cells
 }
 
 /// Where a collection cell's name starts.
@@ -651,6 +750,15 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
     };
     let mut rest = cell;
     let kind = take_u8(&mut rest, "a catalog entry's kind")?;
+    if kind == KIND_FIELD_NAMES {
+        let first = crate::decode::take_u32(&mut rest, "field names' first number")?;
+        let mut names = Vec::new();
+        while !rest.is_empty() {
+            let len = take_u8(&mut rest, "a field name")? as usize;
+            names.push(utf8(take(&mut rest, len, "a field name")?)?);
+        }
+        return Ok(Entry::Names(first, names));
+    }
     let root = take_u64(&mut rest, "a catalog entry's root")?;
     match kind {
         KIND_COLLECTION => {

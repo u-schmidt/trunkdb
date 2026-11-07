@@ -1,7 +1,9 @@
 use crate::decode::{take_array, take_u8, take_u32, take_u64};
-use crate::document::{DocId, Document, decode_document, encode_stored, with_id};
+use crate::document::{DocId, Document, decode_stored, encode_stored, with_id};
 use crate::free_space::FreeSpace;
+use crate::names::FieldNames;
 use crate::storage::{PageId, PageStore, PageType, RecordLocation, SlottedPage, USABLE_PAGE_SIZE};
+use std::sync::Arc;
 
 /// Flags byte value for a document stored entirely inside its cell.
 const INLINE: u8 = 0;
@@ -93,14 +95,17 @@ impl<'a> Cell<'a> {
 ///
 /// A document too large for an empty data page goes to overflow pages
 /// (`write_cell`); its cell is then small and packed like any other.
+/// Its keys are numbered by `names` where it has them: the catalog's
+/// dictionary, which has learned the document's names first.
 pub fn insert_record(
     store: &mut dyn PageStore,
     current: &mut PageId,
     free: &mut FreeSpace,
     id: DocId,
     doc: &Document,
+    names: &FieldNames,
 ) -> std::io::Result<RecordLocation> {
-    let cell = write_cell(store, id, doc)?;
+    let cell = write_cell(store, id, doc, names)?;
     place_cell(store, current, free, &cell)
 }
 
@@ -113,9 +118,10 @@ thread_local! {
 
 pub fn get_record(
     store: &dyn PageStore,
+    names: &Arc<FieldNames>,
     loc: RecordLocation,
 ) -> std::io::Result<(DocId, Document)> {
-    Records::new(store).get(loc)
+    Records::new(store, names).get(loc)
 }
 
 /// Reads documents one after another, keeping the last data page it read:
@@ -126,11 +132,18 @@ pub fn get_record(
 pub struct Records<'a> {
     store: &'a dyn PageStore,
     page: Option<(PageId, SlottedPage)>,
+    /// The dictionary the documents' keys are numbers into: the
+    /// catalog's, as of the reads.
+    names: Arc<FieldNames>,
 }
 
 impl<'a> Records<'a> {
-    pub fn new(store: &'a dyn PageStore) -> Self {
-        Records { store, page: None }
+    pub fn new(store: &'a dyn PageStore, names: &Arc<FieldNames>) -> Self {
+        Records {
+            store,
+            page: None,
+            names: names.clone(),
+        }
     }
 
     pub fn get(&mut self, loc: RecordLocation) -> std::io::Result<(DocId, Document)> {
@@ -146,7 +159,9 @@ impl<'a> Records<'a> {
             }
         };
         match Cell::parse(live_cell(page, loc)?)? {
-            Cell::Inline(id, encoded) => Ok((id, with_id(decode(encoded)?, id))),
+            Cell::Inline(id, encoded) => {
+                Ok((id, with_id(decode_stored(encoded, &self.names)?, id)))
+            }
             Cell::Overflow { id, len, first } => {
                 // `len` is from the file: the chain has to back it up
                 // before it sizes anything (SPEC §55).
@@ -154,7 +169,7 @@ impl<'a> Records<'a> {
                 walk_chain(self.store, first, len, |_page, bytes| {
                     encoded.extend_from_slice(bytes)
                 })?;
-                Ok((id, with_id(decode(&encoded)?, id)))
+                Ok((id, with_id(decode_stored(&encoded, &self.names)?, id)))
             }
         }
     }
@@ -183,6 +198,7 @@ impl Records<'_> {
                     page: page.clone(),
                     slot: loc.slot,
                 },
+                names: self.names.clone(),
             }),
             Cell::Overflow { id, len, first } => {
                 let mut encoded = Vec::with_capacity((len as usize).min(1 << 20));
@@ -192,6 +208,7 @@ impl Records<'_> {
                 Ok(Stored {
                     id,
                     bytes: StoredBytes::Overflow(encoded),
+                    names: self.names.clone(),
                 })
             }
         }
@@ -237,6 +254,7 @@ impl Records<'_> {
 pub struct Stored {
     id: DocId,
     bytes: StoredBytes,
+    names: Arc<FieldNames>,
 }
 
 #[derive(Clone)]
@@ -250,6 +268,11 @@ enum StoredBytes {
 impl Stored {
     pub fn id(&self) -> DocId {
         self.id
+    }
+
+    /// The dictionary its keys are numbers into.
+    pub fn names(&self) -> &FieldNames {
+        &self.names
     }
 
     /// The encoded document (`document::encode_stored`).
@@ -267,7 +290,10 @@ impl Stored {
     pub fn decode(&self) -> std::io::Result<Document> {
         #[cfg(test)]
         DECODED.with(|n| n.set(n.get() + 1));
-        Ok(with_id(decode(self.encoded())?, self.id))
+        Ok(with_id(
+            decode_stored(self.encoded(), &self.names)?,
+            self.id,
+        ))
     }
 
     /// The document as a `T`, straight from its encoding (SPEC §99.4),
@@ -275,14 +301,20 @@ impl Stored {
     pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> crate::Result<T> {
         #[cfg(test)]
         DECODED.with(|n| n.set(n.get() + 1));
-        Ok(crate::serde_stored::from_stored(self.encoded(), self.id)?)
+        Ok(crate::serde_stored::from_stored(
+            self.encoded(),
+            self.id,
+            &self.names,
+        )?)
     }
 
     /// Its top-level fields among `names` (`document::decode_fields`);
     /// `None` for the whole document.
     pub fn fields(&self, names: Option<&[&str]>) -> std::io::Result<Document> {
         match names {
-            Some(names) => crate::document::decode_fields(self.encoded(), self.id, names),
+            Some(fields) => {
+                crate::document::decode_fields(self.encoded(), self.id, fields, &self.names)
+            }
             None => self.decode(),
         }
     }
@@ -312,12 +344,13 @@ pub fn update_record(
     loc: RecordLocation,
     id: DocId,
     doc: &Document,
+    names: &FieldNames,
 ) -> std::io::Result<RecordLocation> {
     let mut page = read_data_page(store, loc.page)?;
     if let Some((len, first)) = Cell::parse(live_cell(&page, loc)?)?.chain() {
         free_chain(store, first, len)?;
     }
-    let cell = write_cell(store, id, doc)?;
+    let cell = write_cell(store, id, doc, names)?;
     if page.update_cell(loc.slot, &cell) {
         note_room(free, *current, loc.page, &page);
         store.write_page(loc.page, page.into_page())?;
@@ -402,8 +435,13 @@ pub fn collection_pages(
 /// fits on an empty data page, otherwise an overflow cell pointing at a
 /// newly written chain. The choice depends on the size alone, so a
 /// document switches kinds when an update moves it across the line.
-fn write_cell(store: &mut dyn PageStore, id: DocId, doc: &Document) -> std::io::Result<Vec<u8>> {
-    let encoded = encode_stored(doc);
+fn write_cell(
+    store: &mut dyn PageStore,
+    id: DocId,
+    doc: &Document,
+    names: &FieldNames,
+) -> std::io::Result<Vec<u8>> {
+    let encoded = encode_stored(doc, names);
     let mut cell = Vec::with_capacity(CELL_HEADER_LEN + encoded.len());
     if SlottedPage::new(PageType::Data).has_room_for(CELL_HEADER_LEN + encoded.len()) {
         cell.push(INLINE);
@@ -669,11 +707,6 @@ fn free_chain(store: &mut dyn PageStore, first: PageId, len: u32) -> std::io::Re
     Ok(())
 }
 
-fn decode(encoded: &[u8]) -> std::io::Result<Document> {
-    let (doc, _rest) = decode_document(encoded)?;
-    Ok(doc)
-}
-
 fn write_or_free(
     store: &mut dyn PageStore,
     current: PageId,
@@ -759,6 +792,7 @@ fn note_room(free: &mut FreeSpace, current: PageId, page_id: PageId, page: &Slot
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::NONE;
     use crate::storage::FileStore;
 
     fn store() -> (tempfile::TempDir, FileStore) {
@@ -790,8 +824,9 @@ mod tests {
             .rev()
             .find(|&n| empty.has_room_for(n))
             .unwrap();
-        // flags + id, then the Binary tag and its u32 length.
-        largest_cell - CELL_HEADER_LEN - 1 - 4
+        // flags + id, then the Binary tag and its varint length, two
+        // bytes for any length a page can hold.
+        largest_cell - CELL_HEADER_LEN - 1 - 2
     }
 
     /// A `PageStore` that counts `read_page` calls.
@@ -826,14 +861,22 @@ mod tests {
         let mut free = FreeSpace::default();
         let locs: Vec<RecordLocation> = (0..30u8)
             .map(|n| {
-                insert_record(&mut store, &mut current, &mut free, id(n), &blob(1000)).unwrap()
+                insert_record(
+                    &mut store,
+                    &mut current,
+                    &mut free,
+                    id(n),
+                    &blob(1000),
+                    &NONE,
+                )
+                .unwrap()
             })
             .collect();
         let pages: Vec<PageId> = locs.iter().map(|loc| loc.page).collect();
         assert!(pages[0] == pages[1] && pages[0] != pages[29], "{pages:?}");
 
         let counting = Counting(&store, std::cell::Cell::new(0));
-        let mut records = Records::new(&counting);
+        let mut records = Records::new(&counting, &NONE);
         for (n, loc) in locs.iter().enumerate() {
             assert_eq!(records.get(*loc).unwrap(), (id(n as u8), blob(1000)));
         }
@@ -852,8 +895,15 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let loc =
-            insert_record(&mut store, &mut current, &mut free, id(1), &Document::Null).unwrap();
+        let loc = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &Document::Null,
+            &NONE,
+        )
+        .unwrap();
         let mut page = read_data_page(&store, loc.page).unwrap();
         let mut cell = page.get_cell(loc.slot).unwrap().to_vec();
         cell[0] = 0x7F;
@@ -861,7 +911,7 @@ mod tests {
         store.write_page(loc.page, page.into_page()).unwrap();
 
         assert_eq!(
-            get_record(&store, loc).unwrap_err().kind(),
+            get_record(&store, &NONE, loc).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
     }
@@ -873,13 +923,13 @@ mod tests {
         let mut free = FreeSpace::default();
 
         let doc = Document::String("Ada".to_string());
-        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc, &NONE).unwrap();
         assert_eq!(
             current, loc.page,
             "the first insert allocates the current page"
         );
 
-        let (found_id, found_doc) = get_record(&store, loc).unwrap();
+        let (found_id, found_doc) = get_record(&store, &NONE, loc).unwrap();
         assert_eq!(found_id, id(1));
         assert_eq!(found_doc, doc);
     }
@@ -890,12 +940,28 @@ mod tests {
         let mut current = 0;
         let mut free = FreeSpace::default();
 
-        let first = insert_record(&mut store, &mut current, &mut free, id(0), &blob(1000)).unwrap();
+        let first = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(0),
+            &blob(1000),
+            &NONE,
+        )
+        .unwrap();
         let mut locs = vec![first];
         while current == first.page {
             let n = locs.len() as u8;
             locs.push(
-                insert_record(&mut store, &mut current, &mut free, id(n), &blob(1000)).unwrap(),
+                insert_record(
+                    &mut store,
+                    &mut current,
+                    &mut free,
+                    id(n),
+                    &blob(1000),
+                    &NONE,
+                )
+                .unwrap(),
             );
         }
 
@@ -912,7 +978,7 @@ mod tests {
         }
         assert_eq!(locs[7].slot, 0);
         for (n, loc) in locs.iter().enumerate() {
-            assert_eq!(get_record(&store, *loc).unwrap().0, id(n as u8));
+            assert_eq!(get_record(&store, &NONE, *loc).unwrap().0, id(n as u8));
         }
     }
 
@@ -927,17 +993,33 @@ mod tests {
             &mut free,
             id(2),
             &Document::Int(1),
+            &NONE,
         )
         .unwrap();
-        let neighbor =
-            insert_record(&mut store, &mut current, &mut free, id(3), &blob(500)).unwrap();
+        let neighbor = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(3),
+            &blob(500),
+            &NONE,
+        )
+        .unwrap();
 
-        let new_loc =
-            update_record(&mut store, &mut current, &mut free, loc, id(2), &blob(3000)).unwrap();
+        let new_loc = update_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            loc,
+            id(2),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
 
         assert_eq!(new_loc, loc);
-        assert_eq!(get_record(&store, loc).unwrap().1, blob(3000));
-        assert_eq!(get_record(&store, neighbor).unwrap().1, blob(500));
+        assert_eq!(get_record(&store, &NONE, loc).unwrap().1, blob(3000));
+        assert_eq!(get_record(&store, &NONE, neighbor).unwrap().1, blob(500));
     }
 
     #[test]
@@ -945,18 +1027,45 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
-        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(3000)).unwrap();
+        let a = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
+        let b = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
 
-        let moved =
-            update_record(&mut store, &mut current, &mut free, a, id(1), &blob(6000)).unwrap();
+        let moved = update_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            a,
+            id(1),
+            &blob(6000),
+            &NONE,
+        )
+        .unwrap();
 
         assert_ne!(moved.page, a.page);
         assert_eq!(current, moved.page, "the move allocated a new current page");
-        assert_eq!(get_record(&store, moved).unwrap(), (id(1), blob(6000)));
-        assert_eq!(get_record(&store, b).unwrap(), (id(2), blob(3000)));
         assert_eq!(
-            get_record(&store, a).unwrap_err().kind(),
+            get_record(&store, &NONE, moved).unwrap(),
+            (id(1), blob(6000))
+        );
+        assert_eq!(get_record(&store, &NONE, b).unwrap(), (id(2), blob(3000)));
+        assert_eq!(
+            get_record(&store, &NONE, a).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData,
             "the old slot is gone"
         );
@@ -967,14 +1076,38 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(5000)).unwrap();
-        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(5000)).unwrap();
+        let a = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(5000),
+            &NONE,
+        )
+        .unwrap();
+        let b = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(5000),
+            &NONE,
+        )
+        .unwrap();
         assert_ne!(a.page, b.page);
         assert_eq!(current, b.page);
 
         // b's page is current: emptied, but kept for the next insert.
         delete_record(&mut store, current, &mut free, b).unwrap();
-        let c = insert_record(&mut store, &mut current, &mut free, id(3), &Document::Null).unwrap();
+        let c = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(3),
+            &Document::Null,
+            &NONE,
+        )
+        .unwrap();
         assert_eq!(c.page, b.page);
 
         // a's page isn't: emptying it frees it for reuse.
@@ -987,9 +1120,33 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
-        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(3000)).unwrap();
-        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(3000)).unwrap();
+        let a = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
+        let b = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
+        let c = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(3),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
         assert_eq!(a.page, b.page);
         assert_ne!(c.page, a.page, "the third didn't fit");
 
@@ -1013,9 +1170,33 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
-        insert_record(&mut store, &mut current, &mut free, id(2), &blob(4000)).unwrap();
-        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(5000)).unwrap();
+        let a = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
+        insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(4000),
+            &NONE,
+        )
+        .unwrap();
+        let c = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(3),
+            &blob(5000),
+            &NONE,
+        )
+        .unwrap();
         assert_ne!(c.page, a.page);
 
         // About 1,100 bytes are left on a's page: more than a page needs
@@ -1028,13 +1209,45 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(3000)).unwrap();
-        insert_record(&mut store, &mut current, &mut free, id(2), &blob(3000)).unwrap();
-        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(5000)).unwrap();
+        let a = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
+        insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(3000),
+            &NONE,
+        )
+        .unwrap();
+        let c = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(3),
+            &blob(5000),
+            &NONE,
+        )
+        .unwrap();
         delete_record(&mut store, current, &mut free, a).unwrap();
 
         // Doesn't fit on the current page, does on a's.
-        let d = insert_record(&mut store, &mut current, &mut free, id(4), &blob(4000)).unwrap();
+        let d = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(4),
+            &blob(4000),
+            &NONE,
+        )
+        .unwrap();
         assert_eq!(d.page, a.page);
         assert_eq!(current, c.page, "the current page stays current");
         assert_eq!(
@@ -1043,7 +1256,7 @@ mod tests {
             "a's page keeps its last room"
         );
         assert_eq!(free.find(1500), None);
-        assert_eq!(get_record(&store, d).unwrap(), (id(4), blob(4000)));
+        assert_eq!(get_record(&store, &NONE, d).unwrap(), (id(4), blob(4000)));
     }
 
     #[test]
@@ -1051,13 +1264,37 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(5000)).unwrap();
-        let b = insert_record(&mut store, &mut current, &mut free, id(2), &blob(6000)).unwrap();
+        let a = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(5000),
+            &NONE,
+        )
+        .unwrap();
+        let b = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(6000),
+            &NONE,
+        )
+        .unwrap();
         assert_ne!(a.page, b.page);
 
         // About 3,000 bytes are left on a's page, no longer current, and
         // 2,000 on b's, too few for c.
-        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(2500)).unwrap();
+        let c = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(3),
+            &blob(2500),
+            &NONE,
+        )
+        .unwrap();
         assert_eq!(c.page, a.page);
     }
 
@@ -1073,7 +1310,9 @@ mod tests {
         let mut current = 0;
         let mut free = FreeSpace::default();
         let small: Vec<RecordLocation> = (0..40)
-            .map(|n| insert_record(&mut store, &mut current, &mut free, id(n), &blob(10)).unwrap())
+            .map(|n| {
+                insert_record(&mut store, &mut current, &mut free, id(n), &blob(10), &NONE).unwrap()
+            })
             .collect();
         let emptied = current;
         assert!(small.iter().all(|loc| loc.page == emptied));
@@ -1082,7 +1321,7 @@ mod tests {
         }
         assert_eq!(current, emptied, "the current page stays, empty");
         let large = blob(largest_inline_blob());
-        let at = insert_record(&mut store, &mut current, &mut free, id(99), &large).unwrap();
+        let at = insert_record(&mut store, &mut current, &mut free, id(99), &large, &NONE).unwrap();
         assert_ne!(at.page, emptied, "the directory left no room for it");
         assert_eq!(current, at.page);
         assert!(
@@ -1097,11 +1336,35 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let a = insert_record(&mut store, &mut current, &mut free, id(1), &blob(4000)).unwrap();
-        insert_record(&mut store, &mut current, &mut free, id(2), &blob(4000)).unwrap();
+        let a = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(4000),
+            &NONE,
+        )
+        .unwrap();
+        insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(4000),
+            &NONE,
+        )
+        .unwrap();
 
         delete_record(&mut store, current, &mut free, a).unwrap();
-        let c = insert_record(&mut store, &mut current, &mut free, id(3), &blob(4000)).unwrap();
+        let c = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(3),
+            &blob(4000),
+            &NONE,
+        )
+        .unwrap();
 
         assert_eq!(c, a, "same page, same (reused) slot");
     }
@@ -1113,22 +1376,33 @@ mod tests {
         let mut free = FreeSpace::default();
         let largest = largest_inline_blob();
 
-        let inline =
-            insert_record(&mut store, &mut current, &mut free, id(1), &blob(largest)).unwrap();
+        let inline = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(largest),
+            &NONE,
+        )
+        .unwrap();
         let overflow = insert_record(
             &mut store,
             &mut current,
             &mut free,
             id(2),
             &blob(largest + 1),
+            &NONE,
         )
         .unwrap();
 
         assert_eq!(flags(&store, inline), INLINE);
         assert_eq!(flags(&store, overflow), OVERFLOW);
-        assert_eq!(get_record(&store, inline).unwrap(), (id(1), blob(largest)));
         assert_eq!(
-            get_record(&store, overflow).unwrap(),
+            get_record(&store, &NONE, inline).unwrap(),
+            (id(1), blob(largest))
+        );
+        assert_eq!(
+            get_record(&store, &NONE, overflow).unwrap(),
             (id(2), blob(largest + 1))
         );
     }
@@ -1138,11 +1412,19 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let small = insert_record(&mut store, &mut current, &mut free, id(1), &blob(100)).unwrap();
+        let small = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(100),
+            &NONE,
+        )
+        .unwrap();
 
         // 3 × capacity, minus the tag and length: exactly three full pages.
         let big = blob(3 * OVERFLOW_CAPACITY - 5);
-        let loc = insert_record(&mut store, &mut current, &mut free, id(2), &big).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(2), &big, &NONE).unwrap();
 
         assert_eq!(
             loc.page, small.page,
@@ -1150,7 +1432,7 @@ mod tests {
         );
         // Data page + 3 overflow pages (+ header, catalog-free store).
         assert_eq!(store.allocate_page().unwrap(), small.page + 4);
-        assert_eq!(get_record(&store, loc).unwrap(), (id(2), big));
+        assert_eq!(get_record(&store, &NONE, loc).unwrap(), (id(2), big));
     }
 
     #[test]
@@ -1160,9 +1442,9 @@ mod tests {
         let mut free = FreeSpace::default();
         let prose = Document::String("It was a dark and stormy night. ".repeat(10_000));
 
-        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &prose).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &prose, &NONE).unwrap();
 
-        assert_eq!(get_record(&store, loc).unwrap(), (id(1), prose));
+        assert_eq!(get_record(&store, &NONE, loc).unwrap(), (id(1), prose));
     }
 
     #[test]
@@ -1170,7 +1452,8 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &blob(10)).unwrap();
+        let loc =
+            insert_record(&mut store, &mut current, &mut free, id(1), &blob(10), &NONE).unwrap();
         let data_page = loc.page;
 
         // Inline → overflow: the cell shrinks to a pointer and stays put.
@@ -1181,11 +1464,12 @@ mod tests {
             loc,
             id(1),
             &blob(20_000),
+            &NONE,
         )
         .unwrap();
         assert_eq!(loc.page, data_page);
         assert_eq!(flags(&store, loc), OVERFLOW);
-        assert_eq!(get_record(&store, loc).unwrap().1, blob(20_000));
+        assert_eq!(get_record(&store, &NONE, loc).unwrap().1, blob(20_000));
 
         // Overflow → larger overflow: the old three pages are reused.
         let loc = update_record(
@@ -1195,18 +1479,27 @@ mod tests {
             loc,
             id(1),
             &blob(30_000),
+            &NONE,
         )
         .unwrap();
-        assert_eq!(get_record(&store, loc).unwrap().1, blob(30_000));
+        assert_eq!(get_record(&store, &NONE, loc).unwrap().1, blob(30_000));
         let high_water = store.allocate_page().unwrap();
         assert_eq!(high_water, data_page + 5, "data page + 4 overflow pages");
         store.free_page(high_water).unwrap();
 
         // Overflow → inline: the chain is freed.
-        let loc =
-            update_record(&mut store, &mut current, &mut free, loc, id(1), &blob(10)).unwrap();
+        let loc = update_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            loc,
+            id(1),
+            &blob(10),
+            &NONE,
+        )
+        .unwrap();
         assert_eq!(flags(&store, loc), INLINE);
-        assert_eq!(get_record(&store, loc).unwrap().1, blob(10));
+        assert_eq!(get_record(&store, &NONE, loc).unwrap().1, blob(10));
         let mut freed: Vec<PageId> = (0..5).map(|_| store.allocate_page().unwrap()).collect();
         freed.sort();
         assert_eq!(freed, (data_page + 1..=data_page + 5).collect::<Vec<_>>());
@@ -1217,8 +1510,17 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let keep = insert_record(&mut store, &mut current, &mut free, id(1), &blob(10)).unwrap();
-        let big = insert_record(&mut store, &mut current, &mut free, id(2), &blob(20_000)).unwrap();
+        let keep =
+            insert_record(&mut store, &mut current, &mut free, id(1), &blob(10), &NONE).unwrap();
+        let big = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(2),
+            &blob(20_000),
+            &NONE,
+        )
+        .unwrap();
 
         delete_record(&mut store, current, &mut free, big).unwrap();
 
@@ -1237,7 +1539,15 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &blob(20_000)).unwrap();
+        let loc = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(20_000),
+            &NONE,
+        )
+        .unwrap();
         let page = read_data_page(&store, loc.page).unwrap();
         let (_len, first) = Cell::parse(page.get_cell(loc.slot).unwrap())
             .unwrap()
@@ -1250,14 +1560,14 @@ mod tests {
         let mut page = store.read_page(second).unwrap().to_vec();
         page[1..9].copy_from_slice(&0u64.to_le_bytes());
         store.write_page(second, page.clone().into()).unwrap();
-        let err = get_record(&store, loc).unwrap_err();
+        let err = get_record(&store, &NONE, loc).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("early"), "{err}");
 
         // Point it at a page that isn't an overflow page.
         page[1..9].copy_from_slice(&loc.page.to_le_bytes());
         store.write_page(second, page.clone().into()).unwrap();
-        let err = get_record(&store, loc).unwrap_err();
+        let err = get_record(&store, &NONE, loc).unwrap_err();
         assert!(err.to_string().contains("isn't an overflow page"), "{err}");
         assert_eq!(
             delete_record(&mut store, current, &mut free, loc)
@@ -1289,7 +1599,7 @@ mod tests {
             ("color", Document::String("black".into())),
             ("_id", Document::Id(id(9))),
         ]);
-        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc).unwrap();
+        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc, &NONE).unwrap();
 
         let page = read_data_page(&store, loc.page).unwrap();
         let cell = page.get_cell(loc.slot).unwrap();
@@ -1303,7 +1613,7 @@ mod tests {
             "nor the one it had"
         );
 
-        let (found, read) = get_record(&store, loc).unwrap();
+        let (found, read) = get_record(&store, &NONE, loc).unwrap();
         assert_eq!(found, id(1));
         let Document::Object(fields) = read else {
             panic!("an object")
@@ -1321,8 +1631,15 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let loc =
-            insert_record(&mut store, &mut current, &mut free, id(1), &Document::Null).unwrap();
+        let loc = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &Document::Null,
+            &NONE,
+        )
+        .unwrap();
         let mut page = read_data_page(&store, loc.page).unwrap();
         let old = object(&[("_id", Document::Id(id(7))), ("n", Document::Int(5))]);
         let mut cell = vec![INLINE];
@@ -1331,7 +1648,7 @@ mod tests {
         assert!(page.update_cell(loc.slot, &cell));
         store.write_page(loc.page, page.into_page()).unwrap();
 
-        let (_, read) = get_record(&store, loc).unwrap();
+        let (_, read) = get_record(&store, &NONE, loc).unwrap();
         assert_eq!(
             read,
             object(&[("_id", Document::Id(id(1))), ("n", Document::Int(5))])
@@ -1345,7 +1662,15 @@ mod tests {
         let (_dir, mut store) = store();
         let mut current = 0;
         let mut free = FreeSpace::default();
-        let loc = insert_record(&mut store, &mut current, &mut free, id(1), &blob(20_000)).unwrap();
+        let loc = insert_record(
+            &mut store,
+            &mut current,
+            &mut free,
+            id(1),
+            &blob(20_000),
+            &NONE,
+        )
+        .unwrap();
         let mut page = read_data_page(&store, loc.page).unwrap();
         let (_len, first) = Cell::parse(page.get_cell(loc.slot).unwrap())
             .unwrap()
@@ -1359,7 +1684,7 @@ mod tests {
         assert!(page.update_cell(loc.slot, &cell));
         store.write_page(loc.page, page.into_page()).unwrap();
 
-        let err = get_record(&store, loc).unwrap_err();
+        let err = get_record(&store, &NONE, loc).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("comes twice"), "{err}");
     }
@@ -1372,7 +1697,8 @@ mod tests {
         let mut current = 0;
         let mut free = FreeSpace::default();
         for doc in [Document::Int(5), blob(20_000)] {
-            let loc = insert_record(&mut store, &mut current, &mut free, id(1), &doc).unwrap();
+            let loc =
+                insert_record(&mut store, &mut current, &mut free, id(1), &doc, &NONE).unwrap();
             let page = read_data_page(&store, loc.page).unwrap();
             let cell = page.get_cell(loc.slot).unwrap().to_vec();
             let shortest = match doc {
@@ -1402,7 +1728,7 @@ mod tests {
         let _catalog = crate::catalog::Catalog::load(&mut store).unwrap();
         let bogus_loc = RecordLocation { page: 1, slot: 0 };
 
-        let err = get_record(&store, bogus_loc).unwrap_err();
+        let err = get_record(&store, &NONE, bogus_loc).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

@@ -79,6 +79,7 @@ mod index;
 mod json;
 mod live;
 pub mod map;
+mod names;
 mod path;
 #[cfg(feature = "regex")]
 mod pattern;

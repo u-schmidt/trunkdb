@@ -46,6 +46,41 @@ pub(crate) fn take_u64(bytes: &mut &[u8], what: &str) -> io::Result<u64> {
     take_array(bytes, what).map(u64::from_le_bytes)
 }
 
+/// An unsigned LEB128 varint: seven bits a byte, lowest first, the high
+/// bit set on every byte but the last. At most ten bytes, the tenth
+/// holding only the top bit of a `u64`.
+pub(crate) fn take_varint(bytes: &mut &[u8], what: &str) -> io::Result<u64> {
+    // Most varints are one byte.
+    if let Some((&byte, rest)) = bytes.split_first()
+        && byte < 0x80
+    {
+        *bytes = rest;
+        return Ok(u64::from(byte));
+    }
+    let mut value = 0u64;
+    for (n, &byte) in bytes.iter().enumerate().take(10) {
+        let bits = u64::from(byte & 0x7F);
+        if n == 9 && byte > 1 {
+            return Err(corrupt(format_args!("{what} is a varint past 64 bits")));
+        }
+        value |= bits << (7 * n);
+        if byte & 0x80 == 0 {
+            *bytes = &bytes[n + 1..];
+            return Ok(value);
+        }
+    }
+    Err(corrupt(format_args!("{what} is a varint that doesn't end")))
+}
+
+/// `value` as `take_varint` reads it.
+pub(crate) fn put_varint(mut value: u64, buffer: &mut Vec<u8>) {
+    while value >= 0x80 {
+        buffer.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    buffer.push(value as u8);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +97,41 @@ mod tests {
             "{err}"
         );
         assert_eq!(bytes, [8], "a failed take moves nothing");
+    }
+
+    #[test]
+    fn varints_read_back_and_damage_is_refused() {
+        for value in [
+            0,
+            1,
+            127,
+            128,
+            300,
+            16_383,
+            16_384,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
+            let mut buffer = Vec::new();
+            put_varint(value, &mut buffer);
+            let mut bytes = &buffer[..];
+            assert_eq!(take_varint(&mut bytes, "v").unwrap(), value);
+            assert!(bytes.is_empty());
+        }
+        assert_eq!(
+            [1usize, 127, 128, 16_383, 16_384].map(|v| {
+                let mut b = Vec::new();
+                put_varint(v as u64, &mut b);
+                b.len()
+            }),
+            [1, 1, 2, 2, 3]
+        );
+        let mut unended: &[u8] = &[0x80, 0x80];
+        assert!(take_varint(&mut unended, "v").is_err());
+        assert_eq!(unended.len(), 2, "a failed take moves nothing");
+        let mut too_wide: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02];
+        assert!(take_varint(&mut too_wide, "v").is_err());
+        let mut eleven: &[u8] = &[0x80; 11];
+        assert!(take_varint(&mut eleven, "v").is_err());
     }
 }
