@@ -1123,3 +1123,47 @@ limit, batches and a write-ahead log. Since then:
     build gains the `regex` and `regex-syntax` crates unless it turns
     default features off. No file format changed, so no fixture
     (§120.9): 0.32.0 and 0.33.0 read each other's files.
+143. **Field names stored once, numbers as varints** (§170): a file
+    keeps one dictionary of field names, in the catalog, and a stored
+    document's keys are small numbers into it, where each key was its
+    4-byte length and its bytes; ints are zigzag varints, and lengths
+    and counts varints, where they were 8 and 4 bytes. A name of at
+    most 64 bytes joins the dictionary in the batch that first stores
+    it, and goes with that batch if it fails; past 4,096 names, and for
+    a longer one, the key is stored inline. Documents stay schemaless,
+    and every read gives what was written. `compact` keeps only the
+    names still in use. On the bench's 100,000 tasks, 1,233 data pages
+    where there were 2,223.
+144. **Index leaves stored after an anchor** (§171): each index leaf
+    keeps one anchor key, its middle entry's when the page is built,
+    and each entry the number of bytes it shares with the anchor, the
+    rest of its key, and its location as varints. Every entry still
+    reads on its own, so the binary search within a page, walks,
+    inserts and removes work as they did; a full leaf is rebuilt
+    around a new anchor before it splits. On the bench, 1,654 index
+    pages where there were 2,742; on 150,000 file paths indexed by run
+    and path, 4,970 where there were 9,250.
+145. **Walks that pass part of a leaf** (§172): a walk enters its first
+    leaf by a binary search instead of stepping over the keys before
+    its range, checks the range's end once a leaf, decodes each entry
+    once and copies only the part of a key that changed. A count, and
+    a skip through an index, pass the part of a leaf inside the range
+    at once, where they stepped through the leaves at the range's
+    ends. Page 50 of 20 by an index takes 21 µs where it took 26, a
+    skip of 5,000 by id 35 µs where it took 38.
+146. **A header counting pages the file lacks is refused** (§55.2):
+    a file whose header counts more pages than it holds opened, and
+    `check` sized a map by the count, so a damaged count ran it out
+    of memory. Open now refuses it as damage, after the WAL's
+    recovery. Found by fuzzing; 0.33.0 and older have it too.
+147. **A page whose cells add up to more than it holds is refused**
+    (§55.2): slots on the same bytes could add up past the page, and a
+    delete on it panicked. Its check refuses it as damage now. Found by
+    fuzzing; 0.33.0 and older have it too.
+
+    Items 143–147 → next release: file format 14, which 0.33.0 and
+    older refuse once this build has opened a file for writing; keep
+    an export or a copy from before to go back. Opening an older file converts nothing: its
+    documents and index leaves read as they are and are stored anew as
+    they are written, all of them by `compact`. Nothing to adapt in a
+    program. A fixture of format 14 comes with the release (§120.9).

@@ -16,13 +16,14 @@
 //! the selection hands out: named the same way, never `_id`, and what's
 //! left keeps its order, an object emptied by them included.
 
-use crate::decode::{take_u8, take_u32};
+use crate::decode::take_u8;
 use crate::document::{
-    DocId, Document, ID_FIELD, TAG_OBJECT, decode_document, decode_value, encodes_object,
-    skip_value, take_str, with_id,
+    DocId, Document, ID_FIELD, decode_stored, decode_value, encodes_object, is_object_tag,
+    skip_value, take_count, take_key, with_id,
 };
 use crate::index::key;
 use crate::map::Map;
+use crate::names::FieldNames;
 
 /// What is selected at one place in a document.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,11 +125,17 @@ impl Selection {
     /// (SPEC §99.2), so the selection is damaged exactly where the whole
     /// document is. A stored `_id` (files before §59) is passed over, as
     /// `with_id` replaces it.
-    pub fn decode(&self, encoded: &[u8], id: DocId) -> std::io::Result<Document> {
+    pub fn decode(
+        &self,
+        encoded: &[u8],
+        id: DocId,
+        names: &FieldNames,
+    ) -> std::io::Result<Document> {
         if !encodes_object(encoded) {
-            return Ok(with_id(decode_document(encoded)?.0, id));
+            return Ok(with_id(decode_stored(encoded, names)?, id));
         }
         // `_id` alone still walks the document: damage reads as damage.
+        let tag = encoded[0];
         let mut bytes = &encoded[1..];
         let levels = Document::MAX_NESTING - 1;
         let fields = match (&self.root, &self.except) {
@@ -139,13 +146,25 @@ impl Selection {
             (Node::Whole, Node::Fields(except)) => {
                 let mut out = Map::new();
                 out.insert(ID_FIELD.to_string(), Document::Id(id));
-                decode_except(&mut bytes, except, levels, true, &mut out)?;
+                let at = Walk {
+                    tag,
+                    levels,
+                    top: true,
+                    names,
+                };
+                decode_except(&mut bytes, except, at, &mut out)?;
                 return Ok(Document::Object(out));
             }
         };
         let mut out = Map::with_capacity(fields.len() + 1);
         out.insert(ID_FIELD.to_string(), Document::Id(id));
-        decode_object(&mut bytes, fields, levels, true, &mut out)?;
+        let at = Walk {
+            tag,
+            levels,
+            top: true,
+            names,
+        };
+        decode_object(&mut bytes, fields, at, &mut out)?;
         Ok(self.take_out(Document::Object(out)))
     }
 
@@ -249,39 +268,66 @@ fn remove(map: &mut Map, fields: &[(String, Node)]) {
     }
 }
 
+/// Where an encoded object is being read: its tag, which says how its
+/// keys are written; `levels` as for `decode_value`, how many more
+/// objects or arrays may open inside it; `top`, the document itself,
+/// whose stored `_id` is passed over; the dictionary its keys are
+/// numbers into.
+#[derive(Clone, Copy)]
+struct Walk<'n> {
+    tag: u8,
+    levels: usize,
+    top: bool,
+    names: &'n FieldNames,
+}
+
+impl<'n> Walk<'n> {
+    /// An object inside, its tag taken from `bytes`.
+    fn inner(self, bytes: &mut &[u8]) -> std::io::Result<Walk<'n>> {
+        Ok(Walk {
+            tag: take_u8(bytes, "a document's type tag")?,
+            levels: self.levels - 1,
+            top: false,
+            names: self.names,
+        })
+    }
+}
+
 /// An encoded object into `out`, less the excepted `fields`, skipped
-/// unbuilt with their checks; `bytes`, `levels` and `top` as for
-/// `decode_object`. A field excepted in part is opened where it is an
-/// object, and decoded whole where it isn't.
+/// unbuilt with their checks; `bytes` at its length (after the tag). A
+/// field excepted in part is opened where it is an object, and decoded
+/// whole where it isn't.
 fn decode_except(
     bytes: &mut &[u8],
     fields: &[(String, Node)],
-    levels: usize,
-    top: bool,
+    at: Walk,
     out: &mut Map,
 ) -> std::io::Result<()> {
-    let count = take_u32(bytes, "an object's length")?;
+    let (levels, names) = (at.levels, at.names);
+    let count = take_count(bytes, at.tag, "an object's length")?;
     for _ in 0..count {
-        let key = take_str(bytes, "a key")?;
-        if top && key == ID_FIELD {
-            skip_value(bytes, levels)?;
+        let key = take_key(bytes, at.tag, names)?;
+        if at.top && key == ID_FIELD {
+            skip_value(bytes, levels, names)?;
             continue;
         }
         let value = match fields.iter().find(|(name, _)| name == key) {
-            None => decode_value(bytes, levels)?,
+            None => decode_value(bytes, levels, names)?,
             Some((_, Node::Whole)) => {
-                skip_value(bytes, levels)?;
+                skip_value(bytes, levels, names)?;
                 continue;
             }
             // An object too deep to open is decoded: `decode_value`
             // reports it.
-            Some((_, Node::Fields(inner))) if bytes.first() == Some(&TAG_OBJECT) && levels > 0 => {
-                take_u8(bytes, "a document's type tag")?;
+            Some((_, Node::Fields(inner)))
+                if bytes.first().is_some_and(|t| is_object_tag(*t)) && levels > 0 =>
+            {
                 let mut kept = Map::new();
-                decode_except(bytes, inner, levels - 1, false, &mut kept)?;
+                let inside = at.inner(bytes)?;
+                decode_except(bytes, inner, inside, &mut kept)?;
                 Document::Object(kept)
             }
-            Some(_) => decode_value(bytes, levels)?,
+            Some(_) => decode_value(bytes, levels, names)?,
         };
         out.insert(key.to_string(), value);
     }
@@ -289,31 +335,29 @@ fn decode_except(
 }
 
 /// An encoded object's `fields` into `out`, in the selection's order,
-/// `bytes` at its length (after the tag). `levels` as for
-/// `decode_value`: how many more objects or arrays may open inside it.
-/// `top`: the document itself, whose stored `_id` is passed over.
+/// `bytes` at its length (after the tag).
 fn decode_object(
     bytes: &mut &[u8],
     fields: &[(String, Node)],
-    levels: usize,
-    top: bool,
+    at: Walk,
     out: &mut Map,
 ) -> std::io::Result<()> {
+    let (levels, names) = (at.levels, at.names);
     let mut slots: Vec<Option<Document>> = vec![None; fields.len()];
-    let count = take_u32(bytes, "an object's length")?;
+    let count = take_count(bytes, at.tag, "an object's length")?;
     for _ in 0..count {
-        let key = take_str(bytes, "a key")?;
-        let at = match top && key == ID_FIELD {
+        let key = take_key(bytes, at.tag, names)?;
+        let found = match at.top && key == ID_FIELD {
             true => None,
             false => fields.iter().position(|(name, _)| name == key),
         };
-        let Some(at) = at else {
-            skip_value(bytes, levels)?;
+        let Some(found) = found else {
+            skip_value(bytes, levels, names)?;
             continue;
         };
-        slots[at] = match &fields[at].1 {
-            Node::Whole => Some(decode_value(bytes, levels)?),
-            Node::Fields(inner) => decode_inner(bytes, inner, levels)?,
+        slots[found] = match &fields[found].1 {
+            Node::Whole => Some(decode_value(bytes, levels, names)?),
+            Node::Fields(inner) => decode_inner(bytes, inner, at)?,
         };
     }
     for ((name, _), slot) in fields.iter().zip(slots) {
@@ -324,21 +368,22 @@ fn decode_object(
     Ok(())
 }
 
-/// One value selected in part: an object's `fields`, `None` if it isn't
-/// an object or has none of them — skipped, with its checks, either way.
+/// One value selected in part, in the object `at`: an object's
+/// `fields`, `None` if it isn't an object or has none of them — skipped,
+/// with its checks, either way.
 fn decode_inner(
     bytes: &mut &[u8],
     fields: &[(String, Node)],
-    levels: usize,
+    at: Walk,
 ) -> std::io::Result<Option<Document>> {
     // An object too deep to open is skipped: `skip_value` reports it.
-    if bytes.first() != Some(&TAG_OBJECT) || levels == 0 {
-        skip_value(bytes, levels)?;
+    if !bytes.first().is_some_and(|t| is_object_tag(*t)) || at.levels == 0 {
+        skip_value(bytes, at.levels, at.names)?;
         return Ok(None);
     }
-    take_u8(bytes, "a document's type tag")?;
+    let inside = at.inner(bytes)?;
     let mut inner = Map::with_capacity(fields.len());
-    decode_object(bytes, fields, levels - 1, false, &mut inner)?;
+    decode_object(bytes, fields, inside, &mut inner)?;
     Ok((!inner.is_empty()).then_some(Document::Object(inner)))
 }
 
@@ -446,6 +491,11 @@ fn build(
 
 #[cfg(test)]
 mod tests {
+    use crate::names::sample;
+
+    fn decode_document(encoded: &[u8]) -> std::io::Result<(Document, &[u8])> {
+        decode_stored(encoded, &sample()).map(|doc| (doc, &[][..]))
+    }
     use super::*;
 
     fn doc(json: &str) -> Document {
@@ -573,7 +623,7 @@ mod tests {
     fn a_selection_is_damaged_when_the_whole_is() {
         let doc =
             doc(r#"{"a":1,"s":"héllo","n":[1,{"x":"y"}],"o":{"p":true,"q":{"r":"t"}},"bin":null}"#);
-        let encoded = crate::document::encode_stored(&doc);
+        let encoded = crate::document::encode_stored(&doc, &sample());
         let id = DocId([3; 16]);
         let mut cases: Vec<Vec<u8>> = (0..encoded.len()).map(|n| encoded[..n].to_vec()).collect();
         for at in 0..encoded.len() {
@@ -600,7 +650,7 @@ mod tests {
                 .map_err(|e| e.to_string());
             for paths in selections {
                 let selected = Selection::new(paths.iter().copied())
-                    .decode(&bytes, id)
+                    .decode(&bytes, id, &sample())
                     .map(|_| ())
                     .map_err(|e| e.to_string());
                 assert_eq!(selected, whole, "{paths:?} of {bytes:?}");
@@ -608,7 +658,7 @@ mod tests {
             for paths in excepts {
                 let left = Selection::everything()
                     .excepting(paths.iter().copied())
-                    .decode(&bytes, id)
+                    .decode(&bytes, id, &sample())
                     .map(|_| ())
                     .map_err(|e| e.to_string());
                 assert_eq!(left, whole, "except {paths:?} of {bytes:?}");
@@ -627,7 +677,7 @@ mod tests {
                 "_id":"stored","z":{"y":{"x":{}}}}"#,
         );
         let encodings = [
-            crate::document::encode_stored(&stored),
+            crate::document::encode_stored(&stored, &sample()),
             crate::document::encode_document(&stored),
         ];
         let id = DocId([7; 16]);
@@ -648,7 +698,7 @@ mod tests {
                     .into_iter()
                     .flat_map(|s| encodings.iter().map(move |e| (s.clone(), e)))
                     {
-                        let decoded = selection.decode(encoded, id).unwrap();
+                        let decoded = selection.decode(encoded, id, &sample()).unwrap();
                         let expected = selection.project(whole.clone());
                         assert_eq!(decoded.to_string(), expected.to_string(), "{selection:?}");
                     }

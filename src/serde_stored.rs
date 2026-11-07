@@ -17,11 +17,13 @@
 //! the nesting limit included, and a document that is both damaged and
 //! of the wrong type for `T` is reported as damaged.
 
-use crate::decode::{take_array, take_u8, take_u32};
+use crate::decode::{take_array, take_u8};
 use crate::document::{
-    self, DocId, Document, ID_FIELD, TAG_ARRAY, TAG_BINARY, TAG_BOOL, TAG_DATETIME, TAG_FLOAT,
-    TAG_ID, TAG_INT, TAG_NULL, TAG_OBJECT, TAG_STRING,
+    self, DocId, Document, ID_FIELD, TAG_ARRAY, TAG_BINARY, TAG_BOOL, TAG_BYTES, TAG_DATETIME,
+    TAG_FIELDS, TAG_FLOAT, TAG_ID, TAG_INT, TAG_LIST, TAG_NULL, TAG_OBJECT, TAG_STRING, TAG_TEXT,
+    TAG_VARINT,
 };
+use crate::names::FieldNames;
 use crate::serde_bridge::DocumentError;
 use crate::serde_bridge::Reader;
 use serde::de::{
@@ -34,19 +36,21 @@ use std::fmt;
 pub(crate) fn from_stored<T: DeserializeOwned>(
     encoded: &[u8],
     id: DocId,
+    names: &FieldNames,
 ) -> Result<T, StoredError> {
     let mut bytes = encoded;
     let value = Value {
         bytes: &mut bytes,
         levels: Document::MAX_NESTING,
         id: Some(id),
+        names,
     };
     match T::deserialize(value) {
         // Damage first, as the full decode finds it before any value
         // reaches `T`.
         Err(StoredError::Message(message)) => {
             let mut whole = encoded;
-            document::skip_value(&mut whole, Document::MAX_NESTING)
+            document::skip_value(&mut whole, Document::MAX_NESTING, names)
                 .map_err(StoredError::Damaged)?;
             Err(StoredError::Message(message))
         }
@@ -95,14 +99,16 @@ fn damaged(e: std::io::Error) -> StoredError {
 
 /// One encoded value at the front of `bytes`, which moves past it.
 /// `levels` as in `document::decode_value`. `id`, only for the document
-/// itself: its `_id`, which goes first.
-struct Value<'a, 'b> {
+/// itself: its `_id`, which goes first. `names`: the dictionary its keys
+/// are numbers into.
+struct Value<'a, 'b, 'n> {
     bytes: &'b mut &'a [u8],
     levels: usize,
     id: Option<DocId>,
+    names: &'n FieldNames,
 }
 
-impl Value<'_, '_> {
+impl Value<'_, '_, '_> {
     fn tag(&self) -> Result<u8, StoredError> {
         let mut peek = *self.bytes;
         take_u8(&mut peek, "a document's type tag").map_err(damaged)
@@ -111,7 +117,7 @@ impl Value<'_, '_> {
     /// The value as a `Document`, as the full decode makes it — for the
     /// shapes handed to the bridge.
     fn decoded(self) -> Result<Document, StoredError> {
-        let value = document::decode_value(self.bytes, self.levels).map_err(damaged)?;
+        let value = document::decode_value(self.bytes, self.levels, self.names).map_err(damaged)?;
         Ok(match self.id {
             Some(id) => document::with_id(value, id),
             None => value,
@@ -121,7 +127,7 @@ impl Value<'_, '_> {
     /// The document itself, and not an object: only damage since §95,
     /// and handed to the bridge whole.
     fn not_an_object(&self) -> Result<bool, StoredError> {
-        Ok(self.id.is_some() && self.tag()? != TAG_OBJECT)
+        Ok(self.id.is_some() && !document::is_object_tag(self.tag()?))
     }
 
     fn too_deep(&self) -> Result<(), StoredError> {
@@ -135,7 +141,7 @@ impl Value<'_, '_> {
     }
 }
 
-impl<'de> Deserializer<'de> for Value<'_, '_> {
+impl<'de> Deserializer<'de> for Value<'_, '_, '_> {
     type Error = StoredError;
 
     /// As the bridge's `deserialize_any` for each kind of `Document`.
@@ -153,19 +159,18 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
         match tag {
             TAG_NULL => visitor.visit_unit(),
             TAG_BOOL => visitor.visit_bool(take_u8(bytes, "a bool").map_err(damaged)? != 0),
-            TAG_INT => {
-                let int = i64::from_le_bytes(take_array(bytes, "an int").map_err(damaged)?);
-                visitor.visit_i64(int)
+            TAG_INT | TAG_VARINT => {
+                visitor.visit_i64(document::take_int(bytes, tag).map_err(damaged)?)
             }
             TAG_FLOAT => {
                 let float = f64::from_le_bytes(take_array(bytes, "a float").map_err(damaged)?);
                 visitor.visit_f64(float)
             }
-            TAG_STRING => {
-                visitor.visit_str(document::take_str(bytes, "a string").map_err(damaged)?)
+            TAG_STRING | TAG_TEXT => {
+                visitor.visit_str(document::take_text(bytes, tag).map_err(damaged)?)
             }
-            TAG_BINARY => {
-                let binary = document::take_len_prefixed(bytes, "binary").map_err(damaged)?;
+            TAG_BINARY | TAG_BYTES => {
+                let binary = document::take_run(bytes, tag, "binary").map_err(damaged)?;
                 visitor.visit_byte_buf(binary.to_vec())
             }
             // As its text, as the bridge hands it over (SPEC §13.5),
@@ -179,23 +184,28 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
                         .encode_lower(&mut text),
                 )
             }
-            TAG_ARRAY => {
+            TAG_ARRAY | TAG_LIST => {
                 Value { bytes, ..self }.too_deep()?;
-                let remaining = take_u32(bytes, "an array's length").map_err(damaged)?;
+                let remaining =
+                    document::take_count(bytes, tag, "an array's length").map_err(damaged)?;
                 let mut items = Items {
                     bytes,
                     remaining,
                     levels: self.levels - 1,
+                    names: self.names,
                 };
                 let value = visitor.visit_seq(&mut items)?;
                 items.finish()?;
                 Ok(value)
             }
-            TAG_OBJECT => {
+            TAG_OBJECT | TAG_FIELDS => {
                 Value { bytes, ..self }.too_deep()?;
-                let remaining = take_u32(bytes, "an object's length").map_err(damaged)?;
+                let remaining =
+                    document::take_count(bytes, tag, "an object's length").map_err(damaged)?;
                 let mut entries = Entries {
                     bytes,
+                    tag,
+                    names: self.names,
                     remaining,
                     levels: self.levels - 1,
                     id: self.id,
@@ -264,7 +274,7 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
 
     /// Skipped, with the checks a decode makes, and nothing built.
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, StoredError> {
-        document::skip_value(self.bytes, self.levels).map_err(damaged)?;
+        document::skip_value(self.bytes, self.levels, self.names).map_err(damaged)?;
         visitor.visit_unit()
     }
 
@@ -276,24 +286,25 @@ impl<'de> Deserializer<'de> for Value<'_, '_> {
 }
 
 /// An array's items, `remaining` still to come.
-struct Items<'a, 'b> {
+struct Items<'a, 'b, 'n> {
     bytes: &'b mut &'a [u8],
-    remaining: u32,
+    remaining: u64,
     levels: usize,
+    names: &'n FieldNames,
 }
 
-impl Items<'_, '_> {
+impl Items<'_, '_, '_> {
     /// Past the items the visitor didn't take, checked.
     fn finish(&mut self) -> Result<(), StoredError> {
         while self.remaining > 0 {
             self.remaining -= 1;
-            document::skip_value(self.bytes, self.levels).map_err(damaged)?;
+            document::skip_value(self.bytes, self.levels, self.names).map_err(damaged)?;
         }
         Ok(())
     }
 }
 
-impl<'de> SeqAccess<'de> for Items<'_, '_> {
+impl<'de> SeqAccess<'de> for Items<'_, '_, '_> {
     type Error = StoredError;
 
     fn next_element_seed<S: DeserializeSeed<'de>>(
@@ -308,21 +319,29 @@ impl<'de> SeqAccess<'de> for Items<'_, '_> {
             bytes: self.bytes,
             levels: self.levels,
             id: None,
+            names: self.names,
         };
         seed.deserialize(value).map(Some)
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.remaining as usize)
+        Some(
+            usize::try_from(self.remaining)
+                .unwrap_or(usize::MAX)
+                .min(self.bytes.len()),
+        )
     }
 }
 
 /// An object's entries, `remaining` still to come — for the document
 /// itself (`top`), its `_id` first, and a stored `_id` passed over, as
 /// `with_id` replaces it.
-struct Entries<'a, 'b> {
+struct Entries<'a, 'b, 'n> {
     bytes: &'b mut &'a [u8],
-    remaining: u32,
+    /// The object's tag, which says how its keys are written.
+    tag: u8,
+    names: &'n FieldNames,
+    remaining: u64,
     levels: usize,
     /// The `_id` whose key is still to come.
     id: Option<DocId>,
@@ -333,22 +352,22 @@ struct Entries<'a, 'b> {
     value_pending: bool,
 }
 
-impl Entries<'_, '_> {
+impl Entries<'_, '_, '_> {
     /// Past the entries the visitor didn't take, checked.
     fn finish(&mut self) -> Result<(), StoredError> {
         if std::mem::take(&mut self.value_pending) {
-            document::skip_value(self.bytes, self.levels).map_err(damaged)?;
+            document::skip_value(self.bytes, self.levels, self.names).map_err(damaged)?;
         }
         while self.remaining > 0 {
             self.remaining -= 1;
-            document::take_str(self.bytes, "a key").map_err(damaged)?;
-            document::skip_value(self.bytes, self.levels).map_err(damaged)?;
+            document::take_key(self.bytes, self.tag, self.names).map_err(damaged)?;
+            document::skip_value(self.bytes, self.levels, self.names).map_err(damaged)?;
         }
         Ok(())
     }
 }
 
-impl<'de> MapAccess<'de> for Entries<'_, '_> {
+impl<'de> MapAccess<'de> for Entries<'_, '_, '_> {
     type Error = StoredError;
 
     fn next_key_seed<S: DeserializeSeed<'de>>(
@@ -360,13 +379,13 @@ impl<'de> MapAccess<'de> for Entries<'_, '_> {
             return seed.deserialize(ID_FIELD.into_deserializer()).map(Some);
         }
         if std::mem::take(&mut self.value_pending) {
-            document::skip_value(self.bytes, self.levels).map_err(damaged)?;
+            document::skip_value(self.bytes, self.levels, self.names).map_err(damaged)?;
         }
         while self.remaining > 0 {
             self.remaining -= 1;
-            let key = document::take_str(self.bytes, "a key").map_err(damaged)?;
+            let key = document::take_key(self.bytes, self.tag, self.names).map_err(damaged)?;
             if self.top && key == ID_FIELD {
-                document::skip_value(self.bytes, self.levels).map_err(damaged)?;
+                document::skip_value(self.bytes, self.levels, self.names).map_err(damaged)?;
                 continue;
             }
             self.value_pending = true;
@@ -389,12 +408,14 @@ impl<'de> MapAccess<'de> for Entries<'_, '_> {
             bytes: self.bytes,
             levels: self.levels,
             id: None,
+            names: self.names,
         };
         seed.deserialize(value)
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.remaining as usize + self.id.is_some() as usize)
+        let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        Some(remaining.min(self.bytes.len()) + self.id.is_some() as usize)
     }
 }
 
@@ -402,7 +423,16 @@ impl<'de> MapAccess<'de> for Entries<'_, '_> {
 mod tests {
     use super::*;
     use crate::datetime::DateTime;
-    use crate::document::{decode_document, encode_stored, with_id};
+    use crate::document::{decode_stored, with_id};
+    use crate::names::sample;
+
+    fn encode_stored(doc: &Document) -> Vec<u8> {
+        crate::document::encode_stored(doc, &sample())
+    }
+
+    fn decode_document(encoded: &[u8]) -> std::io::Result<(Document, &[u8])> {
+        decode_stored(encoded, &sample()).map(|doc| (doc, &[][..]))
+    }
     use crate::serde_bridge::from_document;
     use crate::testing::XorShift;
     use serde::Deserialize;
@@ -417,7 +447,7 @@ mod tests {
     }
 
     fn direct<T: DeserializeOwned>(encoded: &[u8], id: DocId) -> Result<T, String> {
-        from_stored(encoded, id).map_err(|e| match e {
+        from_stored(encoded, id, &sample()).map_err(|e| match e {
             StoredError::Damaged(e) => format!("damaged: {e}"),
             StoredError::Message(e) => e.to_string(),
         })

@@ -76,7 +76,11 @@ impl Database {
 
     /// `collections`, of the commit `state` reads.
     pub(crate) fn collections_of(state: &ReadGuard<'_>) -> crate::Result<Vec<String>> {
-        let mut names: Vec<String> = state.catalog().names().map(str::to_string).collect();
+        let mut names: Vec<String> = state
+            .catalog()
+            .collection_names()
+            .map(str::to_string)
+            .collect();
         names.sort();
         Ok(names)
     }
@@ -100,7 +104,7 @@ impl Database {
         let at = state.snapshot();
 
         write_line(&mut out, &object([(HEADER_KEY, EXPORT_VERSION.into())]))?;
-        let mut names: Vec<&str> = at.catalog.names().collect();
+        let mut names: Vec<&str> = at.catalog.collection_names().collect();
         names.sort();
         for name in names {
             let indexes = at
@@ -136,7 +140,7 @@ impl Database {
             summary.collections += 1;
 
             let meta = at.catalog.get(name).expect("a listed collection");
-            let mut records = data::Records::new(&at.store);
+            let mut records = data::Records::new(&at.store, at.catalog.names());
             for (_key, loc) in BTreeIndex::new(meta.index_root).scan(&at.store)? {
                 let (id, doc) = records.get(loc)?;
                 write_line(&mut out, &document_line(id, &doc))?;

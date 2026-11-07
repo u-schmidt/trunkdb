@@ -159,23 +159,25 @@ it holds the file locked.
 `bench/` runs one document workload against trunkdb, SQLite, redb and
 sled, with the same indexes, durable commits everywhere and the same
 answers checked across all four. 100,000 documents on an M1 Pro, the
-median of three runs (with §153):
+median of three runs (trunkdb with §172, the others as of §153):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| get by id | 2.0 µs | 16 µs | 2.0 µs | 2.3 µs |
-| 1000 documents by index | 0.94 ms | 1.8 ms | 1.0 ms | 1.9 ms |
+| get by id | 2–4 µs | 16 µs | 2.0 µs | 2.3 µs |
+| 1000 documents by index | 0.92 ms | 1.8 ms | 1.0 ms | 1.9 ms |
 | count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
-| page 50 of 20 of a status | 26 µs | 54 µs | 45 µs | 252 µs |
-| scan, 100,000 for a fifth | 58 ms | 43 ms | 54 ms | 67 ms |
-| insert, 1000 per commit | 42k/s | 40k/s | 41k/s | 27k/s |
-| update, 1000 per commit | 15k/s | 14k/s | 18k/s | 23k/s |
-| delete, 1000 per commit | 31k/s | 19k/s | 25k/s | 36k/s |
+| page 50 of 20 of a status | 21 µs | 54 µs | 45 µs | 252 µs |
+| scan, 100,000 for a fifth | 41 ms | 43 ms | 54 ms | 67 ms |
+| insert, 1000 per commit | 48k/s | 40k/s | 41k/s | 27k/s |
+| update, 1000 per commit | 22k/s | 14k/s | 18k/s | 23k/s |
+| delete, 1000 per commit | 36k/s | 19k/s | 25k/s | 36k/s |
 | compact | 0.62 s | 0.20 s | 0.41 s | — |
+| file size after compact | 18 MB | 22 MB | 30 MB | — |
 
 Reads through an index are level with the others or ahead, and so are
-batched inserts and updates in these runs; a full scan and compaction
-are still behind. The full table, why each number
+a full scan and batched inserts and updates in these runs, and the
+file is the smallest: field names are stored once and index keys after
+a shared anchor. Compaction is still behind. The full table, why each number
 is what it is, and what each step changed are in
 [DESIGN.md](DESIGN.md#12-performance).
 

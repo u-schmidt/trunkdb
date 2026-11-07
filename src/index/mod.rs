@@ -10,9 +10,11 @@ pub use btree::BTreeIndex;
 pub(crate) use btree::KEYS_COPIED;
 pub(crate) use btree::SortedBuild;
 #[cfg(test)]
+pub(crate) use btree::rewrite_key_in_place;
+#[cfg(test)]
 pub use in_memory::InMemoryIndex;
 pub use key::KeyRange;
-pub(crate) use leaf::MIN_INDEX_ENTRY_LEN;
+pub(crate) use leaf::{MIN_INDEX_ENTRY_LEN, check_packed};
 
 use crate::storage::{PageStore, RecordLocation};
 

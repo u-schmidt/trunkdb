@@ -20,6 +20,8 @@ fn min_cell(page_type: u8) -> usize {
     match page_type {
         t if t == PageType::IndexLeaf as u8 => crate::index::MIN_INDEX_ENTRY_LEN,
         t if t == PageType::IndexBranch as u8 => crate::index::MIN_BRANCH_ENTRY_LEN,
+        // The anchor: its marker byte; `check_packed` checks the rest.
+        t if t == PageType::IndexLeafPacked as u8 => 1,
         _ => 0,
     }
 }
@@ -28,7 +30,11 @@ impl PageType {
     pub fn is_slotted(&self) -> bool {
         matches!(
             self,
-            PageType::Catalog | PageType::Data | PageType::IndexBranch | PageType::IndexLeaf
+            PageType::Catalog
+                | PageType::Data
+                | PageType::IndexBranch
+                | PageType::IndexLeaf
+                | PageType::IndexLeafPacked
         )
     }
 }
@@ -129,12 +135,14 @@ impl SlottedPage {
         }
 
         // Every slot:
+        let mut live = 0;
         for slot in 0..slot_count {
             let at = Self::slot_offset(slot);
             let (offset, length) = (field(at) as usize, field(at + 2) as usize); // usize, no overflow
             if length == 0 {
                 continue; // a tombstone has no cell to check
             }
+            live += length;
             if offset < data_start || offset + length > USABLE_PAGE_SIZE {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -143,6 +151,20 @@ impl SlottedPage {
                     ),
                 ));
             }
+        }
+        // The cells fit below the directory, packed. Cells that share
+        // bytes may pass (§54.2, `check` finds them, §141), but not so
+        // many that they add up to more than the page: found by fuzzing
+        // (SPEC §55), `reclaimable_space` underflowed, and `compact`
+        // could place them nowhere.
+        if live > USABLE_PAGE_SIZE - directory_end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the cells take {live} bytes, more than the {} the page holds below its directory",
+                    USABLE_PAGE_SIZE - directory_end
+                ),
+            ));
         }
 
         // An index page's cells are each long enough for an entry, which
@@ -158,6 +180,24 @@ impl SlottedPage {
                     format!("slot {slot} is {length} bytes, shorter than any entry"),
                 ));
             }
+        }
+        // A packed leaf's entries, against its anchor. The anchor is read
+        // from slot 0 (SPEC §171.4), so slot 0 must hold it: a tombstone
+        // there would let the next live entry pass as the anchor.
+        if buf[0] == PageType::IndexLeafPacked as u8 {
+            if slot_count > 0 && field(Self::slot_offset(0) + 2) == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "a packed index leaf's slot 0, its anchor, is empty",
+                ));
+            }
+            let cells = (0..slot_count).filter_map(|slot| {
+                let at = Self::slot_offset(slot);
+                let (offset, length) = (field(at) as usize, field(at + 2) as usize);
+                (length != 0).then(|| &buf[offset..offset + length])
+            });
+            crate::index::check_packed(cells)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         }
         Ok(())
     }
@@ -486,6 +526,15 @@ impl SlottedPage {
     /// slot directory alone (SPEC §101.3).
     pub fn live_cells(&self) -> usize {
         let directory = &self.buf[HEADER_LEN..Self::slot_offset(self.slot_count())];
+        let (slots, _) = directory.as_chunks::<SLOT_LEN>();
+        slots.iter().filter(|slot| slot[2..4] != [0, 0]).count()
+    }
+
+    /// How many of the slots in `slots` are live, by the directory alone.
+    pub fn live_in(&self, slots: std::ops::Range<u16>) -> usize {
+        let end = slots.end.min(self.slot_count());
+        let start = slots.start.min(end);
+        let directory = &self.buf[Self::slot_offset(start)..Self::slot_offset(end)];
         let (slots, _) = directory.as_chunks::<SLOT_LEN>();
         slots.iter().filter(|slot| slot[2..4] != [0, 0]).count()
     }
@@ -1213,6 +1262,30 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             error.to_string().contains("past the page's end"),
+            "wrong error: {error}"
+        );
+    }
+
+    /// Found by fuzzing (SPEC §55): two slots on the same bytes, each
+    /// inside the page, added up to more than it holds, and
+    /// `reclaimable_space` underflowed on the next delete.
+    #[test]
+    fn from_bytes_rejects_cells_adding_up_to_more_than_the_page() {
+        // Two slots on the same 4,100 bytes, which fit once, not twice.
+        let (offset, length) = ((USABLE_PAGE_SIZE - 4100) as u16, 4100u16);
+        let mut buf = page_bytes_with_slot(offset, length);
+        buf[9..11].copy_from_slice(&2u16.to_le_bytes());
+        buf[17..19].copy_from_slice(&offset.to_le_bytes());
+        buf[19..21].copy_from_slice(&length.to_le_bytes());
+        // One of them alone is a valid page.
+        assert!(SlottedPage::from_bytes(page_bytes_with_slot(offset, length)).is_ok());
+
+        let error = SlottedPage::from_bytes(buf)
+            .err()
+            .expect("cells adding up to more than the page must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("the page holds"),
             "wrong error: {error}"
         );
     }

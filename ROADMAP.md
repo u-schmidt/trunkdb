@@ -52,6 +52,7 @@ All of it is done:
 | 0.31.0 | **A batch's preconditions:** `Batch::require(&collection, filter)`, at least one document matches, and `Batch::require_none`, none does, checked at `commit` at their place in the batch, after the ops before them and under the writer's lock, so no write comes between the check and the batch's own; a failed one writes nothing and returns `Error::PreconditionFailed { collection, op, matched }`; with `Filter::id`, one document held to what was read, a version the program keeps; read as `count` reads, through an index, stopping at the first match; a sort, skip, limit or selection refused **Parameters in a filter's text:** `:name` where a value or a count stands, `status = :status limit :n`, the values passed apart so none can change what the text says; `Template<Filter>`, `Template<Condition>` and `Template<Aggregate>` read and check a text once, `bind(&Params)` makes the filter, `params()` lists the names; a missing value, an unused one or one that doesn't fit a `BindError`; `trunkdb … --param name=value` for `find`, `fields`, `count`, `aggregate`, `update` and `delete` **An OR of ids and indexed conditions:** `_id in (…) or updated > t` reads the ids from the primary index and the rest from an index range, each document once, where it was a scan; `IndexUnion` with `_id` first among its `fields`; a branch neither naming ids nor indexed, or a hint, as before | §162–§164 |
 | 0.32.0 | **Backups a user can trust:** an export ends with a line of its counts, export version 3, which an import checks, so one cut short fails instead of restoring in part; `Summary::ended`; `verify_export` and `trunkdb verify`, a restore into a file of its own, `check`ed, counted and deleted, a `Verified` report; a section of the guide on backups while running, restores, copying the file and its WAL, and moving between releases; 0.31.0 and older refuse version 3 **Binary in indexes, in the order of its bytes:** compared byte by byte as SQLite compares a BLOB, `<`, ranges and `starts with` a binary prefix, in the text as `{"$binary": …}`; sorted after date-times, where it came last with arrays and objects; an index key, so `=`, ranges, prefixes and sorts read just their entries, a count and a selection none, a unique index refusing the same bytes twice; file format 13, an older file's indexes holding binary rebuilt at its first open; on 100,000 file paths, binary instead of hex text a quarter of the file and a third of the index smaller **An OR of `Eq`s merged by id:** a sort by `_id` with a limit after an OR or an `in` whose ranges `Eq`s fix whole, one index or several, walks the ranges side by side and merges them by id, stopping at the limit, where it read every match and sorted them; `_id` comparisons narrow each range, so paging by the last id works through `tenant in (…)`; `QueryPlan::IndexUnion` says so in `in_order` | §165–§167 |
 | 0.33.0 | **Writes by a filter in a batch:** `Batch::update_many(&collection, filter, &update)`, the operators made to what the filter finds at `commit`, and `Batch::delete_many`, at their place among the ops, under the writer's lock, sort, skip and limit counting; `commit` returns a `Written`, how many documents each op wrote; `Batch::dry_run`, every op run and rolled back, the counts or the error `commit` would give. **`trunkdb batch <file> <ops.jsonl \| ->`:** one op a line as JSON, `insert`, `update`, `delete`, `require` and `require_none`, committed whole or not at all, with `--param`, `--create` and `--dry-run`, each new id printed, what each line wrote, and the line a failure came from. **A regex:** `Filter::regex(field, Regex)`, `notes matches "time-?out"` in the text, the pattern a parameter too, through the `regex` crate, whose matching is linear in the text, behind the `regex` feature, on by default; a `Regex` is compiled once, when made, at most 4,096 bytes and 1 MiB compiled; a pattern beginning `^` and fixed text, `^Fix`, reads an index as `starts with` does, any other every document | §168–§169 |
+| next | **Field names stored once, numbers as varints:** one dictionary of field names for the file, kept in the catalog, and a stored document's keys as numbers into it; ints, lengths and counts as varints; a name of at most 64 bytes, among the first 4,096, joins, any other key stays inline; schemaless still; `compact` keeps only the names in use; older documents read as they are and are stored anew when written. **Index leaves stored after an anchor:** each leaf keeps one anchor key, its middle one when built, and each entry the bytes it shares with it, then the rest, the location as varints; every entry reads on its own, so the binary search, walks, inserts and removes work as they did; older leaves packed at their first insert or by `compact`. File format 14, which 0.33.0 refuses; on the bench's 100,000 tasks the file 42% smaller, on 150,000 file paths 37%. **Walks that pass part of a leaf:** into the first leaf by a binary search, the range's end checked once a leaf, a key copied only where it differs; a count, and a skip through an index, pass the part of a leaf inside the range at once, so paging, skips and counts got faster than before | §170–§172 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -147,26 +148,6 @@ says where the need or the limit is described.
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
-- **Field names stored once, numbers as varints:** a dictionary of each
-  collection's field names in the catalog, and a document's keys as
-  small numbers into it, where each key is its 4-byte length and its
-  bytes today; ints, lengths and counts as varints, where each is 8 or
-  4 bytes. Schemaless still: a new name just joins the dictionary. Old
-  documents read as before, under a type tag of their own. In a real
-  program's later file, 1,030,000 documents of about 217 bytes each,
-  some 104 of them field names and their lengths and about 90 the
-  values; roughly 100 bytes a document after, a quarter of the file.
-  Shapes, a whole set of names stored once, could follow on top if the
-  numbers still call for it.
-- **Prefix compression in index pages:** each key stored as the bytes
-  it shares with the one before it on the page, and the rest, as
-  RocksDB and WiredTiger do. Neighbouring keys in a compound index share
-  long beginnings: the same first field, the same leading path. In a
-  real program's file of 415 MiB, 257,000 documents with two indexes
-  of (a run's id, a path's 230 bytes of hex) took 229 MiB of
-  index pages against 172 MiB of documents, and `compact` would have
-  freed 78 MiB, mostly half-full index pages. A format change; a binary
-  search within a page (§150) needs restart points to keep its speed.
 - **Longer fuzzing runs,** with AddressSanitizer too, and short ones in
   CI on nightly (§55.6).
 

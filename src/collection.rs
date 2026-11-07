@@ -8,6 +8,7 @@ use crate::explain::{Alternative, EntryCount, Trace};
 use crate::id::IdGenerator;
 use crate::index::{BTreeIndex, Index, KeyRange, key};
 use crate::live::{LiveAggregate, LiveQuery};
+use crate::names::FieldNames;
 use crate::query::{
     Condition, Covering, Decider, Explained, Filter, IndexRange, LastDecision, Matcher,
     OrderedRead, QueryPlan, Rank, Ranking, SortOrder, SortWork, Update, caught,
@@ -91,6 +92,7 @@ impl IndexFields for &[String] {
     }
 }
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// The public-facing API. A `Collection` is a lightweight handle: a clone
 /// of the `Database` handle plus a name, no borrow — so it can be stored,
@@ -1100,7 +1102,8 @@ impl Collection<Document> {
             "a location is only good within one commit"
         );
         let state = self.read()?;
-        Ok(data::Records::new(&state.snapshot().store).stored(loc)?)
+        let at = state.snapshot();
+        Ok(data::Records::new(&at.store, at.catalog.names()).stored(loc)?)
     }
 
     /// Replaces the one document matching `filter`'s conditions (keeping
@@ -1260,7 +1263,7 @@ pub(crate) fn update_by_id(
     accept: &mut dyn FnMut(&Document) -> crate::Result<()>,
 ) -> crate::Result<bool> {
     let (_, loc) = locate(catalog, store, collection, &id)?;
-    let old = with_id(data::get_record(store, loc)?.1, id);
+    let old = with_id(data::get_record(store, catalog.names(), loc)?.1, id);
     let mut new = old.clone();
     update
         .apply(&mut new)
@@ -1589,7 +1592,9 @@ fn stored_at(at: &Reading<'_>, collection: &str, id: &DocId) -> crate::Result<Op
     let Some(loc) = index.lookup(&at.store, &key::primary(*id))? else {
         return Ok(None);
     };
-    Ok(Some(data::Records::new(&at.store).stored(loc)?))
+    Ok(Some(
+        data::Records::new(&at.store, at.catalog.names()).stored(loc)?,
+    ))
 }
 
 /// Document `id` of `collection` as of `at`, whole: what a live query
@@ -1635,7 +1640,7 @@ fn find_in(
 ) -> crate::Result<Vec<Found>> {
     let indexes = catalog.indexes(collection);
     follow_hint(collection, filter, indexes)?;
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, catalog.names());
     if let Some(order) = filter.index_order(indexes) {
         // The skipped matches are passed over by the walk (SPEC §72),
         // unread where their entries decided (§100), and not kept (§101).
@@ -1647,7 +1652,7 @@ fn find_in(
     }
     if let Some(ranges) = filter.merged_by_id(indexes) {
         // An OR's ranges, each in id order, merged by id (SPEC §167).
-        let found = walk_merged_by_id(store, filter, ranges, select, trace)?;
+        let found = walk_merged_by_id(catalog.names(), store, filter, ranges, select, trace)?;
         return found
             .into_iter()
             .map(|(source, _fields)| Ok(source.found(&mut records, None, trace)?))
@@ -1782,7 +1787,7 @@ fn find_by_key(
     )?;
     trace.matched(matched);
     kept.sort_unstable_by(order);
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, catalog.names());
     kept.into_iter()
         .take(keep.unwrap_or(usize::MAX))
         .skip(filter.skip)
@@ -1859,7 +1864,9 @@ impl Found {
             (_, Some(whole), None) => Ok(whole),
             (_, Some(whole), Some(select)) => Ok(select.project(whole)),
             (Some(stored), None, None) => stored.decode(),
-            (Some(stored), None, Some(select)) => select.decode(stored.encoded(), stored.id()),
+            (Some(stored), None, Some(select)) => {
+                select.decode(stored.encoded(), stored.id(), stored.names())
+            }
             (None, None, _) => unreachable!("a match is stored or answered"),
         }
     }
@@ -2178,7 +2185,7 @@ fn walk_in_index_order(
         matcher: filter.matcher(),
         trace,
     };
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, catalog.names());
     let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
         trace.examined();
         let stored = records.stored(*loc)?;
@@ -2232,25 +2239,36 @@ fn walk_in_index_order(
             return Ok(page.results); // an alternative's budget (SPEC §133.4)
         }
         if direct && group.is_empty() {
-            // A leaf passed whole: its entries all rejected, or all
-            // matches the skip passes over — where the group its last
-            // entry is in, which may go on past it, is exact.
-            let whole = entries.whole_leaf()?.map(|leaf| {
-                let decided = decider
-                    .as_mut()
-                    .and_then(|d| d.decide_all(leaf.lowest, leaf.highest));
-                (decided, leaf.entries, spans.exact(leaf.highest))
-            });
-            let passed = match whole {
-                Some((Some(false), n, _)) => Some(n),
-                Some((Some(true), n, true)) if page.skipped + n <= page.skip => {
-                    trace.matched(n);
-                    page.skipped += n;
-                    Some(n)
-                }
+            // A run of a leaf passed at once (`Walk::run`): its entries
+            // all rejected, or all matches the skip passes over — where
+            // the group its last entry is in, which may go on past it, is
+            // exact.
+            let mut run = |most: usize| -> std::io::Result<_> {
+                Ok(entries.run(most)?.map(|leaf| {
+                    let decided = decider
+                        .as_mut()
+                        .and_then(|d| d.decide_all(leaf.lowest, leaf.highest));
+                    (decided, leaf.entries, spans.exact(leaf.highest))
+                }))
+            };
+            // How many it passes, and whether they are matches the skip
+            // passes over.
+            let budget = page.skip.saturating_sub(page.skipped);
+            let passed = match run(usize::MAX)? {
+                Some((Some(false), n, _)) => Some((n, false)),
+                Some((Some(true), n, true)) if n <= budget => Some((n, true)),
+                // The skip ends inside it: the part it passes over.
+                Some((Some(true), _, _)) => match run(budget)? {
+                    Some((Some(true), n, true)) => Some((n, true)),
+                    _ => None,
+                },
                 _ => None,
             };
-            if let Some(n) = passed {
+            if let Some((n, matched)) = passed {
+                if matched {
+                    trace.matched(n);
+                    page.skipped += n;
+                }
                 trace.entries(walk, n);
                 entries.pass_leaf();
                 continue;
@@ -2395,6 +2413,7 @@ impl HandOut<'_> {
 /// it covers a walk's (§101.2). No leaf is passed whole
 /// (§101.3): the next entry may be in another range.
 fn walk_merged_by_id(
+    dictionary: &Arc<FieldNames>,
     store: &dyn PageStore,
     filter: &Filter,
     ranges: Vec<IndexRange>,
@@ -2449,7 +2468,7 @@ fn walk_merged_by_id(
     // A walk by id gives the whole order: only the conditions' fields
     // are looked at (§103.4).
     let names = filter.fields_with(false);
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, dictionary);
     let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
         trace.examined();
         let stored = records.stored(*loc)?;
@@ -2779,7 +2798,7 @@ fn each_candidate<E: From<std::io::Error>>(
     // Where the entries may answer the selection (SPEC §106.5), a match
     // keeps its key, to be answered from if it's handed out.
     let answer = answer_for(select, indexed, filter);
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, catalog.names());
     for (key, loc) in entries {
         let decided = decides.as_mut().and_then(|d| d.decide(&key));
         if decided == Some(false) {
@@ -2983,11 +3002,11 @@ pub(crate) fn aggregate_in(
     {
         trace.groups(groups.len());
         let selection = aggregate_selection(aggregate);
-        let mut records = data::Records::new(store);
+        let mut records = data::Records::new(store, catalog.names());
         let rows = groups.finish(|loc| {
             trace.examined();
             let stored = records.stored(loc)?;
-            selection.decode(stored.encoded(), stored.id())
+            selection.decode(stored.encoded(), stored.id(), stored.names())
         })?;
         return Ok((rows, plan));
     }
@@ -3176,7 +3195,7 @@ fn aggregate_by_entries(
         trace.covering(read);
     }
     let matcher = filter.matcher();
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, catalog.names());
     let mut walk = BTreeIndex::new(index.root).walk(store, range, false);
     // The bytes of the last entry's key up to its last group value, when
     // that entry went to a group from its key.
@@ -3331,7 +3350,7 @@ fn index_entries(store: &dyn PageStore, root: PageId) -> std::io::Result<usize> 
     let mut walk = BTreeIndex::new(root).walk(store, KeyRange::everything(), false);
     let mut n = 0;
     loop {
-        if let Some(leaf) = walk.whole_leaf()? {
+        if let Some(leaf) = walk.run(usize::MAX)? {
             n += leaf.entries;
             walk.pass_leaf();
             continue;
@@ -3387,12 +3406,12 @@ fn count_in(
     let mut decider = covering.decider(filter);
     let matcher = filter.matcher();
     let names = filter.fields_with(false);
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, catalog.names());
     let mut walk = BTreeIndex::new(root).walk(store, range, false);
     let mut count = 0;
     loop {
         let whole = walk
-            .whole_leaf()?
+            .run(usize::MAX)?
             .map(|leaf| (decider.decide_all(leaf.lowest, leaf.highest), leaf.entries));
         if let Some((Some(matches), entries)) = whole {
             count += if matches { entries } else { 0 };
@@ -3499,12 +3518,22 @@ fn apply_unchecked(
             }
             let doc = with_id(doc.clone(), *id);
             refuse_too_deep(collection, id, &doc)?;
+            catalog.learn(store, &doc)?;
+            let names = catalog.names().clone();
             let mut current = meta.current_data_page;
             let free = catalog.free_space_mut(collection);
-            let loc = data::insert_record(store, &mut current, free, *id, &doc)?;
+            let loc = data::insert_record(store, &mut current, free, *id, &doc, &names)?;
             index.insert(store, &key::primary(*id), loc)?;
             let secondary = catalog.indexes(collection);
-            update_secondary_indexes(collection, secondary, store, *id, None, Some((&doc, loc)))?;
+            update_secondary_indexes(
+                collection,
+                secondary,
+                &names,
+                store,
+                *id,
+                None,
+                Some((&doc, loc)),
+            )?;
             save_current_data_page(catalog, store, collection, &meta, current)
         }
         WriteOp::Update(collection, id, doc) => {
@@ -3512,10 +3541,12 @@ fn apply_unchecked(
             let mut index = BTreeIndex::new(meta.index_root);
             let doc = with_id(doc.clone(), *id);
             refuse_too_deep(collection, id, &doc)?;
+            catalog.learn(store, &doc)?;
+            let names = catalog.names().clone();
             let (secondary, free) = catalog.indexes_and_free_space(collection);
-            let old = old_document(secondary, store, loc)?;
+            let old = old_document(secondary, &names, store, loc)?;
             let mut current = meta.current_data_page;
-            let new_loc = data::update_record(store, &mut current, free, loc, *id, &doc)?;
+            let new_loc = data::update_record(store, &mut current, free, loc, *id, &doc, &names)?;
             if new_loc != loc {
                 // The document outgrew its page and moved (SPEC §20.3).
                 index.remove(store, &key::primary(*id))?;
@@ -3525,6 +3556,7 @@ fn apply_unchecked(
             update_secondary_indexes(
                 collection,
                 secondary,
+                &names,
                 store,
                 *id,
                 old,
@@ -3535,12 +3567,13 @@ fn apply_unchecked(
         WriteOp::Delete(collection, id) => {
             let (meta, loc) = locate(catalog, store, collection, id)?;
             let mut index = BTreeIndex::new(meta.index_root);
+            let names = catalog.names().clone();
             let (secondary, free) = catalog.indexes_and_free_space(collection);
-            let old = old_document(secondary, store, loc)?;
+            let old = old_document(secondary, &names, store, loc)?;
             data::delete_record(store, meta.current_data_page, free, loc)?;
             index.remove(store, &key::primary(*id))?;
             let old = old.as_ref().map(|old| (old, loc));
-            update_secondary_indexes(collection, secondary, store, *id, old, None)?;
+            update_secondary_indexes(collection, secondary, &names, store, *id, old, None)?;
             Ok(())
         }
     }
@@ -3569,13 +3602,14 @@ fn locate(
 /// to take its old keys out of — otherwise it isn't read at all.
 fn old_document(
     indexes: &[IndexMeta],
+    names: &Arc<FieldNames>,
     store: &dyn PageStore,
     loc: RecordLocation,
 ) -> crate::Result<Option<Document>> {
     if indexes.is_empty() {
         return Ok(None);
     }
-    Ok(Some(data::get_record(store, loc)?.1))
+    Ok(Some(data::get_record(store, names, loc)?.1))
 }
 
 /// A document's keys in `index`, in key order, each once. On one field
@@ -3666,6 +3700,7 @@ pub(crate) fn same_values(a: &[&Document], b: &[&Document]) -> bool {
 fn update_secondary_indexes(
     collection: &str,
     indexes: &[IndexMeta],
+    names: &Arc<FieldNames>,
     store: &mut dyn PageStore,
     id: DocId,
     old: Option<(&Document, RecordLocation)>,
@@ -3688,7 +3723,7 @@ fn update_secondary_indexes(
                 let kept = (held.iter())
                     .any(|(part, was)| *part == value_part && same_values(was, &values));
                 if !kept {
-                    check_unique(store, collection, index, id, &value_part, &values)?;
+                    check_unique(names, store, collection, index, id, &value_part, &values)?;
                 }
             }
         }
@@ -3711,6 +3746,7 @@ fn update_secondary_indexes(
 /// key budget, §28.1), so every document under the same value part is
 /// read and compared — normally none.
 fn check_unique(
+    names: &Arc<FieldNames>,
     store: &dyn PageStore,
     collection: &str,
     index: &IndexMeta,
@@ -3724,7 +3760,7 @@ fn check_unique(
         if existing == id {
             continue;
         }
-        let (_, other) = data::get_record(store, loc)?;
+        let (_, other) = data::get_record(store, names, loc)?;
         let collides = unique_tuples(&other, index)
             .iter()
             .any(|(_, others)| same_values(others, values));
@@ -3774,7 +3810,7 @@ fn build_index(
     let meta = get_or_create_meta(catalog, store, collection)?;
     let index = catalog.create_index(store, collection, fields, options)?;
     let documents = BTreeIndex::new(meta.index_root).scan(store)?;
-    fill_index(store, collection, &index, &documents)?;
+    fill_index(catalog.names(), store, collection, &index, &documents)?;
     Ok(true)
 }
 
@@ -3782,6 +3818,7 @@ fn build_index(
 /// `index`. A unique index checks each document as it goes in, so the
 /// first duplicate fails the batch.
 fn fill_index(
+    names: &Arc<FieldNames>,
     store: &mut dyn PageStore,
     collection: &str,
     index: &IndexMeta,
@@ -3789,10 +3826,10 @@ fn fill_index(
 ) -> crate::Result<()> {
     let mut tree = BTreeIndex::new(index.root);
     for (_key, loc) in documents {
-        let (id, doc) = data::get_record(store, *loc)?;
+        let (id, doc) = data::get_record(store, names, *loc)?;
         if index.unique {
             for (value_part, values) in unique_tuples(&doc, index) {
-                check_unique(store, collection, index, id, &value_part, &values)?;
+                check_unique(names, store, collection, index, id, &value_part, &values)?;
             }
         }
         for key in index_keys(&doc, index, id) {
@@ -3815,11 +3852,11 @@ pub(crate) fn only_objects_in_old_file(
     if format >= 12 {
         return Ok(());
     }
-    let mut names: Vec<&str> = catalog.names().collect();
+    let mut names: Vec<&str> = catalog.collection_names().collect();
     names.sort_unstable();
     for name in names {
         let meta = catalog.get(name).expect("a listed collection");
-        let mut records = data::Records::new(store);
+        let mut records = data::Records::new(store, catalog.names());
         for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
             let (id, object) = records.is_object(loc)?;
             if !object {
@@ -3849,14 +3886,14 @@ pub(crate) fn rekey_old_indexes(
         return Ok(());
     }
     let ids = store.predates_id_keys()?;
-    for name in catalog.names() {
+    for name in catalog.collection_names() {
         if catalog.indexes(name).is_empty() {
             continue;
         }
         let (documents, stale) = stale_indexes(catalog, store, name, ids)?;
         for index in stale {
             BTreeIndex::new(index.root).clear(store)?;
-            fill_index(store, name, index, &documents)?;
+            fill_index(catalog.names(), store, name, index, &documents)?;
         }
     }
     Ok(())
@@ -3878,7 +3915,7 @@ fn stale_indexes<'c>(
     let meta = catalog.get(collection).expect("a listed collection");
     let documents = BTreeIndex::new(meta.index_root).scan(store)?;
     let mut stale = vec![false; indexes.len()];
-    let mut records = data::Records::new(store);
+    let mut records = data::Records::new(store, catalog.names());
     for (_key, loc) in &documents {
         let (_id, doc) = records.get(*loc)?;
         for (stale, index) in stale.iter_mut().zip(indexes) {
@@ -4918,7 +4955,7 @@ mod tests {
     /// with the room they really have (SPEC §75).
     fn assert_free_space_is_true(db: &Database) {
         let state = db.state();
-        for name in state.catalog().names() {
+        for name in state.catalog().collection_names() {
             let Some(free) = state.catalog().free_space(name) else {
                 continue;
             };
@@ -4948,8 +4985,10 @@ mod tests {
         let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
         let docs = db.collection::<Document>("docs");
         // In batches of 100, each one commit: one flush, not one per document.
+        // Numbers of one width as varints (§170), so every document is
+        // the size of every other.
         let mut ids = Vec::new();
-        for chunk in (0..2000).collect::<Vec<i64>>().chunks(100) {
+        for chunk in (1000..3000).collect::<Vec<i64>>().chunks(100) {
             let mut batch = db.batch();
             for &n in chunk {
                 ids.push(batch.insert(&docs, padded(n, 400)).unwrap());
@@ -4963,7 +5002,7 @@ mod tests {
         batch.commit().unwrap();
         let before = db.file_info().unwrap().pages;
 
-        for chunk in (0..1000).collect::<Vec<i64>>().chunks(100) {
+        for chunk in (1000..2000).collect::<Vec<i64>>().chunks(100) {
             let mut batch = db.batch();
             for &n in chunk {
                 batch.insert(&docs, padded(n, 400)).unwrap();
@@ -9114,7 +9153,7 @@ mod tests {
             let meta = *catalog.get(collection).unwrap();
             let mut tree = BTreeIndex::new(index.root);
             for (_key, loc) in BTreeIndex::new(meta.index_root).scan(store)? {
-                let (id, doc) = data::get_record(store, loc)?;
+                let (id, doc) = data::get_record(store, catalog.names(), loc)?;
                 for key in index_keys(&without_ids(doc, unkeyed), &index, id) {
                     tree.insert(store, &key, loc)?;
                 }
@@ -9218,7 +9257,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 901, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 13);
+        assert_eq!(db.file_info().unwrap().format_version, 14);
         assert!(db.check().unwrap().is_ok());
         let cars = db.collection::<Document>("cars");
         assert_eq!(
@@ -9261,7 +9300,7 @@ mod tests {
         drop((notes, db));
         crate::storage::rewrite_format_version(&unkeyed, 9);
         let db = Database::open(&unkeyed).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 13);
+        assert_eq!(db.file_info().unwrap().format_version, 14);
         drop(db);
         let reads = records_read(|| drop(Database::open(&unkeyed).unwrap()));
         assert_eq!(reads, 0);
@@ -9276,7 +9315,7 @@ mod tests {
         drop(db);
         crate::storage::rewrite_format_version(&plain, 9);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 13);
+        assert_eq!(db.file_info().unwrap().format_version, 14);
     }
 
     /// Stores `doc` in `collection` past the check that it is an object,
@@ -9323,7 +9362,7 @@ mod tests {
         drop(read_only(&path).unwrap());
         assert_eq!(format_on_disk(&path), 11, "a read-only open writes nothing");
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 13);
+        assert_eq!(db.file_info().unwrap().format_version, 14);
         assert_eq!(
             db.collection::<Document>("docs")
                 .count(Filter::new())
@@ -9331,14 +9370,14 @@ mod tests {
             301
         );
         drop(db);
-        assert_eq!(format_on_disk(&path), 13);
+        assert_eq!(format_on_disk(&path), 14);
 
         // An empty file is stamped too.
         let empty = dir.path().join("empty.trunkdb");
         drop(Database::open(&empty).unwrap());
         crate::storage::rewrite_format_version(&empty, 11);
         drop(Database::open(&empty).unwrap());
-        assert_eq!(format_on_disk(&empty), 13);
+        assert_eq!(format_on_disk(&empty), 14);
     }
 
     /// SPEC §95: a file of a format before 12 that holds a document that
@@ -9581,7 +9620,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 601, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 13);
+        assert_eq!(db.file_info().unwrap().format_version, 14);
         assert!(db.check().unwrap().is_ok());
         let files = db.collection::<Document>("files");
         assert_eq!(
@@ -9613,7 +9652,7 @@ mod tests {
         drop(db);
         assert_eq!(format_on_disk(&plain), 12);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 13);
+        assert_eq!(db.file_info().unwrap().format_version, 14);
     }
 
     /// Binary never collided in a unique index before format 13 (SPEC
@@ -12590,8 +12629,10 @@ mod tests {
         tasks.ensure_index(["tenant", "tries"]).unwrap();
         tasks.ensure_index(["tenant", "status"]).unwrap();
         let start = 1_700_000_000;
+        // Groups of (tenant, status) bigger than a packed leaf holds.
+        const N: i64 = 30_000;
         let mut batch = db.batch();
-        for n in 0..3000i64 {
+        for n in 0..N {
             let created = crate::DateTime::from_unix(start + n, 0).unwrap();
             batch
                 .insert(
@@ -12634,7 +12675,7 @@ mod tests {
         );
         assert_eq!(
             (r.stats.documents_examined, r.stats.from_entries),
-            (0, 3000),
+            (0, N as u64),
             "{r:?}"
         );
         // Per tenant, all and the running ones: `(tenant, status)`, its
@@ -12658,7 +12699,7 @@ mod tests {
         // Per status, all and those since a date: from the entries, but
         // entry by entry, as `decide_all` can't decide a leaf whose ends
         // differ in `created` (SPEC §126.4).
-        let since = crate::DateTime::from_unix(start + 2000, 0).unwrap();
+        let since = crate::DateTime::from_unix(start + N * 2 / 3, 0).unwrap();
         let recent = Aggregate::new()
             .group_by("status")
             .count()
@@ -12675,7 +12716,7 @@ mod tests {
         );
         assert_eq!(
             (r.stats.documents_examined, r.stats.from_entries, leaves),
-            (0, 3000, 0),
+            (0, N as u64, 0),
             "{r:?}"
         );
         // A condition on a field no index holds beside the others: the
@@ -12687,7 +12728,7 @@ mod tests {
             .named("mean_done");
         let (r, _) = run(Filter::new(), &done);
         assert_eq!(r.plan, QueryPlan::Scan);
-        assert_eq!(r.stats.documents_examined, 3000, "{r:?}");
+        assert_eq!(r.stats.documents_examined, N as u64, "{r:?}");
         // A condition on a string cut in its key: those entries' documents
         // only.
         let notes = db.collection::<Document>("notes");

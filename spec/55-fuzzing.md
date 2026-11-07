@@ -26,7 +26,8 @@ its MSRV. Four targets:
 | `import` | any bytes as JSON Lines, into a fresh database | the import; one that succeeds must pass `check` |
 
 The valid database (`trunkdb_fuzz::base`) is built once per run, with
-two collections, a document in overflow pages, a plain, a unique, a
+two collections, a document in overflow pages, one with a key too long
+for the field-name dictionary (§170), a plain, a unique, a
 compound, a sparse and two multikey indexes, branch pages, and free
 pages from a dropped collection. After opening, a target makes the calls
 the input's first byte chooses: `check`, finds through every kind of plan
@@ -90,6 +91,8 @@ and fixed before the fuzzer got there.
 | 12 | `storage/slotted.rs` | A page with no live slot and its cells "starting" past its end passed §54's check, and the next insert wrote there. | fuzzer |
 | 13 | `catalog.rs` | Catalog pages linking in a loop hung `open`. | fuzzer (hang) |
 | 14 | `storage/file.rs` | A free page linking past the end was followed by the next allocation. | fuzzer |
+| 15 | `storage/file.rs` | A header counting more pages than the file holds opened, and `check` sized its map of owners by the count: a byte changed in the count ran it out of memory. Refused at open now, once the WAL has had its turn. | fuzzer |
+| 16 | `storage/slotted.rs` | Slots on the same bytes added up to more than the page holds below its directory: `reclaimable_space` underflowed on a delete, and `compact` had nowhere to put them. The page's check refuses that now; cells that share bytes but fit stay `check`'s to report (§141). | fuzzer |
 
 ## 55.3 The fixes
 - **`decode.rs`**: `take`, `take_u8`, `take_u32`, `take_u64`,
@@ -197,4 +200,5 @@ document decoding), batched inserts 22–23k/s against 24k/s.
   the targets keep compiling. Fuzzing needs nightly and minutes to
   hours; runs are by hand.
 - **Short so far**: about an hour of fuzzing per target in all, without
-  AddressSanitizer. Coverage was still growing at the end.
+  AddressSanitizer, and 15 to 30 minutes more on format 14 (§172.8).
+  Coverage was still growing at the end.
