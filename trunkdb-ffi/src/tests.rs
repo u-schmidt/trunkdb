@@ -1079,7 +1079,9 @@ fn threads_share_a_handle() {
 }
 
 /// `include/trunkdb.h` is what the code says: made by cbindgen and
-/// compared; `TRUNKDB_WRITE_HEADER=1` writes it anew.
+/// compared; `TRUNKDB_WRITE_HEADER=1` writes it anew. Without any `\r`:
+/// on Windows, Git checks `cbindgen.toml` and the sources out with CRLF,
+/// and the header's comments carry them over (SPEC §179.2).
 #[test]
 fn header_is_current() {
     let dir = env!("CARGO_MANIFEST_DIR");
@@ -1091,13 +1093,25 @@ fn header_is_current() {
         .generate()
         .expect("cbindgen reads the crate")
         .write(&mut made);
+    let made = String::from_utf8(made).unwrap().replace('\r', "");
     let path = format!("{dir}/include/trunkdb.h");
     if std::env::var_os("TRUNKDB_WRITE_HEADER").is_some() {
         std::fs::write(&path, &made).unwrap();
     }
-    let kept = std::fs::read(&path).unwrap_or_default();
-    assert!(
-        kept == made,
+    let kept = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace('\r', "");
+    if let Some((line, (kept, made))) =
+        (kept.lines().zip(made.lines()).enumerate()).find(|(_, (kept, made))| kept != made)
+    {
+        panic!(
+            "include/trunkdb.h isn't what the code says, from line {}:\n  kept: {kept:?}\n  made: {made:?}\nTRUNKDB_WRITE_HEADER=1 cargo test -p trunkdb-ffi header",
+            line + 1
+        );
+    }
+    assert_eq!(
+        kept.lines().count(),
+        made.lines().count(),
         "include/trunkdb.h isn't what the code says: TRUNKDB_WRITE_HEADER=1 cargo test -p trunkdb-ffi header"
     );
 }

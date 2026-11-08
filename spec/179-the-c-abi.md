@@ -69,10 +69,13 @@ and checked in: the rules every function keeps, in its opening comment,
 then the codes, the three opaque types and the functions, each with the
 comment its Rust has. `header_is_current` makes it again and fails when
 it differs; `TRUNKDB_WRITE_HEADER=1` writes it. cbindgen is a
-dev-dependency, in no build. Its lines end in LF on every system, as
-cbindgen writes them and as `.gitattributes` checks the file out: on
-Windows, Git's own conversion to CRLF failed the comparison, in CI's
-first run.
+dev-dependency, in no build. Its lines end in LF on every system:
+`.gitattributes` checks it out so, and the comparison drops every `\r`.
+On Windows, Git checks `cbindgen.toml` out with CRLF too, and the
+header's opening comment, a string of that file, carried them into
+what was made: CI's first two Windows runs failed the comparison, the
+second after only the header was kept in LF. A failure now names the
+first line that differs.
 
 ## 179.3 Built and tested in CI
 A job on Linux, macOS and Windows runs the crate's tests, the header's
