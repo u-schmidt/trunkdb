@@ -72,6 +72,10 @@ fn write_database(path: &Path) {
         r#"{"kind": "binary", "v": {"$binary": "AAEC/f7/"}}"#,
         r#"{"kind": "date", "v": {"$date": "2024-05-01T12:00:00.123456789Z"}}"#,
         r#"{"kind": "date", "v": {"$date": "1969-12-31T23:59:59Z"}}"#,
+        r#"{"kind": "day", "v": {"$date": "2026-11-07"}}"#,
+        r#"{"kind": "day", "v": {"$date": "1969-12-31"}}"#,
+        r#"{"kind": "time", "v": {"$time": "14:05:00.123456789"}}"#,
+        r#"{"kind": "time", "v": {"$time": "00:00:00"}}"#,
         r#"{"kind": "array", "v": [1, 2.0, "three", null, [true, []], {}]}"#,
         r#"{"kind": "object", "v": {"a": {"b": {"c": [{"d": 1}]}}, "": "empty name", "a.b": "dot"}}"#,
     ] {
@@ -116,6 +120,9 @@ fn write_database(path: &Path) {
     // Binary keys (SPEC §166), some a prefix of others, the empty one
     // and bytes above 0x7f among them.
     tasks.ensure_index("digest").unwrap();
+    // Dates and times of day as keys (SPEC §173).
+    tasks.ensure_index("due").unwrap();
+    tasks.ensure_index("starts").unwrap();
     let digests = ["", "AA==", "AAE=", "AAEC", "gA==", "f/8=", "/f7/", "/w=="];
     let statuses = ["open", "blocked", "done", "dropped"];
     // Long names, so the compound index has more than a leaf's worth of
@@ -135,7 +142,7 @@ fn write_database(path: &Path) {
             _ => format!(r#", "owner": "person-{}""#, random.next(30)),
         };
         let json = format!(
-            r#"{{"n": {n}, "title": "task {n}", "status": "{}", "team": "{}", "hours": {hours}, "created": {{"$date": "2026-{:02}-{:02}T{:02}:00:00Z"}}, "tags": ["t{}", "t{}"], "digest": {{"$binary": "{}"}}{owner}}}"#,
+            r#"{{"n": {n}, "title": "task {n}", "status": "{}", "team": "{}", "hours": {hours}, "created": {{"$date": "2026-{:02}-{:02}T{:02}:00:00Z"}}, "tags": ["t{}", "t{}"], "digest": {{"$binary": "{}"}}, "due": {{"$date": "2027-{:02}-{:02}"}}, "starts": {{"$time": "{:02}:{:02}:00"}}{owner}}}"#,
             statuses[random.next(4) as usize],
             teams[random.next(5) as usize],
             1 + random.next(12),
@@ -144,6 +151,10 @@ fn write_database(path: &Path) {
             random.next(10),
             random.next(10),
             digests[random.next(8) as usize],
+            1 + n % 12,
+            1 + n % 28,
+            n % 24,
+            (n * 7) % 60,
         );
         ids.push(tasks.insert(doc(&json)).unwrap());
     }

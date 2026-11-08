@@ -1,0 +1,7 @@
+{"collection": "tasks", "fields": ["status"], "unique": false, "sparse": false}
+{"collection": "tasks", "fields": ["team","created"], "unique": false, "sparse": false}
+{"collection": "tasks", "fields": ["n"], "unique": true, "sparse": false}
+{"collection": "tasks", "fields": ["owner"], "unique": false, "sparse": true}
+{"collection": "tasks", "fields": ["digest"], "unique": false, "sparse": false}
+{"collection": "tasks", "fields": ["due"], "unique": false, "sparse": false}
+{"collection": "tasks", "fields": ["starts"], "unique": false, "sparse": false}

@@ -1181,20 +1181,6 @@ limit, batches and a write-ahead log. Since then:
     `datetime("…")` for a moment; `Kind::Date` and `Kind::Time`, `is
     date` and `is time`; in JSON `{"$date": "2026-11-07"}` and
     `{"$time": "14:05:00"}`.
-
-    Item 148 → next release: **changed answers:** `Kind::DateTime` is
-    named `datetime` in the text now, as `date` names dates, so
-    `hours is date` finds dates where it found date-times; `trunkdb
-    fields` prints `datetime` for them; and a filter prints a
-    date-time as `datetime("…")`. `date("…")` with a time in it still
-    reads as a date-time, so filters written so far mean what they
-    did. `Date`, `Time`, `Document::Date`, `Document::Time`,
-    `Kind::Date` and `Kind::Time` are additions, to enums that were
-    `#[non_exhaustive]` already. **File format 15,** which 0.34.0
-    refuses once this build has opened a file for writing; an older
-    file opens as it is, nothing rebuilt. **Export version 4,** which
-    0.34.0 and older refuse; an import reads 1 to 3 as before. A
-    fixture of format 15 comes with the release (§120.9).
 149. **A window for each group** (§174):
     `Aggregate::newest_per_group(path, n)`, each group's `n` documents
     with the largest values at `path`, and `window_per_group(path,
@@ -1219,3 +1205,19 @@ limit, batches and a write-ahead log. Since then:
     an index: 87 ms before, 48 ms now; memory as small as the limit,
     the index entries read now handed on as the walk reaches them
     rather than gathered first. Results are the same.
+
+    Items 148–151 → 0.35.0. **Changed answers:** `Kind::DateTime` is
+    named `datetime` in the text now, as `date` names dates, so
+    `hours is date` finds dates where it found date-times; `trunkdb
+    fields` prints `datetime` for them; and a filter prints a
+    date-time as `datetime("…")`. `date("…")` with a time in it still
+    reads as a date-time, so filters written so far mean what they
+    did. `Date`, `Time`, `Document::Date`, `Document::Time`,
+    `Kind::Date` and `Kind::Time` are additions, to enums that were
+    `#[non_exhaustive]` already; so is `Written::upserted`. **File
+    format 15,** which 0.34.0 and older refuse once 0.35.0 has opened
+    a file for writing; keep an export or a copy from before to go
+    back. An older file opens as it is, nothing rebuilt. **Export
+    version 4,** which 0.34.0 and older refuse; an import reads 1 to
+    3 as before. With its fixture (§120.9), which adds dates and
+    times of day to the generator, as values and as index keys.
