@@ -74,60 +74,17 @@ application shows what holds for a broader range of users. In practice:
 - **Public dependencies are chosen on purpose:** `serde` is one, as for
   nearly every crate; any other is a decision, not an accident.
 
-This list settles early what would be expensive to change once
-applications rely on trunkdb.
-
-**Settled already.** The free-space map lives in memory, so a
-persisted one can come later (§75); a date-time type, file format 11
-(§69); every document an object, format 12 (§95); snapshot reads in
-memory only, with nothing in the file (§77); `find_with_ids` removed and
-`cursor` handing out `T` (§74); the internals private, and `Error`,
-`Document` and the reports `#[non_exhaustive]` (§60); `indexmap` out of
-the API, behind trunkdb's own `Map` (§116); variants with public fields
-`#[non_exhaustive]` (§117); two passes over the whole public API, the
-second after the hook, live queries and the rest had settled, with
-`Kind::ALL` a slice and the hook's events no longer `Eq` (§118, §161);
-aggregate columns named last, `count().named("n")` (§134); old files as
-fixtures, opened by every test run (§120); unique indexes in the
-`queries` target (§119); every public item documented, the
-`missing_docs` lint on, and the MSRV policy in the README. The WAL's
-format matters less: it's empty after a clean close, so a change needs
-only a checkpoint before upgrading.
-
-**Must: expensive to change once applications use it**
-- Nothing open. Before 1.0, a pass as §118's and §161's over what came
-  after them.
-
-**Optional: where trunkdb is published**
-- **On crates.io**, with its docs on docs.rs, or GitHub alone, as now:
-  not decided. Use in more than one application is what settles the
-  API, and a git dependency pinned to a commit serves that as well as
-  `cargo add trunkdb`; neither changes a file, a program or a query.
-  Nothing is published on crates.io.
-
-**Later: additive, in any release**
-- **An index rebuilt at open, where its key format changed:** not
-  needed now after all. Every open reads the file's format version, so
-  the release that changes a key — the `Int`/`Float` bit and missing
-  mark `sum` from index entries wants (§106.8) — bumps it and rebuilds
-  the indexes of older files then; nothing need be in today's files for
-  it. What a read-only open does then, and how a long first open shows
-  its progress, is decided with that change.
-- New types — a decimal, as dates and times of day came (§173):
-  `Document` is `#[non_exhaustive]`, and a file holding one is refused
-  by an older build, as above.
-- Everything **Planned** or **Deferred** below: new operators, `serde_json` behind a feature, repairing what
-  `check` finds, the planner, performance, the C ABI and the PyO3 bindings. None changes a file today's build
-  writes or what a program or query means today.
-
-**What only use can tell:** whether the API holds up in two or three
-applications, and whether the format has anything that hurts over
-months of real data.
+A third pass over the whole public API, as §118's and §161's, comes
+before 1.0.
 
 ## Open
 In three groups: what is planned, what is deferred until a reason
 comes, and what is not planned. Unordered within each group; each line
-says where the need or the limit is described.
+says where the need or the limit is described. None of it changes a
+file today's build writes, or what a program or query means today.
+
+Not decided: whether trunkdb goes on crates.io, with its docs on
+docs.rs, or stays on GitHub alone, as now.
 
 ### Planned
 - **A C ABI,** `trunkdb-ffi`, with a header made by cbindgen: the way
