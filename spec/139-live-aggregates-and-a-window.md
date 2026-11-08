@@ -157,7 +157,7 @@ Later, if asked for: **a window for each group,** by count or by time,
 limit, counted over every group, nor one newest for the whole
 aggregate gives. SQL's window functions:
 `ROW_NUMBER() OVER (PARTITION BY server ORDER BY at DESC) <= 10`. It
-matters where groups report at rates far apart.
+matters where groups report at rates far apart. It came with §174.
 
 ## 139.7 Limits
 - **Without a window, every commit to the collection runs the aggregate

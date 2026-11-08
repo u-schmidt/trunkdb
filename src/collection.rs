@@ -2961,8 +2961,17 @@ pub(crate) fn aggregate_in(
     follow_hint(collection, filter, indexes)?;
     // A window is a condition once the newest is known (SPEC §139.2).
     let windowed;
+    let picks = filter.sorted() || filter.skip > 0 || filter.limit.is_some();
+    if picks && aggregate.per_group.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an aggregate with a window per group over a filter with a sort, a skip or a \
+             limit: the window keeps each group's newest, the limit of all (SPEC §174)",
+        )
+        .into());
+    }
     let filter = match &aggregate.window {
-        Some(_) if filter.sorted() || filter.skip > 0 || filter.limit.is_some() => {
+        Some(_) if picks => {
             // Two windows, by count and by time: which first would be a
             // rule to learn, and `apply`, given the documents the filter
             // found, could keep only one of them.
@@ -2983,7 +2992,8 @@ pub(crate) fn aggregate_in(
     let mut groups = Groups::new(aggregate);
     // Counts alone, of every match: `count`'s.
     let counts_only = aggregate.columns.iter().all(|c| c.kind == Kind::Count);
-    let whole = aggregate.unwind.is_empty() && !aggregate.has_conditions();
+    let whole =
+        aggregate.unwind.is_empty() && aggregate.per_group.is_none() && !aggregate.has_conditions();
     if aggregate.group_by.is_empty() && counts_only && whole {
         let n = count_matches(catalog, store, collection, filter, trace)?;
         trace.matched(n);
@@ -3020,10 +3030,27 @@ pub(crate) fn aggregate_in(
         Some(&selection),
         trace,
     )?;
-    for found in found {
-        let id = found.id();
-        let doc = found.decode(Some(&selection))?;
-        groups.add_document(&doc, Order::id(id), None)?;
+    match aggregate.per_group {
+        None => {
+            for found in found {
+                let id = found.id();
+                let doc = found.decode(Some(&selection))?;
+                groups.add_document(&doc, Order::id(id), None)?;
+            }
+        }
+        // Each group's window needs its newest, so every match first
+        // (SPEC §174).
+        Some(_) => {
+            let docs = (found.into_iter())
+                .map(|found| {
+                    let order = Order::id(found.id());
+                    Ok((found.decode(Some(&selection))?, order))
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            for (doc, order) in crate::aggregate::per_group(aggregate, docs) {
+                groups.add_document(&doc, order, None)?;
+            }
+        }
     }
     trace.groups(groups.len());
     let rows = groups.finish(|_| unreachable!("every value from its document"))?;

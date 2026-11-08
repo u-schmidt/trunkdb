@@ -699,6 +699,36 @@ std::thread::spawn(move || {
   and an index on its path it reads a few documents. Without one, it
   reads every match each time.
 
+### A window for each group
+
+Where servers report at rates far apart, the window of all leaves out
+the slow ones. Each group can have a window of its own instead (SPEC
+§174), SQL's `row_number() over (partition by server …)`:
+
+```rust
+// The mean of each server's last ten readings.
+let recent = Aggregate::new()
+    .group_by("server")
+    .avg("load").named("mean")
+    .newest_per_group("at", 10);
+// Each server's last five minutes, counted from its own newest reading.
+let lately = Aggregate::new()
+    .group_by("server")
+    .max("load").named("peak")
+    .window_per_group("at", Duration::from_secs(300));
+```
+
+- **A server that stops reporting keeps its last readings,** and its
+  row. Want it to age out? Use `window`, or both: the window of all
+  comes first, then each group's.
+- **By count, any value that sorts:** a date-time, a sequence number.
+  Equal values go by id, the later one newer; `null` and missing are
+  left out.
+- **It reads every match:** a group's newest can be anywhere in time.
+  Bound the filter, `gte("at", an hour ago)`, where there are many
+  readings; live, it runs whole at every commit.
+- In the text: `window at 10 per group`, `window at 5m per group`.
+
 ## Telling the planner which index
 
 The planner follows fixed rules, which don't look at the data. Where

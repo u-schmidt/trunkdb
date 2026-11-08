@@ -494,6 +494,12 @@ within `duration` of the newest date-time at `path` among the matches:
 read first, as the first match sorted newest first, then a condition
 ANDed with the filter's, so an index on `path` bounds both reads
 [§139](spec/139-live-aggregates-and-a-window.md).
+A window per group, `newest_per_group(path, n)` or
+`window_per_group(path, duration)`, keeps each group's newest
+documents by the value at `path`: every match is read, held on the
+paths the aggregate reads until each group's newest is known, and only
+those kept go to the groups; no index bounds it, and entries never
+answer it [§174](spec/174-a-window-for-each-group.md).
 A column can take a condition of its own, `filter` before its name, SQL's
 `FILTER (WHERE …)` [§126](spec/126-a-condition-on-a-column.md): it takes
 in only the group's documents that meet it, while the groups and the
