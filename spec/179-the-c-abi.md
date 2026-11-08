@@ -69,7 +69,10 @@ and checked in: the rules every function keeps, in its opening comment,
 then the codes, the three opaque types and the functions, each with the
 comment its Rust has. `header_is_current` makes it again and fails when
 it differs; `TRUNKDB_WRITE_HEADER=1` writes it. cbindgen is a
-dev-dependency, in no build.
+dev-dependency, in no build. Its lines end in LF on every system, as
+cbindgen writes them and as `.gitattributes` checks the file out: on
+Windows, Git's own conversion to CRLF failed the comparison, in CI's
+first run.
 
 ## 179.3 Built and tested in CI
 A job on Linux, macOS and Windows runs the crate's tests, the header's

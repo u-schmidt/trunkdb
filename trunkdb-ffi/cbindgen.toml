@@ -11,6 +11,8 @@ sys_includes = ["stdbool.h", "stdint.h"]
 documentation = true
 documentation_style = "c99"
 usize_is_size_t = true
+# On every system, as .gitattributes checks the header out.
+line_endings = "LF"
 header = """/*
  * trunkdb's C ABI (SPEC §177, §179 in the trunkdb repository).
  *
