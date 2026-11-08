@@ -116,12 +116,6 @@ Each waits for what its line names: a program that needs it, or a
 measurement that shows the cost. "When asked" means a program that
 uses trunkdb asking for it.
 
-**Data types**
-- `chrono`, `time` and `jiff` recognized on the way in, behind a
-  feature each, as date-times, dates and times of day rather than the
-  strings they serialize to (§69.5, §173.5); conversions between their
-  types and trunkdb's `DateTime`, `Date` and `Time`.
-
 **Queries**
 - Leaves decided whole for filters that accept several intervals of
   keys (`ne`, an OR, a NOT), each leaf checked against the intervals'
@@ -273,5 +267,11 @@ in §6.
 - **A count of all documents kept in the catalog:** counted leaf by
   leaf it takes 0.09 ms for 100,000 (§101), and a total would cost a
   write to the catalog page in every batch that inserts or deletes.
+- **`chrono`, `time` and `jiff` types recognized as times:** they
+  serialize as strings (§69.5, §173.5), so each field would still need
+  an annotation, and the public API would be tied to three crates, one
+  of them before 1.0, for little gain. Store trunkdb's `DateTime`,
+  `Date` and `Time`, and convert through their text (GUIDE.md, "With
+  `chrono` or `jiff`"; `tests/other_date_crates.rs`).
 
 Aggregates were on this list until §106.7, and came in §107.

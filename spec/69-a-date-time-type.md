@@ -108,7 +108,8 @@ now written inside `$object`, like one that looks like any other tag.
   are stored as strings. Reading a `DateTime` as a string gives RFC
   3339, which their `DateTime<Utc>` and similar parse, so a stored time
   reads into them; writing one stores text. Recognizing them on the way
-  in, behind a feature each, is open (ROADMAP.md).
+  in, behind a feature each, is not planned (ROADMAP.md); GUIDE.md
+  shows the conversion.
 - **A field with times written both ways**, as serde's object before
   this change and as a `DateTime` after, sorts the objects apart from
   the times. Rewriting each document once (`update_many` with a closure
