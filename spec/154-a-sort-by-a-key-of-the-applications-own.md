@@ -116,7 +116,7 @@ agreeing to within 4%:
 - **Ten of all, kept as read, beat a sort by a field** with the same
   limit and no index (60 ms against 75): a field sort in memory still
   gathers every match and sorts them all (§102.5). The same keep would
-  serve it; left for a measurement of its own (ROADMAP.md).
+  serve it; it came with §176.
 - **No limit** keeps and sorts every match, 3.2× the time.
 - **Vectors:** 5,000 of 128 dimensions in 8.8 ms, about 1.8 µs each,
   most of it decoding the array. Tens of thousands stay under a tenth

@@ -1691,7 +1691,9 @@ fn find_in(
             .map(|(source, _fields)| Ok(source.found(&mut records, None, trace)?))
             .collect();
     }
-    if let Some(ranking) = filter.ranking() {
+    // A key sort (SPEC §154), or a sort by fields with a limit (§176):
+    // only the best `skip + limit` kept as they are read.
+    if let Some(ranking) = filter.ranking().or_else(|| filter.kept_sort()) {
         return find_by_key(
             catalog,
             store,
@@ -1734,6 +1736,7 @@ fn find_in(
     }
     trace.matched(matches.len());
     if sort {
+        trace.held(matches.len());
         // So equal sort values end up in id order, as they do when read
         // from an index (the sort is stable).
         matches.sort_unstable_by_key(|(source, _fields)| source.id());
@@ -1753,11 +1756,12 @@ fn find_in(
         .collect()
 }
 
-/// `find_in` for a sort by a key of the application's (SPEC §154): each
-/// match ranked as it is read, by its key's closure, and with a limit
-/// only the best `skip + limit` kept, cut back to them by a selection
-/// whenever twice as many are held. Memory stays at about that many
-/// matches, read in full, however many there are.
+/// `find_in` for a sort by a key of the application's (SPEC §154), or by
+/// fields with a limit (§176): each match ranked as it is read, by its
+/// key's closure or its sort fields' values, and with a limit only the
+/// best `skip + limit` kept, cut back to them by a selection whenever
+/// twice as many are held. Memory stays at about that many matches,
+/// read in full, however many there are.
 #[allow(clippy::too_many_arguments)]
 fn find_by_key(
     catalog: &Catalog,
@@ -1809,6 +1813,7 @@ fn find_by_key(
                 return Ok(());
             }
             kept.push((rank, (source, fields)));
+            trace.held(kept.len());
             if let Some(keep) = keep
                 && kept.len() > keep.saturating_mul(2)
             {
@@ -1975,14 +1980,9 @@ impl Source {
     }
 }
 
-/// The index entries `find` has to look at for `filter`: the primary
-/// index's entries for the ids it names (SPEC §61), else the secondary
-/// index ranges its conditions allow (SPEC §28.4, §36.3), otherwise the
-/// whole primary index. Each entry's key ends with its document's id, and
-/// each document comes once, even if several ranges hold it (an OR
-/// whose branches overlap) or one range holds it several times (a
-/// multikey index, SPEC §42.2). With them, which index they come from,
-/// for deciding by entry (SPEC §100).
+/// The index entries `find` has to look at for `filter`, gathered: what
+/// `each_entry` hands on, with the index they come from. For a cursor,
+/// which reads its documents after the lock is let go.
 fn candidate_entries<'a>(
     catalog: &'a Catalog,
     store: &dyn PageStore,
@@ -1990,101 +1990,129 @@ fn candidate_entries<'a>(
     filter: &Filter,
     trace: &Trace,
 ) -> std::io::Result<(Vec<Entry>, Indexed<'a>)> {
+    let mut entries = Vec::new();
+    each_entry(catalog, store, collection, filter, trace, |entry| {
+        entries.push(entry);
+        Ok::<(), std::io::Error>(())
+    })?;
+    Ok((entries, indexed_for(catalog, collection, filter)))
+}
+
+/// Which index `each_entry` reads for `filter`, before it reads it.
+fn indexed_for<'a>(catalog: &'a Catalog, collection: &str, filter: &Filter) -> Indexed<'a> {
+    if catalog.get(collection).is_none() || filter.ids().is_some() {
+        return Indexed::Primary;
+    }
+    match filter.index_reads(catalog.indexes(collection)) {
+        None => Indexed::Primary,
+        Some(crate::query::IndexReads { ids, ranges }) => {
+            let first = ranges.first().map(|range| range.index);
+            match first {
+                Some(first)
+                    if ids.is_empty() && ranges.iter().all(|r| std::ptr::eq(r.index, first)) =>
+                {
+                    Indexed::One(first)
+                }
+                _ => Indexed::Several,
+            }
+        }
+    }
+}
+
+/// The index entries `find` has to look at for `filter`, each handed to
+/// `take` as the walk reaches it (SPEC §176): the primary index's entries
+/// for the ids it names (SPEC §61), else the secondary index ranges its
+/// conditions allow (SPEC §28.4, §36.3), otherwise the whole primary
+/// index. Each entry's key ends with its document's id, and each
+/// document comes once, even if several ranges hold it (an OR whose
+/// branches overlap) or one range holds it several times (a multikey
+/// index, SPEC §42.2): only then are the ids handed on kept, to pass
+/// over the second. Nothing else is held, so a caller that keeps little
+/// holds little however many entries there are; one that stops early,
+/// with an error of its own, reads no further.
+fn each_entry<E: From<std::io::Error>>(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    trace: &Trace,
+    mut take: impl FnMut(Entry) -> Result<(), E>,
+) -> Result<(), E> {
     let Some(meta) = catalog.get(collection) else {
-        return Ok((Vec::new(), Indexed::Primary));
+        return Ok(());
     };
-    let mut reads = Vec::new();
-    let (entries, indexed) = if let Some(ids) = filter.ids() {
+    // Whether the entries decide, so each read is marked as it begins.
+    let covering = indexed_for(catalog, collection, filter)
+        .covering(filter, false)
+        .is_some();
+    let begin = |index: String, bounds: Vec<Condition>| {
+        let read = trace.read(index, bounds, false);
+        if covering {
+            trace.covering(read);
+        }
+        read
+    };
+    let ids_read = |ids: &[DocId]| {
         let by_id = |id: &DocId| Condition::id(*id);
-        let bounds = match &ids[..] {
+        let bounds = match ids {
             [id] => vec![by_id(id)],
             _ => vec![Condition::any(ids.iter().map(by_id))],
         };
-        let read = trace.read(crate::document::ID_FIELD.to_string(), bounds, false);
+        let read = begin(crate::document::ID_FIELD.to_string(), bounds);
         trace.entries(read, ids.len());
-        reads.push(read);
-        let primary = BTreeIndex::new(meta.index_root);
-        let mut entries = Vec::new();
+    };
+    let primary = BTreeIndex::new(meta.index_root);
+    if let Some(ids) = filter.ids() {
+        ids_read(&ids);
         for id in ids {
             let key = key::primary(id);
             if let Some(loc) = primary.lookup(store, &key)? {
-                entries.push((key, loc));
+                take((key, loc))?;
             }
         }
-        (entries, Indexed::Primary)
-    } else {
-        match filter.index_reads(catalog.indexes(collection)) {
-            None => {
-                let read = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
-                let entries = BTreeIndex::new(meta.index_root).scan(store)?;
-                trace.entries(read, entries.len());
-                reads.push(read);
-                (entries, Indexed::Primary)
-            }
-            Some(crate::query::IndexReads { ids, ranges }) => {
-                // An OR of no branches has no ranges, and no entries.
-                let first = ranges.first().map(|range| range.index);
-                let indexed = match first {
-                    Some(first)
-                        if ids.is_empty()
-                            && ranges.iter().all(|r| std::ptr::eq(r.index, first)) =>
-                    {
-                        Indexed::One(first)
-                    }
-                    _ => Indexed::Several,
-                };
-                // One range of an index with one key per document holds
-                // each once; several ranges, or a multikey index, may
-                // hold one several times; so may ids beside a range.
-                let multikey = ranges
-                    .first()
-                    .is_some_and(|r| r.index.fields.iter().any(|f| crate::query::is_multi(f)));
-                let once = ranges.len() == 1 && !multikey && ids.is_empty();
-                let mut seen = std::collections::HashSet::new();
-                let mut entries = Vec::new();
-                // The ids an OR's branches name first, looked up as
-                // `ById` looks them up (SPEC §164.2).
-                if !ids.is_empty() {
-                    let by_id = |id: &DocId| Condition::id(*id);
-                    let bounds = match &ids[..] {
-                        [id] => vec![by_id(id)],
-                        _ => vec![Condition::any(ids.iter().map(by_id))],
-                    };
-                    let read = trace.read(crate::document::ID_FIELD.to_string(), bounds, false);
-                    trace.entries(read, ids.len());
-                    reads.push(read);
-                    let primary = BTreeIndex::new(meta.index_root);
-                    for id in ids {
-                        let key = key::primary(id);
-                        if let Some(loc) = primary.lookup(store, &key)? {
-                            seen.insert(id);
-                            entries.push((key, loc));
-                        }
-                    }
-                }
-                for range in ranges {
-                    let read = trace.read(range.index.name(), range.by, false);
-                    let found = BTreeIndex::new(range.index.root).range(store, &range.range)?;
-                    trace.entries(read, found.len());
-                    reads.push(read);
-                    if once {
-                        entries = found;
-                        continue;
-                    }
-                    for entry in found {
-                        if seen.insert(key::doc_id(&entry.0)) {
-                            entries.push(entry);
-                        }
-                    }
-                }
-                (entries, indexed)
-            }
-        }
-    };
-    if indexed.covering(filter, false).is_some() {
-        reads.into_iter().for_each(|read| trace.covering(read));
+        return Ok(());
     }
-    Ok((entries, indexed))
+    let Some(crate::query::IndexReads { ids, ranges }) =
+        filter.index_reads(catalog.indexes(collection))
+    else {
+        let read = begin(crate::document::ID_FIELD.to_string(), Vec::new());
+        for entry in primary.walk(store, KeyRange::everything(), false) {
+            trace.entries(read, 1);
+            take(entry?)?;
+        }
+        return Ok(());
+    };
+    // One range of an index with one key per document holds each once;
+    // several ranges, or a multikey index, may hold one several times;
+    // so may ids beside a range.
+    let multikey = ranges
+        .first()
+        .is_some_and(|r| r.index.fields.iter().any(|f| crate::query::is_multi(f)));
+    let once = ranges.len() == 1 && !multikey && ids.is_empty();
+    let mut seen = std::collections::HashSet::new();
+    // The ids an OR's branches name first, looked up as `ById` looks
+    // them up (SPEC §164.2).
+    if !ids.is_empty() {
+        ids_read(&ids);
+        for id in ids {
+            let key = key::primary(id);
+            if let Some(loc) = primary.lookup(store, &key)? {
+                seen.insert(id);
+                take((key, loc))?;
+            }
+        }
+    }
+    for range in ranges {
+        let read = begin(range.index.name(), range.by);
+        for entry in BTreeIndex::new(range.index.root).walk(store, range.range, false) {
+            trace.entries(read, 1);
+            let entry = entry?;
+            if once || seen.insert(key::doc_id(&entry.0)) {
+                take(entry)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// An index entry: its key, and where its document is.
@@ -2822,7 +2850,7 @@ fn each_candidate<E: From<std::io::Error>>(
     mut take: impl FnMut(Candidate) -> Result<(), E>,
 ) -> Result<Option<Answer>, E> {
     let Wants { sort, select } = wants;
-    let (entries, indexed) = candidate_entries(catalog, store, collection, filter, trace)?;
+    let indexed = indexed_for(catalog, collection, filter);
     let mut decides = indexed.covering(filter, false).map(|c| c.decider(filter));
     let orders = match sort {
         true => indexed.covering(filter, true).map(|c| c.for_sort(filter)),
@@ -2832,10 +2860,10 @@ fn each_candidate<E: From<std::io::Error>>(
     // keeps its key, to be answered from if it's handed out.
     let answer = answer_for(select, indexed, filter);
     let mut records = data::Records::new(store, catalog.names());
-    for (key, loc) in entries {
+    each_entry(catalog, store, collection, filter, trace, |(key, loc)| {
         let decided = decides.as_mut().and_then(|d| d.decide(&key));
         if decided == Some(false) {
-            continue; // rejected by its entry, never read
+            return Ok(()); // rejected by its entry, never read
         }
         // A match whose entry also holds the sort keys, or with no sort
         // to need them, stays unread: its entry's document is all the
@@ -2848,15 +2876,14 @@ fn each_candidate<E: From<std::io::Error>>(
         if let Some(fields) = entry {
             let id = key::doc_id(&key);
             let key = answer.is_some().then_some(key);
-            take((Source::Entry(id, loc, key), fields))?;
-            continue;
+            return take((Source::Entry(id, loc, key), fields));
         }
         trace.examined();
         // The id stored in the data cell itself (SPEC §11).
         let stored = records.stored(loc)?;
         let fields = stored.fields(names)?;
-        take((Source::Read(stored), fields))?;
-    }
+        take((Source::Read(stored), fields))
+    })?;
     Ok(answer)
 }
 
@@ -6093,6 +6120,93 @@ mod tests {
             "Scan",
         ] {
             assert!(plans.contains(plan), "{plan} never ran: {plans:?}");
+        }
+    }
+
+    /// A sort in memory with a limit holds about twice `skip + limit`
+    /// matches at most, however many match (SPEC §176); without a limit,
+    /// all of them.
+    #[test]
+    fn a_sort_with_a_limit_holds_few_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let mut batch = db.batch();
+        for n in 0..2000i64 {
+            let doc: Document = format!(r#"{{"v": {}}}"#, (n * 7919) % 2000)
+                .parse()
+                .unwrap();
+            batch.insert(&docs, doc).unwrap();
+        }
+        batch.commit().unwrap();
+        let held = |filter: Filter| {
+            let state = docs.read().unwrap();
+            let at = state.snapshot();
+            let trace = Trace::default();
+            let found =
+                find_in(at.catalog, &at.store, "docs", &filter, true, None, &trace).unwrap();
+            (found.len(), trace.held_most())
+        };
+        assert_eq!(held(Filter::new().sort_asc("v").limit(10)), (10, 21));
+        assert_eq!(
+            held(Filter::new().sort_desc("v").skip(5).limit(10)),
+            (10, 31)
+        );
+        assert_eq!(held(Filter::new().sort_asc("v").limit(0)), (0, 0));
+        assert_eq!(held(Filter::new().sort_asc("v")), (2000, 2000));
+    }
+
+    /// The entries are handed on as the walk reaches them, never gathered
+    /// first (SPEC §176): a reader that stops after three has read three,
+    /// of a scan, of an index range and of an OR's ranges.
+    #[test]
+    fn entries_stream_and_stop_where_the_reader_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("v").unwrap();
+        let mut batch = db.batch();
+        for n in 0..2000i64 {
+            let doc: Document = format!(r#"{{"v": {}}}"#, n % 100).parse().unwrap();
+            batch.insert(&docs, doc).unwrap();
+        }
+        batch.commit().unwrap();
+        for (filter, all) in [
+            (Filter::new(), 2000),
+            (Filter::new().gte("v", 50), 1000),
+            ("v < 10 or v >= 90".parse::<Filter>().unwrap(), 400),
+            // Overlapping branches: 40 to 59 in both, each document once.
+            ("v < 60 or v >= 40".parse::<Filter>().unwrap(), 2000),
+        ] {
+            let state = docs.read().unwrap();
+            let at = state.snapshot();
+            let (trace, mut taken) = (Trace::default(), 0);
+            let stopped = each_entry(at.catalog, &at.store, "docs", &filter, &trace, |_| {
+                taken += 1;
+                match taken {
+                    3 => Err(std::io::Error::other("enough")),
+                    _ => Ok(()),
+                }
+            });
+            assert!(stopped.is_err(), "{filter:?}");
+            assert_eq!(trace.entries_read(), 3, "{filter:?}: read no further");
+            let mut taken = Vec::new();
+            each_entry(
+                at.catalog,
+                &at.store,
+                "docs",
+                &filter,
+                &Trace::default(),
+                |(key, _)| {
+                    taken.push(key::doc_id(&key));
+                    Ok::<(), std::io::Error>(())
+                },
+            )
+            .unwrap();
+            let once: std::collections::HashSet<_> = taken.iter().collect();
+            assert_eq!(once.len(), taken.len(), "{filter:?}: each document once");
+            // A range may hold more than its conditions match, checked after.
+            assert!(taken.len() >= all, "{filter:?}: {} of {all}", taken.len());
         }
     }
 

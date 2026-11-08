@@ -190,3 +190,4 @@ say what changed, and DESIGN.md says what is true now.
 173. [A date, and a time of day (`datetime.rs`, `document.rs`, `index/key.rs`, `query.rs`, `query_text.rs`, `json.rs`, `export.rs`, `serde_bridge.rs`, `serde_stored.rs`, `bin/trunkdb.rs`)](173-a-date-and-a-time-of-day.md)
 174. [A window for each group (`aggregate.rs`, `collection.rs`, `query_text.rs`)](174-a-window-for-each-group.md)
 175. [An upsert in a batch (`batch.rs`, `collection.rs`, `bin/trunkdb.rs`)](175-an-upsert-in-a-batch.md)
+176. [A sort with a limit kept small (`query.rs`, `collection.rs`, `explain.rs`)](176-a-sort-with-a-limit-kept-small.md)
