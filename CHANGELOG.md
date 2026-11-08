@@ -1216,5 +1216,6 @@ limit, batches and a write-ahead log. Since then:
     index serves, with a limit, keeps only the best `skip + limit` as
     the matches are read, as a key sort does (§154), instead of
     gathering and sorting them all. Ten of 100,000 by a field without
-    an index: 87 ms before, 52 ms now; memory as small as the limit.
-    Results are the same.
+    an index: 87 ms before, 48 ms now; memory as small as the limit,
+    the index entries read now handed on as the walk reaches them
+    rather than gathered first. Results are the same.

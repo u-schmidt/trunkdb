@@ -1,4 +1,4 @@
-# 176. A sort with a limit kept small (`query.rs`, `collection.rs`)
+# 176. A sort with a limit kept small (`query.rs`, `collection.rs`, `explain.rs`)
 
 A sort no index serves is made in memory: every match was gathered,
 all of them sorted, and the first `skip + limit` handed out (§102.5).
@@ -26,6 +26,19 @@ changed.
   snapshot's reads, a selection, and the writes that find by a sorted,
   limited filter (`update_fields`, `delete_many`, a batch's
   `update_many` and `delete_many`).
+- **The index entries stream:** the candidates' entries, a key and a
+  location for every document a scan or a range reads, were gathered
+  into one list before the first was checked, 30 to 40 bytes a
+  document, so memory still grew with the collection. `each_entry` now
+  hands each one on as the B-tree walk (§49) reaches it, and
+  `each_candidate` checks it there. Only where one document can come
+  twice, an OR's ranges, ids beside them, or a multikey index, are the
+  ids handed on kept, to pass over the second; the walk keeps the leaf
+  pages it has seen, one id a leaf. Found in review of this section.
+  A reader that stops early now reads no further: a precondition
+  (§162) stops at its first match without the rest of the range read.
+  A cursor still gathers its entries' locations, as it reads its
+  documents after the lock is let go (§82).
 - **Without a limit,** every match is kept anyway, so the sort is made as
   before. `Filter::apply`, over what a program already holds, sorts
   them all as before too.
@@ -36,14 +49,15 @@ index; the mean of 20 runs (5 for all), two rounds within 3%:
 
 | | before | now |
 |---|---:|---:|
-| ten by `lon` | 87 ms | 52 ms |
-| ten by `lon`, then `lat` | 99 ms | 62 ms |
-| 1,000 by `lon` | 91 ms | 54 ms |
-| all by `lon`, no limit | 215 ms | 214 ms |
-| all, unsorted | 103 ms | 102 ms |
+| ten by `lon` | 87 ms | 48 ms |
+| ten by `lon`, then `lat` | 99 ms | 57 ms |
+| 1,000 by `lon` | 91 ms | 50 ms |
+| all by `lon`, no limit | 215 ms | 208 ms |
+| all, unsorted | 103 ms | 100 ms |
 
-A third less time with a limit: the matches are no longer all held
-and sorted, about one comparison each instead of a full sort's. Only
+Close to half the time with a limit: the matches are no longer all
+held and sorted, about one comparison each instead of a full sort's,
+and the entries no longer gathered first. Only
 the ones handed out were ever read in full, before as now. Every match
 is still read and its sort fields decoded; an index on the sort field
 is what makes it fast (§34.2).
@@ -78,7 +92,10 @@ ignored, runs it.
   most, ten after skipping five 31, a limit of 0 none, and no limit all
   2,000. Memory can't be seen from a test, so the read's trace counts
   the most matches a sort in memory held at once (`Trace::held`); it is
-  for the tests, not in `Explained`.
+  for the tests, not in `Explained`. Entries handed on as they are
+  read: a reader stopping after three has read three, of a scan, an
+  index range, and an OR's ranges; each document once, through
+  overlapping branches too.
 - Every earlier test that reads a sort with a limit in memory runs
   through the keep now, the key sort's (§154) and the random reads of
   `collection.rs` among them.
@@ -88,7 +105,8 @@ ignored, runs it.
 ## 176.5 Fuzzed and mutated
 - **Fuzzed:** the `queries` target, whose reads sort with skips and
   limits and are checked against the model: 1,000 random programs of
-  seed 11, then 15 minutes guided, 3,005 programs. Nothing found.
+  seed 11, then 15 minutes guided, 3,005 programs; after the entries
+  were streamed, 1,000 programs of seed 13. Nothing found.
   Nothing in storage changed, so the other targets weren't run.
 - **Mutated,** ten ways by hand, each run against the library's, the
   key sort's and these tests: one fewer kept than `skip + limit`; cut
@@ -100,4 +118,6 @@ ignored, runs it.
   `Trace::held` and the test above it. Two stand: the keep used
   without a limit, which keeps every match as the sort it replaces
   does, and the key of 0 compared the other way round, which is equal
-  either way.
+  either way. Two more for the streamed entries, both caught: the
+  scan's entries gathered before the first is handed on, and an OR's
+  duplicates no longer passed over.
