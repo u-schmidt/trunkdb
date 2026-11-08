@@ -1221,3 +1221,13 @@ limit, batches and a write-ahead log. Since then:
     version 4,** which 0.34.0 and older refuse; an import reads 1 to
     3 as before. With its fixture (§120.9), which adds dates and
     times of day to the generator, as values and as index keys.
+152. **Text a program passes, read by the library** (§178), the first
+    step of the C ABI (§177): `Update` from MongoDB's operators as JSON,
+    `TryFrom<Document>` and `FromStr`; `Params` from an object of
+    values, with `names()` and `only(names)` for texts that share them;
+    `BatchLines`, a batch's ops read from JSON lines as `trunkdb batch`
+    reads them, each mistake naming its line, `batch(&db)` making the
+    `Batch`, and `failed_line` finding the line a commit failed at.
+    `trunkdb update` and `batch` read through them now, printing what
+    they printed; of several unused `--param`s, the first by name is
+    named.

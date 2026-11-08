@@ -2073,7 +2073,7 @@ fn batch_names_a_mistake_in_a_line() {
     );
     refused(
         r#"{"op": "require", "collection": "log", "filter": "a = :a"}"#,
-        "line 1: filter: no value for the parameter :a",
+        "line 1: filter: no value for the parameter :a: give it with --param a=…",
     );
     let output = trunkdb_with(&["batch", &db, "-", "--param", "b=1"], &format!("{ok}\n"));
     assert_eq!(output.status.code(), Some(2));

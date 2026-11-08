@@ -688,7 +688,7 @@ more than four.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `batch`, a file of ops, one JSON object a line, committed as one batch [§168](spec/168-a-batch-through-the-command.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `verify`, whether an export restores [§165](spec/165-backups-a-user-can-trust.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `batch`, a file of ops, one JSON object a line, committed as one batch [§168](spec/168-a-batch-through-the-command.md), read by the library's `BatchLines`, as updates by `Update`'s `FromStr`, so a program reads them as the command does [§178](spec/178-text-a-program-passes-read-by-the-library.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `verify`, whether an export restores [§165](spec/165-backups-a-user-can-trust.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't
   add up: damaged pages, pages neither used nor free, index entries
@@ -866,6 +866,7 @@ src/
 ├── collection.rs      Collection<T>: CRUD, find, indexes, update_many,
 │                        update_fields
 ├── batch.rs           Batch: typed atomic multi-op writes
+├── batch_lines.rs     BatchLines: a batch's ops read from JSON lines
 ├── changes.rs         Changes, Commit, Change: what each commit changed
 ├── cursor.rs          Cursor: streaming find, of one moment
 ├── snapshot.rs        Snapshot and View<T>: the database at one
@@ -878,7 +879,8 @@ src/
 ├── aggregate.rs       Aggregate: count, sum, min, max, avg by group, a condition per column
 ├── explain.rs         explain and explain_run: how a query ran
 ├── stats.rs           Database::stats: where a file's space goes
-├── update.rs          Update: operators on dotted paths
+├── update.rs          Update: operators on dotted paths, and read
+│                        from MongoDB's operators as JSON
 ├── document.rs        Document and DocId: the schema-less value type
 ├── datetime.rs        DateTime, Date and Time, what their Document variants hold
 ├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document

@@ -950,16 +950,22 @@ where
         }
     }
     bind(&template, &params).map_err(|e| {
-        let message = match &e {
-            BindError::Missing { name, .. } => format!("{e}: give it with --param {name}=…"),
-            _ => e.to_string(),
-        };
-        match e.offset() {
-            Some(at) => eprintln!("trunkdb: {}", marked(what, text, at, message)),
-            None => eprintln!("trunkdb: {what}: {message}"),
-        }
+        print_bind_error(what, text, &e);
         ExitCode::from(2)
     })
+}
+
+/// Values that don't fit `text`, a `what`, printed with the parameter's
+/// place marked.
+fn print_bind_error(what: &str, text: &str, e: &BindError) {
+    let message = match e {
+        BindError::Missing { name, .. } => format!("{e}: give it with --param {name}=…"),
+        _ => e.to_string(),
+    };
+    match e.offset() {
+        Some(at) => eprintln!("trunkdb: {}", marked(what, text, at, message)),
+        None => eprintln!("trunkdb: {what}: {message}"),
+    }
 }
 
 /// A collection, and the filter to read it with.
@@ -1525,131 +1531,11 @@ fn insert(file: &str, collection: &str, args: &[&str]) -> Outcome {
 }
 
 /// An update written as MongoDB writes one (SPEC §156.2): an object of
-/// operators, each an object of paths and what to do there.
+/// operators, each an object of paths and what to do there, as the
+/// library reads one (SPEC §178).
 fn parse_update(text: &str) -> Result<trunkdb::query::Update, String> {
-    let doc: Document = text
-        .parse()
-        .map_err(|e| format!("the update isn't JSON: {e}"))?;
-    update_from(doc)
-}
-
-/// An update given as a document of operators, as `parse_update` reads
-/// one: for `trunkdb batch`, where it is a value in a line (SPEC §168).
-fn update_from(doc: Document) -> Result<trunkdb::query::Update, String> {
-    use trunkdb::query::Update;
-    const OPERATORS: &str = "$set $setOnInsert $unset $inc $mul $min $max $rename $push \
-                             $addToSet $pull $pop";
-    let Document::Object(ops) = doc else {
-        return Err(
-            r#"the update is an object of operators, like {"$set": {"status": "done"}}"#
-                .to_string(),
-        );
-    };
-    if ops.is_empty() {
-        return Err(format!("the update has no operators; one of {OPERATORS}"));
-    }
-    let paths = |op: &str, args: Document| -> Result<Vec<(String, Document)>, String> {
-        match args {
-            Document::Object(fields) if !fields.is_empty() => Ok(fields.into_iter().collect()),
-            _ => Err(format!(
-                r#"{op} takes an object of paths, like {{"{op}": {{"status": …}}}}"#
-            )),
-        }
-    };
-    let mut update = Update::new();
-    for (op, args) in ops {
-        match op.as_str() {
-            "$set" | "$setOnInsert" | "$inc" | "$mul" | "$min" | "$max" | "$pull" => {
-                for (path, value) in paths(&op, args)? {
-                    update = match op.as_str() {
-                        "$set" => update.set(path, value),
-                        "$setOnInsert" => update.set_on_insert(path, value),
-                        "$inc" => update.inc(path, value),
-                        "$mul" => update.mul(path, value),
-                        "$min" => update.min(path, value),
-                        "$max" => update.max(path, value),
-                        _ => update.pull(path, value),
-                    };
-                }
-            }
-            "$unset" => {
-                let names: Vec<String> = match args {
-                    Document::Array(names) => names
-                        .into_iter()
-                        .map(|name| match name {
-                            Document::String(name) => Ok(name),
-                            _ => Err("$unset takes paths as strings".to_string()),
-                        })
-                        .collect::<Result<_, _>>()?,
-                    args => paths(&op, args)?
-                        .into_iter()
-                        .map(|(path, _)| path)
-                        .collect(),
-                };
-                for path in names {
-                    update = update.unset(path);
-                }
-            }
-            "$rename" => {
-                for (from, to) in paths(&op, args)? {
-                    let Document::String(to) = to else {
-                        return Err(format!(
-                            "$rename takes the new path as a string, for {from}"
-                        ));
-                    };
-                    update = update.rename(from, to);
-                }
-            }
-            "$push" | "$addToSet" => {
-                for (path, value) in paths(&op, args)? {
-                    let each = match &value {
-                        Document::Object(fields) if fields.len() == 1 => {
-                            match fields.get("$each") {
-                                Some(Document::Array(values)) => Some(values.clone()),
-                                Some(_) => {
-                                    return Err(format!("{op}: $each takes an array, for {path}"));
-                                }
-                                None => None,
-                            }
-                        }
-                        _ => None,
-                    };
-                    update = match (op.as_str(), each) {
-                        ("$push", Some(values)) => update.push_all(path, values),
-                        ("$push", None) => update.push(path, value),
-                        (_, Some(values)) => values.into_iter().fold(update, |update, value| {
-                            update.add_to_set(path.clone(), value)
-                        }),
-                        (_, None) => update.add_to_set(path, value),
-                    };
-                }
-            }
-            "$pop" => {
-                for (path, end) in paths(&op, args)? {
-                    update = match end {
-                        Document::Int(1) => update.pop_last(path),
-                        Document::Int(-1) => update.pop_first(path),
-                        _ => {
-                            return Err(format!(
-                                "$pop takes 1 for the last element or -1 for the first, for {path}"
-                            ));
-                        }
-                    };
-                }
-            }
-            other if other.starts_with('$') => {
-                return Err(format!(
-                    "{other}: not an update operator; one of {OPERATORS}"
-                ));
-            }
-            field => {
-                return Err(format!(
-                    r#"`{field}` isn't an operator: say how to change it, {{"$set": {{"{field}": …}}}}; a whole document isn't replaced"#
-                ));
-            }
-        }
-    }
-    Ok(update)
+    text.parse()
+        .map_err(|e: trunkdb::query::ParseUpdateError| e.to_string())
 }
 
 /// A write whose filter takes every document of the collection, more than
@@ -1761,192 +1647,25 @@ fn delete(file: &str, collection: &str, args: &[&str], values: &Given) -> Outcom
     Ok(ExitCode::SUCCESS)
 }
 
-/// One line of `trunkdb batch` (SPEC §168), read and checked.
-enum Step {
-    Insert(Document),
-    Update(Filter, trunkdb::query::Update),
-    Delete(Filter),
-    Require(Filter, bool),
-    Upsert(Filter, trunkdb::query::Update),
-}
-
-/// A line's op, with the collection it names and its line number.
-struct BatchOp {
-    line: usize,
-    collection: String,
-    op: Step,
-}
-
-/// `text`, a line of a batch, as an op: a JSON object with `op` and
-/// `collection`, and what that op takes. `Err(Some(why))` is a mistake
-/// to print; `Err(None)` one already printed, as `bound` prints a
-/// filter's.
-fn batch_line(text: &str, given: &Given, line: usize) -> Result<BatchOp, Option<String>> {
-    let doc: Document = text
-        .parse()
-        .map_err(|e| Some(format!("not a JSON object: {e}")))?;
-    let Document::Object(mut fields) = doc else {
-        return Err(Some(
-            r#"an op is a JSON object, like {"op": "delete", "collection": "tasks", "filter": "done = true"}"#
-                .to_string(),
-        ));
-    };
-    let mut take = |name: &str| fields.remove(name);
-    let op = match take("op") {
-        Some(Document::String(op)) => op,
-        Some(_) => return Err(Some("`op` is a string".to_string())),
-        None => {
-            return Err(Some(
-                "no `op`: one of insert, update, delete, upsert, require, require_none".to_string(),
-            ));
+/// A batch's lines that didn't read (SPEC §168, §178), printed as each
+/// mistake of the command is, the filter's with its place marked.
+fn print_line_error(e: &trunkdb::BatchLineError) {
+    use trunkdb::BatchLineError;
+    match e {
+        BatchLineError::Filter {
+            line, text, error, ..
+        } => eprintln!(
+            "trunkdb: {}",
+            text_error(&format!("line {line}: filter"), text, error)
+        ),
+        BatchLineError::Bind {
+            line, text, error, ..
+        } => print_bind_error(&format!("line {line}: filter"), text, error),
+        BatchLineError::Unused { name, .. } => {
+            eprintln!("trunkdb: --param {name}: no filter of the batch has the parameter :{name}")
         }
-    };
-    let collection = match take("collection") {
-        Some(Document::String(name)) if !name.is_empty() => name,
-        Some(_) => {
-            return Err(Some(
-                "`collection` is a collection's name, a string".to_string(),
-            ));
-        }
-        None => return Err(Some(format!("{op}: no `collection`"))),
-    };
-    let filter_text = take("filter");
-    let filter = |what: &str| -> Result<(Filter, bool), Option<String>> {
-        let text = match filter_text.clone() {
-            Some(Document::String(text)) => text,
-            Some(_) => {
-                return Err(Some(format!(
-                    "{what}: `filter` is a filter's text, a string, \"\" for none"
-                )));
-            }
-            None => {
-                return Err(Some(format!(
-                    "{what}: no `filter`; \"\" takes every document"
-                )));
-            }
-        };
-        let parsed = bound(
-            &format!("line {line}: filter"),
-            &text,
-            given,
-            Template::<Filter>::bind,
-        )
-        .map_err(|_| None)?;
-        Ok((parsed, text.trim().is_empty()))
-    };
-    let op = match op.as_str() {
-        "insert" => match take("document") {
-            Some(doc @ Document::Object(_)) => Step::Insert(doc),
-            Some(_) => return Err(Some("insert: `document` is a JSON object".to_string())),
-            None => return Err(Some("insert: no `document`".to_string())),
-        },
-        "update" | "delete" => {
-            let (parsed, empty) = filter(&op)?;
-            let all = match take("all") {
-                Some(Document::Bool(all)) => all,
-                None => false,
-                Some(_) => return Err(Some(format!("{op}: `all` is true or false"))),
-            };
-            if empty && !all {
-                return Err(Some(format!(
-                    "{op}: the filter is empty, which takes every document of {collection}; add \"all\": true if that's meant"
-                )));
-            }
-            match op.as_str() {
-                "update" => {
-                    let update = match take("update") {
-                        Some(update) => update_from(update).map_err(Some)?,
-                        None => return Err(Some(
-                            r#"update: no `update`, the operators, like {"$set": {"status": "done"}}"#
-                                .to_string(),
-                        )),
-                    };
-                    Step::Update(parsed, update)
-                }
-                _ => Step::Delete(parsed),
-            }
-        }
-        "require" | "require_none" => Step::Require(filter(&op)?.0, op == "require_none"),
-        // At most one document, so an empty filter needs no `all`: the
-        // collection's one document, as for settings kept in one.
-        "upsert" => {
-            let parsed = filter(&op)?.0;
-            match take("update") {
-                Some(update) => Step::Upsert(parsed, update_from(update).map_err(Some)?),
-                None => {
-                    return Err(Some(
-                        r#"upsert: no `update`, the operators, like {"$inc": {"hits": 1}}"#
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        other => {
-            return Err(Some(format!(
-                "{other}: not an op; one of insert, update, delete, upsert, require, require_none"
-            )));
-        }
-    };
-    if filter_text.is_some() && matches!(op, Step::Insert(_)) {
-        return Err(Some("insert: takes no `filter`".to_string()));
+        e => eprintln!("trunkdb: {e}; nothing written"),
     }
-    if let Some(name) = fields.keys().next() {
-        return Err(Some(format!("`{name}`: not a field of an op line")));
-    }
-    Ok(BatchOp {
-        line,
-        collection,
-        op,
-    })
-}
-
-/// `ops` as a batch of `db`, with each insert's id, `None` for the other
-/// ops; `Err` names the line whose op is refused as written, as a
-/// precondition with a limit is.
-fn batch_of(
-    db: &Database,
-    ops: &[BatchOp],
-) -> Result<(trunkdb::Batch, Vec<Option<trunkdb::DocId>>), String> {
-    let mut batch = db.batch();
-    let mut ids = Vec::new();
-    for op in ops {
-        let target = db.collection::<Document>(&op.collection);
-        let mut id = None;
-        let added = match &op.op {
-            Step::Insert(doc) => batch.insert(&target, doc.clone()).map(|new| id = Some(new)),
-            Step::Update(filter, update) => batch.update_many(&target, filter.clone(), update),
-            Step::Delete(filter) => {
-                batch.delete_many(&target, filter.clone());
-                Ok(())
-            }
-            Step::Require(filter, false) => batch.require(&target, filter.clone()),
-            Step::Require(filter, true) => batch.require_none(&target, filter.clone()),
-            Step::Upsert(filter, update) => batch.upsert_fields(&target, filter.clone(), update),
-        };
-        added.map_err(|e| format!("line {}: {e}", op.line))?;
-        ids.push(id);
-    }
-    Ok((batch, ids))
-}
-
-/// The line of the op a batch failed at: a precondition's own, any other
-/// error's by dry runs of ever shorter beginnings of the batch, the
-/// first that fails ending at it. The file is locked while open (SPEC
-/// §27), so nothing else writes between them.
-fn failed_line(db: &Database, ops: &[BatchOp], error: &trunkdb::Error) -> Option<usize> {
-    if let trunkdb::Error::PreconditionFailed { op, .. } = error {
-        return ops.get(*op).map(|op| op.line);
-    }
-    // A beginning of `ok` ops runs; one of `fails` doesn't.
-    let (mut ok, mut fails) = (0, ops.len());
-    while fails - ok > 1 {
-        let mid = (ok + fails) / 2;
-        match batch_of(db, &ops[..mid]).ok()?.0.dry_run() {
-            Ok(_) => ok = mid,
-            Err(_) => fails = mid,
-        }
-    }
-    Some(ops[fails - 1].line)
 }
 
 /// `trunkdb batch` (SPEC §168): one op a line, as JSON, all committed in
@@ -1973,36 +1692,33 @@ fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
             Err(e) => return Err(format!("{path}: {e}")),
         },
     };
-    let mut ops = Vec::new();
-    for (i, text) in lines.lines().enumerate() {
-        let text = text.map_err(|e| format!("{source}: {e}"))?;
-        if text.trim().is_empty() {
-            continue;
-        }
-        match batch_line(&text, values, i + 1) {
-            Ok(op) => ops.push(op),
-            Err(why) => {
-                if let Some(why) = why {
-                    eprintln!("trunkdb: line {}: {why}; nothing written", i + 1);
-                }
-                return Ok(ExitCode::from(2));
-            }
-        }
+    let mut text = String::new();
+    let mut lines = lines;
+    if let Err(e) = lines.read_to_string(&mut text) {
+        return Err(format!("{source}: {e}"));
     }
-    if let Some(name) = values.unused() {
-        eprintln!("trunkdb: --param {name}: no filter of the batch has the parameter :{name}");
-        return Ok(ExitCode::from(2));
-    }
+    let params = (values.values.iter()).fold(Params::new(), |params, (name, value)| {
+        params.set(name.clone(), value.clone())
+    });
+    let ops = match trunkdb::BatchLines::read(&text, &params) {
+        Ok(ops) => ops,
+        Err(e) => {
+            print_line_error(&e);
+            return Ok(ExitCode::from(2));
+        }
+    };
     let db = match create {
         true => open(file)?,
         false => existing(file)?,
     };
     if !create {
         let names = db.collections().map_err(|e| e.to_string())?;
-        if let Some(op) = ops.iter().find(|op| !names.contains(&op.collection)) {
+        if let Some(op) = (ops.ops().iter()).find(|op| !names.iter().any(|n| n == op.collection()))
+        {
             return Err(format!(
                 "line {}: {}: no such collection; --create makes it; nothing written",
-                op.line, op.collection
+                op.line(),
+                op.collection()
             ));
         }
     }
@@ -2010,10 +1726,10 @@ fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
         eprintln!("no ops; nothing written");
         return Ok(ExitCode::SUCCESS);
     }
-    let (batch, ids) = match batch_of(&db, &ops) {
+    let (batch, ids) = match ops.batch(&db) {
         Ok(built) => built,
-        Err(why) => {
-            eprintln!("trunkdb: {why}; nothing written");
+        Err(e) => {
+            print_line_error(&e);
             return Ok(ExitCode::from(2));
         }
     };
@@ -2025,7 +1741,7 @@ fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
         Ok(written) => written,
         Err(e) => {
             let at =
-                failed_line(&db, &ops, &e).map_or(String::new(), |line| format!("line {line}: "));
+                (ops.failed_line(&db, &e)).map_or(String::new(), |line| format!("line {line}: "));
             return Err(format!("{at}{e}; nothing written"));
         }
     };
@@ -2049,9 +1765,10 @@ fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
     }
     let would = if dry_run { "would " } else { "" };
     let (mut inserted, mut updated, mut deleted) = (0, 0, 0);
-    for (at, (op, &n)) in ops.iter().zip(written.counts()).enumerate() {
-        let verb = match op.op {
-            Step::Upsert(..) => match written.upserted(at) {
+    for (at, (op, &n)) in ops.ops().iter().zip(written.counts()).enumerate() {
+        use trunkdb::OpKind;
+        let verb = match op.kind() {
+            OpKind::Upsert => match written.upserted(at) {
                 Some(trunkdb::Upserted::Inserted(_)) => {
                     inserted += n;
                     if dry_run { "insert" } else { "inserted" }
@@ -2061,21 +1778,21 @@ fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
                     if dry_run { "update" } else { "updated" }
                 }
             },
-            Step::Insert(_) => {
+            OpKind::Insert => {
                 inserted += n;
                 continue;
             }
-            Step::Update(..) => {
+            OpKind::Update => {
                 updated += n;
                 if dry_run { "update" } else { "updated" }
             }
-            Step::Delete(_) => {
+            OpKind::Delete => {
                 deleted += n;
                 if dry_run { "delete" } else { "deleted" }
             }
-            Step::Require(..) => continue,
+            _ => continue,
         };
-        eprintln!("line {}: {would}{verb} {}", op.line, count(n, "document"));
+        eprintln!("line {}: {would}{verb} {}", op.line(), count(n, "document"));
     }
     let done: Vec<String> = [
         ("insert", "inserted", inserted),
