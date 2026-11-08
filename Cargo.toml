@@ -52,5 +52,9 @@ regex-syntax = { version = "0.8", optional = true, default-features = false, fea
 
 [dev-dependencies]
 tempfile = "3"
+# Only for tests/other_date_crates.rs, which checks what GUIDE.md says
+# about them: neither is a dependency of trunkdb.
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+jiff = { version = "0.2", features = ["serde"] }
 trybuild = "1"
 regex = "1.10"

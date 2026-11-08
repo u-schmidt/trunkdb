@@ -76,7 +76,11 @@ shell; strings inside it take double quotes (`'name = "Ada"'`, never
 its own: a moment, `datetime("2026-10-01T12:00:00Z")`; a day,
 `date("2026-10-01")`; a time of day, `time("14:05")`. `trunkdb fields`
 says which a field holds (`datetime`, `date`, `time`): `date(…)` on a
-field of moments finds nothing. The common forms:
+field of moments finds nothing. A field of times that `fields` says
+holds `string` was likely written from `chrono` or `jiff` types, which
+trunkdb stores as text: `datetime(…)` doesn't match it, and it sorts
+as text. Compare it with a string of the same form, and tell the user
+it should be a `trunkdb::DateTime`. The common forms:
 
 ```text
 status = "open" and hours >= 4

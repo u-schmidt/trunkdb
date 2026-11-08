@@ -177,6 +177,37 @@ moments writes a moment. `trunkdb fields` says which a field holds:
 1970, `Date::from_days_since_epoch(day.days_since_epoch() + 7)`; for
 months, zones and the rest, convert to `jiff` or `chrono`.
 
+### With `chrono` or `jiff`
+
+Store trunkdb's types, and convert where the program does calendar
+work. A `chrono::DateTime<Utc>` or `jiff::Timestamp` field serializes as
+a string, and trunkdb stores it as one (SPEC §69.5): a filter with
+`datetime(…)` never matches it, a window by time leaves it out, and it
+sorts as text, `…:00.500Z` before `…:00Z`. Nothing warns; `trunkdb
+fields` shows `string`.
+
+The text is the bridge, with each crate's own parsing. trunkdb writes
+RFC 3339 in UTC and reads any offset, so the moment is kept whatever
+zone it came from:
+
+```rust
+let c: chrono::DateTime<chrono::Utc> = shift.logged.to_string().parse()?;
+let logged: trunkdb::DateTime = c.to_rfc3339().parse()?;
+
+let j: jiff::Timestamp = shift.logged.to_string().parse()?;
+let logged: trunkdb::DateTime = j.to_string().parse()?;
+
+let day: trunkdb::Date = chrono_date.to_string().parse()?; // "2026-11-07"
+let starts: trunkdb::Time = jiff_time.to_string().parse()?; // "14:05:00"
+```
+
+- A jiff `Zoned` writes its zone's name, `…+01:00[Europe/Berlin]`,
+  which trunkdb refuses: convert its `.timestamp()`.
+- A chrono `NaiveDateTime` has no zone, so no moment: say which, as
+  `.and_utc()`, first.
+- Years past 9999 are written with a sign, `+10000-01-01T00:00:00Z`:
+  chrono reads them, jiff can't hold them.
+
 ## A condition of your own
 
 For a test no operator covers, a closure: name the fields it reads, and
