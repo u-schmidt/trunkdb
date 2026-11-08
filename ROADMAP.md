@@ -91,12 +91,13 @@ docs.rs, or stays on GitHub alone, as now.
   in for every language that calls C, C# through P/Invoke, Swift, Go,
   Java, Node, Dart. Handles for a database, a cursor and a snapshot;
   documents in and out as tagged JSON, filters and aggregates as text
-  with parameters (§163), updates as JSON operators, so about 25
+  with parameters (§163), updates as JSON operators, so about 35
   functions carry the whole query language; errors as codes and a last
   error's text; no panic across the boundary. Closures (custom
   conditions, a sort by key, `update_many`'s change) have no text and
   stay out. A thin wrapper per language on top, C# first. Built on one
-  embedding API inside trunkdb that the PyO3 bindings share.
+  embedding API inside trunkdb that the PyO3 bindings share. Designed
+  in §177, before the code.
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
