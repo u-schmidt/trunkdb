@@ -189,3 +189,4 @@ say what changed, and DESIGN.md says what is true now.
 172. [Walks that pass part of a leaf (`index/btree.rs`, `index/leaf.rs`, `collection.rs`, `decode.rs`, `storage/slotted.rs`)](172-walks-that-pass-part-of-a-leaf.md)
 173. [A date, and a time of day (`datetime.rs`, `document.rs`, `index/key.rs`, `query.rs`, `query_text.rs`, `json.rs`, `export.rs`, `serde_bridge.rs`, `serde_stored.rs`, `bin/trunkdb.rs`)](173-a-date-and-a-time-of-day.md)
 174. [A window for each group (`aggregate.rs`, `collection.rs`, `query_text.rs`)](174-a-window-for-each-group.md)
+175. [An upsert in a batch (`batch.rs`, `collection.rs`, `bin/trunkdb.rs`)](175-an-upsert-in-a-batch.md)

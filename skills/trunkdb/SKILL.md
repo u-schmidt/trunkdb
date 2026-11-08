@@ -252,7 +252,9 @@ trunkdb index app.trunkdb users add email --unique
 
   Each line has `op` and `collection`: `insert` takes `document`;
   `update` takes `filter` and `update` (operators as above); `delete`
-  takes `filter`; `require` and `require_none` take `filter` and stop
+  takes `filter`; `upsert` takes `filter` and `update`, and changes the
+  one document found or inserts one made of the filter's `=`, printing
+  its id; `require` and `require_none` take `filter` and stop
   the whole batch unless a document matches, or none does. Each op sees
   what the lines before it wrote. An update or delete with an empty
   filter needs `"all": true`. Run it with `--dry-run` first: it prints

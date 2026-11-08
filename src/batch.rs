@@ -1,9 +1,11 @@
 use crate::catalog::Catalog;
 use crate::collection::{
-    Collection, any_match_in, apply_write_op, delete_matching_in, update_by_id, update_matching_in,
+    Collection, Upserted, any_match_in, apply_write_op, delete_matching_in, update_by_id,
+    update_matching_in, upsert_fields_in,
 };
 use crate::database::Database;
 use crate::document::{DocId, Document};
+use crate::id::IdGenerator;
 use crate::query::{Filter, Update};
 use crate::storage::PageStore;
 use crate::txn::WriteOp;
@@ -85,6 +87,16 @@ enum Op {
         collection: String,
         filter: Filter,
     },
+    /// `update`'s operators made to the one document `filter` finds, or
+    /// `seed` and them inserted as `id` where it finds none (SPEC §175).
+    Upsert {
+        collection: String,
+        filter: Filter,
+        id: DocId,
+        seed: Document,
+        update: Update,
+        accept: fn(&Document) -> crate::Result<()>,
+    },
 }
 
 /// What a batch did (SPEC §168): `Batch::commit` returns it, and
@@ -93,6 +105,8 @@ enum Op {
 #[non_exhaustive]
 pub struct Written {
     counts: Vec<usize>,
+    /// For each op, what it upserted: `Some` for `upsert_fields` only.
+    upserted: Vec<Option<Upserted>>,
 }
 
 impl Written {
@@ -100,9 +114,19 @@ impl Written {
     /// wrote: 1 for an insert, an update or a delete by id; for
     /// `update_fields` 1, or 0 where the operators left the document as it
     /// was; for `update_many` the documents it changed, for `delete_many`
-    /// those it deleted; 0 for a precondition.
+    /// those it deleted; for `upsert_fields` 1, or 0 where it found a
+    /// document the operators left as it was; 0 for a precondition.
     pub fn counts(&self) -> &[usize] {
         &self.counts
+    }
+
+    /// What op `op` of the batch, counted from 0 in the order added, did
+    /// if it is an `upsert_fields` (SPEC §175): `Upserted::Inserted` with
+    /// the new document's id, or `Upserted::Updated` with the id of the one
+    /// it found, written or left as it was. `None` for any other op, and
+    /// past the last.
+    pub fn upserted(&self, op: usize) -> Option<Upserted> {
+        self.upserted.get(op).copied().flatten()
     }
 
     /// How many documents the ops wrote, all of them together: a document
@@ -298,20 +322,7 @@ impl Batch {
         none: bool,
     ) -> crate::Result<()> {
         let name = self.name_of(collection);
-        let has = [
-            (!filter.sort.is_empty() || filter.by_key.is_some(), "a sort"),
-            (filter.skip > 0, "a skip"),
-            (filter.limit.is_some(), "a limit"),
-            (
-                filter.select.is_some() || !filter.except.is_empty(),
-                "a selection",
-            ),
-        ];
-        if let Some((_, what)) = has.iter().find(|(has, _)| *has) {
-            return Err(crate::collection::invalid_input(format!(
-                "a precondition's filter can't have {what}: only its conditions are checked"
-            )));
-        }
+        conditions_only(&filter, "a precondition's")?;
         self.ops.push(Op::Require {
             collection: name,
             filter,
@@ -384,6 +395,70 @@ impl Batch {
         });
     }
 
+    /// Adds an upsert by operators (SPEC §175), as
+    /// `Collection::upsert_fields` makes one, at the op's place: at
+    /// `commit`, `update`'s operators are made to the one document of
+    /// `collection` that `filter` finds then, as the ops before leave it;
+    /// where it finds none, a document made of the filter's `eq`s and
+    /// then the operators, `set_on_insert` included, is inserted.
+    /// `Written::upserted` says which, and the id.
+    ///
+    /// Refused here, leaving the batch as it was, with
+    /// `ErrorKind::InvalidInput`: an update refused as written, a filter
+    /// whose `eq`s can't be made into one document (SPEC §144.2), and a
+    /// filter with a sort, a skip, a limit or a selection, as for
+    /// `require`: only its conditions count. The id a new document gets is
+    /// chosen here, the filter's `_id` if it has one.
+    ///
+    /// At `commit`, several matches fail the whole batch with
+    /// `Error::MultipleMatches`; so does an operator that can't be made
+    /// (`Error::Update`), and, on a typed collection, a document written
+    /// that doesn't convert to `T`. A match the operators leave as it was
+    /// isn't written.
+    ///
+    /// ```no_run
+    /// # fn main() -> trunkdb::Result<()> {
+    /// use trunkdb::{Database, DateTime, Document, query::{Filter, Update}};
+    ///
+    /// let db = Database::open("app.trunkdb")?;
+    /// let (visits, totals) = (db.collection::<Document>("visits"), db.collection::<Document>("totals"));
+    /// // A page's count and the site's, in one commit: each made by the
+    /// // first visit, added to by the later ones.
+    /// let mut batch = db.batch();
+    /// batch.upsert_fields(
+    ///     &visits,
+    ///     Filter::new().eq("page", "/home"),
+    ///     &Update::new().inc("hits", 1).set_on_insert("first", DateTime::now()),
+    /// )?;
+    /// batch.upsert_fields(&totals, Filter::new().eq("site", "main"), &Update::new().inc("hits", 1))?;
+    /// let written = batch.commit()?;
+    /// let page = written.upserted(0).unwrap().id();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn upsert_fields<T: FromDocument>(
+        &mut self,
+        collection: &Collection<T>,
+        filter: Filter,
+        update: &Update,
+    ) -> crate::Result<()> {
+        let name = self.name_of(collection);
+        conditions_only(&filter, "an upsert's")?;
+        update.check().map_err(crate::collection::invalid_input)?;
+        let (named, seed) =
+            crate::update::seed(&filter.conditions).map_err(crate::collection::invalid_input)?;
+        let id = named.unwrap_or_else(|| self.db.id_gen().generate());
+        self.ops.push(Op::Upsert {
+            collection: name,
+            filter,
+            id,
+            seed,
+            update: update.clone(),
+            accept: T::accept,
+        });
+        Ok(())
+    }
+
     /// How many ops the batch holds.
     pub fn len(&self) -> usize {
         self.ops.len()
@@ -399,10 +474,10 @@ impl Batch {
     pub fn commit(self) -> crate::Result<Written> {
         if self.ops.is_empty() {
             // Reports a poisoned database.
-            return self
-                .db
-                .write_batch(Vec::new())
-                .map(|()| Written { counts: Vec::new() });
+            return self.db.write_batch(Vec::new()).map(|()| Written {
+                counts: Vec::new(),
+                upserted: Vec::new(),
+            });
         }
         self.db.transact(|catalog, store| self.run(catalog, store))
     }
@@ -421,7 +496,9 @@ impl Batch {
     /// next.
     fn run(&self, catalog: &mut Catalog, store: &mut dyn PageStore) -> crate::Result<Written> {
         let mut counts = Vec::with_capacity(self.ops.len());
+        let mut upserted = Vec::with_capacity(self.ops.len());
         for (at, op) in self.ops.iter().enumerate() {
+            upserted.push(None);
             counts.push(match op {
                 Op::Write(write) => {
                     apply_write_op(catalog, store, write)?;
@@ -477,9 +554,29 @@ impl Batch {
                 Op::DeleteMany { collection, filter } => {
                     delete_matching_in(catalog, store, collection, filter)?
                 }
+                Op::Upsert {
+                    collection,
+                    filter,
+                    id,
+                    seed,
+                    update,
+                    accept,
+                } => {
+                    let (done, written) = upsert_fields_in(
+                        catalog,
+                        store,
+                        collection,
+                        filter,
+                        (*id, seed),
+                        update,
+                        &mut |doc| accept(doc),
+                    )?;
+                    upserted[at] = Some(done);
+                    usize::from(written)
+                }
             });
         }
-        Ok(Written { counts })
+        Ok(Written { counts, upserted })
     }
 
     /// The collection's name — after checking the handle belongs to this
@@ -492,6 +589,26 @@ impl Batch {
             "Batch op on a collection of a different Database"
         );
         collection.name().to_string()
+    }
+}
+
+/// Refuses `filter` with anything but conditions, for an op where only
+/// they count: `whose` filter, as the error names it.
+fn conditions_only(filter: &Filter, whose: &str) -> crate::Result<()> {
+    let has = [
+        (!filter.sort.is_empty() || filter.by_key.is_some(), "a sort"),
+        (filter.skip > 0, "a skip"),
+        (filter.limit.is_some(), "a limit"),
+        (
+            filter.select.is_some() || !filter.except.is_empty(),
+            "a selection",
+        ),
+    ];
+    match has.iter().find(|(has, _)| *has) {
+        Some((_, what)) => Err(crate::collection::invalid_input(format!(
+            "{whose} filter can't have {what}: only its conditions are checked"
+        ))),
+        None => Ok(()),
     }
 }
 

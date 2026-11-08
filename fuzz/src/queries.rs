@@ -180,6 +180,11 @@ pub struct Ran {
     pub batch_fields_failed: [u64; 3],
     /// Batches whose ops failed before operators could be added.
     pub batch_fields_skipped: u64,
+    /// A batch's `upsert_fields` ops (SPEC §175), how many inserted, and
+    /// how many failed as the model says.
+    pub batch_upserts: u64,
+    pub batch_upserts_inserted: u64,
+    pub batch_upserts_failed: u64,
 }
 
 pub const STEP_NAMES: [&str; 15] = [
@@ -1343,6 +1348,11 @@ impl Run<'_> {
         if with_fields && earlier {
             self.ran.batch_fields_skipped += 1;
         }
+        // Half of them end with an upsert instead (SPEC §175), checked
+        // against what the ops before it leave.
+        if with_fields && !earlier && self.program.one_in(2) {
+            return self.batch_upsert(batch, after);
+        }
         if with_fields && !earlier {
             for _ in 0..1 + self.program.below(3) {
                 // Mostly a document the batch holds by then, so that most
@@ -1422,6 +1432,120 @@ impl Run<'_> {
             "{}: a batch the model says {fails:?} of: {result:?}",
             self.at()
         );
+    }
+
+    /// `batch`, ending with an `upsert_fields` op on `after`, the model as
+    /// the ops before it leave it: it fails, or commits, as
+    /// `Collection::upsert_fields` would on that model (SPEC §175).
+    fn batch_upsert(&mut self, mut batch: trunkdb::Batch, after: BTreeMap<DocId, Document>) {
+        let query = self.query();
+        // Mostly its conditions alone; one in eight with the rest of the
+        // query, which is refused if it sorts, skips, limits or selects.
+        let whole = self.program.one_in(8);
+        let filter = match whole {
+            true => query.filter(),
+            false => query.conditions_only(),
+        };
+        // One in four by the id of a document the batch holds, so that
+        // as many find one as find none or several.
+        let held = match after.len() {
+            n if n > 0 && self.program.one_in(4) => {
+                Some(*after.keys().nth(self.program.below(n)).unwrap())
+            }
+            _ => None,
+        };
+        let (filter, query) = match held {
+            Some(id) => {
+                let by_id = Query {
+                    conditions: vec![Condition::id(id)],
+                    ..query
+                };
+                (by_id.conditions_only(), by_id)
+            }
+            None => (filter, query),
+        };
+        let whole = whole && held.is_none();
+        let update = self.random_update();
+        let conditions = query.conditions_only();
+        let matches: Vec<DocId> = (self.expected(&after, &conditions).iter())
+            .map(id_of)
+            .collect();
+        if matches.is_empty() && after.len() >= MAX_DOCS {
+            return;
+        }
+        let at = batch.len();
+        // Only its conditions count: a sort, skip, limit or selection is
+        // refused, as for a precondition.
+        let docs = self.docs();
+        let added = batch.upsert_fields(&docs, filter.clone(), &update);
+        let plain = !whole
+            || query.sort.is_empty()
+                && query.skip == 0
+                && query.limit.is_none()
+                && query.select.is_none()
+                && query.except.is_empty();
+        match added {
+            Ok(()) => assert!(plain, "{}: {filter:?} added", self.at()),
+            // Refused as written: the update, the filter's `eq`s, or what
+            // only conditions may be.
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => return,
+            Err(e) => panic!("{}: upsert_fields {filter:?} added: {e:?}", self.at()),
+        }
+        self.ran.batch_upserts += 1;
+        let rehearsed = batch.dry_run();
+        let result = batch.commit();
+        if self.trace {
+            eprintln!("  batch upsert {filter:?} {update:?}, matching {matches:?}: {result:?}");
+        }
+        assert_eq!(
+            format!("{rehearsed:?}"),
+            format!("{result:?}"),
+            "{}: a dry run says what commit does",
+            self.at()
+        );
+        let into = match (&matches[..], &result) {
+            (_, Err(Error::MultipleMatches { count, .. })) if matches.len() > 1 => {
+                assert_eq!(*count, matches.len(), "{}", self.at());
+                None
+            }
+            ([one], Err(Error::Update { id, .. })) if id == one => None,
+            ([], Err(Error::Update { .. })) => None,
+            ([one], Err(Error::DuplicateValue { id, existing, .. }))
+                if id == one && after.contains_key(existing) =>
+            {
+                self.ran.refused_duplicates += 1;
+                None
+            }
+            ([], Err(Error::DuplicateValue { id, existing, .. }))
+                if !after.contains_key(id) && after.contains_key(existing) =>
+            {
+                self.ran.refused_duplicates += 1;
+                None
+            }
+            ([], Err(Error::DuplicateId { id, .. })) if after.contains_key(id) => None,
+            ([one], Ok(written)) if written.upserted(at) == Some(Upserted::Updated(*one)) => {
+                Some(*one)
+            }
+            ([], Ok(written)) => match written.upserted(at) {
+                Some(Upserted::Inserted(id)) if !after.contains_key(&id) => {
+                    self.ran.batch_upserts_inserted += 1;
+                    Some(id)
+                }
+                other => panic!("{}: batch upsert inserting: {other:?}", self.at()),
+            },
+            _ => panic!(
+                "{}: batch upsert {filter:?} {update:?}, matching {matches:?}: {result:?}",
+                self.at()
+            ),
+        };
+        let Some(id) = into else {
+            self.ran.batch_upserts_failed += 1;
+            return;
+        };
+        self.model = after;
+        let stored = self.docs().get(&id).unwrap().expect("upserted");
+        self.model.insert(id, stored);
+        self.no_duplicates(&format!("a batch's upsert_fields {filter:?} {update:?}"));
     }
 
     fn replace(&mut self) {

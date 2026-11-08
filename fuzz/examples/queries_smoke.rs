@@ -85,6 +85,9 @@ fn main() {
                 total.batch_fields += ran.batch_fields;
                 total.batch_fields_committed += ran.batch_fields_committed;
                 total.batch_fields_skipped += ran.batch_fields_skipped;
+                total.batch_upserts += ran.batch_upserts;
+                total.batch_upserts_inserted += ran.batch_upserts_inserted;
+                total.batch_upserts_failed += ran.batch_upserts_failed;
                 for (total, ran) in total
                     .batch_fields_failed
                     .iter_mut()
@@ -149,6 +152,10 @@ fn main() {
         total.batch_fields_failed[1],
         total.batch_fields_failed[2],
         total.batch_fields_skipped
+    );
+    println!(
+        "  upsert_fields ops in batches (§175): {}, {} inserting, {} failing as the model says",
+        total.batch_upserts, total.batch_upserts_inserted, total.batch_upserts_failed
     );
     println!("plans:");
     for plan in &total.plans {
