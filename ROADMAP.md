@@ -100,6 +100,14 @@ docs.rs, or stays on GitHub alone, as now.
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
+- **A sort with a limit kept small:** by fields in memory, the best
+  `skip + limit` kept as they are read, as §154 keeps a key sort's,
+  instead of every match gathered and sorted. Ten of 100,000 by a
+  field no index holds took 75 ms, ten by a key 60 (§154.4).
+- **An upsert in a batch,** `Batch::upsert_fields`, and an `upsert`
+  line for `trunkdb batch` (§168.6): today it takes two ops, a
+  `require_none` and an insert, or a `require` and an `update_many`.
+  Through the C ABI, a batch is how a program writes.
 - **Longer fuzzing runs,** with AddressSanitizer too, and short ones in
   CI on nightly (§55.6).
 
@@ -115,40 +123,14 @@ uses trunkdb asking for it.
   types and trunkdb's `DateTime`, `Date` and `Time`.
 
 **Queries**
-- Rules are enough while every plan is bounded by one pass over one
-  collection; where they are blind to the data, a hint (§132) and the
-  plans `explain_run` passed over (§133) cover it. With lookups into
-  another collection, that bound is gone and the choice of a rule-based
-  planner wants a second look. The alternatives for
-  `explain_aggregate`'s reads from entries wait until asked for
-  (§133.5).
 - Leaves decided whole for filters that accept several intervals of
   keys (`ne`, an OR, a NOT), each leaf checked against the intervals'
   bounds; they decide entry by entry, on bytes, since §104 (§104.6).
-- A sort by fields in memory with a limit, which still gathers every
-  match and sorts them all: the best `skip + limit` kept as they are
-  read, as §154 keeps a key sort's, would serve it too. Ten of 100,000
-  by a field no index holds took 75 ms, ten by a key 60 (§154.4).
 - A scan, 1.3× SQLite's: each document's filtered fields are decoded
   into a small object to be checked (§99); checking them as they are
   decoded would save that.
-- The count of all documents, 0.09 ms for 100,000 where SQLite and redb
-  keep a total: counted leaf by leaf since §101. A total kept in the
-  catalog would make it free, at a write to the catalog page in every
-  batch that inserts or deletes.
 
-**Changes as they happen**
-
-Built in §135–§139, as one group: the hook after each commit,
-`Condition::custom`, live queries, live aggregates and a window.
-[§140](spec/140-changes-as-they-happen.md) says what they share.
-- Conditions on places built in: a point within a circle or a polygon,
-  as MongoDB's `$geoWithin`, with an index on points. Geometry runs
-  deep (sphere or plane, the antimeridian, polygons with holes), and
-  SQLite and PostgreSQL keep it in extensions (R*Tree, PostGIS); the
-  file would need pages of a new kind. Only if `Condition::custom`,
-  with a coarse key indexed, or the fences in the application's own
-  memory (§140.6), is too slow for a program that uses it.
+**Changes as they happen** ([§140](spec/140-changes-as-they-happen.md))
 - A window counted back from the clock, with a timer to run the
   aggregate again as readings age out: a second source of events
   (§139.2).
@@ -172,23 +154,15 @@ Built in §135–§139, as one group: the hook after each commit,
   recovery now take memory that doesn't grow with the file (§90, §91,
   §108), but for each index's keys, sorted in memory while it is
   rebuilt: an external sort, if real files ask for it (§108.8).
-- Batched writes: inserts about 0.7× SQLite's after §123 raised the
-  checkpoint threshold, level with it or a little ahead after §150–§152
-  (43k/s against 39k/s, §152.2); updates level since §153 (15k/s
-  against 14k/s), still behind redb and sled: a batch of 1,000 updates
-  writes about 2,160 whole pages, 2.7× an insert batch, so the WAL
-  record and the checkpoints are a third of its CPU and most of its
-  disk time (§153). §149 measured WAL
-  records of a page's changed bytes after its first whole image before
-  building them: 4.2× fewer WAL bytes on inserts, but only about 15%
-  faster, as the CPU is most of a commit (designed there, WAL version
-  4; whether to build it is open, §149.8). The CPU part, profiled in
-  §150: done are the search within a page (§150), a page copied once a
-  batch instead of on every change (§151), and a page's layout mark
-  kept through its own changes instead of checked on every read
-  (§152). Next, the WAL record written from the pages instead of
-  copied into one buffer (4–5%); then a checkpoint without the WAL's own flush, a generation
-  number in its header and records.
+- Batched writes: inserts level with SQLite's (43k/s against 39k/s,
+  §152.2), updates too (15k/s against 14k/s, §153), still behind redb
+  and sled: a batch of 1,000 updates writes about 2,160 whole pages.
+  Next, the WAL record written from the pages instead of copied into
+  one buffer (4–5%); then a checkpoint without the WAL's own flush, a
+  generation number in its header and records. WAL records of a page's
+  changed bytes (§149), designed as WAL version 4, gave 4.2× fewer WAL
+  bytes but only about 15% speed; whether to build them is open
+  (§149.8).
 
 - A native backup while the application runs, `Database::backup_to(path)`:
   a snapshot written as one compacted file without a WAL, as SQLite's
@@ -217,13 +191,13 @@ Built in §135–§139, as one group: the hook after each commit,
   holds no entry for a value that isn't an array or an element of a
   kind no index holds, and one for a value repeated. With a marker entry
   for each document whose entries don't stand for its array whole, file
-  format 13 and multikey indexes rebuilt at the first open, every
+  a format bump and multikey indexes rebuilt at the first open, every
   column would be: if a collection makes per-element aggregates slow.
 - A document as `serde_json::Value`, beside its text form (§71), if a
   tool needs it: behind a feature named `serde_json-1`, so `serde_json`
   stays out of the default public API (§71.4).
 - Aggregates beyond §107, §146 and §147, when asked (§107.8): `push`, percentiles; `sum` from index entries, which wants an
-  `Int`/`Float` bit and a missing mark in every key, file format 13
+  `Int`/`Float` bit and a missing mark in every key, a format bump
   (§106.8); `min` and `max` that seek a group's ends instead of walking
   its entries; rows handed out as they are made rather than collected.
 - A leaf decided whole for a column's range after the group fields
@@ -245,29 +219,9 @@ Built in §135–§139, as one group: the hook after each commit,
   string (§169.3): a count or a selection of `_id` by a regex would read
   no document. Each is checked on its document now, as `contains` is.
   If a program counts by a regex over many documents.
-- A word index, for a search over long text in milliseconds (§169.6):
-  each word of a field an entry, `notes has word "timeout"`. A regex
-  over long text reads every document. If a program searches notes or
-  messages that way.
-- An upsert in a batch, `Batch::upsert_fields`, and an `upsert` line
-  for `trunkdb batch` (§168.6): a `require_none` and an insert, or a
-  `require` and an `update_many`, do it in two ops today. When a
-  program needs it in one.
-- A closure in a batch's `update_many`, as `Collection::update_many`
-  takes one (§168.1): it would have to be `Send + 'static` and run with
-  every write waiting. When a program has a change no operator makes
-  and reading by id with a `require` doesn't serve.
-- A version kept by trunkdb on every document, raised by every write,
-  for `require` to hold a read-modify-write to (§162.5): a format change
-  and a cost to every write, where a program's own `version` field does
-  the same. If programs keep writing that field by hand.
 
 **Tooling and reach**
 - Repairing what `check` finds, beyond export and import (§39.5).
-- Updates as text (§111.11), as aggregates have had theirs since §157.
-  The command takes an update as MongoDB's operators in JSON (§156),
-  which serves it and agents; a text of their own when a program asks
-  for one.
 
 ### Not planned
 Decided against, each for the reason given; the scope was first drawn
@@ -295,5 +249,29 @@ in §6.
   order of `created`, and in id order only among equal ones (§103.1).
   A merge would need a range per value of `created`, which only reading
   the range tells; the sort in memory reads no more (§167.7).
+- **Lookups into another collection, and a planner for them:** joins
+  are not planned, so plans stay bounded by one pass over one
+  collection, which rules serve.
+- **Conditions on places:** a point within a circle or a polygon, as
+  MongoDB's `$geoWithin`, with an index on points. Geometry runs deep
+  (sphere or plane, the antimeridian, polygons with holes), and SQLite
+  and PostgreSQL keep it in extensions (R*Tree, PostGIS).
+  `Condition::custom` with a coarse key indexed, or the fences in the
+  application's own memory, serves (§140.6).
+- **A word index,** full-text search: words, languages and stemming
+  are a product of their own, as vector search is. A regex (§169)
+  searches text, reading each document (§169.6).
+- **A version on every document, kept by trunkdb:** a format change and
+  a cost to every write, where a program's own `version` field and
+  `require` (§162.5) do the same.
+- **A closure in a batch's `update_many`:** it would have to be
+  `Send + 'static` and run with every write waiting (§168.1). A read by
+  id and a write held by `require` serve.
+- **Updates as text** (§111.11): updates are MongoDB's operators in
+  JSON (§156), in the command and through the C ABI; a third form adds
+  nothing.
+- **A count of all documents kept in the catalog:** counted leaf by
+  leaf it takes 0.09 ms for 100,000 (§101), and a total would cost a
+  write to the catalog page in every batch that inserts or deletes.
 
 Aggregates were on this list until §106.7, and came in §107.
