@@ -1205,3 +1205,10 @@ limit, batches and a write-ahead log. Since then:
     `aggregate`, `apply`, snapshots and live aggregates; refused
     beside a filter's sort, skip or limit, as `window` is. In the
     text, `window at 10 per group` and `window at 5m per group`.
+150. **An upsert in a batch** (§175): `Batch::upsert_fields(&collection,
+    filter, &update)`, `Collection::upsert_fields` as an op, at its
+    place among the batch's ops: a counter and its total made or added
+    to in one commit. `Written::upserted(op)` says whether it inserted
+    or updated, and the id. Several matches fail the batch; a filter
+    with a sort, skip, limit or selection is refused when added. An
+    `upsert` line for `trunkdb batch`, its id printed with the inserts'.

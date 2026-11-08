@@ -102,12 +102,15 @@ writing (each command is one atomic batch; the file must exist but for insert --
                               {\"op\": \"update\", \"collection\": \"tasks\",
                                \"filter\": \"due < :now\", \"update\": {\"$set\": …}}
                               {\"op\": \"delete\", \"collection\": …, \"filter\": …}
+                              {\"op\": \"upsert\", \"collection\": …, \"filter\": …,
+                               \"update\": …}: the one document found, or
+                              one made of the filter's = and inserted
                               {\"op\": \"require\" or \"require_none\", \"collection\": …,
                                \"filter\": …}: must find a document, or none,
                               or nothing is written. An update or delete
                               with an empty filter needs \"all\": true.
-                              Prints each new id; a failure names its
-                              line. --create makes missing collections;
+                              Prints each inserted or upserted id; a
+                              failure names its line. --create makes missing collections;
                               --dry-run says what it would do
   index  <file> <collection> add <field>... [--unique] [--sparse]
   index  <file> <collection> drop <field>...
@@ -1764,6 +1767,7 @@ enum Step {
     Update(Filter, trunkdb::query::Update),
     Delete(Filter),
     Require(Filter, bool),
+    Upsert(Filter, trunkdb::query::Update),
 }
 
 /// A line's op, with the collection it names and its line number.
@@ -1793,7 +1797,7 @@ fn batch_line(text: &str, given: &Given, line: usize) -> Result<BatchOp, Option<
         Some(_) => return Err(Some("`op` is a string".to_string())),
         None => {
             return Err(Some(
-                "no `op`: one of insert, update, delete, require, require_none".to_string(),
+                "no `op`: one of insert, update, delete, upsert, require, require_none".to_string(),
             ));
         }
     };
@@ -1863,9 +1867,23 @@ fn batch_line(text: &str, given: &Given, line: usize) -> Result<BatchOp, Option<
             }
         }
         "require" | "require_none" => Step::Require(filter(&op)?.0, op == "require_none"),
+        // At most one document, so an empty filter needs no `all`: the
+        // collection's one document, as for settings kept in one.
+        "upsert" => {
+            let parsed = filter(&op)?.0;
+            match take("update") {
+                Some(update) => Step::Upsert(parsed, update_from(update).map_err(Some)?),
+                None => {
+                    return Err(Some(
+                        r#"upsert: no `update`, the operators, like {"$inc": {"hits": 1}}"#
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         other => {
             return Err(Some(format!(
-                "{other}: not an op; one of insert, update, delete, require, require_none"
+                "{other}: not an op; one of insert, update, delete, upsert, require, require_none"
             )));
         }
     };
@@ -1882,18 +1900,20 @@ fn batch_line(text: &str, given: &Given, line: usize) -> Result<BatchOp, Option<
     })
 }
 
-/// `ops` as a batch of `db`; `Err` names the line whose op is refused as
-/// written, as a precondition with a limit is.
+/// `ops` as a batch of `db`, with each insert's id, `None` for the other
+/// ops; `Err` names the line whose op is refused as written, as a
+/// precondition with a limit is.
 fn batch_of(
     db: &Database,
     ops: &[BatchOp],
-) -> Result<(trunkdb::Batch, Vec<trunkdb::DocId>), String> {
+) -> Result<(trunkdb::Batch, Vec<Option<trunkdb::DocId>>), String> {
     let mut batch = db.batch();
     let mut ids = Vec::new();
     for op in ops {
         let target = db.collection::<Document>(&op.collection);
+        let mut id = None;
         let added = match &op.op {
-            Step::Insert(doc) => batch.insert(&target, doc.clone()).map(|id| ids.push(id)),
+            Step::Insert(doc) => batch.insert(&target, doc.clone()).map(|new| id = Some(new)),
             Step::Update(filter, update) => batch.update_many(&target, filter.clone(), update),
             Step::Delete(filter) => {
                 batch.delete_many(&target, filter.clone());
@@ -1901,8 +1921,10 @@ fn batch_of(
             }
             Step::Require(filter, false) => batch.require(&target, filter.clone()),
             Step::Require(filter, true) => batch.require_none(&target, filter.clone()),
+            Step::Upsert(filter, update) => batch.upsert_fields(&target, filter.clone(), update),
         };
         added.map_err(|e| format!("line {}: {e}", op.line))?;
+        ids.push(id);
     }
     Ok((batch, ids))
 }
@@ -2008,9 +2030,15 @@ fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
         }
     };
     if !dry_run {
-        // The new ids, as `trunkdb insert` prints them: a script reads them.
+        // The new ids, as `trunkdb insert` prints them, and each upsert's,
+        // as `update --upsert` prints it, in the order of their lines: a
+        // script reads them.
+        let ids = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(at, id)| id.or_else(|| written.upserted(at).map(|done| done.id())));
         let mut out = io::BufWriter::new(io::stdout().lock());
-        for id in &ids {
+        for id in ids {
             if let Err(e) = writeln!(out, "{id}") {
                 return stopped_writing(e);
             }
@@ -2021,8 +2049,18 @@ fn batch(file: &str, args: &[&str], values: &Given) -> Outcome {
     }
     let would = if dry_run { "would " } else { "" };
     let (mut inserted, mut updated, mut deleted) = (0, 0, 0);
-    for (op, &n) in ops.iter().zip(written.counts()) {
+    for (at, (op, &n)) in ops.iter().zip(written.counts()).enumerate() {
         let verb = match op.op {
+            Step::Upsert(..) => match written.upserted(at) {
+                Some(trunkdb::Upserted::Inserted(_)) => {
+                    inserted += n;
+                    if dry_run { "insert" } else { "inserted" }
+                }
+                _ => {
+                    updated += n;
+                    if dry_run { "update" } else { "updated" }
+                }
+            },
             Step::Insert(_) => {
                 inserted += n;
                 continue;

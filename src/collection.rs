@@ -1175,32 +1175,18 @@ impl Collection<Document> {
         update.check().map_err(invalid_input)?;
         let (named, seed) = crate::update::seed(&filter.conditions).map_err(invalid_input)?;
         let id_if_new = named.unwrap_or_else(|| self.db.id_gen().generate());
-        self.db.transact(
-            |catalog, store| match self.only_match(catalog, store, &filter)? {
-                Some(id) => {
-                    update_by_id(catalog, store, &self.name, id, update, &mut accept)?;
-                    Ok(Upserted::Updated(id))
-                }
-                None => {
-                    let mut doc = seed;
-                    update
-                        .apply_inserting(&mut doc)
-                        .map_err(|message| crate::Error::Update {
-                            collection: self.name.clone(),
-                            id: id_if_new,
-                            message,
-                        })?;
-                    let doc = with_id(doc, id_if_new);
-                    accept(&doc)?;
-                    apply_write_op(
-                        catalog,
-                        store,
-                        &WriteOp::Insert(self.name.clone(), id_if_new, doc),
-                    )?;
-                    Ok(Upserted::Inserted(id_if_new))
-                }
-            },
-        )
+        self.db.transact(|catalog, store| {
+            upsert_fields_in(
+                catalog,
+                store,
+                &self.name,
+                &filter,
+                (id_if_new, &seed),
+                update,
+                &mut accept,
+            )
+            .map(|(upserted, _)| upserted)
+        })
     }
 
     /// The id of the one document matching `filter`'s conditions, `None`
@@ -1212,35 +1198,82 @@ impl Collection<Document> {
         store: &dyn PageStore,
         filter: &Filter,
     ) -> crate::Result<Option<DocId>> {
-        follow_hint(&self.name, filter, catalog.indexes(&self.name))?;
-        let names = filter.fields_with(false);
-        let trace = Trace::default();
-        let matcher = filter.matcher();
-        let candidates = read_candidates(
-            catalog,
-            store,
-            &self.name,
-            filter,
-            names.as_deref(),
-            Wants::default(),
-            &trace,
-        )?
-        .0;
-        let mut matches: Vec<DocId> = Vec::new();
-        for (source, fields) in candidates {
-            if source.decided() || matcher.matches(&fields)? {
-                matches.push(source.id());
-            }
-        }
-        match matches[..] {
-            [] => Ok(None),
-            [id] => Ok(Some(id)),
-            _ => Err(crate::Error::MultipleMatches {
-                collection: self.name.clone(),
-                count: matches.len(),
-            }),
+        only_match_in(catalog, store, &self.name, filter)
+    }
+}
+
+/// The id of the one document of `collection` matching `filter`'s
+/// conditions, `None` if none does; `Error::MultipleMatches` if several
+/// do: what an upsert writes to (SPEC §29.3).
+pub(crate) fn only_match_in(
+    catalog: &Catalog,
+    store: &dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+) -> crate::Result<Option<DocId>> {
+    follow_hint(collection, filter, catalog.indexes(collection))?;
+    let names = filter.fields_with(false);
+    let trace = Trace::default();
+    let matcher = filter.matcher();
+    let candidates = read_candidates(
+        catalog,
+        store,
+        collection,
+        filter,
+        names.as_deref(),
+        Wants::default(),
+        &trace,
+    )?
+    .0;
+    let mut matches: Vec<DocId> = Vec::new();
+    for (source, fields) in candidates {
+        if source.decided() || matcher.matches(&fields)? {
+            matches.push(source.id());
         }
     }
+    match matches[..] {
+        [] => Ok(None),
+        [id] => Ok(Some(id)),
+        _ => Err(crate::Error::MultipleMatches {
+            collection: collection.to_string(),
+            count: matches.len(),
+        }),
+    }
+}
+
+/// `upsert_fields` under the writer's lock (SPEC §144.2, §175): `update`
+/// made to the one document of `collection` matching `filter`, or, where
+/// none does, to a copy of `seed` inserted as `id`. With whether a
+/// document was written: an update the operators leave as it was isn't.
+pub(crate) fn upsert_fields_in(
+    catalog: &mut Catalog,
+    store: &mut dyn PageStore,
+    collection: &str,
+    filter: &Filter,
+    (id, seed): (DocId, &Document),
+    update: &Update,
+    accept: &mut dyn FnMut(&Document) -> crate::Result<()>,
+) -> crate::Result<(Upserted, bool)> {
+    if let Some(found) = only_match_in(catalog, store, collection, filter)? {
+        let changed = update_by_id(catalog, store, collection, found, update, accept)?;
+        return Ok((Upserted::Updated(found), changed));
+    }
+    let mut doc = seed.clone();
+    update
+        .apply_inserting(&mut doc)
+        .map_err(|message| crate::Error::Update {
+            collection: collection.to_string(),
+            id,
+            message,
+        })?;
+    let doc = with_id(doc, id);
+    accept(&doc)?;
+    apply_write_op(
+        catalog,
+        store,
+        &WriteOp::Insert(collection.to_string(), id, doc),
+    )?;
+    Ok((Upserted::Inserted(id), true))
 }
 
 /// An `InvalidInput` error saying `message`: an update or filter refused

@@ -99,6 +99,7 @@ nothing. Its path is checked as `set`'s.
   the ops before it would need a count back from `commit`. The
   collection's `update_fields` is one batch of its own already.
 - **`Batch::upsert`:** not asked for; a batch that needs one reads first.
+  `Batch::upsert_fields` came with §175.
 - **An operator op in `WriteOp`:** `WriteOp` is what a commit records,
   for the report (§135) and the indexes; operators become an `Update`
   of the whole document when they're made, so the rest of the commit

@@ -1924,6 +1924,69 @@ fn batch_names_the_line_a_commit_failed_at() {
     assert_eq!(stdout(&trunkdb(&["count", &db, "tasks", "due = 1"])), "1\n");
 }
 
+/// SPEC §175: an upsert line, its id printed with the inserts' in the
+/// order of the lines, what it wrote on its line, and a dry run.
+#[test]
+fn batch_upserts_print_their_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = tasks_db(dir.path());
+    let lines = r#"{"op": "upsert", "collection": "counts", "filter": "page = \"/home\"", "update": {"$inc": {"hits": 1}}}
+{"op": "insert", "collection": "log", "document": {"what": "visit"}}
+{"op": "upsert", "collection": "counts", "filter": "page = \"/home\"", "update": {"$inc": {"hits": 1}}}
+{"op": "upsert", "collection": "tasks", "filter": "title = \"a\"", "update": {"$set": {"due": 1}}}
+"#;
+    let output = trunkdb_with(&["batch", &db, "-", "--create"], lines);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let ids: Vec<String> = stdout(&output).lines().map(String::from).collect();
+    assert_eq!(ids.len(), 4, "{ids:?}");
+    assert_eq!(ids[0], ids[2], "the second upsert found the first's");
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        stderr(&output),
+        "line 1: inserted 1 document\nline 3: updated 1 document\nline 4: updated 0 documents\n\
+         committed 4 ops: inserted 2 documents and updated 1 document\n"
+    );
+    let counted = stdout(&trunkdb(&["get", &db, "counts", &ids[0]]));
+    assert!(counted.contains(r#""page":"/home","hits":2"#), "{counted}");
+    let a = stdout(&trunkdb(&["get", &db, "tasks", &ids[3]]));
+    assert!(a.contains(r#""title":"a""#), "the task found: {a}");
+
+    let output = trunkdb_with(&["batch", &db, "-", "--dry-run"], lines);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "", "no ids on a dry run");
+    assert_eq!(
+        stderr(&output),
+        "line 1: would update 1 document\nline 3: would update 1 document\n\
+         line 4: would update 0 documents\n\
+         4 ops would insert 1 document and update 2 documents; nothing written\n"
+    );
+
+    // An empty filter is the collection's one document: no `all` needed.
+    let settings = r#"{"op": "upsert", "collection": "settings", "filter": "", "update": {"$set": {"theme": "dark"}}}
+"#;
+    for _ in 0..2 {
+        let output = trunkdb_with(&["batch", &db, "-", "--create"], settings);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    assert_eq!(stdout(&trunkdb(&["count", &db, "settings"])), "1\n");
+
+    // Several matches fail the batch at the upsert's line.
+    let output = trunkdb_with(
+        &["batch", &db, "-"],
+        r#"{"op": "insert", "collection": "log", "document": {"what": "x"}}
+{"op": "upsert", "collection": "tasks", "filter": "done = false", "update": {"$set": {"seen": true}}}
+"#,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).starts_with("trunkdb: line 2: upsert into \"tasks\": 2 documents match"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stdout(&trunkdb(&["count", &db, "log"])), "2\n");
+}
+
 /// Mistakes in the lines are found before anything is opened for
 /// writing, named with their line, exit code 2: nothing written.
 #[test]
@@ -1949,8 +2012,24 @@ fn batch_names_a_mistake_in_a_line() {
     refused("[1]\n", "line 1: an op is a JSON object");
     refused(r#"{"collection": "log"}"#, "line 1: no `op`");
     refused(
-        r#"{"op": "upsert", "collection": "log"}"#,
-        "upsert: not an op",
+        r#"{"op": "replace", "collection": "log"}"#,
+        "replace: not an op; one of insert, update, delete, upsert, require, require_none",
+    );
+    refused(
+        r#"{"op": "upsert", "collection": "log", "filter": "a = 1"}"#,
+        "upsert: no `update`",
+    );
+    refused(
+        r#"{"op": "upsert", "collection": "log", "filter": "a = 1 limit 1", "update": {"$set": {"b": 1}}}"#,
+        "line 1: an upsert's filter can't have a limit",
+    );
+    refused(
+        r#"{"op": "upsert", "collection": "log", "filter": "a = 1 and a = 2", "update": {"$set": {"b": 1}}}"#,
+        "line 1: ",
+    );
+    refused(
+        r#"{"op": "upsert", "collection": "log", "filter": "a = 1", "update": {"$set": {"b": 1}}, "all": true}"#,
+        "`all`: not a field of an op line",
     );
     refused(
         r#"{"op": "insert", "document": {}}"#,

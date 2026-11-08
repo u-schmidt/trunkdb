@@ -344,6 +344,21 @@ let written = batch.commit()?;
 assert_eq!(written.counts(), [0, 1, 1]);
 ```
 
+An upsert goes in a batch too (SPEC §175): the one document the filter
+finds gets the operators, or one made of its `eq`s is inserted, at the
+op's place. `upserted` says which, and the id:
+
+```rust
+let mut batch = db.batch();
+batch.upsert_fields(&visits, Filter::new().eq("page", "/home"), &Update::new().inc("hits", 1))?;
+batch.upsert_fields(&totals, Filter::new().eq("site", "main"), &Update::new().inc("hits", 1))?;
+let written = batch.commit()?;
+let made = matches!(written.upserted(0), Some(Upserted::Inserted(_)));
+```
+
+Several matches fail the whole batch, and a filter with a sort, skip or
+limit is refused when added: only its conditions count.
+
 From the command line, `trunkdb batch` commits a file of such ops, one
 JSON object a line, as one batch, and names the line a failure came
 from:

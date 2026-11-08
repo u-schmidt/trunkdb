@@ -159,8 +159,8 @@ the file is locked, each dry run sees what the commit saw.
 - **An upsert in a batch:** `Batch::upsert_fields`, "insert unless
   there is one". `Collection::upsert` reads the one match under its own
   lock; in a batch it is a `require_none` and an insert, or a
-  `require` and an `update_many`, chosen by the program. It can come
-  when a program needs it in one op (ROADMAP.md, Deferred).
+  `require` and an `update_many`, chosen by the program. It came with
+  §175.
 - **A closure in a batch's `update_many`:** see §168.1. A program
   with a change no operator makes reads, then writes by id, with a
   `require` holding what it read.
