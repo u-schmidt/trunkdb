@@ -123,7 +123,8 @@ by them (`compare_values`, the comparison `compare_by` made: per key,
 order they came in.
 
 Only the items the skip and limit leave are then moved out, in order.
-A sort of 1,000 matches for a page of 20 moves 20.
+A sort of 1,000 matches for a page of 20 moves 20. Since §176, a read
+with a limit keeps only the best as it reads, and sorts those.
 
 ## 102.6 What stays
 - **Every result, count and order.** The matcher answers as `Filter`

@@ -144,6 +144,9 @@ pub(crate) struct Trace {
     matched: Cell<u64>,
     from_entries: Cell<u64>,
     groups: Cell<u64>,
+    /// The most matches a sort in memory held at once (SPEC §176): for
+    /// the tests, which can't see memory; not in `Explained`.
+    held: Cell<u64>,
     /// Entries past which `spent` holds; `None`: no limit.
     budget: Option<u64>,
 }
@@ -190,6 +193,17 @@ impl Trace {
     /// `n` documents checked that matched.
     pub fn matched(&self, n: usize) {
         self.matched.set(self.matched.get() + n as u64);
+    }
+
+    /// A sort in memory holds `n` matches now (SPEC §176).
+    pub fn held(&self, n: usize) {
+        self.held.set(self.held.get().max(n as u64));
+    }
+
+    /// The most matches a sort in memory held at once.
+    #[cfg(test)]
+    pub fn held_most(&self) -> u64 {
+        self.held.get()
     }
 
     pub fn explained(

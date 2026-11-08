@@ -1212,3 +1212,9 @@ limit, batches and a write-ahead log. Since then:
     or updated, and the id. Several matches fail the batch; a filter
     with a sort, skip, limit or selection is refused when added. An
     `upsert` line for `trunkdb batch`, its id printed with the inserts'.
+151. **A sort with a limit kept small** (§176): a sort by fields that no
+    index serves, with a limit, keeps only the best `skip + limit` as
+    the matches are read, as a key sort does (§154), instead of
+    gathering and sorting them all. Ten of 100,000 by a field without
+    an index: 87 ms before, 52 ms now; memory as small as the limit.
+    Results are the same.

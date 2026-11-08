@@ -421,6 +421,10 @@ what it picked (`QueryPlan`):
   equal served keys [§47](spec/47-sorting-by-several-fields.md). A sort by `_id` walks the primary index,
   whose order is `_id`'s, and `_id` comparisons with an id narrow the
   walk exactly [§96](spec/96-sorting-by-id-through-the-primary-index.md).
+- **A sort in memory:** where no index serves it, every match is read
+  and ranked; with a limit only the best `skip + limit` are kept as
+  they come, cut back by a selection, so memory stays small however
+  many match [§154](spec/154-a-sort-by-a-key-of-the-applications-own.md) [§176](spec/176-a-sort-with-a-limit-kept-small.md).
 
 **A hint** names the index where the rules, blind to the data, pick
 the wrong one [§132](spec/132-a-hint-in-the-query.md): `use_index(fields)`, or `no_index()` to scan.

@@ -1691,7 +1691,9 @@ fn find_in(
             .map(|(source, _fields)| Ok(source.found(&mut records, None, trace)?))
             .collect();
     }
-    if let Some(ranking) = filter.ranking() {
+    // A key sort (SPEC §154), or a sort by fields with a limit (§176):
+    // only the best `skip + limit` kept as they are read.
+    if let Some(ranking) = filter.ranking().or_else(|| filter.kept_sort()) {
         return find_by_key(
             catalog,
             store,
@@ -1734,6 +1736,7 @@ fn find_in(
     }
     trace.matched(matches.len());
     if sort {
+        trace.held(matches.len());
         // So equal sort values end up in id order, as they do when read
         // from an index (the sort is stable).
         matches.sort_unstable_by_key(|(source, _fields)| source.id());
@@ -1753,11 +1756,12 @@ fn find_in(
         .collect()
 }
 
-/// `find_in` for a sort by a key of the application's (SPEC §154): each
-/// match ranked as it is read, by its key's closure, and with a limit
-/// only the best `skip + limit` kept, cut back to them by a selection
-/// whenever twice as many are held. Memory stays at about that many
-/// matches, read in full, however many there are.
+/// `find_in` for a sort by a key of the application's (SPEC §154), or by
+/// fields with a limit (§176): each match ranked as it is read, by its
+/// key's closure or its sort fields' values, and with a limit only the
+/// best `skip + limit` kept, cut back to them by a selection whenever
+/// twice as many are held. Memory stays at about that many matches,
+/// read in full, however many there are.
 #[allow(clippy::too_many_arguments)]
 fn find_by_key(
     catalog: &Catalog,
@@ -1809,6 +1813,7 @@ fn find_by_key(
                 return Ok(());
             }
             kept.push((rank, (source, fields)));
+            trace.held(kept.len());
             if let Some(keep) = keep
                 && kept.len() > keep.saturating_mul(2)
             {
@@ -6094,6 +6099,39 @@ mod tests {
         ] {
             assert!(plans.contains(plan), "{plan} never ran: {plans:?}");
         }
+    }
+
+    /// A sort in memory with a limit holds about twice `skip + limit`
+    /// matches at most, however many match (SPEC §176); without a limit,
+    /// all of them.
+    #[test]
+    fn a_sort_with_a_limit_holds_few_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let mut batch = db.batch();
+        for n in 0..2000i64 {
+            let doc: Document = format!(r#"{{"v": {}}}"#, (n * 7919) % 2000)
+                .parse()
+                .unwrap();
+            batch.insert(&docs, doc).unwrap();
+        }
+        batch.commit().unwrap();
+        let held = |filter: Filter| {
+            let state = docs.read().unwrap();
+            let at = state.snapshot();
+            let trace = Trace::default();
+            let found =
+                find_in(at.catalog, &at.store, "docs", &filter, true, None, &trace).unwrap();
+            (found.len(), trace.held_most())
+        };
+        assert_eq!(held(Filter::new().sort_asc("v").limit(10)), (10, 21));
+        assert_eq!(
+            held(Filter::new().sort_desc("v").skip(5).limit(10)),
+            (10, 31)
+        );
+        assert_eq!(held(Filter::new().sort_asc("v").limit(0)), (0, 0));
+        assert_eq!(held(Filter::new().sort_asc("v")), (2000, 2000));
     }
 
     #[test]

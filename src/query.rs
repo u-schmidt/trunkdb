@@ -320,9 +320,11 @@ impl std::panic::RefUnwindSafe for KeySort {}
 
 /// How a sort by a key of the application's orders matches (SPEC §154):
 /// by the key, then by the sort fields after it. Equal in all, the
-/// caller keeps them in id order, as a sort by fields does.
+/// caller keeps them in id order, as a sort by fields does. Without a
+/// key, by the sort fields alone: a sort by fields whose limit keeps
+/// only the best as they are read (SPEC §176).
 pub(crate) struct Ranking<'f> {
-    by_key: &'f KeySort,
+    by_key: Option<&'f KeySort>,
     /// The top-level fields the key's closure gets (SPEC §136.1).
     names: Option<Vec<&'f str>>,
     then: &'f [Sort],
@@ -330,7 +332,7 @@ pub(crate) struct Ranking<'f> {
 }
 
 /// A match's place in a key sort: its key, never NaN, and its values of
-/// the sort fields after it.
+/// the sort fields after it. Without a key, 0 for every match.
 #[derive(Debug, Clone)]
 pub(crate) struct Rank {
     key: f64,
@@ -353,7 +355,10 @@ impl Ranking<'_> {
     /// panic caught. `None` where it gives `None` or NaN, which leaves
     /// `doc` out.
     pub(crate) fn rank(&self, doc: &Document) -> Result<Option<Rank>, Panicked> {
-        let key = run_cut(self.names.as_deref(), doc, |doc| (self.by_key.key)(doc))?;
+        let key = match self.by_key {
+            Some(by_key) => run_cut(self.names.as_deref(), doc, |doc| (by_key.key)(doc))?,
+            None => Some(0.0),
+        };
         let Some(key) = key.filter(|key| !key.is_nan()) else {
             return Ok(None);
         };
@@ -368,9 +373,9 @@ impl Ranking<'_> {
     pub(crate) fn compare(&self, a: &Rank, b: &Rank) -> std::cmp::Ordering {
         // Never NaN; -0.0 and 0.0 are equal.
         let by_key = a.key.partial_cmp(&b.key).expect("a key isn't NaN");
-        let by_key = match self.by_key.order {
-            SortOrder::Asc => by_key,
-            SortOrder::Desc => by_key.reverse(),
+        let by_key = match self.by_key.map(|by_key| by_key.order) {
+            Some(SortOrder::Desc) => by_key.reverse(),
+            _ => by_key,
         };
         by_key.then_with(|| {
             (self.then.iter().zip(a.then.iter().zip(&b.then)))
@@ -1310,8 +1315,24 @@ impl Filter {
     pub(crate) fn ranking(&self) -> Option<Ranking<'_>> {
         let by_key = self.by_key.as_ref()?;
         Some(Ranking {
-            by_key,
+            by_key: Some(by_key),
             names: top_names(&by_key.fields),
+            then: &self.sort,
+            paths: self.sort.iter().map(|key| Path::new(&key.field)).collect(),
+        })
+    }
+
+    /// For a sort by fields with a limit, read in memory, the order that
+    /// keeps only the best `skip + limit` as the matches are read (SPEC
+    /// §176), as a key sort's does; `None` without a sort by fields
+    /// alone, or without a limit, which keeps every match anyway.
+    pub(crate) fn kept_sort(&self) -> Option<Ranking<'_>> {
+        if self.by_key.is_some() || self.sort.is_empty() || self.limit.is_none() {
+            return None;
+        }
+        Some(Ranking {
+            by_key: None,
+            names: None,
             then: &self.sort,
             paths: self.sort.iter().map(|key| Path::new(&key.field)).collect(),
         })
