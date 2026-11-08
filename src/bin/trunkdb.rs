@@ -168,8 +168,8 @@ fn main() -> ExitCode {
         ["check", file] => read_only(file).and_then(|db| check(&db, Format::Text)),
         ["check", file, "--json"] => read_only(file).and_then(|db| check(&db, Format::Json)),
         ["compact", file] => existing(file).and_then(|db| compact(&db)),
-        ["export", file] => read_only(file).and_then(|db| export(&db, file, None)),
-        ["export", file, out] => read_only(file).and_then(|db| export(&db, file, Some(out))),
+        ["export", file] => read_only(file).and_then(|db| export(&db, None)),
+        ["export", file, out] => read_only(file).and_then(|db| export(&db, Some(out))),
         ["import", file, input] => open(file).and_then(|db| import(&db, input, None)),
         ["verify", input] => verify(input),
         ["find", file, collection, ref filter @ .., "--explain"] => read_only(file)
@@ -555,55 +555,9 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// Whether two paths name the same file: the same inode (so hard links and
-/// symlinks count), or the same resolved path where there are no inodes.
-fn same_file(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
-            return a.dev() == b.dev() && a.ino() == b.ino();
-        }
-    }
-    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
-}
-
-/// Exports to `out` through a temporary file beside it, renamed over `out`
-/// only once the export is complete: a failed export leaves an existing
-/// `out` alone, and `out` can never be the database itself.
-fn export_to_file(db: &Database, file: &str, out: &str) -> Result<trunkdb::Summary, String> {
-    // The WAL beside the file a symlink names, as the open uses (SPEC §127).
-    let resolved = std::fs::canonicalize(file).unwrap_or_else(|_| file.into());
-    let mut wal = resolved.into_os_string();
-    wal.push(".wal");
-    for protected in [Path::new(file), Path::new(&wal)] {
-        if same_file(Path::new(out), protected) {
-            return Err(format!(
-                "{out}: is the database or its log; choose another file"
-            ));
-        }
-    }
-    // Write through a symlink to its target, not over the link.
-    let target = std::fs::canonicalize(out).unwrap_or_else(|_| out.into());
-    let mut temp = target.clone().into_os_string();
-    temp.push(format!(".tmp{}", std::process::id()));
-    let temp = std::path::PathBuf::from(temp);
-    let written = (|| {
-        let file = std::fs::File::create(&temp)?;
-        let summary = db.export(&file).map_err(io::Error::other)?;
-        file.sync_all()?;
-        std::fs::rename(&temp, &target)?;
-        Ok::<_, io::Error>(summary)
-    })();
-    written.map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        format!("{out}: {e}")
-    })
-}
-
-fn export(db: &Database, file: &str, out: Option<&str>) -> Outcome {
+fn export(db: &Database, out: Option<&str>) -> Outcome {
     let summary = match out {
-        Some(path) => export_to_file(db, file, path),
+        Some(path) => (db.export_to_file(path)).map_err(|e| format!("{path}: {e}")),
         None => db.export(io::stdout().lock()).map_err(|e| e.to_string()),
     }?;
     // To stderr, so standard output stays pure JSON Lines.
@@ -718,7 +672,7 @@ fn find(db: &Database, collection: &str, filter: &str, given: &Given, show: Show
         let explained = docs.explain_run(filter).map_err(failed)?;
         return match io::stdout()
             .lock()
-            .write_all(explanation(&explained).as_bytes())
+            .write_all(explained.to_string().as_bytes())
         {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => stopped_writing(e),
@@ -768,7 +722,7 @@ fn aggregate(
         let explained = docs.explain_aggregate(filter, &parsed).map_err(failed)?;
         return match io::stdout()
             .lock()
-            .write_all(explanation(&explained).as_bytes())
+            .write_all(explained.to_string().as_bytes())
         {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => stopped_writing(e),
@@ -1029,102 +983,6 @@ fn marked(what: &str, filter: &str, at: usize, message: impl std::fmt::Display) 
         &filter[start..end],
         " ".repeat(column)
     )
-}
-
-/// How a query ran (SPEC §113), a line for each thing `explain_run` says.
-fn explanation(explained: &trunkdb::query::Explained) -> String {
-    use std::fmt::Write;
-    use trunkdb::query::EntryCount;
-    let mut text = String::new();
-    let plan = plan_words(&explained.plan);
-    let hinted = if explained.hinted { ", as hinted" } else { "" };
-    let _ = writeln!(text, "plan: {plan}{hinted}");
-    for read in &explained.reads {
-        let bounds = match read.bounds.as_slice() {
-            [] => "the whole index".to_string(),
-            bounds => {
-                let bounds: Vec<String> = bounds.iter().map(|b| b.to_string()).collect();
-                format!("where {}", bounds.join(" and "))
-            }
-        };
-        let _ = write!(
-            text,
-            "read: {}, {bounds}, {}",
-            read.index,
-            match read.entries {
-                1 => "1 entry".to_string(),
-                n => format!("{n} entries"),
-            }
-        );
-        if read.backward {
-            text.push_str(", backward");
-        }
-        if read.covering {
-            text.push_str(", its entries decide the filter");
-        }
-        text.push('\n');
-    }
-    if let Some(ref sort) = explained.sort {
-        let _ = writeln!(
-            text,
-            "sort: {} from the index order, {} in memory",
-            count(sort.from_index, "key"),
-            sort.in_memory
-        );
-    }
-    // The plans passed over (SPEC §133.5), after what the run did.
-    for other in &explained.alternatives {
-        let entries = |n: u64| match n {
-            1 => "1 entry".to_string(),
-            n => format!("{n} entries"),
-        };
-        let entries = match other.entries {
-            EntryCount::Exactly(n) => entries(n),
-            EntryCount::MoreThan(n) => format!("more than {}", entries(n)),
-            _ => format!("{:?}", other.entries),
-        };
-        let _ = write!(text, "instead: {}, {entries}", plan_words(&other.plan));
-        if !other.reads_documents {
-            text.push_str(", its entries decide the filter");
-        }
-        if other.fewer {
-            text.push_str(", fewer");
-        }
-        text.push('\n');
-    }
-    let stats = &explained.stats;
-    let _ = writeln!(text, "keys examined: {}", stats.keys_examined);
-    let _ = writeln!(text, "documents examined: {}", stats.documents_examined);
-    let _ = writeln!(text, "documents matched: {}", stats.documents_matched);
-    let _ = writeln!(text, "documents returned: {}", stats.documents_returned);
-    let _ = writeln!(text, "answered from index entries: {}", stats.from_entries);
-    let _ = writeln!(text, "time: {:.2} ms", stats.elapsed.as_secs_f64() * 1000.0);
-    text
-}
-
-/// A plan in words, as `--explain` names it (SPEC §113).
-fn plan_words(plan: &trunkdb::query::QueryPlan) -> String {
-    use trunkdb::query::QueryPlan;
-    match plan {
-        QueryPlan::Scan => "scan of every document".to_string(),
-        QueryPlan::Index { field, .. } => format!("index on {field}"),
-        QueryPlan::IndexOrder { field, .. } => format!("index on {field}, in its order"),
-        // Ids looked up beside index ranges, `_id` first (SPEC §164.4).
-        QueryPlan::IndexUnion { fields, .. } => match fields.split_first() {
-            Some((first, [only])) if first == "_id" => {
-                format!("ids looked up, and the index on {only}, together")
-            }
-            Some((first, rest)) if first == "_id" => {
-                format!(
-                    "ids looked up, and the indexes on {}, together",
-                    rest.join(", ")
-                )
-            }
-            _ => format!("indexes on {}, together", fields.join(", ")),
-        },
-        QueryPlan::ById => "by id".to_string(),
-        other => format!("{other:?}"),
-    }
 }
 
 /// At most this many paths are kept (SPEC §121.4): documents whose keys

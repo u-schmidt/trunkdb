@@ -1231,3 +1231,19 @@ limit, batches and a write-ahead log. Since then:
     `trunkdb update` and `batch` read through them now, printing what
     they printed; of several unused `--param`s, the first by name is
     named.
+153. **The C ABI** (§179): `trunkdb-ffi`, trunkdb as a C library,
+    `libtrunkdb.so`, `libtrunkdb.dylib`, `trunkdb.dll` and `libtrunkdb.a`,
+    with `include/trunkdb.h`, made by cbindgen and checked in. 36
+    functions: open, close, checkpoint, compact, check, stats,
+    collections, drop, export and import; indexes; `get`, `find`,
+    `find_one`, `count`, `aggregate` and `explain`, of the database or
+    a snapshot; `insert`, `replace`, `delete`, `update`, `delete_many`,
+    `upsert`; a batch as JSON lines; snapshots and cursors. Documents as
+    tagged JSON, filters and aggregates as text with their parameters
+    as a JSON object; an error code from each call, the thread's last
+    error as text and as JSON with what it knows; handles checked by a
+    tag; no panic across. Tested through raw pointers, and from a C
+    program under AddressSanitizer in CI. In the library for it:
+    `Display` for `Explained` and `QueryPlan`, the lines `find
+    --explain` prints, and `Database::export_to_file`, as `trunkdb
+    export` wrote a file.

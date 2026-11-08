@@ -1,0 +1,48 @@
+# How include/trunkdb.h is made from src/ (SPEC §179). The header is
+# checked in; `cargo test -p trunkdb-ffi header` fails when it differs
+# from what the code says, and TRUNKDB_WRITE_HEADER=1 writes it anew.
+
+language = "C"
+include_guard = "TRUNKDB_H"
+cpp_compat = true
+style = "type"
+no_includes = true
+sys_includes = ["stdbool.h", "stdint.h"]
+documentation = true
+documentation_style = "c99"
+usize_is_size_t = true
+header = """/*
+ * trunkdb's C ABI (SPEC §177, §179 in the trunkdb repository).
+ *
+ * The rules every function keeps:
+ *
+ * - Text, in and out, is UTF-8 ending in a zero byte. Text passed in is
+ *   only read, during the call. Documents are JSON as an export writes
+ *   it: {"$id": ...}, {"$date": ...}, {"$time": ...}, {"$binary": ...}.
+ *   Filters and aggregates are text, `status = :s order by due`, their
+ *   parameters' values a JSON object, {"s": "open"}, or NULL.
+ * - Every function but the frees returns TRUNKDB_OK or an error code.
+ *   trunkdb_error_message() and trunkdb_error_detail() say more, for the
+ *   last error on the calling thread.
+ * - Results come back through the last parameters. Each is set to NULL,
+ *   0 or false before anything else, and is written only on success.
+ *   A `char *` handed out is the caller's: give it back with
+ *   trunkdb_string_free(), never with free().
+ * - Handles (trunkdb_db, trunkdb_snapshot, trunkdb_cursor) come from an
+ *   _open function and go back to its _close. A handle of another kind,
+ *   or a closed one, is refused where it can be told, never trusted:
+ *   don't pass one. Closing NULL does nothing.
+ * - A database handle, or a snapshot, may be used from any number of
+ *   threads at once; a cursor from one at a time.
+ * - No panic crosses into C: one is TRUNKDB_PANIC.
+ */"""
+autogen_warning = "/* Made by cbindgen from trunkdb-ffi/src: change the Rust, not this file. */"
+
+[export]
+item_types = ["constants", "opaque", "functions"]
+
+[parse]
+parse_deps = false
+
+[fn]
+args = "Vertical"

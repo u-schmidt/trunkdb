@@ -257,6 +257,98 @@ impl Trace {
     }
 }
 
+/// How a query ran, a line for each thing it says (SPEC §113, §179): what
+/// `trunkdb find --explain` prints.
+impl std::fmt::Display for Explained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entries = |n: u64| match n {
+            1 => "1 entry".to_string(),
+            n => format!("{n} entries"),
+        };
+        let hinted = if self.hinted { ", as hinted" } else { "" };
+        writeln!(f, "plan: {}{hinted}", self.plan)?;
+        for read in &self.reads {
+            let bounds = match read.bounds.as_slice() {
+                [] => "the whole index".to_string(),
+                bounds => {
+                    let bounds: Vec<String> = bounds.iter().map(|b| b.to_string()).collect();
+                    format!("where {}", bounds.join(" and "))
+                }
+            };
+            write!(
+                f,
+                "read: {}, {bounds}, {}",
+                read.index,
+                entries(read.entries)
+            )?;
+            if read.backward {
+                f.write_str(", backward")?;
+            }
+            if read.covering {
+                f.write_str(", its entries decide the filter")?;
+            }
+            writeln!(f)?;
+        }
+        if let Some(ref sort) = self.sort {
+            let keys = match sort.from_index {
+                1 => "1 key".to_string(),
+                n => format!("{n} keys"),
+            };
+            writeln!(
+                f,
+                "sort: {keys} from the index order, {} in memory",
+                sort.in_memory
+            )?;
+        }
+        // The plans passed over (SPEC §133.5), after what the run did.
+        for other in &self.alternatives {
+            let count = match other.entries {
+                EntryCount::Exactly(n) => entries(n),
+                EntryCount::MoreThan(n) => format!("more than {}", entries(n)),
+            };
+            write!(f, "instead: {}, {count}", other.plan)?;
+            if !other.reads_documents {
+                f.write_str(", its entries decide the filter")?;
+            }
+            if other.fewer {
+                f.write_str(", fewer")?;
+            }
+            writeln!(f)?;
+        }
+        let stats = &self.stats;
+        writeln!(f, "keys examined: {}", stats.keys_examined)?;
+        writeln!(f, "documents examined: {}", stats.documents_examined)?;
+        writeln!(f, "documents matched: {}", stats.documents_matched)?;
+        writeln!(f, "documents returned: {}", stats.documents_returned)?;
+        writeln!(f, "answered from index entries: {}", stats.from_entries)?;
+        writeln!(f, "time: {:.2} ms", stats.elapsed.as_secs_f64() * 1000.0)
+    }
+}
+
+/// A plan in words, as `--explain` names it (SPEC §113, §179).
+impl std::fmt::Display for QueryPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryPlan::Scan => f.write_str("scan of every document"),
+            QueryPlan::Index { field, .. } => write!(f, "index on {field}"),
+            QueryPlan::IndexOrder { field, .. } => write!(f, "index on {field}, in its order"),
+            // Ids looked up beside index ranges, `_id` first (SPEC §164.4).
+            QueryPlan::IndexUnion { fields, .. } => match fields.split_first() {
+                Some((first, [only])) if first == "_id" => {
+                    write!(f, "ids looked up, and the index on {only}, together")
+                }
+                Some((first, rest)) if first == "_id" => write!(
+                    f,
+                    "ids looked up, and the indexes on {}, together",
+                    rest.join(", ")
+                ),
+                _ => write!(f, "indexes on {}, together", fields.join(", ")),
+            },
+            QueryPlan::ById => f.write_str("by id"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

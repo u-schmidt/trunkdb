@@ -145,6 +145,29 @@ counted with `--dry-run` and confirmed before it runs. Copy the folder
 to where your agent reads skills. The file must not be open in another
 program meanwhile: one that writes holds it locked.
 
+### From C and other languages
+
+[trunkdb-ffi/](trunkdb-ffi/include/trunkdb.h) builds trunkdb as a C
+library, `libtrunkdb.so`, `libtrunkdb.dylib` or `trunkdb.dll`, with a
+header: the way in for C, and for every language that calls C, as C#
+does through P/Invoke. Documents go in and out as JSON, filters and
+aggregates as the same text the command takes, with their parameters
+apart; handles for a database, a snapshot and a cursor; an error code
+from every call, and the last error's message and details.
+
+```c
+trunkdb_db *db;
+trunkdb_open("app.trunkdb", NULL, &db);
+char *found;
+trunkdb_find(db, NULL, "users", "age >= :min limit 10", "{\"min\": 30}", &found);
+puts(found);                          /* a JSON array of documents */
+trunkdb_string_free(found);
+trunkdb_close(db);
+```
+
+`cargo build --release -p trunkdb-ffi` builds it into `target/release/`.
+A C# wrapper comes next (SPEC §177).
+
 ### A desktop app
 
 [TrunkDB Admin](https://github.com/u-schmidt/trunkdb-admin) looks into
