@@ -1,7 +1,7 @@
 # 180. The C# wrapper (`bindings/dotnet/`)
 
 Step 3 of §177.10: trunkdb from C#, over the C ABI of §179. A library,
-`TrunkDb.dll`, of plain classes: a database opened with `using`,
+`TrunkDb.Net.dll`, of plain classes: a database opened with `using`,
 documents as a program's own classes, errors as exceptions. Nothing in
 Rust changed; no file format changed.
 
@@ -126,7 +126,12 @@ taken is .NET's `ArgumentNullException`, before any C.
 The wrapper doesn't carry the C library: a program puts the one for its
 system beside its executable (§177.12), `trunkdb.dll`,
 `libtrunkdb.dylib` or `libtrunkdb.so`, and .NET finds it by the name
-`trunkdb`. The tests take it from `target/debug/`, where `cargo build
+`trunkdb`. The wrapper's own file is `TrunkDb.Net.dll`, not
+`TrunkDb.dll`: Windows doesn't tell that from `trunkdb.dll`, and with
+both in one directory .NET loaded the wrapper where it looked for the C
+library, every call "no entry point `trunkdb_abi_version`". CI's first
+Windows run failed so; macOS and Linux name the library
+`libtrunkdb.*`. A test refuses the name on every system. The tests take it from `target/debug/`, where `cargo build
 -p trunkdb-ffi` puts it, or from `-p:TrunkDbNative=<directory>`; the
 build fails naming the command when it isn't there.
 
@@ -145,6 +150,7 @@ and runs its tests, on Linux, macOS and Windows, warnings as errors.
 - **A NuGet package now:** §177.12.
 
 ## 180.7 Tests
+- The wrapper's file not the C library's, in any case.
 - `JsonTests`, without the library: each tag written and read; a
   `DateTime` local, unspecified and with a fraction to the tick; nine
   digits of fraction cut to seven; a date refused as a `DateTime` and

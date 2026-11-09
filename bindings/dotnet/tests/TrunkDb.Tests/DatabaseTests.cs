@@ -54,6 +54,15 @@ public sealed class DatabaseTests : IDisposable
     }
 
     [Fact]
+    public void The_wrappers_file_is_not_the_c_librarys_on_windows()
+    {
+        // Windows doesn't tell TrunkDb.dll from trunkdb.dll: .NET loaded the
+        // wrapper where it looked for the C library, on every call.
+        var file = Path.GetFileName(typeof(Database).Assembly.Location);
+        Assert.NotEqual("trunkdb.dll", file, StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void A_document_is_inserted_changed_and_updated_as_an_object()
     {
         using var db = Open();

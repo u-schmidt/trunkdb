@@ -18,7 +18,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/TrunkDb/TrunkDb.csproj" />
+    <ProjectReference Include="../../src/TrunkDb.Net/TrunkDb.Net.csproj" />
     <None Include="$(TrunkDbNative)/$(TrunkDbLibrary)" Link="$(TrunkDbLibrary)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 
