@@ -168,15 +168,19 @@ trunkdb_close(db);
 `cargo build --release -p trunkdb-ffi` builds it into `target/release/`.
 
 From C#, [bindings/dotnet/](bindings/dotnet/) wraps it: a `Database`
-opened with `using`, documents as your own classes through
+opened with `using`, a `Collection<T>` of your own classes through
 System.Text.Json, `DateOnly` and `DocId` included, errors as
 exceptions. Put the library beside your executable.
 
 ```csharp
 using var db = Database.Open("app.trunkdb");
-db.Insert("tasks", new TaskItem { Title = "Write it", Status = "open" });
-foreach (var task in db.Find<TaskItem>("tasks", "status = :s limit 10", new { s = "open" }))
-    Console.WriteLine(task.Title);
+var tasks = db.Collection<TaskItem>("tasks");
+var task = new TaskItem { Title = "Write it" };
+tasks.Insert(task);                   // task.Id is set
+task.Status = "done";
+tasks.Update(task);
+foreach (var open in tasks.Find("status = :s limit 10", new { s = "open" }))
+    Console.WriteLine(open.Title);
 ```
 
 ### A desktop app

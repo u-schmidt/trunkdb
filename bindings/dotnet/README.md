@@ -8,18 +8,21 @@ what was built in [§180](../../spec/180-the-csharp-wrapper.md).
 using TrunkDb;
 
 using var db = Database.Open("app.trunkdb");
-db.EnsureIndex("tasks", "status");
-var id = db.Insert("tasks", new TaskItem { Title = "Write it", Due = new DateOnly(2026, 11, 9) });
+var tasks = db.Collection<TaskItem>("tasks");
+tasks.EnsureIndex("status");
 
-foreach (var task in db.Find<TaskItem>("tasks", "status = :s order by due limit 10", new { s = "open" }))
-    Console.WriteLine($"{task.Id} {task.Title}");
+var task = new TaskItem { Title = "Write it", Due = new DateOnly(2026, 11, 9) };
+tasks.Insert(task);                   // task.Id is set
+task.Status = "done";
+tasks.Update(task);                   // replaced, found by task.Id
 
-db.Update("tasks", "_id = :id", """{"$set": {"status": "done"}}""", new { id });
+foreach (var open in tasks.Find("status = :s order by due limit 10", new { s = "open" }))
+    Console.WriteLine($"{open.Id} {open.Title}");
 
 using (var snapshot = db.OpenSnapshot())
-using (var cursor = snapshot.OpenCursor<TaskItem>("tasks"))
-    foreach (var task in cursor)
-        Console.WriteLine(task.Title);
+using (var cursor = snapshot.Collection<TaskItem>("tasks").OpenCursor())
+    foreach (var then in cursor)
+        Console.WriteLine(then.Title);
 
 class TaskItem
 {
@@ -32,7 +35,11 @@ class TaskItem
 
 - **Filters and aggregates** are trunkdb's text, as the `trunkdb`
   command takes it; parameters an object, `new { s = "open" }`.
-- **Updates** are MongoDB's operators as JSON, `{"$inc": {"hits": 1}}`.
+- **A collection** is a name and the database: `db.Collection<T>(name)`,
+  as cheap as that, nothing to close. `Update(task)` replaces the
+  document whole, found by its `Id`.
+- **Changing many at once,** `UpdateMany(filter, update)`, takes
+  MongoDB's operators as JSON, `{"$inc": {"hits": 1}}`.
 - **Documents** go through System.Text.Json, camelCase by default; pass
   your own options as `OpenOptions.Json`. `DocId`, `DateTime`,
   `DateOnly`, `TimeOnly` and `byte[]` are written as trunkdb's tags.

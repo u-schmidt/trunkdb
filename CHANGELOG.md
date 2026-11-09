@@ -1249,10 +1249,13 @@ limit, batches and a write-ahead log. Since then:
     export` wrote a file.
 154. **The C# wrapper** (§180), `bindings/dotnet/`, over the C ABI:
     `Database.Open`, `Snapshot` and `Cursor<T>`, each `IDisposable`
-    over a `SafeHandle`; the reads, `Get`, `Find`, `FindOne`, `Count`,
-    `Aggregate`, `Explain` and `OpenCursor`, on the database or a
-    snapshot; the writes, indexes, batches, check, stats, compact,
-    export and import. Documents are a program's own classes through
+    over a `SafeHandle`; `db.Collection<T>(name)`, as in Rust, with
+    `Insert(task)` setting its id, `Update(task)` and `Delete(task)` by
+    it, `InsertMany`, `UpdateMany` and `DeleteMany` by a filter,
+    `Upsert` and indexes; the reads, `Get`, `Find`, `FindOne`, `Count`,
+    `Aggregate`, `Explain` and `OpenCursor`, of the collection now or
+    as a snapshot was taken; batches, check, stats, compact, export
+    and import on the database. Documents are a program's own classes through
     System.Text.Json, a converter for each tag: `DocId`, `DateTime`,
     `DateOnly`, `TimeOnly`, `byte[]`, and floats kept floats; a
     property `Id` is `_id`. Errors are a `TrunkDbException` with the

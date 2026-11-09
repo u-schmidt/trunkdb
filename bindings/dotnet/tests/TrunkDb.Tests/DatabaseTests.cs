@@ -13,6 +13,11 @@ public sealed class TaskItem
     public double Hours { get; set; }
 }
 
+public sealed class Note
+{
+    public string Text { get; set; } = "";
+}
+
 public sealed record Kinds(
     DateTime At,
     DateTimeOffset Seen,
@@ -30,6 +35,8 @@ public sealed record Group(string Status, ulong N, double Hours);
 /// <summary>Every method of the wrapper, against the library cargo built (SPEC §180).</summary>
 public sealed class DatabaseTests : IDisposable
 {
+    private static readonly DocId Absent = DocId.Parse("01a1bc72-c792-772e-a864-a359a7ffaeb6");
+
     private readonly string directory = Directory.CreateTempSubdirectory("trunkdb-dotnet-").FullName;
 
     public void Dispose() => Directory.Delete(directory, recursive: true);
@@ -47,36 +54,80 @@ public sealed class DatabaseTests : IDisposable
     }
 
     [Fact]
-    public void Documents_go_in_as_objects_and_come_back_as_them()
+    public void A_document_is_inserted_changed_and_updated_as_an_object()
     {
         using var db = Open();
-        var id = db.Insert("tasks", new TaskItem { Title = "Write it", Due = new DateOnly(2026, 11, 9), Hours = 2 });
-        db.Insert("tasks", new TaskItem { Title = "Test it", Status = "done" });
+        var tasks = db.Collection<TaskItem>("tasks");
+        Assert.Equal("tasks", tasks.Name);
+        Assert.Same(db, tasks.Database);
 
-        var task = db.Get<TaskItem>("tasks", id)!;
+        var task = new TaskItem { Title = "Write it", Due = new DateOnly(2026, 11, 9) };
+        var id = tasks.Insert(task);
         Assert.Equal(id, task.Id);
-        Assert.Equal("Write it", task.Title);
-        Assert.Equal(new DateOnly(2026, 11, 9), task.Due);
-        Assert.Null(db.Get<TaskItem>("tasks", DocId.Parse("01a1bc72-c792-772e-a864-a359a7ffaeb6")));
 
-        var open = db.Find<TaskItem>("tasks", "status = :s", new { s = "open" });
-        Assert.Equal(["Write it"], open.Select(t => t.Title));
-        Assert.Equal(2, db.Find<TaskItem>("tasks").Count);
-        Assert.Equal("Test it", db.FindOne<TaskItem>("tasks", "status = \"done\"")!.Title);
-        Assert.Null(db.FindOne<TaskItem>("tasks", "hours > 10"));
-        Assert.Equal(1ul, db.Count("tasks", "due = :d", new { d = new DateOnly(2026, 11, 9) }));
-        Assert.Equal(0ul, db.Count("nothing"));
+        var mine = tasks.Get(id)!;
+        mine.Status = "done";
+        Assert.True(tasks.Update(mine));
+        Assert.Equal("done", tasks.Get(id)!.Status);
+        Assert.Equal(new DateOnly(2026, 11, 9), tasks.Get(id)!.Due);
+        Assert.Equal(id, tasks.Get(id)!.Id);
 
-        // The id a document has is kept.
-        var mine = new DocId(Guid.Parse("01a1bc72-c792-772e-a864-a359a7ffaeb6"));
-        Assert.Equal(mine, db.Insert("tasks", new TaskItem { Id = mine, Title = "Mine" }));
-        Assert.Equal("Mine", db.Get<TaskItem>("tasks", mine)!.Title);
+        Assert.True(tasks.Delete(mine));
+        Assert.False(tasks.Delete(mine));
+        Assert.False(tasks.Update(mine));
+        Assert.Null(tasks.Get(id));
+
+        // An id the document has is kept, and not overwritten.
+        var given = new TaskItem { Id = Absent, Title = "Mine" };
+        Assert.Equal(Absent, tasks.Insert(given));
+        Assert.Equal(Absent, given.Id);
+        Assert.Equal("Mine", tasks.Get(Absent)!.Title);
+
+        // By id, for a document that has none of its own.
+        var notes = db.Collection<Note>("notes");
+        var noteId = notes.Insert(new Note { Text = "a" });
+        Assert.True(notes.Update(noteId, new Note { Text = "b" }));
+        Assert.Equal("b", notes.Get(noteId)!.Text);
+        var noId = Assert.Throws<InvalidOperationException>(() => notes.Update(new Note()));
+        Assert.Contains("Update(id, document)", noId.Message);
+        var notYet = Assert.Throws<InvalidOperationException>(() => tasks.Update(new TaskItem()));
+        Assert.Contains("insert it first", notYet.Message);
+        Assert.True(notes.Delete(noteId));
+    }
+
+    [Fact]
+    public void Documents_are_found_counted_and_inserted_many_at_once()
+    {
+        using var db = Open();
+        var tasks = db.Collection<TaskItem>("tasks");
+        var items = new List<TaskItem>
+        {
+            new() { Title = "Write it", Due = new DateOnly(2026, 11, 9), Hours = 2 },
+            new() { Title = "Test it", Status = "done" },
+        };
+        var ids = tasks.InsertMany(items);
+        Assert.Equal(ids, items.Select(t => t.Id));
+        Assert.Empty(tasks.InsertMany([]));
+
+        Assert.Equal(["Write it"], tasks.Find("status = :s", new { s = "open" }).Select(t => t.Title));
+        Assert.Equal(2, tasks.Find().Count);
+        Assert.Equal("Test it", tasks.FindOne("status = \"done\"")!.Title);
+        Assert.Null(tasks.FindOne("hours > 10"));
+        Assert.Equal(1ul, tasks.Count("due = :d", new { d = new DateOnly(2026, 11, 9) }));
+        Assert.Equal(0ul, db.Collection<TaskItem>("nothing").Count());
+
+        // All or none: an id the collection has stops every insert.
+        var again = new List<TaskItem> { new() { Title = "new" }, new() { Id = ids[0], Title = "twice" } };
+        Assert.Throws<DuplicateIdException>(() => tasks.InsertMany(again));
+        Assert.Equal(2ul, tasks.Count());
+        Assert.True(again[0].Id.IsEmpty);
     }
 
     [Fact]
     public void Every_tagged_kind_goes_through_the_database_and_back()
     {
         using var db = Open();
+        var collection = db.Collection<Kinds>("kinds");
         var at = new DateTime(2026, 11, 9, 14, 5, 0, DateTimeKind.Utc).AddTicks(1234567);
         var kinds = new Kinds(
             at,
@@ -87,11 +138,11 @@ public sealed class DatabaseTests : IDisposable
             3.0,
             double.NaN,
             float.PositiveInfinity,
-            DocId.Parse("01a1bc72-c792-772e-a864-a359a7ffaeb6"),
+            Absent,
             long.MaxValue);
-        var id = db.Insert("kinds", kinds);
+        var id = collection.Insert(kinds);
 
-        var back = db.Get<Kinds>("kinds", id)!;
+        var back = collection.Get(id)!;
         Assert.Equal(kinds.At, back.At);
         Assert.Equal(kinds.Seen, back.Seen);
         Assert.Equal(kinds.Day, back.Day);
@@ -104,108 +155,104 @@ public sealed class DatabaseTests : IDisposable
         Assert.Equal(long.MaxValue, back.Big);
 
         // As trunkdb holds it: a float stays a float, a date a date.
-        var raw = db.Get<JsonElement>("kinds", id);
+        var raw = db.Collection<JsonElement>("kinds").Get(id);
         Assert.Equal("3.0", raw.GetProperty("whole").GetRawText());
         Assert.Equal("""{"$date":"2026-11-09"}""", raw.GetProperty("day").GetRawText());
-        Assert.Equal(1ul, db.Count("kinds", "day = :d and clock > :t", new { d = kinds.Day, t = new TimeOnly(14, 0) }));
-        Assert.Equal(1ul, db.Count("kinds", "at < :now", new { now = DateTime.UtcNow.AddYears(1) }));
+        Assert.Equal(1ul, collection.Count("day = :d and clock > :t", new { d = kinds.Day, t = new TimeOnly(14, 0) }));
+        Assert.Equal(1ul, collection.Count("at < :now", new { now = DateTime.UtcNow.AddYears(1) }));
     }
 
     [Fact]
     public void Untyped_documents_are_json_nodes_tags_and_all()
     {
         using var db = Open();
-        var id = db.Insert("notes", JsonNode.Parse("""{"text": "hi", "when": {"$date": "2026-11-09"}}""")!);
-        var note = db.Get<JsonObject>("notes", id)!;
+        var notes = db.Collection<JsonObject>("notes");
+        var id = notes.Insert(JsonNode.Parse("""{"text": "hi", "when": {"$date": "2026-11-09"}}""")!.AsObject());
+        var note = notes.Get(id)!;
         Assert.Equal(id.ToString(), note["_id"]!["$id"]!.GetValue<string>());
         Assert.Equal("2026-11-09", note["when"]!["$date"]!.GetValue<string>());
     }
 
     [Fact]
-    public void Writes_replace_delete_update_and_upsert()
+    public void Many_are_updated_and_deleted_by_a_filter_and_upserted()
     {
         using var db = Open();
-        var id = db.Insert("tasks", new TaskItem { Title = "a", Hours = 1 });
-        db.Insert("tasks", new TaskItem { Title = "b", Hours = 1 });
+        var tasks = db.Collection<TaskItem>("tasks");
+        var a = new TaskItem { Title = "a", Hours = 1 };
+        tasks.InsertMany([a, new TaskItem { Title = "b", Hours = 1 }]);
 
-        Assert.True(db.Replace("tasks", id, new TaskItem { Title = "a2", Hours = 5 }));
-        Assert.Equal("a2", db.Get<TaskItem>("tasks", id)!.Title);
-        Assert.Equal(id, db.Get<TaskItem>("tasks", id)!.Id);
-        Assert.False(db.Replace("tasks", DocId.Parse("01a1bc72-c792-772e-a864-a359a7ffaeb6"), new TaskItem()));
+        Assert.Equal(2ul, tasks.UpdateMany(null, """{"$inc": {"hours": 1}}"""));
+        Assert.Equal(2.0, tasks.Get(a.Id)!.Hours);
+        Assert.Equal(1ul, tasks.UpdateMany("title = :t", """{"$set": {"status": "done"}}""", new { t = "b" }));
+        Assert.Equal(1ul, tasks.UpdateMany("_id = :id", """{"$set": {"title": "a2"}}""", new { id = a.Id }));
+        Assert.Equal("a2", tasks.Get(a.Id)!.Title);
 
-        Assert.Equal(2ul, db.Update("tasks", null, """{"$inc": {"hours": 1}}"""));
-        Assert.Equal(6.0, db.Get<TaskItem>("tasks", id)!.Hours);
-        Assert.Equal(1ul, db.Update("tasks", "title = :t", """{"$set": {"status": "done"}}""", new { t = "b" }));
-        Assert.Equal(1ul, db.Update("tasks", "_id = :id", """{"$set": {"title": "a3"}}""", new { id }));
-        Assert.Equal("a3", db.Get<TaskItem>("tasks", id)!.Title);
-
-        var first = db.Upsert("visits", "page = :p", """{"$inc": {"hits": 1}}""", new { p = "/" });
+        var visits = db.Collection<JsonObject>("visits");
+        var first = visits.Upsert("page = :p", """{"$inc": {"hits": 1}}""", new { p = "/" });
         Assert.True(first.Inserted);
-        var second = db.Upsert("visits", "page = :p", """{"$inc": {"hits": 1}}""", new { p = "/" });
+        var second = visits.Upsert("page = :p", """{"$inc": {"hits": 1}}""", new { p = "/" });
         Assert.False(second.Inserted);
         Assert.Equal(first.Id, second.Id);
-        Assert.Equal(2, db.Get<JsonElement>("visits", first.Id).GetProperty("hits").GetInt32());
+        Assert.Equal(2, visits.Get(first.Id)!["hits"]!.GetValue<int>());
 
-        Assert.True(db.Delete("tasks", id));
-        Assert.False(db.Delete("tasks", id));
-        Assert.Equal(1ul, db.DeleteMany("tasks", null));
-        Assert.Equal(0ul, db.Count("tasks"));
+        Assert.Equal(1ul, tasks.DeleteMany("status = \"done\""));
+        Assert.Equal(1ul, tasks.DeleteMany(null));
+        Assert.Equal(0ul, tasks.Count());
     }
 
     [Fact]
     public void Aggregates_come_back_as_rows_and_explain_as_lines()
     {
         using var db = Open();
-        db.Insert("tasks", new TaskItem { Title = "a", Hours = 1 });
-        db.Insert("tasks", new TaskItem { Title = "b", Hours = 2 });
-        db.Insert("tasks", new TaskItem { Title = "c", Status = "done", Hours = 4 });
+        var tasks = db.Collection<TaskItem>("tasks");
+        tasks.InsertMany([
+            new TaskItem { Title = "a", Hours = 1 },
+            new TaskItem { Title = "b", Hours = 2 },
+            new TaskItem { Title = "c", Status = "done", Hours = 4 },
+        ]);
 
-        var rows = db.Aggregate<Group>("tasks", "hours >= :min", "count() as n, sum(hours) as hours group by status", new { min = 1 });
+        var rows = tasks.Aggregate<Group>("hours >= :min", "count() as n, sum(hours) as hours group by status", new { min = 1 });
         Assert.Equal([new Group("done", 1, 4), new Group("open", 2, 3)], rows.OrderBy(r => r.Status));
 
-        db.EnsureIndex("tasks", "status");
-        Assert.Contains("plan: index on", db.Explain("tasks", "status = :s", new { s = "open" }));
+        tasks.EnsureIndex("status");
+        Assert.Contains("plan: index on", tasks.Explain("status = :s", new { s = "open" }));
     }
 
     [Fact]
     public void Indexes_are_made_listed_enforced_and_dropped()
     {
         using var db = Open();
-        Assert.True(db.EnsureIndex("users", "email", unique: true));
-        Assert.False(db.EnsureIndex("users", "email", unique: true));
-        Assert.True(db.EnsureIndex("users", ["team", "name"], sparse: true));
-        Assert.Equal(
-            [new IndexInfo(["email"], true, false), new IndexInfo(["team", "name"], false, true)],
-            db.Indexes("users").Select(i => i with { Fields = [.. i.Fields] }).OrderBy(i => i.Fields[0]).ToList(),
-            new IndexComparer());
+        var users = db.Collection<JsonObject>("users");
+        Assert.True(users.EnsureIndex("email", unique: true));
+        Assert.False(users.EnsureIndex("email", unique: true));
+        Assert.True(users.EnsureIndex(["team", "name"], sparse: true));
+        var indexes = users.Indexes().OrderBy(i => i.Fields[0]).ToList();
+        Assert.Equal(2, indexes.Count);
+        Assert.Equal(["email"], indexes[0].Fields);
+        Assert.True(indexes[0].Unique);
+        Assert.Equal(["team", "name"], indexes[1].Fields);
+        Assert.True(indexes[1].Sparse);
 
-        var first = db.Insert("users", new { email = "a@example.com" });
-        var refused = Assert.Throws<DuplicateValueException>(() => db.Insert("users", new { email = "a@example.com" }));
+        var first = users.Insert(new JsonObject { ["email"] = "a@example.com" });
+        var refused = Assert.Throws<DuplicateValueException>(() => users.Insert(new JsonObject { ["email"] = "a@example.com" }));
         Assert.Equal(ErrorCode.DuplicateValue, refused.Code);
         Assert.Equal("users", refused.Collection);
         Assert.Equal("email", refused.Field);
         Assert.Equal(first, refused.Existing);
 
-        var other = Assert.Throws<TrunkDbException>(() => db.EnsureIndex("users", "email"));
+        var other = Assert.Throws<TrunkDbException>(() => users.EnsureIndex("email"));
         Assert.Equal(ErrorCode.InvalidArgument, other.Code);
 
-        Assert.True(db.DropIndex("users", ["team", "name"]));
-        Assert.False(db.DropIndex("users", ["team", "name"]));
-        Assert.Single(db.Indexes("users"));
-    }
-
-    private sealed class IndexComparer : IEqualityComparer<IndexInfo>
-    {
-        public bool Equals(IndexInfo? x, IndexInfo? y) =>
-            x!.Fields.SequenceEqual(y!.Fields) && x.Unique == y.Unique && x.Sparse == y.Sparse;
-
-        public int GetHashCode(IndexInfo obj) => obj.Fields.Count;
+        Assert.True(users.DropIndex(["team", "name"]));
+        Assert.False(users.DropIndex(["team", "name"]));
+        Assert.Single(users.Indexes());
     }
 
     [Fact]
     public void A_batch_writes_all_or_nothing_and_names_the_line_that_failed()
     {
         using var db = Open();
+        var log = db.Collection<JsonObject>("log");
         const string lines = """
             {"op": "insert", "collection": "log", "document": {"n": 1}}
 
@@ -213,14 +260,14 @@ public sealed class DatabaseTests : IDisposable
             """;
         var dry = db.Batch(lines, new { n = 1 }, dryRun: true);
         Assert.True(dry.DryRun);
-        Assert.Equal(0ul, db.Count("log"));
+        Assert.Equal(0ul, log.Count());
         Assert.All(dry.Ops, op => Assert.Null(op.Id));
 
         var done = db.Batch(lines, new { n = 1 });
         Assert.Equal(2ul, done.Total);
         Assert.Equal([1ul, 3ul], done.Ops.Select(op => op.Line));
         Assert.Equal(["insert", "update"], done.Ops.Select(op => op.Op));
-        Assert.Equal(done.Ops[0].Id, db.FindOne<JsonObject>("log") is { } log ? DocId.Parse(log["_id"]!["$id"]!.GetValue<string>()) : null);
+        Assert.True(log.Get(done.Ops[0].Id!.Value)!["seen"]!.GetValue<bool>());
 
         var failed = Assert.Throws<PreconditionFailedException>(() => db.Batch("""
             {"op": "insert", "collection": "log", "document": {"n": 2}}
@@ -230,7 +277,7 @@ public sealed class DatabaseTests : IDisposable
         Assert.Equal(1, failed.Op);
         Assert.True(failed.Matched);
         Assert.Equal("log", failed.Collection);
-        Assert.Equal(1ul, db.Count("log"));
+        Assert.Equal(1ul, log.Count());
 
         var unread = Assert.Throws<ParseException>(() => db.Batch("""
             {"op": "insert", "collection": "log", "document": {"n": 3}}
@@ -244,21 +291,23 @@ public sealed class DatabaseTests : IDisposable
     public void A_snapshot_and_its_cursor_read_the_database_as_it_was()
     {
         using var db = Open();
-        for (var i = 0; i < 300; i++)
-        {
-            db.Insert("tasks", new TaskItem { Title = $"t{i}", Hours = i });
-        }
-        db.DeleteMany("tasks", "hours >= 10");
+        var tasks = db.Collection<TaskItem>("tasks");
+        tasks.InsertMany(Enumerable.Range(0, 300).Select(i => new TaskItem { Title = $"t{i}", Hours = i }));
+        tasks.DeleteMany("hours >= 10");
 
         using (var snapshot = db.OpenSnapshot())
         {
-            db.DeleteMany("tasks", "hours >= 5");
-            Assert.Equal(5ul, db.Count("tasks"));
-            Assert.Equal(10ul, snapshot.Count("tasks"));
-            Assert.Equal(10, snapshot.Find<TaskItem>("tasks").Count);
-            Assert.Equal(9.0, snapshot.FindOne<TaskItem>("tasks", "hours = 9")!.Hours);
+            var then = snapshot.Collection<TaskItem>("tasks");
+            tasks.DeleteMany("hours >= 5");
+            Assert.Equal(5ul, tasks.Count());
+            Assert.Equal(10ul, then.Count());
+            Assert.Equal(10, then.Find().Count);
+            Assert.Equal(9.0, then.FindOne("hours = 9")!.Hours);
+            Assert.Equal("t9", then.Get(then.FindOne("hours = 9")!.Id)!.Title);
+            Assert.Equal(10, then.Aggregate<JsonObject>(null, "count() as n").Single()["n"]!.GetValue<int>());
+            Assert.Contains("plan:", then.Explain());
 
-            using var cursor = snapshot.OpenCursor<TaskItem>("tasks", "hours >= :h order by hours", new { h = 3 });
+            using var cursor = then.OpenCursor("hours >= :h order by hours", new { h = 3 });
             Assert.Equal([3.0, 4, 5, 6, 7, 8, 9], cursor.Select(t => t.Hours));
             Assert.Throws<InvalidOperationException>(() => cursor.First());
 
@@ -269,7 +318,7 @@ public sealed class DatabaseTests : IDisposable
         Assert.True(compacted.PagesAfter < compacted.PagesBefore);
 
         // Left before its end, a cursor is closed by Dispose.
-        using var live = db.OpenCursor<TaskItem>("tasks");
+        using var live = tasks.OpenCursor();
         Assert.Equal("t0", live.First().Title);
     }
 
@@ -277,9 +326,10 @@ public sealed class DatabaseTests : IDisposable
     public void The_database_is_checked_measured_exported_and_imported()
     {
         using var db = Open();
-        db.EnsureIndex("tasks", "status");
-        db.Insert("tasks", new TaskItem { Title = "a" });
-        db.Insert("notes", new { text = "n" });
+        var tasks = db.Collection<TaskItem>("tasks");
+        tasks.EnsureIndex("status");
+        tasks.Insert(new TaskItem { Title = "a" });
+        db.Collection<Note>("notes").Insert(new Note { Text = "n" });
         db.Checkpoint();
 
         var check = db.Check();
@@ -290,18 +340,17 @@ public sealed class DatabaseTests : IDisposable
         var stats = db.Stats();
         Assert.True(stats.File.Pages > 0);
         Assert.Equal(Database.LibraryVersion, stats.File.WrittenBy);
-        var tasks = Assert.Single(stats.Collections, c => c.Name == "tasks");
-        Assert.Equal(1ul, tasks.Documents);
-        Assert.Equal(["status"], Assert.Single(tasks.Indexes).Fields);
+        var counted = Assert.Single(stats.Collections, c => c.Name == "tasks");
+        Assert.Equal(1ul, counted.Documents);
+        Assert.Equal(["status"], Assert.Single(counted.Indexes).Fields);
 
         Assert.Equal(["notes", "tasks"], db.Collections().Order());
-        var exported = db.Export(File("backup.jsonl"));
-        Assert.Equal(new TransferSummary(2, 2, true), exported);
+        Assert.Equal(new TransferSummary(2, 2, true), db.Export(File("backup.jsonl")));
 
         using var copy = Open("copy.trunkdb");
         Assert.Equal(new TransferSummary(2, 2, true), copy.Import(File("backup.jsonl")));
-        Assert.Equal("a", copy.FindOne<TaskItem>("tasks")!.Title);
-        Assert.True(copy.DropCollection("notes"));
+        Assert.Equal("a", copy.Collection<TaskItem>("tasks").FindOne()!.Title);
+        Assert.True(copy.Collection<Note>("notes").Drop());
         Assert.False(copy.DropCollection("notes"));
         Assert.Equal(["tasks"], copy.Collections());
 
@@ -315,37 +364,37 @@ public sealed class DatabaseTests : IDisposable
     {
         using (var db = Open())
         {
-            var filter = Assert.Throws<ParseException>(() => db.Count("tasks", "hours = = 1"));
+            var tasks = db.Collection<TaskItem>("tasks");
+            var filter = Assert.Throws<ParseException>(() => tasks.Count("hours = = 1"));
             Assert.Equal(ErrorCode.Parse, filter.Code);
             Assert.Equal("filter", filter.What);
-            Assert.NotNull(filter.Offset);
+            Assert.Equal(8, filter.Offset);
             Assert.Equal("parse", filter.Detail.GetProperty("kind").GetString());
 
-            var unused = Assert.Throws<ParseException>(() => db.Find<TaskItem>("tasks", "status = :s", new { s = "open", t = 1 }));
+            var unused = Assert.Throws<ParseException>(() => tasks.Find("status = :s", new { s = "open", t = 1 }));
             Assert.Equal("t", unused.Parameter);
-            var missing = Assert.Throws<ParseException>(() => db.Find<TaskItem>("tasks", "status = :s"));
+            var missing = Assert.Throws<ParseException>(() => tasks.Find("status = :s"));
             Assert.Equal("s", missing.Parameter);
-            Assert.Throws<ParseException>(() => db.Update("tasks", null, """{"$bump": {"n": 1}}"""));
+            Assert.Throws<ParseException>(() => tasks.UpdateMany(null, """{"$bump": {"n": 1}}"""));
 
-            var id = db.Insert("tasks", new TaskItem { Title = "a" });
-            var twice = Assert.Throws<DuplicateIdException>(() => db.Insert("tasks", new TaskItem { Id = id }));
+            var id = tasks.Insert(new TaskItem { Title = "a" });
+            var twice = Assert.Throws<DuplicateIdException>(() => tasks.Insert(new TaskItem { Id = id }));
             Assert.Equal(id, twice.DocumentId);
             Assert.Equal("tasks", twice.Collection);
 
-            var many = Assert.Throws<TrunkDbException>(() =>
-            {
-                db.Insert("tasks", new TaskItem { Title = "b" });
-                db.Upsert("tasks", "status = \"open\"", """{"$set": {"x": 1}}""");
-            });
+            tasks.Insert(new TaskItem { Title = "b" });
+            var many = Assert.Throws<TrunkDbException>(() => tasks.Upsert("status = \"open\"", """{"$set": {"x": 1}}"""));
             Assert.Equal(ErrorCode.MultipleMatches, many.Code);
-            Assert.Throws<ArgumentNullException>(() => db.Count(null!));
+            Assert.Throws<ArgumentNullException>(() => db.Collection<TaskItem>(null!));
+            Assert.Throws<ArgumentNullException>(() => tasks.Insert(null!));
         }
 
         using (var reader = Open(options: new OpenOptions { ReadOnly = true, CacheSize = 1 << 20 }))
         {
-            var refused = Assert.Throws<TrunkDbException>(() => reader.Insert("tasks", new TaskItem()));
+            var tasks = reader.Collection<TaskItem>("tasks");
+            var refused = Assert.Throws<TrunkDbException>(() => tasks.Insert(new TaskItem()));
             Assert.Equal(ErrorCode.ReadOnly, refused.Code);
-            Assert.Equal(2ul, reader.Count("tasks"));
+            Assert.Equal(2ul, tasks.Count());
         }
 
         var missingFile = Assert.Throws<TrunkDbException>(() => Open("none.trunkdb", new OpenOptions { ReadOnly = true }));
@@ -358,31 +407,34 @@ public sealed class DatabaseTests : IDisposable
     public void A_closed_database_or_snapshot_is_refused_by_dotnet()
     {
         var db = Open();
+        var tasks = db.Collection<TaskItem>("tasks");
         var snapshot = db.OpenSnapshot();
+        var then = snapshot.Collection<TaskItem>("tasks");
         snapshot.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => snapshot.Count("tasks"));
+        Assert.Throws<ObjectDisposedException>(() => then.Count());
         db.Dispose();
         db.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => db.Count("tasks"));
+        Assert.Throws<ObjectDisposedException>(() => tasks.Count());
     }
 
     [Fact]
     public void One_database_is_used_by_eight_threads_at_once()
     {
         using var db = Open();
+        var tasks = db.Collection<JsonObject>("tasks");
         Parallel.For(0, 8, thread =>
         {
             for (var i = 0; i < 25; i++)
             {
-                db.Insert("tasks", new { thread, i });
-                Assert.True(db.Count("tasks", "thread = :t", new { t = thread }) >= (ulong)i + 1);
+                tasks.Insert(new JsonObject { ["thread"] = thread, ["i"] = i });
+                Assert.True(tasks.Count("thread = :t", new { t = thread }) >= (ulong)i + 1);
             }
         });
-        Assert.Equal(200ul, db.Count("tasks"));
+        Assert.Equal(200ul, tasks.Count());
         // Each thread's errors are its own: the offset its text had.
         Parallel.For(0, 8, thread =>
         {
-            var e = Assert.Throws<ParseException>(() => db.Count("tasks", new string(' ', thread) + "thread = = 1"));
+            var e = Assert.Throws<ParseException>(() => tasks.Count(new string(' ', thread) + "thread = = 1"));
             Assert.Equal(thread + 9, e.Offset);
         });
     }

@@ -9,11 +9,17 @@ Rust changed; no file format changed.
 using TrunkDb;
 
 using var db = Database.Open("app.trunkdb");
-db.EnsureIndex("tasks", "status");
-var id = db.Insert("tasks", new TaskItem { Title = "Write it", Due = new DateOnly(2026, 11, 9) });
-foreach (var task in db.Find<TaskItem>("tasks", "status = :s order by due limit 10", new { s = "open" }))
-    Console.WriteLine($"{task.Id} {task.Title}");
-db.Update("tasks", "_id = :id", """{"$set": {"status": "done"}}""", new { id });
+var tasks = db.Collection<TaskItem>("tasks");
+tasks.EnsureIndex("status");
+
+var task = new TaskItem { Title = "Write it", Due = new DateOnly(2026, 11, 9) };
+tasks.Insert(task);                    // task.Id is set
+task.Status = "done";
+tasks.Update(task);                    // the stored document replaced
+
+foreach (var open in tasks.Find("status = :s order by due limit 10", new { s = "open" }))
+    Console.WriteLine($"{open.Id} {open.Title}");
+tasks.UpdateMany("due < :today", """{"$set": {"late": true}}""", new { today = DateOnly.FromDateTime(DateTime.Today) });
 
 class TaskItem
 {
@@ -32,11 +38,28 @@ class TaskItem
   called. The design's `TrunkDb.Open` is `Database.Open`: a class named
   as its namespace makes every use `TrunkDb.TrunkDb`, and `Database` is
   Rust's name.
-- **The reads on a base class, `Reader`:** `Get`, `Find`, `FindOne`,
-  `Count`, `Aggregate`, `Explain`, `OpenCursor`, on the database as it
-  is and on a snapshot as it was taken, as `trunkdb_find` takes either.
-  The writes, indexes and the rest are the database's. A snapshot's
-  reads need its database open: each call passes both handles.
+- **Documents through a `Collection<T>`,** as Rust's
+  `db.collection::<T>(name)`: `db.Collection<TaskItem>("tasks")`, a
+  name and the database, nothing to close. A document doesn't know its
+  collection, so a write by the object alone needs one. Its reads,
+  `Get`, `Find`, `FindOne`, `Count`, `Aggregate`, `Explain` and
+  `OpenCursor`, are a `CollectionView<T>`'s, which a snapshot hands
+  out, `snapshot.Collection<T>(name)`, for reads as it was taken; the
+  writes and indexes are the collection's. A snapshot's reads need its
+  database open: each call passes both handles. The database keeps
+  what is the whole file's: collections listed and dropped, snapshots,
+  batches, checkpoint, compact, check, stats, export and import.
+- **A write by the object:** `Insert(task)` sets `task.Id` when it was
+  empty; `Update(task)` replaces the stored document, found by its
+  `Id`, and `Delete(task)` deletes it. A type without an `Id`, or an
+  object not inserted yet, is `InvalidOperationException` naming
+  `Update(id, document)`. `InsertMany` inserts in one batch, all or
+  none, and sets each id. Changing some fields of many documents is
+  `UpdateMany(filter, update)`, with MongoDB's operators: `Update`
+  replaces whole, as Rust's `Collection::update` does. The first cut
+  had every call on the database with the collection's name and
+  `Update(name, filter, operators)`: not how C# programs work with
+  objects.
 - **A cursor is an `IEnumerable<T>` read once;** a `foreach` to its end
   disposes it, `Dispose` when left before. A second enumeration is
   `InvalidOperationException`, not a silent empty sequence.
@@ -114,9 +137,9 @@ and runs its tests, on Linux, macOS and Windows, warnings as errors.
 ## 180.6 Rejected
 - **Updates as objects:** an anonymous type can't name `$set`, and a
   dictionary of dictionaries says less than the JSON.
-- **The id written back into the object inserted,** as some .NET
-  drivers do: a write reaching into a program's object by reflection;
-  `Insert` returns it.
+- **A collection named by an attribute on the class,**
+  `db.Collection<TaskItem>()`: one class may live in two collections,
+  and a name in the call is what Rust and the command use.
 - **`Find` as a lazy `IEnumerable`:** `trunkdb_find` returns the whole
   array at once anyway; `OpenCursor` is the lazy one.
 - **A NuGet package now:** §177.12.
@@ -130,14 +153,17 @@ and runs its tests, on Linux, macOS and Windows, warnings as errors.
   kept, a record's `Id` read from `_id`; ids in their text's order.
 - `DatabaseTests`, against the library:
   - the library's version the wrapper's, its ABI 1;
-  - insert, get, find with parameters, find one, count, a date as a
-    parameter, an id the document has kept;
+  - an object inserted, its id set, changed, updated and deleted by
+    itself; an id it has kept; by id for a type without one; a type
+    without an id and an object not inserted refused by name;
+  - many inserted at once, their ids set; all refused for one
+    duplicate id, none set; find with parameters, find one, count, a
+    date as a parameter;
   - every tagged kind through the database and back, a float stored as
     a float and a date as a date, compared in filters;
   - a `JsonObject` in and out with its tags;
-  - replace, delete, update with a filter and without, upsert inserting
-    then updating, an update by `_id` with the id as a parameter,
-    delete many;
+  - many updated with a filter and without, one by `_id` with the id
+    as a parameter; upsert inserting then updating; delete many;
   - an aggregate's rows as records; explain naming its index;
   - indexes on one field and on two, unique and sparse, listed; a
     duplicate value's field and existing id; another kind refused;
@@ -145,7 +171,8 @@ and runs its tests, on Linux, macOS and Windows, warnings as errors.
   - a batch dry-run without ids, committed with them, a blank line
     counted; a precondition failing at line 2, nothing written; a line
     that doesn't read;
-  - a snapshot's count, find, find one and cursor as they were; a
+  - a snapshot's get, count, find, find one, aggregate, explain and
+    cursor as they were; a
     cursor read twice refused; a compaction refused while a snapshot
     holds the last commit, done after;
   - check, stats, checkpoint, collections, export, import into another
@@ -160,14 +187,17 @@ and runs its tests, on Linux, macOS and Windows, warnings as errors.
     own.
 
 ## 180.8 Mutated
-Thirteen ways by hand: an empty id written; parameters with the `_id`
-rule; a float without `.0`; the
-fraction not cut; local time not converted; a snapshot's reads of the
-database now; `ReadOnly` not passed; a dry run committed; an upsert's
+Nineteen ways by hand: an empty id written; parameters with the `_id`
+rule; `Id` not mapped to `_id`; an inserted object's id not set, or
+each of many's; `Update(task)` and `Delete(task)` by an empty id; an
+object not inserted taken as one; a snapshot's collection reading the
+database now; a float without `.0`; the fraction not cut; local time
+not converted; `ReadOnly` not passed; a dry run committed; an upsert's
 `Inserted` inverted; `unique` dropped; a duplicate value as the plain
-exception; a cursor read twice allowed; `Id` not mapped to `_id`. Each
-failed a test. Untested: the ABI check, which needs a library of
-another ABI, and the free of each string, which no test can see.
+exception; a cursor read twice allowed. Each failed a test but one: an
+id set again when the object had one, which trunkdb returns as it was,
+so the same. Untested: the ABI check, which needs a library of another
+ABI, and the free of each string, which no test can see.
 
 ## 180.9 Left for later
 - **The files on a GitHub release:** the library for each system and
