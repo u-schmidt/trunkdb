@@ -54,7 +54,10 @@ class TaskItem
   `Id`, and `Delete(task)` deletes it. A type without an `Id`, or an
   object not inserted yet, is `InvalidOperationException` naming
   `Update(id, document)`. `InsertMany` inserts in one batch, all or
-  none, and sets each id. Changing some fields of many documents is
+  none, and sets each id. Each op is written as one line whatever the
+  program's options: with `WriteIndented`, a document written as it
+  came split its op over lines, and the batch refused it (found in
+  review). Changing some fields of many documents is
   `UpdateMany(filter, update)`, with MongoDB's operators: `Update`
   replaces whole, as Rust's `Collection::update` does. The first cut
   had every call on the database with the collection's name and
@@ -99,8 +102,11 @@ program's own (`OpenOptions.Json`), with a converter for each tag:
 | `byte[]` | `{"$binary": "AQID"}` |
 | `double`, `float` | `3.0`; `{"$float": "NaN"}` |
 
-- **A property `Id` of type `DocId` is `_id`,** unless it has a
-  `[JsonPropertyName]`; left out when empty, `default`, so trunkdb
+- **A property `Id` of type `DocId` is `_id`,** by the member's own
+  name, whatever a naming policy calls it, unless it has a
+  `[JsonPropertyName]`. Matched by the name the policy made, a policy
+  renaming `Id` left it an ordinary field: `Insert` didn't set it and
+  `Update(task)` found none (found in review). left out when empty, `default`, so trunkdb
   chooses one. A `DocId` sorts as its text, as trunkdb orders ids.
 - **A `DateTime` is an instant:** local time converted to UTC,
   unspecified taken as UTC, read back as UTC. .NET keeps 100 ns, trunkdb
@@ -151,6 +157,10 @@ and runs its tests, on Linux, macOS and Windows, warnings as errors.
 
 ## 180.7 Tests
 - The wrapper's file not the C library's, in any case.
+- A program's own options, indented, with a naming policy renaming
+  every property: `InsertMany` and its ids, `Id` still the document's
+  id, inserted, updated and read back; a `[JsonPropertyName]` on `Id`
+  kept, an ordinary field.
 - `JsonTests`, without the library: each tag written and read; a
   `DateTime` local, unspecified and with a fraction to the tick; nine
   digits of fraction cut to seven; a date refused as a `DateTime` and
@@ -193,7 +203,8 @@ and runs its tests, on Linux, macOS and Windows, warnings as errors.
     own.
 
 ## 180.8 Mutated
-Nineteen ways by hand: an empty id written; parameters with the `_id`
+Twenty-one ways by hand: a batch's op written indented; `Id` matched
+by the name the policy made; an empty id written; parameters with the `_id`
 rule; `Id` not mapped to `_id`; an inserted object's id not set, or
 each of many's; `Update(task)` and `Delete(task)` by an empty id; an
 object not inserted taken as one; a snapshot's collection reading the

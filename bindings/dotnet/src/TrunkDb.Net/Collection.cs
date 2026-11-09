@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization.Metadata;
 
 namespace TrunkDb;
@@ -142,8 +143,13 @@ public sealed class Collection<T> : CollectionView<T>
         {
             return [];
         }
-        var lines = string.Join('\n', all.Select(d =>
-            $$"""{"op":"insert","collection":{{JsonSerializer.Serialize(Name)}},"document":{{Database.Write(d)}}}"""));
+        // One op a line, whatever the program's options indent.
+        var lines = string.Join('\n', all.Select(d => new JsonObject
+        {
+            ["op"] = "insert",
+            ["collection"] = Name,
+            ["document"] = JsonNode.Parse(Database.Write(d)),
+        }.ToJsonString()));
         var done = Database.Batch(lines);
         var ids = done.Ops.Select(op => op.Id!.Value).ToList();
         if (id?.Set is { } set && !typeof(T).IsValueType)

@@ -132,6 +132,49 @@ public sealed class DatabaseTests : IDisposable
         Assert.True(again[0].Id.IsEmpty);
     }
 
+    /// <summary>Renames every property: <c>Id</c> is <c>f_Id</c>.</summary>
+    private sealed class Prefixed : JsonNamingPolicy
+    {
+        public override string ConvertName(string name) => "f_" + name;
+    }
+
+    public sealed class Named
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("ident")]
+        public DocId Id { get; set; }
+        public string Title { get; set; } = "";
+    }
+
+    [Fact]
+    public void Options_of_the_programs_own_change_neither_ids_nor_batches()
+    {
+        // Indented: a document over several lines, which a batch's line can't be.
+        var json = new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true, PropertyNamingPolicy = new Prefixed() };
+        using var db = Open(options: new OpenOptions { Json = json });
+        var tasks = db.Collection<TaskItem>("tasks");
+        var items = new List<TaskItem> { new() { Title = "a" }, new() { Title = "b" } };
+        var ids = tasks.InsertMany(items);
+        Assert.Equal(ids, items.Select(t => t.Id));
+
+        // A policy renaming Id leaves it the document's id.
+        var task = new TaskItem { Title = "c" };
+        var id = tasks.Insert(task);
+        Assert.Equal(id, task.Id);
+        task.Status = "done";
+        Assert.True(tasks.Update(task));
+        var raw = db.Collection<JsonObject>("tasks").Get(id)!;
+        Assert.Equal("done", raw["f_Status"]!.GetValue<string>());
+        Assert.False(raw.ContainsKey("f_Id"));
+        Assert.Equal(id, tasks.Get(id)!.Id);
+
+        // A name of its own is kept: an ordinary field, no id to update by.
+        var named = db.Collection<Named>("named");
+        var made = named.Insert(new Named { Id = Absent, Title = "n" });
+        Assert.NotEqual(Absent, made);
+        Assert.Equal(Absent, named.Get(made)!.Id);
+        Assert.Throws<InvalidOperationException>(() => named.Update(new Named { Id = Absent }));
+    }
+
     [Fact]
     public void Every_tagged_kind_goes_through_the_database_and_back()
     {

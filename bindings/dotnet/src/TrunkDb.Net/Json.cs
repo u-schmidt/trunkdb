@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
@@ -69,7 +70,8 @@ public static class TrunkJson
 
     /// <summary>
     /// A property <c>Id</c> of type <see cref="DocId"/> is the document's
-    /// <c>_id</c> unless it has a name of its own; left out when empty, so
+    /// <c>_id</c>, whatever a naming policy would call it, unless it has a
+    /// <see cref="JsonPropertyNameAttribute"/>; left out when empty, so
     /// trunkdb chooses one.
     /// </summary>
     private static void MapIds(JsonTypeInfo info)
@@ -84,8 +86,11 @@ public static class TrunkJson
             {
                 continue;
             }
-            var named = property.AttributeProvider?.IsDefined(typeof(JsonPropertyNameAttribute), false) == true;
-            if (!named && string.Equals(property.Name, "id", StringComparison.OrdinalIgnoreCase))
+            // By the member's own name, whatever the naming policy made of
+            // it; a name given with [JsonPropertyName] is kept.
+            var member = property.AttributeProvider as MemberInfo;
+            var named = member?.IsDefined(typeof(JsonPropertyNameAttribute), false) == true;
+            if (!named && string.Equals(member?.Name ?? property.Name, "id", StringComparison.OrdinalIgnoreCase))
             {
                 property.Name = "_id";
             }
