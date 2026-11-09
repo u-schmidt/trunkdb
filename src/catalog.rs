@@ -26,6 +26,9 @@ const KIND_UNIQUE_INDEX: u8 = 2;
 const KIND_INDEX_WITH_FLAGS: u8 = 3;
 const FLAG_UNIQUE: u8 = 1;
 const FLAG_SPARSE: u8 = 2;
+/// A one-field index that counts the documents it leaves out (SPEC
+/// §181, file format 16), laid out so the count is rewritten in place.
+const KIND_COUNTED_INDEX: u8 = 5;
 /// Field names of the file's dictionary (`names.rs`, file format 14):
 /// `[u8 kind = 4][u32 first number]`, then each name as `[u8
 /// length][name]`, numbered on from the first.
@@ -55,6 +58,14 @@ pub struct IndexMeta {
     /// Null and missing values get no entry (SPEC §44) — on several
     /// fields, a document null in all of them.
     pub sparse: bool,
+    /// How many documents have a value at its field that nothing orders
+    /// — an array, an object, NaN — and so no place in its order (SPEC
+    /// §181): a walk in its order finds those after it only by a scan,
+    /// which a count of 0 spares. Kept for a one-field index without
+    /// `[*]` (`counts_left_out`), the only kind a walk in sort order
+    /// scans after; `None` for the others, and for one an older file
+    /// holds until it's built anew.
+    pub left_out: Option<u64>,
 }
 
 /// How `Collection::ensure_index_with` builds an index: `new()` is what
@@ -160,6 +171,21 @@ impl IndexMeta {
 
     pub fn is_compound(&self) -> bool {
         self.fields.len() > 1
+    }
+
+    /// Whether it keeps `left_out`: on one field, without `[*]` (SPEC
+    /// §181).
+    pub(crate) fn counts_left_out(&self) -> bool {
+        self.single()
+            .is_some_and(|field| !crate::query::is_multi(field))
+    }
+
+    /// Whether `doc` is one `left_out` counts: its value at the field is
+    /// one nothing orders, which a walk in the index's order finds only
+    /// by a scan (SPEC §181). `false` for an index that doesn't count.
+    pub(crate) fn leaves_out(&self, doc: &crate::Document) -> bool {
+        self.counts_left_out()
+            && crate::query::is_unordered(crate::query::value_or_null(doc, &self.fields[0]))
     }
 
     /// The field of a one-field index.
@@ -375,6 +401,12 @@ impl Catalog {
         Ok(())
     }
 
+    /// How many pages the catalog's chain has: for tests.
+    #[cfg(test)]
+    fn pages_used(&self, store: &dyn PageStore) -> usize {
+        Catalog::pages(store).unwrap().len()
+    }
+
     /// The catalog's own pages: the chain from page 1.
     pub fn pages(store: &dyn PageStore) -> std::io::Result<Vec<PageId>> {
         let mut pages = Vec::new();
@@ -426,9 +458,15 @@ impl Catalog {
         for name in names {
             let meta = self.collections[name];
             let cells = std::iter::once(encode_collection(name, &meta).len()).chain(
-                self.indexes(name)
-                    .iter()
-                    .map(|index| encode_index(name, index).len()),
+                self.indexes(name).iter().map(|index| {
+                    // Compaction counts what each index leaves out
+                    // (SPEC §181), an older file's too: its cell's size.
+                    let counted = IndexMeta {
+                        left_out: index.counts_left_out().then_some(0),
+                        ..index.clone()
+                    };
+                    encode_index(name, &counted).len()
+                }),
             );
             for cell in cells {
                 let needed = SlottedPage::space_needed(cell);
@@ -471,12 +509,17 @@ impl Catalog {
         }
         assert!(self.collections.contains_key(collection));
         assert!(!self.indexes(collection).iter().any(|i| i.fields == fields));
-        let index = IndexMeta {
+        let mut index = IndexMeta {
             fields: fields.to_vec(),
             root: allocate_index_root(store)?,
             unique: options.unique,
             sparse: options.sparse,
+            left_out: None,
         };
+        // Empty, it leaves nothing out; filling it counts (SPEC §181).
+        if index.counts_left_out() {
+            index.left_out = Some(0);
+        }
         append_cell(store, &encode_index(collection, &index))?;
         self.indexes
             .entry(collection.to_string())
@@ -559,6 +602,91 @@ impl Catalog {
         let indexes = self.indexes.get(collection).map_or(&[][..], Vec::as_slice);
         let free = self.free_space.entry(collection.to_string()).or_default();
         (indexes, free)
+    }
+
+    /// Records how many documents `collection`'s index at `position`
+    /// leaves out (SPEC §181) — in its catalog cell and in the cache. A
+    /// cell with a count keeps its length, so it's rewritten in place;
+    /// an older file's, without one, is replaced by a cell of kind 5.
+    /// Nothing is written if the count is already `left_out`.
+    pub(crate) fn set_left_out(
+        &mut self,
+        store: &mut dyn PageStore,
+        collection: &str,
+        position: usize,
+        left_out: u64,
+    ) -> Result<()> {
+        let index = &mut self
+            .indexes
+            .get_mut(collection)
+            .expect("set_left_out on a collection with indexes")[position];
+        assert!(
+            index.counts_left_out(),
+            "set_left_out on an index that doesn't count"
+        );
+        if index.left_out == Some(left_out) {
+            return Ok(());
+        }
+        let cell = encode_index(collection, index);
+        index.left_out = Some(left_out);
+        let entry_bytes = encode_index(collection, index);
+        let (page_id, mut page, slot) =
+            find_cell(store, |c| c == cell.as_slice())?.ok_or_else(|| {
+                corrupt(format!(
+                    "index {collection}.{} has no catalog entry",
+                    index.name()
+                ))
+            })?;
+        if !page.update_cell(slot, &entry_bytes) {
+            // An older file's cell, shorter: counted for the first time.
+            page.delete_cell(slot);
+            store.write_page(page_id, page.into_page())?;
+            return Ok(append_cell(store, &entry_bytes)?);
+        }
+        store.write_page(page_id, page.into_page())?;
+        Ok(())
+    }
+
+    /// Makes `collection`'s index at `position` one an older file holds,
+    /// without a count (SPEC §181.4): for tests.
+    #[cfg(test)]
+    pub(crate) fn forget_left_out(
+        &mut self,
+        store: &mut dyn PageStore,
+        collection: &str,
+        position: usize,
+    ) -> Result<()> {
+        let index = &mut self.indexes.get_mut(collection).unwrap()[position];
+        let cell = encode_index(collection, index);
+        index.left_out = None;
+        let (page_id, mut page, slot) = find_cell(store, |c| c == cell.as_slice())?.unwrap();
+        page.delete_cell(slot);
+        store.write_page(page_id, page.into_page())?;
+        Ok(append_cell(store, &encode_index(collection, index))?)
+    }
+
+    /// Adds `change` to how many documents `collection`'s index at
+    /// `position` leaves out (SPEC §181), for a write that changed it.
+    /// An index that doesn't know its count yet stays so.
+    pub(crate) fn add_left_out(
+        &mut self,
+        store: &mut dyn PageStore,
+        collection: &str,
+        position: usize,
+        change: i64,
+    ) -> Result<()> {
+        let index = &self.indexes(collection)[position];
+        let Some(count) = index.left_out else {
+            return Ok(());
+        };
+        let count = count.checked_add_signed(change).ok_or_else(|| {
+            corrupt(format!(
+                "index {collection}.{} counts {count} documents left out, not {}",
+                index.name(),
+                -change
+            ))
+        })?;
+        self.set_left_out(store, collection, position, count)
     }
 
     /// Records a collection's new current data page — in its catalog
@@ -717,19 +845,24 @@ fn encode_collection(name: &str, meta: &CollectionMeta) -> Vec<u8> {
 /// unique) the field name. Any other (kind 3: compound, SPEC §43.1, or
 /// sparse, §44) has `[u8 flags][u8 count]` and each field as `[u8
 /// length][field name]`. Names are at most 255 bytes, so one length
-/// byte does.
+/// byte does. An index that counts what it leaves out (kind 5, SPEC
+/// §181) has `[u64 left_out]` after the collection name, then what kind
+/// 3 has: the count at the same place whatever it is.
 fn encode_index(collection: &str, index: &IndexMeta) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(12 + collection.len() + 256 * index.fields.len());
+    let mut buffer = Vec::with_capacity(20 + collection.len() + 256 * index.fields.len());
     let plain = !index.is_compound() && !index.sparse;
-    buffer.push(match (plain, index.unique) {
-        (true, false) => KIND_INDEX,
-        (true, true) => KIND_UNIQUE_INDEX,
-        (false, _) => KIND_INDEX_WITH_FLAGS,
+    buffer.push(match (index.left_out, plain, index.unique) {
+        (Some(_), ..) => KIND_COUNTED_INDEX,
+        (None, true, false) => KIND_INDEX,
+        (None, true, true) => KIND_UNIQUE_INDEX,
+        (None, false, _) => KIND_INDEX_WITH_FLAGS,
     });
     buffer.extend_from_slice(&index.root.to_le_bytes());
     buffer.push(collection.len() as u8);
     buffer.extend_from_slice(collection.as_bytes());
-    if plain {
+    if let Some(left_out) = index.left_out {
+        buffer.extend_from_slice(&left_out.to_le_bytes());
+    } else if plain {
         buffer.extend_from_slice(index.fields[0].as_bytes());
         return buffer;
     }
@@ -781,12 +914,17 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
                     root,
                     unique: kind == KIND_UNIQUE_INDEX,
                     sparse: false,
+                    left_out: None,
                 },
             ))
         }
-        KIND_INDEX_WITH_FLAGS => {
+        kind @ (KIND_INDEX_WITH_FLAGS | KIND_COUNTED_INDEX) => {
             let name_len = take_u8(&mut rest, "an index's collection name")? as usize;
             let collection = take(&mut rest, name_len, "an index's collection name")?;
+            let left_out = match kind {
+                KIND_COUNTED_INDEX => Some(take_u64(&mut rest, "an index's count left out")?),
+                _ => None,
+            };
             let flags = take_u8(&mut rest, "an index's flags")?;
             if flags & !(FLAG_UNIQUE | FLAG_SPARSE) != 0 {
                 return Err(corrupt(format!("unknown index flags {flags:#04x}")));
@@ -797,15 +935,20 @@ fn decode_entry(cell: &[u8]) -> std::io::Result<Entry> {
                 let len = take_u8(&mut rest, "an index's field")? as usize;
                 fields.push(utf8(take(&mut rest, len, "an index's field")?)?);
             }
-            Ok(Entry::Index(
-                utf8(collection)?,
-                IndexMeta {
-                    fields,
-                    root,
-                    unique: flags & FLAG_UNIQUE != 0,
-                    sparse: flags & FLAG_SPARSE != 0,
-                },
-            ))
+            let index = IndexMeta {
+                fields,
+                root,
+                unique: flags & FLAG_UNIQUE != 0,
+                sparse: flags & FLAG_SPARSE != 0,
+                left_out,
+            };
+            if index.left_out.is_some() && !index.counts_left_out() {
+                return Err(corrupt(format!(
+                    "index {} counts documents left out, which only an index on one field does",
+                    index.name()
+                )));
+            }
+            Ok(Entry::Index(utf8(collection)?, index))
         }
         other => Err(corrupt(format!("unknown catalog entry kind {other}"))),
     }
@@ -1030,6 +1173,7 @@ mod tests {
                 root: 9,
                 unique: options.unique,
                 sparse: options.sparse,
+                left_out: None,
             };
             let cell = encode_index("users", &index);
             assert_eq!(cell[0], kind);
@@ -1043,6 +1187,7 @@ mod tests {
             root: 9,
             unique: false,
             sparse: true,
+            left_out: None,
         };
         let mut cell = encode_index("users", &index);
         cell[10 + "users".len()] |= 4;
@@ -1053,6 +1198,135 @@ mod tests {
             err.to_string().contains("unknown index flags 0x06"),
             "{err}"
         );
+    }
+
+    /// A one-field index's count of documents left out (SPEC §181) is
+    /// read back with its options, rewritten in place, and refused on an
+    /// index that can't keep one.
+    #[test]
+    fn index_cells_carry_their_count_left_out() {
+        for options in [PLAIN, UNIQUE, SPARSE, BOTH] {
+            let index = IndexMeta {
+                fields: fields(&["a.b"]),
+                root: 9,
+                unique: options.unique,
+                sparse: options.sparse,
+                left_out: Some(u64::MAX - 1),
+            };
+            let cell = encode_index("users", &index);
+            assert_eq!(cell[0], KIND_COUNTED_INDEX);
+            let Entry::Index(_, decoded) = decode_entry(&cell).unwrap() else {
+                panic!("an index cell decodes as an index");
+            };
+            assert_eq!(decoded, index);
+            let other = encode_index(
+                "users",
+                &IndexMeta {
+                    left_out: Some(0),
+                    ..index
+                },
+            );
+            assert_eq!(other.len(), cell.len(), "rewritten in place");
+        }
+        for list in [&["a", "b"][..], &["a[*]"]] {
+            let index = IndexMeta {
+                fields: fields(list),
+                root: 9,
+                unique: false,
+                sparse: false,
+                left_out: Some(0),
+            };
+            let Err(err) = decode_entry(&encode_index("users", &index)) else {
+                panic!("{list:?} can't count");
+            };
+            assert!(
+                err.to_string().contains("only an index on one field"),
+                "{err}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let mut store = FileStore::open(&path).unwrap();
+        let mut catalog = Catalog::load(&mut store).unwrap();
+        catalog.create_collection(&mut store, "users").unwrap();
+        for list in [&["a"][..], &["a", "b"], &["c[*]"]] {
+            catalog
+                .create_index(&mut store, "users", &fields(list), PLAIN)
+                .unwrap();
+        }
+        let counts = |catalog: &Catalog| -> Vec<Option<u64>> {
+            catalog
+                .indexes("users")
+                .iter()
+                .map(|i| i.left_out)
+                .collect()
+        };
+        assert_eq!(counts(&catalog), [Some(0), None, None]);
+        catalog.add_left_out(&mut store, "users", 0, 3).unwrap();
+        catalog.add_left_out(&mut store, "users", 0, -1).unwrap();
+        catalog.add_left_out(&mut store, "users", 1, 1).unwrap();
+        assert_eq!(counts(&catalog), [Some(2), None, None]);
+        assert!(catalog.add_left_out(&mut store, "users", 0, -3).is_err());
+        drop(store);
+        let mut store = FileStore::open(&path).unwrap();
+        assert_eq!(
+            counts(&Catalog::load(&mut store).unwrap()),
+            [Some(2), None, None]
+        );
+    }
+
+    /// An older file's cell, without a count, that can't grow where it
+    /// is, on a full catalog page, is replaced by one appended where
+    /// there's room as it gets its first count (SPEC §181.2).
+    #[test]
+    fn a_first_count_on_a_full_page_moves_the_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let mut store = FileStore::open(&path).unwrap();
+        let mut catalog = Catalog::load(&mut store).unwrap();
+        catalog.create_collection(&mut store, "c").unwrap();
+        // An older file's cell, kind 1, written as it was: nothing
+        // deleted before it that compacting the page could reclaim.
+        let old = IndexMeta {
+            fields: fields(&["a"]),
+            root: allocate_index_root(&mut store).unwrap(),
+            unique: false,
+            sparse: false,
+            left_out: None,
+        };
+        append_cell(&mut store, &encode_index("c", &old)).unwrap();
+        catalog.indexes.insert("c".to_string(), vec![old]);
+        let free = |store: &FileStore| {
+            SlottedPage::from_bytes(store.read_page(CATALOG_PAGE_ID).unwrap())
+                .unwrap()
+                .free_space()
+        };
+        // Collections until page 1 has fewer free bytes than the cell
+        // grows by: the count's 8, and the flags, the field count and
+        // the field's length, a byte each.
+        let grows = 11;
+        for n in 0.. {
+            let room = free(&store);
+            if room < grows {
+                break;
+            }
+            // A name filling what's left exactly, or a long one first.
+            let needed = SlottedPage::space_needed(COLLECTION_NAME_AT + 1);
+            let more = room.saturating_sub(needed);
+            let len = 1 + if more < 200 { more } else { 100 };
+            let name = format!("{n:0>len$}");
+            catalog.create_collection(&mut store, &name).unwrap();
+            if catalog.pages_used(&store) > 1 {
+                break;
+            }
+        }
+        assert!(free(&store) < grows, "page 1 full: {}", free(&store));
+        catalog.set_left_out(&mut store, "c", 0, 4).unwrap();
+        drop(store);
+        let mut store = FileStore::open(&path).unwrap();
+        let loaded = Catalog::load(&mut store).unwrap();
+        assert_eq!(loaded.indexes("c")[0].left_out, Some(4));
     }
 
     /// The field names' cells must number the names from 0, without a
@@ -1137,6 +1411,7 @@ mod tests {
                         root: 9,
                         unique: false,
                         sparse: false,
+                        left_out: None,
                     },
                 ),
                 10 + "users".len(),
@@ -1149,6 +1424,7 @@ mod tests {
                         root: 9,
                         unique: true,
                         sparse: true,
+                        left_out: None,
                     },
                 ),
                 10 + "users".len() + 2,

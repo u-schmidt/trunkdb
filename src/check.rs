@@ -315,6 +315,8 @@ fn check_collection(
     let indexes = catalog.indexes(name);
     // How many entries the documents call for, index by index.
     let mut expected = vec![0usize; indexes.len()];
+    // How many documents each leaves out (SPEC §181).
+    let mut left_out = vec![0u64; indexes.len()];
 
     let mut documents = 0;
     let mut unreadable = BTreeSet::new();
@@ -347,8 +349,11 @@ fn check_collection(
                     .into_iter()
                     .for_each(|p| check.claim_shared(p, data_pages));
                 chain.into_iter().for_each(|p| check.claim(p, chain_pages));
-                for (expected, index) in expected.iter_mut().zip(indexes) {
+                for ((expected, left_out), index) in
+                    expected.iter_mut().zip(&mut left_out).zip(indexes)
+                {
                     *expected += index_keys(&doc, index, id).len();
+                    *left_out += u64::from(index.leaves_out(&doc));
                 }
             }
             Ok((id, _)) => check.problem(format!(
@@ -383,6 +388,18 @@ fn check_collection(
             .for_each(|p| check.claim_shared(p, data_pages));
     }
 
+    // A document that can't be read can't be counted.
+    if unreadable.is_empty() {
+        for (index, counted) in indexes.iter().zip(&left_out) {
+            if let Some(kept) = index.left_out.filter(|kept| kept != counted) {
+                check.problem(format!(
+                    "{name:?}'s index on {:?} counts {kept} documents left out of its \
+                     order, where the documents give {counted}",
+                    index.name(),
+                ));
+            }
+        }
+    }
     for (index, expected) in indexes.iter().zip(expected) {
         let checked = check_index(check, store, name, &primary, index, expected, &unreadable);
         if let Err(e) = checked {
@@ -769,7 +786,7 @@ mod tests {
         assert_eq!(report.problems, Vec::<String>::new());
         assert_eq!((report.collections, report.documents), (2, 200));
         let info = db.file_info().unwrap();
-        assert_eq!((info.format_version, info.page_size), (15, PAGE_SIZE));
+        assert_eq!((info.format_version, info.page_size), (16, PAGE_SIZE));
         assert_eq!(info.pages, report.pages);
         assert!(info.free_pages > 0, "the deletes freed pages");
 
@@ -1081,6 +1098,29 @@ mod tests {
         .unwrap();
         assert_found(&db, &format!("index on \"age\" lacks document {id}"));
         assert_found(&db, &format!("entry for document {id} that doesn't match"));
+    }
+
+    #[test]
+    fn an_index_counting_the_wrong_number_left_out_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = sample(&dir);
+        let people = db.collection::<Document>("people");
+        people
+            .insert(object(&[("age", Document::Array(vec![]))]))
+            .unwrap();
+        assert!(problems(&db).is_empty(), "{:?}", problems(&db));
+        db.transact(|catalog, store| {
+            let position = (catalog.indexes("people").iter())
+                .position(|index| index.fields == ["age"])
+                .unwrap();
+            catalog.set_left_out(store, "people", position, 0)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_found(
+            &db,
+            "index on \"age\" counts 0 documents left out of its order, where the documents give 1",
+        );
     }
 
     #[test]

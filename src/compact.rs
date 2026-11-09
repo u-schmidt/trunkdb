@@ -54,6 +54,9 @@ impl Database {
             let pages_after = image.page_count();
             if pages_after >= pages_before {
                 // Already this small: rewriting it would gain nothing.
+                // But the counts it made are kept, an older file's
+                // indexes counted for the first time (SPEC §181.4).
+                keep_counts(catalog, store, &rebuilt)?;
                 return Ok(Compacted {
                     pages_before,
                     pages_after: pages_before,
@@ -67,6 +70,31 @@ impl Database {
             })
         })
     }
+}
+
+/// The counts of documents left out `rebuilt` made (SPEC §181), set
+/// on `catalog`'s indexes that lack one, for a compaction that keeps
+/// the file as it is. Its indexes are `catalog`'s, in the same order.
+fn keep_counts(
+    catalog: &mut Catalog,
+    store: &mut dyn PageStore,
+    rebuilt: &Catalog,
+) -> crate::Result<()> {
+    let names: Vec<String> = catalog.collection_names().map(str::to_string).collect();
+    for name in names {
+        let counts: Vec<Option<u64>> = rebuilt
+            .indexes(&name)
+            .iter()
+            .map(|index| index.left_out)
+            .collect();
+        for (position, count) in counts.into_iter().enumerate() {
+            let known = catalog.indexes(&name)[position].left_out.is_some();
+            if let (Some(count), false) = (count, known) {
+                catalog.set_left_out(store, &name, position, count)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Copies every collection, in name order, into a new image: its
@@ -88,6 +116,7 @@ fn rebuild(
         let indexes = catalog.indexes(name);
         let mut index_entries: Vec<Vec<(Vec<u8>, RecordLocation)>> =
             vec![Vec::new(); indexes.len()];
+        let mut left_out = vec![0u64; indexes.len()];
 
         let mut primary = BTreeIndex::new(new_meta.index_root);
         let mut current = 0;
@@ -104,7 +133,10 @@ fn rebuild(
             let new_loc =
                 data::insert_record(&mut image, &mut current, &mut free, id, &doc, names)?;
             primary.insert(&mut image, &primary_key, new_loc)?;
-            for (entries, index) in index_entries.iter_mut().zip(indexes) {
+            for ((entries, index), left_out) in
+                index_entries.iter_mut().zip(indexes).zip(&mut left_out)
+            {
+                *left_out += u64::from(index.leaves_out(&doc));
                 for key in index_keys(&doc, index, id) {
                     entries.push((key, new_loc));
                 }
@@ -114,9 +146,15 @@ fn rebuild(
             rebuilt.set_current_data_page(&mut image, name, current)?;
         }
 
-        for (index, mut entries) in indexes.iter().zip(index_entries) {
+        for (position, ((index, mut entries), left_out)) in
+            indexes.iter().zip(index_entries).zip(left_out).enumerate()
+        {
             let new_index =
                 rebuilt.create_index(&mut image, name, &index.fields, index.options())?;
+            // Counted anew, an older file's index too (SPEC §181).
+            if new_index.left_out.is_some() {
+                rebuilt.set_left_out(&mut image, name, position, left_out)?;
+            }
             entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             if index.unique {
                 refuse_duplicates(&image, rebuilt.names(), name, &new_index, &entries)?;
@@ -389,6 +427,52 @@ mod tests {
         );
         drop(db);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// A compaction that gains nothing still keeps the counts of
+    /// documents left out it made (SPEC §181.4): an older file's index,
+    /// without one, gets it, and a walk in its order no longer scans.
+    #[test]
+    fn a_compaction_that_gains_nothing_keeps_its_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.ensure_index("v").unwrap();
+        docs.ensure_index("w").unwrap();
+        for n in 0..50 {
+            let doc = format!(r#"{{"v": {n}, "w": {}}}"#, if n == 7 { "[1]" } else { "1" });
+            docs.insert(doc.parse().unwrap()).unwrap();
+        }
+        db.compact().unwrap();
+        db.transact(|catalog, store| {
+            catalog.forget_left_out(store, "docs", 0)?;
+            catalog.forget_left_out(store, "docs", 1)?;
+            Ok(())
+        })
+        .unwrap();
+        let scans = |db: &Database, text: &str| {
+            let run = db.collection::<Document>("docs");
+            let run = run.explain_run(text.parse().unwrap()).unwrap();
+            run.reads.iter().any(|read| read.index == "_id")
+        };
+        let (by_v, by_w) = ("v != 5 order by v limit 100", "w != 5 order by w limit 100");
+        assert!(scans(&db, by_v) && scans(&db, by_w), "no count: scans");
+        drop(docs);
+        drop(db);
+
+        let db = Database::open(&path).unwrap();
+        let again = db.compact().unwrap();
+        assert_eq!(again.pages_before, again.pages_after, "gains nothing");
+        let counts: Vec<_> = (db.state().catalog().indexes("docs").iter())
+            .map(|index| index.left_out)
+            .collect();
+        assert_eq!(counts, [Some(0), Some(1)]);
+        assert!(!scans(&db, by_v) && scans(&db, by_w));
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert!(!scans(&db, by_v), "kept");
+        assert!(db.check().unwrap().is_ok());
     }
 
     /// A secondary index whose values arrived in random order is rebuilt

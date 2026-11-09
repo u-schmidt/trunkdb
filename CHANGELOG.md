@@ -1268,3 +1268,16 @@ limit, batches and a write-ahead log. Since then:
     trunkdb, and so does the C# wrapper, which checks the ABI's version
     when it opens a database. No file format changed: format 15 and
     export version 4, as in 0.35.0, so no fixture.
+155. **Documents an index leaves out, counted** (§181): an index on one
+    field, without `[*]`, keeps in its catalog cell how many documents
+    have a value there that nothing orders, an array, an object or
+    NaN, which it holds no entry for. A sorted page read through the
+    index that the walk doesn't fill scanned every document for those
+    afterwards; now only when the count isn't 0. Found through the
+    admin app: `category != "Salad" order by category limit 50` on six
+    recipes read 12 entries and 11 documents, now 6 and 5. The count
+    changes only when a document moves in or out of it, a cell
+    rewritten in place; `ensure_index` and `compact` count it,
+    `check` recounts it. **File format 16,** which 0.36.0 refuses; a
+    format 15 file opens as it is, its indexes scanning as before
+    until `compact` counts them.

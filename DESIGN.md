@@ -126,8 +126,8 @@ cell is long enough for its entry [§55](spec/55-fuzzing.md).
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
 shrink until a compaction [§41](spec/41-compaction.md).
 
-**The format version** is 15 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md) [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md) [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md) [§173](spec/173-a-date-and-a-time-of-day.md). A build opens its own format and
-the older ones that are valid files of it (6 to 14), and stamps them
+**The format version** is 16 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md) [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md) [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md) [§173](spec/173-a-date-and-a-time-of-day.md) [§181](spec/181-documents-an-index-leaves-out-counted.md). A build opens its own format and
+the older ones that are valid files of it (6 to 15), and stamps them
 with the current one at open; it refuses newer ones, and older ones
 that need converting. Opening a 6–9 file with secondary indexes checks
 them once and rebuilds any that a document holds an id in, since ids
@@ -136,7 +136,8 @@ is an object, by its type byte, and refuses the file, unchanged, if one
 isn't [§95](spec/95-only-objects.md). Opening a 6–12 file rebuilds the indexes a document holds binary in [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md).
 A 6–13 file's documents and index leaves read in their older encoding,
 and are stored in the new one as they are written, all of them by a
-compaction [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md). Moving between formats is
+compaction [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md). A 6–15 file's indexes don't
+know how many documents they leave out until a compaction counts them [§181](spec/181-documents-an-index-leaves-out-counted.md). Moving between formats is
 export and import [§30](spec/30-export-and-import-as-json-lines.md). The history is in the comment on
 `FORMAT_VERSION` in `storage/file.rs`.
 
@@ -298,7 +299,9 @@ the first of a chain of overflow pages [§26](spec/26-overflow-pages-and-u32-len
 
 **The catalog** (page 1) holds a cell per collection (its primary
 index root, its current data page, its name), one per index (its
-fields, root and flags: unique, sparse) [§9](spec/09-catalog.md) [§28](spec/28-secondary-indexes.md) [§44](spec/44-sparse-indexes.md), and the
+fields, root and flags: unique, sparse; for one on a field without
+`[*]`, how many documents it leaves out of its order, rewritten in
+place when a write changes it) [§9](spec/09-catalog.md) [§28](spec/28-secondary-indexes.md) [§44](spec/44-sparse-indexes.md) [§181](spec/181-documents-an-index-leaves-out-counted.md), and the
 field-name dictionary's cells [§170](spec/170-field-names-stored-once.md). It's read at
 open and kept in memory, one per commit: a batch works on a copy of
 its own, which becomes the readers' at commit and is dropped if the
@@ -418,7 +421,9 @@ what it picked (`QueryPlan`):
   whose leading fields an `Eq` fixes gives both the filter and the order
   (`status == "Queued"`, newest first, on `(status, created)`). Sort
   keys the index doesn't serve are sorted in memory within each run of
-  equal served keys [§47](spec/47-sorting-by-several-fields.md). A sort by `_id` walks the primary index,
+  equal served keys [§47](spec/47-sorting-by-several-fields.md). Values no one-field index holds (arrays,
+  objects, NaN) sort last; a walk that runs out before the limit scans
+  for them, unless the index counts none left out [§181](spec/181-documents-an-index-leaves-out-counted.md). A sort by `_id` walks the primary index,
   whose order is `_id`'s, and `_id` comparisons with an id narrow the
   walk exactly [§96](spec/96-sorting-by-id-through-the-primary-index.md).
 - **A sort in memory:** where no index serves it, every match is read

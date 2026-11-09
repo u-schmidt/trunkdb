@@ -195,3 +195,4 @@ say what changed, and DESIGN.md says what is true now.
 178. [Text a program passes, read by the library (`update.rs`, `query_text.rs`, `batch_lines.rs`, `bin/trunkdb.rs`)](178-text-a-program-passes-read-by-the-library.md)
 179. [The C ABI (`trunkdb-ffi/`, `explain.rs`, `export.rs`, `bin/trunkdb.rs`)](179-the-c-abi.md)
 180. [The C# wrapper (`bindings/dotnet/`)](180-the-csharp-wrapper.md)
+181. [Documents an index leaves out, counted (`catalog.rs`, `collection.rs`, `compact.rs`, `check.rs`)](181-documents-an-index-leaves-out-counted.md)

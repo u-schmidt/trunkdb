@@ -2212,7 +2212,11 @@ fn walk_in_index_order(
     };
     // Each key a group of its own: one id, in id order (SPEC §96, §103).
     let by_id = order.by_id;
-    let unordered_can_match = order.range.is_none() && !compound && !by_id;
+    // An index that counts none left out spares the scan (SPEC §181).
+    let unordered_can_match = order.range.is_none()
+        && !compound
+        && !by_id
+        && order.index.is_none_or(|index| index.left_out != Some(0));
     let backward = first.order == SortOrder::Desc;
     let walk = trace.read(name, order.by, backward);
     let mut entries = BTreeIndex::new(root).walk(
@@ -3612,7 +3616,7 @@ fn apply_unchecked(
             let loc = data::insert_record(store, &mut current, free, *id, &doc, &names)?;
             index.insert(store, &key::primary(*id), loc)?;
             let secondary = catalog.indexes(collection);
-            update_secondary_indexes(
+            let left_out = update_secondary_indexes(
                 collection,
                 secondary,
                 &names,
@@ -3621,6 +3625,7 @@ fn apply_unchecked(
                 None,
                 Some((&doc, loc)),
             )?;
+            count_left_out(catalog, store, collection, left_out)?;
             save_current_data_page(catalog, store, collection, &meta, current)
         }
         WriteOp::Update(collection, id, doc) => {
@@ -3640,7 +3645,7 @@ fn apply_unchecked(
                 index.insert(store, &key::primary(*id), new_loc)?;
             }
             let old = old.as_ref().map(|old| (old, loc));
-            update_secondary_indexes(
+            let left_out = update_secondary_indexes(
                 collection,
                 secondary,
                 &names,
@@ -3649,6 +3654,7 @@ fn apply_unchecked(
                 old,
                 Some((&doc, new_loc)),
             )?;
+            count_left_out(catalog, store, collection, left_out)?;
             save_current_data_page(catalog, store, collection, &meta, current)
         }
         WriteOp::Delete(collection, id) => {
@@ -3660,8 +3666,9 @@ fn apply_unchecked(
             data::delete_record(store, meta.current_data_page, free, loc)?;
             index.remove(store, &key::primary(*id))?;
             let old = old.as_ref().map(|old| (old, loc));
-            update_secondary_indexes(collection, secondary, &names, store, *id, old, None)?;
-            Ok(())
+            let left_out =
+                update_secondary_indexes(collection, secondary, &names, store, *id, old, None)?;
+            count_left_out(catalog, store, collection, left_out)
         }
     }
 }
@@ -3784,6 +3791,11 @@ pub(crate) fn same_values(a: &[&Document], b: &[&Document]) -> bool {
 /// equal as `Eq` sees them: they can't be a new duplicate. Values, not
 /// keys: a key that stays may hold another value, past where a long
 /// string is cut (SPEC §119.1).
+///
+/// Returns each index whose count of documents left out the write
+/// changed (SPEC §181), by position, with the change: for
+/// `Catalog::add_left_out`, once `indexes` is no longer borrowed. Nearly
+/// always none.
 fn update_secondary_indexes(
     collection: &str,
     indexes: &[IndexMeta],
@@ -3792,9 +3804,17 @@ fn update_secondary_indexes(
     id: DocId,
     old: Option<(&Document, RecordLocation)>,
     new: Option<(&Document, RecordLocation)>,
-) -> crate::Result<()> {
+) -> crate::Result<Vec<(usize, i64)>> {
     let moved = old.map(|(_, loc)| loc) != new.map(|(_, loc)| loc);
-    for index in indexes {
+    let mut left_out = Vec::new();
+    for (position, index) in indexes.iter().enumerate() {
+        let leaves_out = |side: Option<(&Document, RecordLocation)>| {
+            side.is_some_and(|(doc, _)| index.leaves_out(doc))
+        };
+        let change = i64::from(leaves_out(new)) - i64::from(leaves_out(old));
+        if change != 0 {
+            left_out.push((position, change));
+        }
         let before = old.map_or(Vec::new(), |(doc, _)| index_keys(doc, index, id));
         let after = new.map_or(Vec::new(), |(doc, _)| index_keys(doc, index, id));
         let mut tree = BTreeIndex::new(index.root);
@@ -3819,6 +3839,20 @@ fn update_secondary_indexes(
                 tree.insert(store, key, loc)?;
             }
         }
+    }
+    Ok(left_out)
+}
+
+/// Brings the counts of documents left out up to date after a write
+/// (SPEC §181): `changes` from `update_secondary_indexes`.
+fn count_left_out(
+    catalog: &mut Catalog,
+    store: &mut dyn PageStore,
+    collection: &str,
+    changes: Vec<(usize, i64)>,
+) -> crate::Result<()> {
+    for (position, change) in changes {
+        catalog.add_left_out(store, collection, position, change)?;
     }
     Ok(())
 }
@@ -3897,23 +3931,30 @@ fn build_index(
     let meta = get_or_create_meta(catalog, store, collection)?;
     let index = catalog.create_index(store, collection, fields, options)?;
     let documents = BTreeIndex::new(meta.index_root).scan(store)?;
-    fill_index(catalog.names(), store, collection, &index, &documents)?;
+    let left_out = fill_index(catalog.names(), store, collection, &index, &documents)?;
+    if index.left_out.is_some() {
+        let position = catalog.indexes(collection).len() - 1;
+        catalog.set_left_out(store, collection, position, left_out)?;
+    }
     Ok(true)
 }
 
 /// Puts the `documents` (the primary index's entries) into the empty
 /// `index`. A unique index checks each document as it goes in, so the
-/// first duplicate fails the batch.
+/// first duplicate fails the batch. Returns how many it leaves out (SPEC
+/// §181).
 fn fill_index(
     names: &Arc<FieldNames>,
     store: &mut dyn PageStore,
     collection: &str,
     index: &IndexMeta,
     documents: &[(Vec<u8>, RecordLocation)],
-) -> crate::Result<()> {
+) -> crate::Result<u64> {
     let mut tree = BTreeIndex::new(index.root);
+    let mut left_out = 0;
     for (_key, loc) in documents {
         let (id, doc) = data::get_record(store, names, *loc)?;
+        left_out += u64::from(index.leaves_out(&doc));
         if index.unique {
             for (value_part, values) in unique_tuples(&doc, index) {
                 check_unique(names, store, collection, index, id, &value_part, &values)?;
@@ -3923,7 +3964,7 @@ fn fill_index(
             tree.insert(store, &key, *loc)?;
         }
     }
-    Ok(())
+    Ok(left_out)
 }
 
 /// Makes sure a file of a format before 12 holds only objects (SPEC
@@ -9446,7 +9487,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 901, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 15);
+        assert_eq!(db.file_info().unwrap().format_version, 16);
         assert!(db.check().unwrap().is_ok());
         let cars = db.collection::<Document>("cars");
         assert_eq!(
@@ -9489,7 +9530,7 @@ mod tests {
         drop((notes, db));
         crate::storage::rewrite_format_version(&unkeyed, 9);
         let db = Database::open(&unkeyed).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 15);
+        assert_eq!(db.file_info().unwrap().format_version, 16);
         drop(db);
         let reads = records_read(|| drop(Database::open(&unkeyed).unwrap()));
         assert_eq!(reads, 0);
@@ -9504,7 +9545,7 @@ mod tests {
         drop(db);
         crate::storage::rewrite_format_version(&plain, 9);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 15);
+        assert_eq!(db.file_info().unwrap().format_version, 16);
     }
 
     /// Stores `doc` in `collection` past the check that it is an object,
@@ -9551,7 +9592,7 @@ mod tests {
         drop(read_only(&path).unwrap());
         assert_eq!(format_on_disk(&path), 11, "a read-only open writes nothing");
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 15);
+        assert_eq!(db.file_info().unwrap().format_version, 16);
         assert_eq!(
             db.collection::<Document>("docs")
                 .count(Filter::new())
@@ -9559,14 +9600,14 @@ mod tests {
             301
         );
         drop(db);
-        assert_eq!(format_on_disk(&path), 15);
+        assert_eq!(format_on_disk(&path), 16);
 
         // An empty file is stamped too.
         let empty = dir.path().join("empty.trunkdb");
         drop(Database::open(&empty).unwrap());
         crate::storage::rewrite_format_version(&empty, 11);
         drop(Database::open(&empty).unwrap());
-        assert_eq!(format_on_disk(&empty), 15);
+        assert_eq!(format_on_disk(&empty), 16);
     }
 
     /// SPEC §95: a file of a format before 12 that holds a document that
@@ -9809,7 +9850,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 601, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 15);
+        assert_eq!(db.file_info().unwrap().format_version, 16);
         assert!(db.check().unwrap().is_ok());
         let files = db.collection::<Document>("files");
         assert_eq!(
@@ -9841,7 +9882,7 @@ mod tests {
         drop(db);
         assert_eq!(format_on_disk(&plain), 12);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 15);
+        assert_eq!(db.file_info().unwrap().format_version, 16);
     }
 
     /// Binary never collided in a unique index before format 13 (SPEC

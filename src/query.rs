@@ -4309,6 +4309,7 @@ mod tests {
             root: 1,
             unique: false,
             sparse: false,
+            left_out: None,
         }
     }
 
@@ -4391,6 +4392,7 @@ mod tests {
     fn sparse(fields: &[&str]) -> IndexMeta {
         IndexMeta {
             sparse: true,
+            left_out: None,
             ..compound(fields)
         }
     }
@@ -5728,6 +5730,7 @@ mod tests {
             root: 1,
             unique: false,
             sparse: false,
+            left_out: None,
         }
     }
 
