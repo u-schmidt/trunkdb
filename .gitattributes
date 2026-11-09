@@ -1,1 +1,4 @@
 tests/fixtures/** -text
+# As cbindgen writes it on every system, so header_is_current compares
+# like with like on Windows too (SPEC §179.2).
+trunkdb-ffi/include/trunkdb.h text eol=lf

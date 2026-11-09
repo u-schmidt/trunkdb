@@ -609,6 +609,160 @@ fn kind(value: &Document) -> &'static str {
     }
 }
 
+/// Why a document of operators isn't an update (SPEC §178): its text,
+/// as `trunkdb update` prints it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ParseUpdateError {
+    message: String,
+}
+
+/// An update written as MongoDB writes one (SPEC §156.2, §178): an
+/// object of operators, each an object of paths and what to do there,
+/// `{"$inc": {"hits": 1}, "$set": {"seen": true}}`. `$set`,
+/// `$setOnInsert`, `$unset` (an object or an array of paths), `$inc`,
+/// `$mul`, `$min`, `$max`, `$rename`, `$push` and `$addToSet` (each with
+/// `$each`), `$pull`, and `$pop` (1 for the last element, -1 for the
+/// first). A field that isn't an operator is refused: a whole document
+/// isn't replaced.
+impl TryFrom<Document> for Update {
+    type Error = ParseUpdateError;
+
+    fn try_from(doc: Document) -> Result<Self, ParseUpdateError> {
+        from_operators(doc).map_err(|message| ParseUpdateError { message })
+    }
+}
+
+/// An update from its JSON text, as `TryFrom<Document>` reads the
+/// document (SPEC §178).
+impl std::str::FromStr for Update {
+    type Err = ParseUpdateError;
+
+    fn from_str(text: &str) -> Result<Self, ParseUpdateError> {
+        let doc: Document = text.parse().map_err(|e| ParseUpdateError {
+            message: format!("the update isn't JSON: {e}"),
+        })?;
+        Update::try_from(doc)
+    }
+}
+
+/// The operators of `doc` as an update; `Err` says why not.
+fn from_operators(doc: Document) -> Result<Update, String> {
+    const OPERATORS: &str = "$set $setOnInsert $unset $inc $mul $min $max $rename $push \
+                             $addToSet $pull $pop";
+    let Document::Object(ops) = doc else {
+        return Err(
+            r#"the update is an object of operators, like {"$set": {"status": "done"}}"#
+                .to_string(),
+        );
+    };
+    if ops.is_empty() {
+        return Err(format!("the update has no operators; one of {OPERATORS}"));
+    }
+    let paths = |op: &str, args: Document| -> Result<Vec<(String, Document)>, String> {
+        match args {
+            Document::Object(fields) if !fields.is_empty() => Ok(fields.into_iter().collect()),
+            _ => Err(format!(
+                r#"{op} takes an object of paths, like {{"{op}": {{"status": …}}}}"#
+            )),
+        }
+    };
+    let mut update = Update::new();
+    for (op, args) in ops {
+        match op.as_str() {
+            "$set" | "$setOnInsert" | "$inc" | "$mul" | "$min" | "$max" | "$pull" => {
+                for (path, value) in paths(&op, args)? {
+                    update = match op.as_str() {
+                        "$set" => update.set(path, value),
+                        "$setOnInsert" => update.set_on_insert(path, value),
+                        "$inc" => update.inc(path, value),
+                        "$mul" => update.mul(path, value),
+                        "$min" => update.min(path, value),
+                        "$max" => update.max(path, value),
+                        _ => update.pull(path, value),
+                    };
+                }
+            }
+            "$unset" => {
+                let names: Vec<String> = match args {
+                    Document::Array(names) => names
+                        .into_iter()
+                        .map(|name| match name {
+                            Document::String(name) => Ok(name),
+                            _ => Err("$unset takes paths as strings".to_string()),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    args => paths(&op, args)?
+                        .into_iter()
+                        .map(|(path, _)| path)
+                        .collect(),
+                };
+                for path in names {
+                    update = update.unset(path);
+                }
+            }
+            "$rename" => {
+                for (from, to) in paths(&op, args)? {
+                    let Document::String(to) = to else {
+                        return Err(format!(
+                            "$rename takes the new path as a string, for {from}"
+                        ));
+                    };
+                    update = update.rename(from, to);
+                }
+            }
+            "$push" | "$addToSet" => {
+                for (path, value) in paths(&op, args)? {
+                    let each = match &value {
+                        Document::Object(fields) if fields.len() == 1 => {
+                            match fields.get("$each") {
+                                Some(Document::Array(values)) => Some(values.clone()),
+                                Some(_) => {
+                                    return Err(format!("{op}: $each takes an array, for {path}"));
+                                }
+                                None => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    update = match (op.as_str(), each) {
+                        ("$push", Some(values)) => update.push_all(path, values),
+                        ("$push", None) => update.push(path, value),
+                        (_, Some(values)) => values.into_iter().fold(update, |update, value| {
+                            update.add_to_set(path.clone(), value)
+                        }),
+                        (_, None) => update.add_to_set(path, value),
+                    };
+                }
+            }
+            "$pop" => {
+                for (path, end) in paths(&op, args)? {
+                    update = match end {
+                        Document::Int(1) => update.pop_last(path),
+                        Document::Int(-1) => update.pop_first(path),
+                        _ => {
+                            return Err(format!(
+                                "$pop takes 1 for the last element or -1 for the first, for {path}"
+                            ));
+                        }
+                    };
+                }
+            }
+            other if other.starts_with('$') => {
+                return Err(format!(
+                    "{other}: not an update operator; one of {OPERATORS}"
+                ));
+            }
+            field => {
+                return Err(format!(
+                    r#"`{field}` isn't an operator: say how to change it, {{"$set": {{"{field}": …}}}}; a whole document isn't replaced"#
+                ));
+            }
+        }
+    }
+    Ok(update)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

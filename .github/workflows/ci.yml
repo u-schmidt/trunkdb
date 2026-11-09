@@ -24,6 +24,24 @@ jobs:
       # `#[trunkdb::document]` and its compile-fail tests (SPEC §114).
       - run: cargo test --features derive
 
+  ffi:
+    name: C ABI (${{ matrix.os }}; SPEC §179)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Every function called through raw pointers, and the header
+      # compared with what the code says.
+      - run: cargo test -p trunkdb-ffi
+      # A C program calling every function, under AddressSanitizer.
+      - if: runner.os != 'Windows'
+        run: sh trunkdb-ffi/tests/c/run.sh
+
   lint:
     name: Clippy and rustfmt
     runs-on: ubuntu-latest
@@ -53,6 +71,8 @@ jobs:
       - run: cargo test --all-targets
       # `#[trunkdb::document]` and its compile-fail tests (SPEC §114).
       - run: cargo test --features derive
+      # The C ABI's library builds with it too (SPEC §179).
+      - run: cargo build -p trunkdb-ffi
 
   bench:
     name: Benchmark (builds, lints, runs small)

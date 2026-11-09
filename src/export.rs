@@ -98,6 +98,41 @@ impl Database {
         Self::export_of(&self.read()?, out)
     }
 
+    /// `export` to the file at `out`, written beside it and renamed over
+    /// it only once complete and synced (SPEC §179): a failed export
+    /// leaves a file already there as it was. Through a symlink, its
+    /// target is written. `out` can't be this database's file or its
+    /// WAL: that is `Error::Io` of kind `InvalidInput`, nothing written.
+    pub fn export_to_file(&self, out: impl AsRef<Path>) -> crate::Result<Summary> {
+        let out = out.as_ref();
+        let wal = self.wal_path();
+        // The database's own file, which the WAL is named after (§127).
+        let file = wal.with_extension("");
+        for protected in [file.as_path(), wal] {
+            if same_file(out, protected) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "is the database or its log; choose another file",
+                )));
+            }
+        }
+        let target = std::fs::canonicalize(out).unwrap_or_else(|_| out.into());
+        let mut temp = target.clone().into_os_string();
+        temp.push(format!(".tmp{}", std::process::id()));
+        let temp = PathBuf::from(temp);
+        let written = (|| {
+            let file = std::fs::File::create(&temp)?;
+            let summary = self.export(&file)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, &target)?;
+            Ok::<_, Error>(summary)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written
+    }
+
     /// `export`, of the commit `state` reads.
     pub(crate) fn export_of(state: &ReadGuard<'_>, out: impl Write) -> crate::Result<Summary> {
         let mut out = BufWriter::new(out);
@@ -682,6 +717,18 @@ fn write_line(out: &mut impl Write, value: &Value) -> std::io::Result<()> {
     out.write_all(b"\n")
 }
 
+/// Whether `a` and `b` are one file, through links and other names.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +753,55 @@ mod tests {
         // An endless line is refused after max bytes, not read to its end.
         let mut endless = std::io::BufReader::new(std::io::repeat(b'a'));
         assert!(read_line(&mut endless, 1 << 20, 1).is_err());
+    }
+
+    /// An export to a file: the whole of it, renamed over what was there;
+    /// never over the database or its WAL, by any name (SPEC §179.4).
+    #[test]
+    fn an_export_to_a_file_replaces_it_whole_and_never_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.trunkdb");
+        let db = Database::open(&path).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.insert("{\"n\": 1}".parse().unwrap()).unwrap();
+        let out = dir.path().join("backup.jsonl");
+        std::fs::write(&out, "old").unwrap();
+        let summary = db.export_to_file(&out).unwrap();
+        assert_eq!((summary.collections, summary.documents), (1, 1));
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert!(written.contains("\"n\":1"), "{written}");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            !left
+                .iter()
+                .any(|name| name.to_string_lossy().contains(".tmp")),
+            "{left:?}"
+        );
+
+        let wal = dir.path().join("app.trunkdb.wal");
+        let mut protected = vec![path.clone(), wal.clone()];
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.trunkdb");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            protected.push(link);
+        }
+        for target in protected {
+            let before = std::fs::read(&target).ok();
+            match db.export_to_file(&target) {
+                Err(Error::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{target:?}")
+                }
+                other => panic!("{target:?}: {other:?}"),
+            }
+            assert_eq!(std::fs::read(&target).ok(), before, "{target:?} as it was");
+        }
+        assert!(db.check().unwrap().is_ok());
+        let missing = dir.path().join("no/such/dir/out.jsonl");
+        assert!(matches!(db.export_to_file(&missing), Err(Error::Io(_))));
     }
     use crate::document::{DocId, Document};
     use crate::query::{Condition, Filter, Op};

@@ -13,10 +13,10 @@ categories = ["database-implementations", "database"]
 # own dependencies (SPEC §48, §55).
 exclude = ["assets/", "bench/", "fuzz/", "skills/", "tests/fixtures/"]
 
-# The `derive` feature's macro crate (SPEC §114). `bench/` and `fuzz/`
-# are workspaces of their own.
+# The `derive` feature's macro crate (SPEC §114), and the C ABI (SPEC
+# §177, §179). `bench/` and `fuzz/` are workspaces of their own.
 [workspace]
-members = ["trunkdb-derive"]
+members = ["trunkdb-derive", "trunkdb-ffi"]
 
 [features]
 default = ["regex"]

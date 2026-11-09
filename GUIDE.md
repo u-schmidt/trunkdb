@@ -370,6 +370,28 @@ trunkdb batch app.trunkdb - --param now='datetime("2026-11-06T12:00:00Z")' <<'EN
 END
 ```
 
+### Ops as text, from a program
+
+A program that gets its writes as JSON, from a web request, a script or
+another language, hands them to the library as the command does
+(SPEC §178): `BatchLines` reads the lines, `Update` reads operators,
+`Params` reads an object of values:
+
+```rust
+use trunkdb::BatchLines;
+use trunkdb::query::{Params, Update};
+
+let params: Params = r#"{"now": {"$date": "2026-11-06T12:00:00Z"}}"#.parse()?;
+let ops = BatchLines::read(request_body, &params)?;   // every line checked first
+let (batch, ids) = ops.batch(&db)?;                   // each insert's new id
+let written = batch.commit()?;
+
+let update: Update = r#"{"$inc": {"hits": 1}, "$set": {"seen": true}}"#.parse()?;
+```
+
+A mistake names its line, and a filter's says where in the filter; a
+commit that fails finds its line with `ops.failed_line(&db, &error)`.
+
 ## Hearing about changes
 
 `subscribe` hands out a receiver that hears of every batch committed

@@ -191,3 +191,6 @@ say what changed, and DESIGN.md says what is true now.
 174. [A window for each group (`aggregate.rs`, `collection.rs`, `query_text.rs`)](174-a-window-for-each-group.md)
 175. [An upsert in a batch (`batch.rs`, `collection.rs`, `bin/trunkdb.rs`)](175-an-upsert-in-a-batch.md)
 176. [A sort with a limit kept small (`query.rs`, `collection.rs`, `explain.rs`)](176-a-sort-with-a-limit-kept-small.md)
+177. [A C ABI: the design (`trunkdb-ffi/`)](177-a-c-abi-the-design.md)
+178. [Text a program passes, read by the library (`update.rs`, `query_text.rs`, `batch_lines.rs`, `bin/trunkdb.rs`)](178-text-a-program-passes-read-by-the-library.md)
+179. [The C ABI (`trunkdb-ffi/`, `explain.rs`, `export.rs`, `bin/trunkdb.rs`)](179-the-c-abi.md)

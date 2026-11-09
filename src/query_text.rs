@@ -343,6 +343,63 @@ impl Params {
     ) -> Result<Self, crate::DocumentError> {
         Ok(self.set(name, crate::serde_bridge::to_document(value)?))
     }
+
+    /// The names that have a value, in order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.values.keys().map(String::as_str)
+    }
+
+    /// Only the values of `names`, those that have one: for a text of
+    /// several that share the values, as a filter and an aggregate do,
+    /// or a batch's lines (SPEC §178). `bind` refuses a value its text
+    /// has no parameter of, so each text is bound to its own.
+    pub fn only(&self, names: &[&str]) -> Params {
+        let values = (self.values.iter())
+            .filter(|(name, _)| names.contains(&name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Params { values }
+    }
+}
+
+/// Why a document isn't a template's values (SPEC §178).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ParseParamsError {
+    message: String,
+}
+
+/// The values from an object, each field's name a parameter's, without
+/// its `:`, `{"status": "open", "n": 10}` (SPEC §178): how a program
+/// that speaks JSON, through the C ABI (§177), passes them.
+impl TryFrom<Document> for Params {
+    type Error = ParseParamsError;
+
+    fn try_from(doc: Document) -> Result<Self, ParseParamsError> {
+        match doc {
+            Document::Object(fields) => Ok(Params {
+                values: fields.into_iter().collect(),
+            }),
+            _ => Err(ParseParamsError {
+                message:
+                    r#"the parameters are an object of names and values, like {"status": "open"}"#
+                        .to_string(),
+            }),
+        }
+    }
+}
+
+/// The values from the JSON text of an object, as `TryFrom<Document>`
+/// reads it.
+impl FromStr for Params {
+    type Err = ParseParamsError;
+
+    fn from_str(text: &str) -> Result<Self, ParseParamsError> {
+        let doc: Document = text.parse().map_err(|e| ParseParamsError {
+            message: format!("the parameters aren't JSON: {e}"),
+        })?;
+        Params::try_from(doc)
+    }
 }
 
 /// Why `Template::bind` refused the values (SPEC §163.4). `offset` is

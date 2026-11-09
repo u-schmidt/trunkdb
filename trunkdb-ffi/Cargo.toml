@@ -1,0 +1,28 @@
+[package]
+name = "trunkdb-ffi"
+version = "0.35.0"
+edition = "2024"
+rust-version = "1.89"
+description = "trunkdb's C ABI: the library as plain C functions, for every language that calls C."
+license = "MIT"
+repository = "https://github.com/u-schmidt/trunkdb"
+publish = false
+
+# The library a C program links, `trunkdb.dll`, `libtrunkdb.dylib` or
+# `libtrunkdb.so`, and `libtrunkdb.a` to link in whole (SPEC §177.8).
+[lib]
+name = "trunkdb"
+crate-type = ["cdylib", "staticlib"]
+# Its documentation is include/trunkdb.h; rustdoc would also write it
+# where trunkdb's own goes, under the same name.
+doc = false
+
+[dependencies]
+# Renamed: this crate's own library is called `trunkdb`.
+db = { package = "trunkdb", path = ".." }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+
+[dev-dependencies]
+# Only to check that include/trunkdb.h is what the code says.
+cbindgen = { version = "0.29", default-features = false }
+tempfile = "3"

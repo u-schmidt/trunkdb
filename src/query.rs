@@ -10,9 +10,9 @@ use crate::map::Map;
 use crate::path::Path;
 #[cfg(feature = "regex")]
 pub use crate::pattern::{Regex, RegexError};
-pub use crate::query_text::{BindError, Params, ParseFilterError, Template};
+pub use crate::query_text::{BindError, Params, ParseFilterError, ParseParamsError, Template};
 use crate::select::Selection;
-pub use crate::update::Update;
+pub use crate::update::{ParseUpdateError, Update};
 use std::sync::Arc;
 
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
