@@ -166,7 +166,18 @@ trunkdb_close(db);
 ```
 
 `cargo build --release -p trunkdb-ffi` builds it into `target/release/`.
-A C# wrapper comes next (SPEC §177).
+
+From C#, [bindings/dotnet/](bindings/dotnet/) wraps it: a `Database`
+opened with `using`, documents as your own classes through
+System.Text.Json, `DateOnly` and `DocId` included, errors as
+exceptions. Put the library beside your executable.
+
+```csharp
+using var db = Database.Open("app.trunkdb");
+db.Insert("tasks", new TaskItem { Title = "Write it", Status = "open" });
+foreach (var task in db.Find<TaskItem>("tasks", "status = :s limit 10", new { s = "open" }))
+    Console.WriteLine(task.Title);
+```
 
 ### A desktop app
 

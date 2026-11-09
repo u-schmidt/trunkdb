@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- trunkdb from C#, over its C ABI (SPEC §177.9, §180). The library,
+       trunkdb.dll, libtrunkdb.dylib or libtrunkdb.so, is not in here:
+       a program puts it beside its executable. -->
+  <PropertyGroup>
+    <RootNamespace>TrunkDb</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+</Project>
