@@ -1262,3 +1262,9 @@ limit, batches and a write-ahead log. Since then:
     code and details, and a subclass for a parse error, a duplicate id
     or value, a document not found, a failed precondition and a
     snapshot too old. .NET 8; tested in CI on the three systems.
+
+    Items 152–154 → 0.36.0. Additions only: nothing a program has to
+    change. The C ABI, `trunkdb-ffi`, carries the same version as
+    trunkdb, and so does the C# wrapper, which checks the ABI's version
+    when it opens a database. No file format changed: format 15 and
+    export version 4, as in 0.35.0, so no fixture.
