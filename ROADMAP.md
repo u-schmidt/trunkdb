@@ -88,11 +88,6 @@ Not decided: whether trunkdb goes on crates.io, with its docs on
 docs.rs, or stays on GitHub alone, as now.
 
 ### Planned
-- **The C library on each GitHub release:** the library for Windows
-  x64, Linux x64 and macOS arm64, which CI builds anyway, with the
-  header, attached by one more job, so a C# program copies the one for
-  its system beside its executable (§177.12). The C ABI and the C#
-  wrapper themselves came in 0.36.0 (§177–§180).
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
@@ -206,6 +201,10 @@ uses trunkdb asking for it.
 - Repairing what `check` finds, beyond export and import (§39.5).
 - Changes and live queries through the C ABI, as handles polled with
   a timeout, and in the C# wrapper: when asked (§177.10, §180.9).
+- The C library on each GitHub release, built for Linux, macOS and
+  Windows with its header, and the C# wrapper beside it (§177.12): for
+  now a program builds it from the source, `cargo build --release -p
+  trunkdb-ffi`; when someone who can't build it asks.
 - A NuGet package of the C# wrapper with the library for each system:
   when the ABI holds still and programs other than the author's use it
   (§177.12).
