@@ -35,7 +35,7 @@ public sealed class Database : IDisposable
     /// <summary>How documents are read and written: <see cref="OpenOptions.Json"/> with trunkdb's converters.</summary>
     public JsonSerializerOptions JsonOptions { get; }
 
-    /// <summary>The release of the trunkdb library loaded, <c>0.36.0</c>.</summary>
+    /// <summary>The release of the trunkdb library loaded, <c>0.37.0</c>.</summary>
     public static string LibraryVersion => Native.Read(Native.trunkdb_version());
 
     /// <summary>The version of the C ABI the library loaded speaks.</summary>

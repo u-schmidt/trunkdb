@@ -121,7 +121,7 @@ extern "C" {
 // `TRUNKDB_ABI_VERSION` of its header.
 uint32_t trunkdb_abi_version(void);
 
-// trunkdb's release, "0.36.0": owned by the library, never freed.
+// trunkdb's release, "0.37.0": owned by the library, never freed.
 const char *trunkdb_version(void);
 
 // The message of this thread's last error, as text: owned by the

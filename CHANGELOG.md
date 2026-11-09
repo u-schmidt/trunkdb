@@ -1281,3 +1281,11 @@ limit, batches and a write-ahead log. Since then:
     `check` recounts it. **File format 16,** which 0.36.0 refuses; a
     format 15 file opens as it is, its indexes scanning as before
     until `compact` counts them.
+
+    Item 155 → 0.37.0. Nothing a program has to change; queries
+    answer as before. **File format 16,** which 0.36.0 and older
+    refuse once 0.37.0 has opened a file for writing; keep an export
+    or a copy from before to go back. A format 15 file opens as it is,
+    its indexes counted at its next `compact`. Export version 4, as in
+    0.35.0. With its fixture (§120.9), whose generator adds an index
+    on `kinds.v`, every kind as a key, five documents left out of it.

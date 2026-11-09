@@ -107,6 +107,9 @@ fn write_database(path: &Path) {
             numbers.join(", ")
         )))
         .unwrap();
+    // Every kind as a key, built after the documents, so it counts the
+    // ones it leaves out, the arrays, objects and NaN (SPEC §181).
+    kinds.ensure_index("v").unwrap();
 
     let tasks = db.collection::<Document>("tasks");
     tasks.ensure_index("status").unwrap();
