@@ -88,19 +88,11 @@ Not decided: whether trunkdb goes on crates.io, with its docs on
 docs.rs, or stays on GitHub alone, as now.
 
 ### Planned
-- **A C ABI,** `trunkdb-ffi`, with a header made by cbindgen: the way
-  in for every language that calls C, C# through P/Invoke, Swift, Go,
-  Java, Node, Dart. Handles for a database, a cursor and a snapshot;
-  documents in and out as tagged JSON, filters and aggregates as text
-  with parameters (§163), updates as JSON operators, so about 35
-  functions carry the whole query language; errors as codes and a last
-  error's text; no panic across the boundary. Closures (custom
-  conditions, a sort by key, `update_many`'s change) have no text and
-  stay out. A thin wrapper per language on top, C# first. Built on one
-  embedding API inside trunkdb that the PyO3 bindings share. Designed
-  in §177, before the code; the library and its header built (§178,
-  §179), and the C# wrapper (§180), all in 0.36.0. Next: the files on
-  each GitHub release (§177.12).
+- **The C library on each GitHub release:** the library for Windows
+  x64, Linux x64 and macOS arm64, which CI builds anyway, with the
+  header, attached by one more job, so a C# program copies the one for
+  its system beside its executable (§177.12). The C ABI and the C#
+  wrapper themselves came in 0.36.0 (§177–§180).
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.
@@ -212,6 +204,11 @@ uses trunkdb asking for it.
 
 **Tooling and reach**
 - Repairing what `check` finds, beyond export and import (§39.5).
+- Changes and live queries through the C ABI, as handles polled with
+  a timeout, and in the C# wrapper: when asked (§177.10, §180.9).
+- A NuGet package of the C# wrapper with the library for each system:
+  when the ABI holds still and programs other than the author's use it
+  (§177.12).
 
 ### Not planned
 Decided against, each for the reason given; the scope was first drawn
