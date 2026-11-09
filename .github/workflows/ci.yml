@@ -25,7 +25,7 @@ jobs:
       - run: cargo test --features derive
 
   ffi:
-    name: C ABI (${{ matrix.os }}; SPEC §179)
+    name: C ABI and C# (${{ matrix.os }}; SPEC §179, §180)
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +41,12 @@ jobs:
       # A C program calling every function, under AddressSanitizer.
       - if: runner.os != 'Windows'
         run: sh trunkdb-ffi/tests/c/run.sh
+      # The C# wrapper's tests, against the library built here (SPEC §180).
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: cargo build -p trunkdb-ffi
+      - run: dotnet test bindings/dotnet/tests/TrunkDb.Tests
 
   lint:
     name: Clippy and rustfmt

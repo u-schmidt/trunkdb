@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The wrapper's tests, against the library cargo built (SPEC §180):
+       cargo build -p trunkdb-ffi, then dotnet test. TrunkDbNative names
+       another directory to take it from. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <TrunkDbNative Condition="'$(TrunkDbNative)' == ''">$(MSBuildThisFileDirectory)../../../../target/debug</TrunkDbNative>
+    <TrunkDbLibrary Condition="$([MSBuild]::IsOSPlatform('Windows'))">trunkdb.dll</TrunkDbLibrary>
+    <TrunkDbLibrary Condition="$([MSBuild]::IsOSPlatform('OSX'))">libtrunkdb.dylib</TrunkDbLibrary>
+    <TrunkDbLibrary Condition="'$(TrunkDbLibrary)' == ''">libtrunkdb.so</TrunkDbLibrary>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/TrunkDb.Net/TrunkDb.Net.csproj" />
+    <None Include="$(TrunkDbNative)/$(TrunkDbLibrary)" Link="$(TrunkDbLibrary)" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
+  <Target Name="TrunkDbNativeThere" BeforeTargets="Build">
+    <Error Condition="!Exists('$(TrunkDbNative)/$(TrunkDbLibrary)')"
+           Text="$(TrunkDbNative)/$(TrunkDbLibrary) is not there: build it with `cargo build -p trunkdb-ffi`, or name its directory with -p:TrunkDbNative=…" />
+  </Target>
+</Project>
