@@ -17,7 +17,8 @@ hard link.
 
 ## 84.2 The output is written whole or not at all
 The export goes to `<out>.tmp<pid>` in the destination's directory, is
-synced, and is renamed over `out`. If anything fails, the temporary file
+synced, and is renamed over `out`. (Since §182.1 `<out>.tmp<pid>-<n>`,
+always a new file, and the directory is synced after the rename.) If anything fails, the temporary file
 is removed and `out` is as it was. A symlink as `out` is resolved first,
 so the target is replaced and the link stays. Standard output is as
 before.

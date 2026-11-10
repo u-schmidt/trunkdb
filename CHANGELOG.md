@@ -1289,3 +1289,15 @@ limit, batches and a write-ahead log. Since then:
     its indexes counted at its next `compact`. Export version 4, as in
     0.35.0. With its fixture (§120.9), whose generator adds an index
     on `kinds.v`, every kind as a key, five documents left out of it.
+156. **Files made new, and their names synced** (§182), found in a
+    review of writes, recovery and backups: `export_to_file`'s
+    temporary file, `<out>.tmp<pid>`, was opened emptying whatever was
+    under that name, through a link too, and two exports to one file
+    from one process shared it; now `<out>.tmp<pid>-<n>`, always a new
+    file. `verify_export` checked that its files weren't there, then
+    opened them, and removed them afterwards, so another open in
+    between could lose its files; now it creates them, and removes
+    only those. A new database's file and WAL, and an export renamed
+    into place, now have their directory synced, so a power cut can't
+    lose their names (Unix). A WAL replayed into a file it doesn't
+    belong to is planned (ROADMAP.md).

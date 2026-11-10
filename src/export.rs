@@ -98,9 +98,10 @@ impl Database {
         Self::export_of(&self.read()?, out)
     }
 
-    /// `export` to the file at `out`, written beside it and renamed over
-    /// it only once complete and synced (SPEC §179): a failed export
-    /// leaves a file already there as it was. Through a symlink, its
+    /// `export` to the file at `out`, written beside it to a new file
+    /// and renamed over it only once complete and synced, the directory
+    /// synced after (SPEC §179, §182): a failed export leaves a file
+    /// already there as it was. Through a symlink, its
     /// target is written. `out` can't be this database's file or its
     /// WAL: that is `Error::Io` of kind `InvalidInput`, nothing written.
     pub fn export_to_file(&self, out: impl AsRef<Path>) -> crate::Result<Summary> {
@@ -117,16 +118,16 @@ impl Database {
             }
         }
         let target = std::fs::canonicalize(out).unwrap_or_else(|_| out.into());
-        let mut temp = target.clone().into_os_string();
-        temp.push(format!(".tmp{}", std::process::id()));
-        let temp = PathBuf::from(temp);
+        let (temp, file) = new_beside(&target)?;
         let written = (|| {
-            let file = std::fs::File::create(&temp)?;
             let summary = self.export(&file)?;
             file.sync_all()?;
             std::fs::rename(&temp, &target)?;
+            // The new name kept through a power cut too (SPEC §182).
+            crate::storage::sync_dir(&target)?;
             Ok::<_, Error>(summary)
         })();
+        // Ours alone to remove: `new_beside` created it.
         if written.is_err() {
             let _ = std::fs::remove_file(&temp);
         }
@@ -372,8 +373,9 @@ impl ImportOptions {
 /// Whether an export restores (SPEC §165.2): it is imported into a new
 /// database at `at`, as a restore would be, which is then `check`ed and
 /// each collection's documents counted against the export's lines. `at`
-/// and its WAL are deleted afterwards, whatever the outcome; an `at` that
-/// exists, or its WAL, is refused before anything is written. The restore
+/// and its WAL are created here, and deleted afterwards, whatever the
+/// outcome; an `at` that exists, or its WAL, is refused before anything
+/// is written, and left as it is (SPEC §182.2). The restore
 /// takes about as much room as the database the export came from.
 ///
 /// An export that doesn't import fails as `import` fails, with
@@ -389,14 +391,10 @@ impl ImportOptions {
 /// # let db = trunkdb::Database::open(dir.path().join("app.trunkdb"))?;
 /// # db.collection::<trunkdb::Document>("users").insert(r#"{"name": "Ada"}"#.parse()?)?;
 /// let backup = dir.path().join("backup.jsonl");
-/// let temp = dir.path().join("backup.jsonl.tmp");
 ///
-/// // A snapshot (SPEC §80): reads and writes go on meanwhile.
-/// let file = File::create(&temp)?;
-/// db.export(&file)?;
-/// file.sync_all()?;
-/// // Only a whole export takes the last one's place.
-/// std::fs::rename(&temp, &backup)?;
+/// // A snapshot (SPEC §80): reads and writes go on meanwhile. Only a
+/// // whole export takes the last one's place.
+/// db.export_to_file(&backup)?;
 ///
 /// let verified = trunkdb::verify_export(File::open(&backup)?, dir.path().join("verify.trunkdb"))?;
 /// assert!(verified.is_ok() && verified.ended, "{verified:?}");
@@ -406,18 +404,34 @@ impl ImportOptions {
 pub fn verify_export(input: impl Read, at: impl AsRef<Path>) -> crate::Result<Verified> {
     let at = at.as_ref();
     let wal = crate::durability::wal_path(at);
-    if let Some(there) = [at, wal.as_path()].into_iter().find(|path| path.exists()) {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "{}: exists; an export is verified by a restore into a new file",
-                there.display()
-            ),
-        )));
-    }
+    // Both created here, each only if it isn't there, so that what is
+    // removed afterwards is only ever what this made (SPEC §182.2): a
+    // check that they don't exist, then an open, would let another
+    // process make them in between, and lose them.
+    let create = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{}: exists; an export is verified by a restore into a new file",
+                        path.display()
+                    ),
+                )),
+                _ => Error::Io(e),
+            })
+    };
+    create(at)?;
     // Declared before the database, so dropped after it: the files go
     // once nothing has them open.
-    let _remove = Remove([at.to_path_buf(), wal]);
+    let mut remove = Remove(vec![at.to_path_buf()]);
+    create(&wal)?;
+    remove.0.push(wal);
+    // An empty file opens as a new database (SPEC §22.1), an empty WAL
+    // as one with nothing in it.
     let db = Database::open(at)?;
     let mut counts = Vec::new();
     let summary = db.import_counting(input, ImportOptions::default(), &mut counts)?;
@@ -457,8 +471,34 @@ fn restored_problems(
     Ok((problems, indexes))
 }
 
+/// The `<n>` of the next name `new_beside` tries.
+static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A new file beside `target`, named after it, `<target>.tmp<pid>-<n>`,
+/// and opened for writing: created, never one that was there, nor
+/// through a link under that name, and never the same as another
+/// export's in this process at the same time (SPEC §182.1).
+fn new_beside(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    loop {
+        let n = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut temp = target.as_os_str().to_os_string();
+        temp.push(format!(".tmp{}-{n}", std::process::id()));
+        let temp = PathBuf::from(temp);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((temp, file)),
+            // Someone else's: left as it is, the next name tried.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Files removed when dropped, each if it's there.
-struct Remove([PathBuf; 2]);
+struct Remove(Vec<PathBuf>);
 
 impl Drop for Remove {
     fn drop(&mut self) {
@@ -1391,5 +1431,166 @@ mod tests {
             problems.iter().any(|p| p.contains("damaged")),
             "{problems:?}"
         );
+    }
+
+    fn temps_left(dir: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp"))
+            .collect()
+    }
+
+    /// An export's temporary file is always a new one: a file or a link
+    /// under the names it would try is left as it was, and so is what
+    /// the link points to (SPEC §182.1).
+    #[test]
+    fn an_exports_temporary_file_is_never_one_that_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("app.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        docs.insert("{\"n\": 1}".parse().unwrap()).unwrap();
+        let out = dir.path().join("backup.jsonl");
+        let target = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("backup.jsonl");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "victim").unwrap();
+        // The next names this process tries; other tests may take some
+        // first, which leaves these as they are all the same.
+        let next = NEXT_TEMP.load(std::sync::atomic::Ordering::Relaxed);
+        let mut there = Vec::new();
+        for n in next..next + 4 {
+            let mut name = target.as_os_str().to_os_string();
+            name.push(format!(".tmp{}-{n}", std::process::id()));
+            let name = PathBuf::from(name);
+            #[cfg(unix)]
+            if n % 2 == 1 {
+                std::os::unix::fs::symlink(&victim, &name).unwrap();
+                there.push(name);
+                continue;
+            }
+            std::fs::write(&name, "mine").unwrap();
+            there.push(name);
+        }
+
+        db.export_to_file(&out).unwrap();
+        assert!(std::fs::read_to_string(&out).unwrap().contains("\"n\":1"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "victim");
+        for name in &there {
+            if name.is_symlink() {
+                continue;
+            }
+            assert_eq!(std::fs::read_to_string(name).unwrap(), "mine", "{name:?}");
+        }
+        assert_eq!(temps_left(dir.path()).len(), there.len());
+    }
+
+    /// Exports from several threads to the same file at once: each its
+    /// own temporary file, so each succeeds, and the file is one of them
+    /// whole (SPEC §182.1).
+    #[test]
+    fn exports_to_the_same_file_at_once_each_write_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("app.trunkdb")).unwrap();
+        let docs = db.collection::<Document>("docs");
+        let mut batch = db.batch();
+        for n in 0..2_000 {
+            let doc = format!("{{\"n\": {n}, \"pad\": \"{}\"}}", "x".repeat(100));
+            batch.insert(&docs, doc.parse().unwrap()).unwrap();
+        }
+        batch.commit().unwrap();
+        let out = dir.path().join("backup.jsonl");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let summary = db.export_to_file(&out).unwrap();
+                    assert_eq!(summary.documents, 2_000);
+                });
+            }
+        });
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(written, export_text(&db));
+        assert!(temps_left(dir.path()).is_empty());
+    }
+
+    /// A `verify_export` that finds its files already made by another
+    /// leaves them be, even while the other is still at work in them: it
+    /// removes only files it created (SPEC §182.2).
+    #[test]
+    fn a_verify_removes_only_the_files_it_made() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("app.trunkdb")).unwrap();
+        db.collection::<Document>("docs")
+            .insert("{\"n\": 1}".parse().unwrap())
+            .unwrap();
+        let text = export_text(&db);
+        let at = dir.path().join("verify.trunkdb");
+        let wal = crate::durability::wal_path(&at);
+
+        /// The export's text, held back after its first line until told.
+        struct Held<'a> {
+            text: &'a [u8],
+            go: mpsc::Receiver<()>,
+            started: Option<mpsc::Sender<()>>,
+        }
+        impl Read for Held<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    started.send(()).unwrap();
+                    self.go.recv().unwrap();
+                }
+                self.text.read(buf)
+            }
+        }
+
+        let (go, wait) = mpsc::channel();
+        let (started, has_started) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                let held = Held {
+                    text: text.as_bytes(),
+                    go: wait,
+                    started: Some(started),
+                };
+                verify_export(held, &at)
+            });
+            has_started.recv().unwrap();
+            assert!(at.exists() && wal.exists());
+            let second = verify_export(text.as_bytes(), &at);
+            assert!(
+                matches!(second, Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::AlreadyExists),
+                "{second:?}"
+            );
+            assert!(at.exists() && wal.exists(), "the first's files kept");
+            go.send(()).unwrap();
+            let verified = first.join().unwrap().unwrap();
+            assert!(verified.is_ok() && verified.documents == 1, "{verified:?}");
+        });
+        assert!(!at.exists() && !wal.exists());
+    }
+
+    /// A new database's file and WAL, and an export renamed into place,
+    /// each have their directory synced; an open of a file that's there
+    /// syncs none (SPEC §182.3).
+    #[test]
+    fn new_files_and_a_rename_sync_their_directory() {
+        use crate::storage::DIR_SYNCS;
+        let syncs = || DIR_SYNCS.with(|syncs| syncs.get());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.trunkdb");
+        let before = syncs();
+        let db = Database::open(&path).unwrap();
+        assert_eq!(syncs() - before, 2, "the file and its WAL");
+        drop(db);
+
+        let before = syncs();
+        let db = Database::open(&path).unwrap();
+        assert_eq!(syncs() - before, 0, "both there");
+
+        let before = syncs();
+        db.export_to_file(dir.path().join("backup.jsonl")).unwrap();
+        assert_eq!(syncs() - before, 1, "after the rename");
     }
 }

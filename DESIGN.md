@@ -173,7 +173,12 @@ time, so it takes one record's memory whatever the WAL's size
 idempotent, so writing one back twice is harmless [§19](spec/19-durability-take-two-a-page-image-wal.md). A WAL page
 past the file's end, as the header before it has it, is refused before
 anything is written [§55](spec/55-fuzzing.md). A checkpoint
-that fails keeps its pages waiting, and the next one tries again.
+that fails keeps its pages waiting, and the next one tries again. A
+new file or WAL has its directory synced before the first batch is
+logged, so a power cut can't lose its name; the WAL is cut at a
+checkpoint, never removed [§182](spec/182-files-made-new-and-their-names-synced.md). The WAL doesn't yet name the file it
+belongs to, so one left beside another copy of the file is replayed
+into it (ROADMAP.md).
 
 A batch whose log fails is taken back alone: the WAL is cut to where
 it was before, which keeps the batches committed earlier and not yet

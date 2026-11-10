@@ -56,6 +56,7 @@ All of it is done:
 | 0.35.0 | **A date, and a time of day:** `Date`, a day in the calendar, and `Time`, a time of day to the nanosecond, as `Document::Date` and `Document::Time`, a struct's fields of those types stored as them; each compares only with its own kind, never with a date-time; keys in an index in their order, sorted after binary; `date("2026-11-07")`, `time("14:05")` and `datetime("…")` in a filter's text, `is date` and `is time`, `date` naming dates now where it named date-times; `{"$date": "2026-11-07"}` and `{"$time": …}` in JSON, export version 4; `DateTime::date()`, `time()` and `Date::at`; file format 15; **a window for each group:** `Aggregate::newest_per_group(path, n)`, each group's `n` newest by `path`, and `window_per_group(path, duration)`, each group's documents within `duration` of its own newest, so a group gone silent keeps its last ones; beside `window`, which comes first; live too; `window at 10 per group` and `window at 5m per group` in the text; **an upsert in a batch:** `Batch::upsert_fields`, at its place among the ops, `Written::upserted` saying whether it inserted and the id; an `upsert` line for `trunkdb batch`; **a sort with a limit kept small:** a sort by fields no index serves keeps only the best `skip + limit` as it reads, the index entries streamed, close to twice as fast, memory as small as the limit | §173–§176 |
 | 0.36.0 | **Text a program passes, read by the library:** `Update` from MongoDB's operators as JSON, `Params` from an object, `BatchLines`, a batch's ops read from JSON lines with each mistake's line, the batch made, a failed commit's line found; the command reads through them; **the C ABI:** `trunkdb-ffi`, trunkdb as a C library and its header, 36 functions over documents as JSON and filters as text, opaque handles checked by a tag, error codes and the last error as text and JSON, no panic across; tested from C under AddressSanitizer; **the C# wrapper:** `Database`, `Collection<T>` written by the object, `Snapshot`, `Cursor<T>` over safe handles, documents as a program's classes through System.Text.Json, `DateOnly`, `TimeOnly`, `byte[]` and `DocId` as their tags, errors as exceptions | §177–§180 |
 | 0.37.0 | **Documents an index leaves out, counted:** each index on one field keeps how many documents have a value there that nothing orders (an array, an object, NaN), rewritten in place only when a write changes it; a sorted page through the index that isn't full skips the scan for them when there are none, so `category != "Salad" order by category limit 50` reads each document once, not twice; `check` recounts it; file format 16, an older file's indexes counted by `compact` | §181 |
+| next | **Files made new, and their names synced** (found in a review): an export's temporary file always a new one, `<out>.tmp<pid>-<n>`, never one that was there nor through a link, and never shared by two exports at once; `verify_export` creates its files and removes only those; a new database's file and WAL, and an export renamed into place, have their directory synced, so a power cut can't lose their names | §182 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -89,6 +90,15 @@ Not decided: whether trunkdb goes on crates.io, with its docs on
 docs.rs, or stays on GitHub alone, as now.
 
 ### Planned
+- **A WAL bound to its file:** the WAL's header names nothing about
+  the file it belongs to, so a WAL left by a crash beside an older copy
+  of the file, or another database's, is replayed into it, writing
+  over newer pages before anything notices. A database id and a
+  checkpoint count in the file's header and the WAL's, a WAL that
+  doesn't match refused before a page is written; a crash between a
+  checkpoint's write-back and its cut must still recover. Needs a file
+  and WAL format change. Found in the review that led to §182; until
+  then, GUIDE.md says to remove a WAL that didn't come with a copy.
 - **PyO3 bindings,** for Python apps: `pip install` from wheels,
   documents as dicts, errors as exceptions, on the embedding API the C
   ABI uses.

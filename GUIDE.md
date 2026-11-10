@@ -851,16 +851,15 @@ in part (SPEC §165).
 
 **While the application runs**, the application makes it: it holds the
 file locked, so `trunkdb export` from outside waits until it's closed.
-Export into a temporary file, sync it and rename it over the last
-backup, so only a whole one ever takes its place; then try it:
+`export_to_file` writes a new temporary file beside the backup, syncs
+it, renames it over the last one and syncs the directory, so only a
+whole backup ever takes its place, and keeps it through a power cut;
+then try it:
 
 ```rust
 use std::fs::File;
 
-let file = File::create("backup.jsonl.tmp")?;
-db.export(&file)?; // a snapshot: the application goes on meanwhile
-file.sync_all()?;
-std::fs::rename("backup.jsonl.tmp", "backup.jsonl")?;
+db.export_to_file("backup.jsonl")?; // a snapshot: the application goes on meanwhile
 
 let verified = trunkdb::verify_export(File::open("backup.jsonl")?, "verify.trunkdb")?;
 assert!(verified.is_ok() && verified.ended);
@@ -887,7 +886,11 @@ has it open: copy `app.trunkdb` and `app.trunkdb.wal` beside it, if
 it's there. The WAL can hold committed writes that aren't in the file
 yet, after a crash; a clean close empties it. A copy taken while the
 application runs can be torn: export instead. A `.compact` file beside
-it belongs to a compaction and is never needed.
+it belongs to a compaction and is never needed. **To restore a copy,**
+put back the WAL that was copied with it, or, if none was, remove any
+`app.trunkdb.wal` beside the target first: the next open replays a WAL
+it finds there into the file, and one left by a crash of the newer
+file would be written over the older copy.
 
 **Upgrading** to a newer release needs nothing: it opens every file
 format from 6 on, written by 0.6.0 or later, and `trunkdb info` says a

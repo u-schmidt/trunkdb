@@ -36,6 +36,54 @@ pub(crate) fn sync(file: &std::fs::File) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Syncs the directory `path` is in, so that a file just created or
+/// renamed there is still under its name after a power cut (SPEC §182):
+/// a file's own sync doesn't promise its directory entry. Unix only;
+/// Windows can't open a directory as a file, and NTFS journals the
+/// entry. Not under `--cfg fuzzing`, as `sync`.
+pub(crate) fn sync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    DIR_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+    if cfg!(fuzzing) || cfg!(not(unix)) {
+        return Ok(());
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many times `sync_dir` ran on this thread.
+    pub(crate) static DIR_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Opens the file at `path` for reading and writing, creating it if it
+/// isn't there, as `create(true)` would; a file it creates has its
+/// directory synced before it is handed out (`sync_dir`), so that what
+/// is written to it later can't be lost with its name.
+pub(crate) fn open_or_create(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    loop {
+        match options.clone().create_new(true).open(path) {
+            Ok(file) => {
+                sync_dir(path)?;
+                return Ok(file);
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            Err(_) => {}
+        }
+        match options.open(path) {
+            // Gone again between the two: try creating it once more.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            opened => return opened,
+        }
+    }
+}
+
 /// A page's id plus its full bytes (`USABLE_PAGE_SIZE` long) — what the WAL
 /// records and crash recovery writes back (`FileStore::restore_pages`).
 /// For tests: recovery itself takes `PendingPages`, and holds no list.

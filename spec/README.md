@@ -196,3 +196,4 @@ say what changed, and DESIGN.md says what is true now.
 179. [The C ABI (`trunkdb-ffi/`, `explain.rs`, `export.rs`, `bin/trunkdb.rs`)](179-the-c-abi.md)
 180. [The C# wrapper (`bindings/dotnet/`)](180-the-csharp-wrapper.md)
 181. [Documents an index leaves out, counted (`catalog.rs`, `collection.rs`, `compact.rs`, `check.rs`)](181-documents-an-index-leaves-out-counted.md)
+182. [Files made new, and their names synced (`export.rs`, `storage/mod.rs`, `durability/wal.rs`, `storage/file.rs`)](182-files-made-new-and-their-names-synced.md)

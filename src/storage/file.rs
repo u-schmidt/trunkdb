@@ -323,12 +323,9 @@ impl FileStore {
     /// page, and `restore_pages` writes it back. `check_header` then
     /// finds only real damage.
     pub(crate) fn open_before_recovery(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        // A new file's directory synced before its first batch (SPEC
+        // §182).
+        let file = super::open_or_create(path.as_ref())?;
         Self::from_file(file, Lock::Exclusive)
     }
 

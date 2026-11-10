@@ -4,7 +4,7 @@ use crate::crc32::crc32;
 #[cfg(test)]
 use crate::storage::PageImage;
 use crate::storage::{HEADER_PAGE, PageId, PendingPages, SeePage, TakePage, USABLE_PAGE_SIZE};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -417,12 +417,9 @@ impl WalDurability {
     /// checkpoints, before handing out a usable `Database`.
     pub fn open(db_path: &Path) -> io::Result<(Self, Pending)> {
         let path = wal_path(db_path);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        // A new WAL's directory synced before anything is logged to it
+        // (SPEC §182).
+        let file = crate::storage::open_or_create(&path)?;
         let len = file.metadata()?.len();
         // On a handle of its own, so reading it again for the restore
         // doesn't move the place `log` writes at.
