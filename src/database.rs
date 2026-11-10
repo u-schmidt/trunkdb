@@ -3856,13 +3856,19 @@ mod tests {
         }
     }
 
-    /// A copy of `path` and its WAL into `dir`, taken while it is open:
-    /// what a crash would leave (SPEC §183).
-    fn crash_image(path: &Path, dir: &Path) -> PathBuf {
+    /// The file at `path` copied into `dir`, while it is closed: on
+    /// Windows its lock keeps any other reader out while it is open.
+    fn copy_closed(path: &Path, dir: &Path) -> PathBuf {
         let copy = dir.join("copy.trunkdb");
         std::fs::copy(path, &copy).unwrap();
-        std::fs::copy(durability::wal_path(path), durability::wal_path(&copy)).unwrap();
         copy
+    }
+
+    /// The WAL of `path`, open, copied beside `copy`: with a copy of the
+    /// file taken since its last checkpoint, what a crash would leave
+    /// (SPEC §183). The WAL isn't locked.
+    fn copy_wal(path: &Path, copy: &Path) {
+        std::fs::copy(durability::wal_path(path), durability::wal_path(copy)).unwrap();
     }
 
     fn pending_wal_bytes(path: &Path) -> u64 {
@@ -3872,26 +3878,32 @@ mod tests {
     /// Batches committed through `write_batch`, in the session after a
     /// checkpoint as in the first, are recovered from a crash image: the
     /// WAL names its file and both sessions as the file's header has
-    /// them (SPEC §183).
+    /// them (SPEC §183). The image: the file as its last checkpoint left
+    /// it, copied while closed, and the WAL as the batches since left it.
     #[test]
     fn a_crash_image_recovers_in_every_session() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+        let first = tempfile::tempdir().unwrap();
+        let copy = copy_closed(&path, first.path());
         let db = Database::open(&path).unwrap();
         db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
         assert!(pending_wal_bytes(&path) > 0);
-        let first = tempfile::tempdir().unwrap();
-        let copy = crash_image(&path, first.path());
+        copy_wal(&path, &copy);
         let recovered = Database::open(&copy).unwrap();
         assert_eq!(get(&recovered, "posts", 1), Some(Document::Int(10)));
         drop(recovered);
 
-        db.checkpoint().unwrap();
+        // A clean close checkpoints; the next session starts from it.
+        drop(db);
         assert_eq!(pending_wal_bytes(&path), 0);
+        let second = tempfile::tempdir().unwrap();
+        let copy = copy_closed(&path, second.path());
+        let db = Database::open(&path).unwrap();
         db.write_batch(vec![insert("posts", 2, 20)]).unwrap();
         db.write_batch(vec![insert("posts", 3, 30)]).unwrap();
-        let second = tempfile::tempdir().unwrap();
-        let copy = crash_image(&path, second.path());
+        copy_wal(&path, &copy);
         let recovered = Database::open(&copy).unwrap();
         for (id, v) in [(1, 10), (2, 20), (3, 30)] {
             assert_eq!(get(&recovered, "posts", id), Some(Document::Int(v)));
