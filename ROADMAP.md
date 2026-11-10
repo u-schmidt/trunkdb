@@ -95,6 +95,9 @@ docs.rs, or stays on GitHub alone, as now.
   ABI uses.
 - **Longer fuzzing runs,** with AddressSanitizer too, and short ones in
   CI on nightly (§55.6).
+- **Readers in other processes,** beside the one that writes: an admin
+  tool or an agent reading the file while the application runs.
+  Designed in §185, its questions decided; not built.
 
 ### Deferred
 Each waits for what its line names: a program that needs it, or a
@@ -221,8 +224,8 @@ in §6.
 - **Joins:** a document holds what belongs together, and a reference
   (a `DocId` field, §62) is looked up by the application.
 - **Multiple writers:** batches are serialized (§27); readers run
-  beside the writer on snapshots (§77), and one process owns the file
-  (§21).
+  beside the writer on snapshots (§77), and one process writes the file
+  (§21). Readers in other processes are planned (§185).
 - **Encryption:** left to the disk or the operating system.
 - **Schema validation:** the application's own types are the schema,
   checked as documents convert to and from them.

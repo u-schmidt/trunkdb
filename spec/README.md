@@ -199,3 +199,4 @@ say what changed, and DESIGN.md says what is true now.
 182. [Files made new, and their names synced (`export.rs`, `storage/mod.rs`, `durability/wal.rs`, `storage/file.rs`)](182-files-made-new-and-their-names-synced.md)
 183. [A WAL bound to its file (`storage/file.rs`, `storage/mod.rs`, `durability/wal.rs`, `database.rs`)](183-a-wal-bound-to-its-file.md)
 184. [Writes that do what they say (`bindings/dotnet/`, `bin/trunkdb.rs`, `collection.rs`)](184-writes-that-do-what-they-say.md)
+185. [Readers in other processes, designed first (`storage/file.rs`, `durability/wal.rs`, `database.rs`)](185-readers-in-other-processes-designed-first.md) — a draft, not built
