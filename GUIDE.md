@@ -887,10 +887,12 @@ it's there. The WAL can hold committed writes that aren't in the file
 yet, after a crash; a clean close empties it. A copy taken while the
 application runs can be torn: export instead. A `.compact` file beside
 it belongs to a compaction and is never needed. **To restore a copy,**
-put back the WAL that was copied with it, or, if none was, remove any
-`app.trunkdb.wal` beside the target first: the next open replays a WAL
-it finds there into the file, and one left by a crash of the newer
-file would be written over the older copy.
+put back the WAL that was copied with it, if one was. A WAL a crash of
+the newer file left beside it doesn't belong to the copy: the open
+refuses it, changes nothing, and says so
+(`FormatError::WalNotThisFiles`). Move it aside, to
+`app.trunkdb.wal.stale` say, to open the copy as it is, without the
+writes the WAL holds.
 
 **Upgrading** to a newer release needs nothing: it opens every file
 format from 6 on, written by 0.6.0 or later, and `trunkdb info` says a

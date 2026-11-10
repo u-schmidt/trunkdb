@@ -197,3 +197,4 @@ say what changed, and DESIGN.md says what is true now.
 180. [The C# wrapper (`bindings/dotnet/`)](180-the-csharp-wrapper.md)
 181. [Documents an index leaves out, counted (`catalog.rs`, `collection.rs`, `compact.rs`, `check.rs`)](181-documents-an-index-leaves-out-counted.md)
 182. [Files made new, and their names synced (`export.rs`, `storage/mod.rs`, `durability/wal.rs`, `storage/file.rs`)](182-files-made-new-and-their-names-synced.md)
+183. [A WAL bound to its file (`storage/file.rs`, `storage/mod.rs`, `durability/wal.rs`, `database.rs`)](183-a-wal-bound-to-its-file.md)

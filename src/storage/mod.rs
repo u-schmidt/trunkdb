@@ -9,7 +9,7 @@ mod snapshot;
 pub(crate) use file::HEADER_PAGE;
 pub use file::{DEFAULT_CACHE_SIZE, FileStore};
 #[cfg(test)]
-pub(crate) use file::{rewrite_format_version, rewrite_releases};
+pub(crate) use file::{clear_binding, rewrite_format_version, rewrite_releases};
 pub use page::Page;
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use pages::checksum;
@@ -22,6 +22,33 @@ pub use slotted::SlottedPage;
 pub(crate) use snapshot::{Commit, SnapshotStore};
 
 pub type PageId = u64;
+
+/// What a WAL's header says of the file it belongs to (SPEC §183): the
+/// file's id, the session the file's header had when the WAL started
+/// from empty, and the session the WAL's batches were logged in, which
+/// their images of the header carry. Recovery replays a WAL only into
+/// the file with that id, at either session: the one before, as a crash
+/// left it, or the WAL's own, which a checkpoint that didn't get to cut
+/// the WAL had already written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct WalBinding {
+    pub(crate) file_id: [u8; 16],
+    pub(crate) prev: u64,
+    pub(crate) session: u64,
+}
+
+impl WalBinding {
+    /// Whether this WAL may be replayed into a file whose header says
+    /// `file_id` and `session` (`FileStore::disk_binding`). A file
+    /// without an id, new or from before, takes only a WAL started on
+    /// a file without one.
+    pub(crate) fn belongs_to(&self, file_id: [u8; 16], session: u64) -> bool {
+        if file_id == [0; 16] {
+            return self.prev == 0;
+        }
+        file_id == self.file_id && (session == self.prev || session == self.session)
+    }
+}
 
 /// `file.sync_all()`, the flush every durability promise rests on —
 /// except under `--cfg fuzzing` (SPEC §55.1), which `cargo fuzz` sets and

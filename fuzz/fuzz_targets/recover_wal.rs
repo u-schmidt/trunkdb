@@ -27,7 +27,7 @@ fuzz_target!(|input: &[u8]| {
             0 => usize::MAX,
             pages => pages as usize,
         };
-        trunkdb::fuzzing::wal(&images, record_pages)
+        trunkdb::fuzzing::wal(base, &images, record_pages)
     };
     trunkdb_fuzz::open_and_exercise(&trunkdb::fuzzing::seal(base), Some(&wal), mode);
 });

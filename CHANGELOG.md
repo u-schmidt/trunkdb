@@ -1300,4 +1300,18 @@ limit, batches and a write-ahead log. Since then:
     only those. A new database's file and WAL, and an export renamed
     into place, now have their directory synced, so a power cut can't
     lose their names (Unix). A WAL replayed into a file it doesn't
-    belong to is planned (ROADMAP.md).
+    belong to is §183, next.
+157. **A WAL bound to its file** (§183), the review's fourth finding:
+    the WAL said nothing of the file it belonged to, so one a crash
+    left beside an older copy of the file, restored from a backup say,
+    or beside another database, or beside a new file where the old
+    one was deleted, was replayed into it, writing its pages over the
+    file's before anything checked. Now the file's header holds a
+    random id and a session, new each time the WAL starts again from
+    empty, and the WAL's header, version 4, the id and both sessions.
+    An open replays a WAL only into the file it names, at either
+    session, and refuses any other with
+    `FormatError::WalNotThisFiles`, before writing anything; its
+    message says to move the WAL aside, or put back the copy it
+    belongs to. Versions 2 and 3 are still replayed, unchecked. File
+    format 16 still: the fields sit in bytes older releases leave zero.

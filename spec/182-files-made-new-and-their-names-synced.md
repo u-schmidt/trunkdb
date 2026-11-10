@@ -22,8 +22,7 @@ with their name:
   directory.
 
 The fourth finding, a WAL that belongs to another file or an older copy
-of this one replayed over the file, needs a file format change and is
-planned on its own (ROADMAP.md).
+of this one replayed over the file, is §183.
 
 ## 182.1 An export's temporary file is always a new one
 `<out>.tmp<pid>-<n>`, where `n` counts up for each one this process

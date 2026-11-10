@@ -438,6 +438,7 @@ impl Database {
             store.set_cache_size(options.cache_size);
             store.set_snapshot_memory(options.snapshot_memory);
             let pending = durability::read_pending(path)?;
+            belongs(&store, &pending, path)?;
             let recovered = crate::Recovered::of(&pending, true);
             if !pending.is_empty() {
                 store.restore_in_memory(&pending)?;
@@ -461,6 +462,9 @@ impl Database {
         store.set_cache_size(options.cache_size);
         store.set_snapshot_memory(options.snapshot_memory);
         let (mut durability, pending) = WalDurability::open(path)?;
+        // Before a page is written: a WAL of another file, or of another
+        // copy of this one, is refused (SPEC §183).
+        belongs(&store, &pending, path)?;
         let recovered = crate::Recovered::of(&pending, false);
         if !pending.is_empty() {
             store.restore_pages(&pending)?;
@@ -474,11 +478,20 @@ impl Database {
         durability.checkpoint()?;
 
         let catalog = Self::load_catalog(&mut store)?;
-        let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
-        if pages.is_empty() {
-            drop(pages);
+        if store.dirty_pages().next().is_none() {
             store.rollback(); // an existing file: nothing was bootstrapped
         } else {
+            // The WAL was just emptied: this batch starts a session
+            // (SPEC §183).
+            let binding = match store.start_session() {
+                Ok(binding) => binding,
+                Err(e) => {
+                    store.rollback();
+                    return Err(e.into());
+                }
+            };
+            durability.bind(binding);
+            let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
             // No retry or poisoning here, unlike `write_batch`: a failure
             // fails `open` itself, and the next `open` recovers from the WAL.
             durability.log(&pages)?;
@@ -920,6 +933,18 @@ impl Database {
             None
         };
 
+        // The first batch since the WAL was empty starts a session: the
+        // header, with a new one, among its pages, and the WAL's header
+        // to name the file and both sessions (SPEC §183).
+        if wal(&mut writer.durability).len() == 0 {
+            match writer.store.start_session() {
+                Ok(binding) => wal(&mut writer.durability).bind(binding),
+                Err(e) => {
+                    writer.store.rollback();
+                    return Err(e.into());
+                }
+            }
+        }
         // A record's pages at a time: a compaction's image is in a file
         // (SPEC §108).
         let logged = wal(&mut writer.durability)
@@ -1087,6 +1112,21 @@ const MAX_LINKS: usize = 40;
 /// followed: one directory reached by two names keeps one WAL already.
 /// A path that isn't there is left as it is, and so is a symlink's
 /// target that isn't there: the open creates it, and the WAL beside it.
+/// Whether what the WAL beside the file at `path` holds may be replayed
+/// into it (SPEC §183): `FormatError::WalNotThisFiles` if it belongs to
+/// another file, or to another copy of this one. Before anything is
+/// written.
+fn belongs(store: &FileStore, pending: &durability::Pending, path: &Path) -> crate::Result<()> {
+    let (file_id, session) = store.disk_binding()?;
+    if pending.belongs_to(file_id, session) {
+        return Ok(());
+    }
+    Err(crate::Error::Format(crate::FormatError::WalNotThisFiles {
+        wal: durability::wal_path(path),
+        file: path.to_path_buf(),
+    }))
+}
+
 fn followed(given: &Path) -> std::io::Result<PathBuf> {
     let mut path = given.to_path_buf();
     for _ in 0..MAX_LINKS {
@@ -1324,6 +1364,8 @@ mod tests {
         for op in ops {
             apply_write_op(&mut catalog, &mut store, op).unwrap();
         }
+        // As `write_batch` does, the WAL being empty (SPEC §183).
+        wal.bind(store.start_session().unwrap());
         let pages: Vec<(PageId, &[u8])> = store.dirty_pages().collect();
         let page_count = pages.len();
         if matches!(crash, CrashPoint::DuringApply) {
@@ -1878,7 +1920,7 @@ mod tests {
         let wal = path.with_extension("trunkdb.wal");
 
         let mut newer = b"TRUNKWAL".to_vec();
-        newer.extend_from_slice(&4u32.to_le_bytes());
+        newer.extend_from_slice(&5u32.to_le_bytes());
         for (bytes, expected, message) in [
             (
                 b"some other program's log".to_vec(),
@@ -1887,8 +1929,8 @@ mod tests {
             ),
             (
                 newer,
-                crate::FormatError::WalVersion { found: 4 },
-                "unsupported WAL version 4, this build reads 2 and 3",
+                crate::FormatError::WalVersion { found: 5 },
+                "unsupported WAL version 5, this build reads 2 to 4",
             ),
         ] {
             std::fs::write(&wal, &bytes).unwrap();
@@ -3812,5 +3854,160 @@ mod tests {
             let now = db.current();
             assert_reads(&now.reading(&db.inner.pages), &model, "reopened");
         }
+    }
+
+    /// A copy of `path` and its WAL into `dir`, taken while it is open:
+    /// what a crash would leave (SPEC §183).
+    fn crash_image(path: &Path, dir: &Path) -> PathBuf {
+        let copy = dir.join("copy.trunkdb");
+        std::fs::copy(path, &copy).unwrap();
+        std::fs::copy(durability::wal_path(path), durability::wal_path(&copy)).unwrap();
+        copy
+    }
+
+    fn pending_wal_bytes(path: &Path) -> u64 {
+        std::fs::metadata(durability::wal_path(path)).unwrap().len()
+    }
+
+    /// Batches committed through `write_batch`, in the session after a
+    /// checkpoint as in the first, are recovered from a crash image: the
+    /// WAL names its file and both sessions as the file's header has
+    /// them (SPEC §183).
+    #[test]
+    fn a_crash_image_recovers_in_every_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        assert!(pending_wal_bytes(&path) > 0);
+        let first = tempfile::tempdir().unwrap();
+        let copy = crash_image(&path, first.path());
+        let recovered = Database::open(&copy).unwrap();
+        assert_eq!(get(&recovered, "posts", 1), Some(Document::Int(10)));
+        drop(recovered);
+
+        db.checkpoint().unwrap();
+        assert_eq!(pending_wal_bytes(&path), 0);
+        db.write_batch(vec![insert("posts", 2, 20)]).unwrap();
+        db.write_batch(vec![insert("posts", 3, 30)]).unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let copy = crash_image(&path, second.path());
+        let recovered = Database::open(&copy).unwrap();
+        for (id, v) in [(1, 10), (2, 20), (3, 30)] {
+            assert_eq!(get(&recovered, "posts", id), Some(Document::Int(v)));
+        }
+    }
+
+    /// A WAL a crash left, beside an older copy of its file, is refused
+    /// by either open, and nothing is written; the message says what to
+    /// do. Moved aside, the copy opens as it was; beside the file it
+    /// belongs to, it is recovered (SPEC §183).
+    #[test]
+    fn a_wal_beside_an_older_copy_of_its_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let db = Database::open(&path).unwrap();
+        db.write_batch(vec![insert("posts", 11, 10)]).unwrap();
+        drop(db);
+        let older = std::fs::read(&path).unwrap();
+        let db = Database::open(&path).unwrap();
+        db.write_batch(vec![insert("posts", 12, 20)]).unwrap();
+        drop(db);
+        let newer = std::fs::read(&path).unwrap();
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+        let wal = durability::wal_path(&path);
+        let logged = std::fs::read(&wal).unwrap();
+
+        std::fs::write(&path, &older).unwrap();
+        let (error, message) = format_error_of(&path);
+        assert_eq!(
+            error,
+            crate::FormatError::WalNotThisFiles {
+                wal: wal.clone(),
+                file: path.clone()
+            }
+        );
+        for says in [
+            "this WAL holds writes of another database file, or of another copy of this one",
+            "Nothing was changed",
+            &format!("rename it to {}.stale", wal.display()),
+            "put that copy back beside it",
+        ] {
+            assert!(message.contains(says), "{says:?} in {message}");
+        }
+        assert_eq!(std::fs::read(&wal).unwrap(), logged, "the WAL as it was");
+
+        // Beside the file it belongs to, it is replayed.
+        std::fs::write(&path, &newer).unwrap();
+        let db = Database::open(&path).unwrap();
+        assert_two_collection_batch_present(&db);
+        assert_eq!(get(&db, "posts", 12), Some(Document::Int(20)));
+        drop(db);
+
+        // Moved aside, the older copy opens as it was.
+        std::fs::write(&path, &older).unwrap();
+        std::fs::write(&wal, &logged).unwrap();
+        assert!(Database::open(&path).is_err());
+        std::fs::rename(&wal, dir.path().join("test.trunkdb.wal.stale")).unwrap();
+        let db = Database::open(&path).unwrap();
+        assert_eq!(get(&db, "posts", 11), Some(Document::Int(10)));
+        assert_eq!(get(&db, "posts", 12), None);
+        assert_eq!(get(&db, "authors", 2), None);
+        assert!(db.check().unwrap().is_ok());
+    }
+
+    /// Nor is another database's WAL replayed, nor one left beside a
+    /// file made new where the old one was deleted (SPEC §183).
+    #[test]
+    fn a_wal_of_another_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let other = dir.path().join("other.trunkdb");
+        drop(Database::open(&path).unwrap());
+        drop(Database::open(&other).unwrap());
+        log_batch_then_crash(&other, &two_collection_batch(), CrashPoint::AfterLog);
+        let wal = durability::wal_path(&other);
+        std::fs::copy(&wal, durability::wal_path(&path)).unwrap();
+        assert!(matches!(
+            format_error_of(&path).0,
+            crate::FormatError::WalNotThisFiles { .. }
+        ));
+
+        // The file deleted, its WAL kept: the open makes a new file, and
+        // replays nothing into it.
+        std::fs::remove_file(&other).unwrap();
+        match Database::open(&other) {
+            Err(crate::Error::Format(crate::FormatError::WalNotThisFiles { .. })) => {}
+            other => panic!("{:?}", other.err()),
+        }
+        assert_eq!(
+            std::fs::metadata(&other).unwrap().len(),
+            0,
+            "nothing written"
+        );
+    }
+
+    /// A file from before §183, without an id, takes a WAL that started
+    /// on it; its first session gives it one, kept from then on.
+    #[test]
+    fn a_file_without_an_id_gets_one_with_its_first_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        drop(Database::open(&path).unwrap());
+        // As an older release leaves the header: no id, no session.
+        crate::storage::clear_binding(&path);
+        let id_of = |path: &Path| std::fs::read(path).unwrap()[44..60].to_vec();
+        assert_eq!(id_of(&path), vec![0; 16]);
+        log_batch_then_crash(&path, &two_collection_batch(), CrashPoint::AfterLog);
+        let db = Database::open(&path).unwrap();
+        assert_two_collection_batch_present(&db);
+        drop(db);
+        let id = id_of(&path);
+        assert_ne!(id, vec![0; 16]);
+        let db = Database::open(&path).unwrap();
+        db.write_batch(vec![insert("posts", 7, 70)]).unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+        assert_eq!(id_of(&path), id, "kept");
     }
 }

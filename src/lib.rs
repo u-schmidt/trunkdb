@@ -399,6 +399,23 @@ pub enum FormatError {
         /// The WAL's version.
         found: u32,
     },
+    /// The WAL beside the file holds batches of another database file,
+    /// or of another copy of this one, older or newer (SPEC §183): left
+    /// by a crash, then the file restored from a copy, say. Replaying
+    /// it would write that file's pages over this one's, so the open
+    /// refuses, and changes nothing. The message says how to go on.
+    #[non_exhaustive]
+    #[error(
+        "{wal}: this WAL holds writes of another database file, or of another copy of this one, so it isn't replayed: its pages would overwrite {file}'s. Nothing was changed. If {file} is the file you want as it is, move the WAL aside (rename it to {wal}.stale, say) and open again; the writes it holds are left out. If the WAL belongs to another copy of the file, put that copy back beside it and open it there, so its writes reach it.",
+        wal = .wal.display(),
+        file = .file.display(),
+    )]
+    WalNotThisFiles {
+        /// The WAL.
+        wal: std::path::PathBuf,
+        /// The database file it was found beside.
+        file: std::path::PathBuf,
+    },
     /// A file of a format before 12 holds a document that isn't an
     /// object, which this build can't hold (SPEC §95): `id`, in
     /// `collection`, is the first one found. Open the file with trunkdb

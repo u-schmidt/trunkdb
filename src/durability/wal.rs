@@ -3,7 +3,9 @@ use crate::FormatError;
 use crate::crc32::crc32;
 #[cfg(test)]
 use crate::storage::PageImage;
-use crate::storage::{HEADER_PAGE, PageId, PendingPages, SeePage, TakePage, USABLE_PAGE_SIZE};
+use crate::storage::{
+    HEADER_PAGE, PageId, PendingPages, SeePage, TakePage, USABLE_PAGE_SIZE, WalBinding,
+};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +42,9 @@ pub struct WalDurability {
     /// an older version, nor behind a torn header. A checkpoint empties
     /// the file, and `Database::open` always makes one before it logs.
     appendable: bool,
+    /// What the header says of the file, written with the first record
+    /// after the WAL was empty: as the last `bind` set it (SPEC §183).
+    binding: WalBinding,
     /// Test-only: how many times the file was flushed by `log`.
     #[cfg(test)]
     pub(crate) syncs: u32,
@@ -64,13 +69,19 @@ pub struct WalDurability {
 /// (1, before page checksums: SPEC §40), is a clear error rather than a
 /// misread. Version 2 had one record per batch, with no flags; it is
 /// still read, so a WAL a crash left under an older build is recovered
-/// (SPEC §91), and never added to.
+/// (SPEC §91), and never added to. So is version 3, whose header says
+/// nothing of the file it belongs to: version 4's goes on with a
+/// `WalBinding`, the file's id and two sessions (SPEC §183), 32 bytes.
 /// Written together with the first record after a checkpoint, never on
 /// its own.
 const WAL_MAGIC: &[u8; 8] = b"TRUNKWAL";
-const WAL_VERSION: u32 = 3;
+const WAL_VERSION: u32 = 4;
+const WAL_VERSION_UNBOUND: u32 = 3;
 const WAL_VERSION_WITHOUT_FLAGS: u32 = 2;
-const WAL_HEADER_LEN: usize = 12;
+/// Magic and version, as every version has them.
+const WAL_HEADER_START: usize = 12;
+/// Version 4's whole header.
+const WAL_HEADER_LEN: usize = WAL_HEADER_START + 32;
 
 /// Bytes per page entry in a record body: `[u64 page id][page bytes]`.
 const PAGE_ENTRY_LEN: usize = 8 + USABLE_PAGE_SIZE;
@@ -83,10 +94,13 @@ const MORE: u32 = 1;
 /// nor recovery holds more than one of this size in memory.
 const RECORD_PAGES: usize = (32 << 20) / crate::storage::PAGE_SIZE;
 
-pub(crate) fn encode_header() -> [u8; WAL_HEADER_LEN] {
+pub(crate) fn encode_header(binding: &WalBinding) -> [u8; WAL_HEADER_LEN] {
     let mut header = [0u8; WAL_HEADER_LEN];
     header[0..8].copy_from_slice(WAL_MAGIC);
     header[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
+    header[12..28].copy_from_slice(&binding.file_id);
+    header[28..36].copy_from_slice(&binding.prev.to_le_bytes());
+    header[36..44].copy_from_slice(&binding.session.to_le_bytes());
     header
 }
 
@@ -154,6 +168,9 @@ pub(crate) fn encode_batch(pages: &[(PageId, &[u8])], record_pages: usize) -> Ve
 struct Records<R> {
     input: R,
     version: u32,
+    /// What its header says of the file it belongs to: `None` before
+    /// version 4.
+    binding: Option<WalBinding>,
     /// How many bytes of the WAL are still to be read.
     left: u64,
     /// How many have been read, as whole records and the header.
@@ -185,23 +202,36 @@ impl<R: Read> Records<R> {
     /// start. `None` for one shorter than its header, which holds
     /// nothing: the header is only ever written together with a record.
     fn new(mut input: R, len: u64) -> io::Result<Option<Self>> {
-        if len < WAL_HEADER_LEN as u64 {
+        if len < WAL_HEADER_START as u64 {
             return Ok(None);
         }
         let mut header = [0u8; WAL_HEADER_LEN];
-        input.read_exact(&mut header)?;
+        input.read_exact(&mut header[..WAL_HEADER_START])?;
         if &header[0..8] != WAL_MAGIC {
             return Err(FormatError::WalNotTrunkdb.into_io());
         }
         let version = read_u32(&header[8..]);
-        if version != WAL_VERSION && version != WAL_VERSION_WITHOUT_FLAGS {
-            return Err(FormatError::WalVersion { found: version }.into_io());
+        let header_len = match version {
+            WAL_VERSION => WAL_HEADER_LEN,
+            WAL_VERSION_UNBOUND | WAL_VERSION_WITHOUT_FLAGS => WAL_HEADER_START,
+            found => return Err(FormatError::WalVersion { found }.into_io()),
+        };
+        // Shorter than its header: torn, and so holding nothing.
+        if len < header_len as u64 {
+            return Ok(None);
         }
+        input.read_exact(&mut header[WAL_HEADER_START..header_len])?;
+        let binding = (version == WAL_VERSION).then(|| WalBinding {
+            file_id: header[12..28].try_into().unwrap(),
+            prev: u64::from_le_bytes(header[28..36].try_into().unwrap()),
+            session: u64::from_le_bytes(header[36..44].try_into().unwrap()),
+        });
         Ok(Some(Records {
             input,
             version,
-            left: len - WAL_HEADER_LEN as u64,
-            offset: WAL_HEADER_LEN as u64,
+            binding,
+            left: len - header_len as u64,
+            offset: header_len as u64,
             body: Vec::new(),
         }))
     }
@@ -231,7 +261,11 @@ impl<R: Read> Records<R> {
         }
         self.offset += 8 + body_len;
 
-        let flags_len = if self.version == WAL_VERSION { 4 } else { 0 };
+        let flags_len = if self.version == WAL_VERSION_WITHOUT_FLAGS {
+            0
+        } else {
+            4
+        };
         if self.body.len() < 4 + flags_len {
             return Err(corrupt("WAL batch record too short for its page count"));
         }
@@ -279,6 +313,9 @@ pub struct Pending {
     ids: Vec<PageId>,
     /// The header page's images, each with its place in `ids`.
     headers: Vec<(usize, Vec<u8>)>,
+    /// What the WAL's header says of the file it belongs to (SPEC
+    /// §183): `None` for a WAL before version 4, or with nothing in it.
+    binding: Option<WalBinding>,
 }
 
 impl Pending {
@@ -288,6 +325,7 @@ impl Pending {
             end: 0,
             ids: Vec::new(),
             headers: Vec::new(),
+            binding: None,
         }
     }
 
@@ -299,7 +337,7 @@ impl Pending {
         let Some(mut records) = Records::new(input, len)? else {
             return Ok((Self::nothing(), None));
         };
-        let version = records.version;
+        let (version, binding) = (records.version, records.binding);
         let (mut ids, mut headers) = (Vec::new(), Vec::new());
         // How much of `ids`, and of the file, whole batches make up.
         let (mut whole, mut end) = (0, records.offset);
@@ -324,6 +362,7 @@ impl Pending {
             end,
             ids,
             headers,
+            binding,
         };
         Ok((pending, Some(version)))
     }
@@ -331,6 +370,17 @@ impl Pending {
     /// Whether nothing is pending.
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+
+    /// Whether what is pending may be replayed into a file whose header
+    /// on disk says `file_id` and `session` (SPEC §183): always when
+    /// nothing is, or when the WAL is from before version 4 and so says
+    /// nothing of its file.
+    pub(crate) fn belongs_to(&self, file_id: [u8; 16], session: u64) -> bool {
+        self.is_empty()
+            || self
+                .binding
+                .is_none_or(|binding| binding.belongs_to(file_id, session))
     }
 
     /// Every pending page image, in log order: for tests, which read
@@ -390,7 +440,7 @@ impl PendingPages for Pending {
 /// The WAL versions recovery reads, as `FormatError::WalVersion`'s
 /// message names them.
 pub(crate) fn readable_wal_versions() -> String {
-    format!("{WAL_VERSION_WITHOUT_FLAGS} and {WAL_VERSION}")
+    format!("{WAL_VERSION_WITHOUT_FLAGS} to {WAL_VERSION}")
 }
 
 /// How many bytes of the WAL a read asks the file for at once.
@@ -430,6 +480,7 @@ impl WalDurability {
             len,
             record_pages: RECORD_PAGES,
             appendable: len == 0 || version == Some(WAL_VERSION),
+            binding: WalBinding::default(),
             #[cfg(test)]
             failing_logs: 0,
             #[cfg(test)]
@@ -440,6 +491,13 @@ impl WalDurability {
             syncs: 0,
         };
         Ok((wal, pending))
+    }
+
+    /// What the WAL's header is to say of the file it belongs to, once
+    /// it is next written: with the first batch logged after the WAL
+    /// was empty (SPEC §183). `FileStore::start_session` makes it.
+    pub(crate) fn bind(&mut self, binding: WalBinding) {
+        self.binding = binding;
     }
 
     /// Test-only: at most `pages` pages in a record from here on, for
@@ -477,7 +535,7 @@ impl WalDurability {
         let largest = count.min(self.record_pages);
         let mut record = Vec::with_capacity(WAL_HEADER_LEN + 16 + largest * PAGE_ENTRY_LEN);
         if end == 0 {
-            record.extend_from_slice(&encode_header());
+            record.extend_from_slice(&encode_header(&self.binding));
         }
         let mut chunk: Vec<(PageId, P)> = Vec::with_capacity(largest);
         let mut len = 0;
@@ -744,7 +802,7 @@ mod tests {
         let eight = images(8);
         log(&mut wal, &eight);
         assert_eq!(wal.syncs, 1 + 3, "three records, each flushed");
-        let mut expected = encode_header().to_vec();
+        let mut expected = encode_header(&WalBinding::default()).to_vec();
         expected.extend(encode_batch(&borrowed(&two_page_batch()), 3));
         expected.extend(encode_batch(&borrowed(&eight), 3));
         assert_eq!(wal_bytes(&db_path), expected);
@@ -896,13 +954,16 @@ mod tests {
 
         wal.checkpoint().unwrap();
         wal.log(&[(1, &one[..])]).unwrap();
-        assert_eq!(wal_bytes(&db_path)[..WAL_HEADER_LEN], encode_header());
+        assert_eq!(
+            wal_bytes(&db_path)[..WAL_HEADER_LEN],
+            encode_header(&WalBinding::default())
+        );
         drop(wal);
         let (_wal, pending) = WalDurability::open(&db_path).unwrap();
         assert_eq!(pending.images(), vec![(1, one)]);
 
         // Any other version is refused, as before.
-        for version in [1u32, 4] {
+        for version in [1u32, 5] {
             let mut other = WAL_MAGIC.to_vec();
             other.extend_from_slice(&version.to_le_bytes());
             other.extend(version_2_record(&two_page_batch()));
@@ -922,7 +983,7 @@ mod tests {
     fn a_torn_header_is_not_added_to() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.trunkdb");
-        set_wal_bytes(&db_path, &encode_header()[..5]);
+        set_wal_bytes(&db_path, &encode_header(&WalBinding::default())[..5]);
         let (mut wal, pending) = WalDurability::open(&db_path).unwrap();
         assert!(pending.is_empty());
         let one = page(1);
@@ -937,7 +998,7 @@ mod tests {
     fn a_record_with_unknown_flags_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.trunkdb");
-        let mut bytes = encode_header().to_vec();
+        let mut bytes = encode_header(&WalBinding::default()).to_vec();
         bytes.extend(encode_batch(&borrowed(&two_page_batch()), 3));
         let record = WAL_HEADER_LEN;
         bytes[record + 12] = 2; // the flags, after length, CRC and count
@@ -1153,5 +1214,59 @@ mod tests {
         let good = wal_bytes(&db_path);
         wal.undo_failed_log().unwrap();
         assert_eq!(wal_bytes(&db_path), good);
+    }
+
+    /// What a WAL's header says decides which file it is replayed into
+    /// (SPEC §183): one of version 4 only the file with its id, at the
+    /// session before or its own; one of version 3, from before, says
+    /// nothing, and goes into any; one with nothing pending, too.
+    #[test]
+    fn a_wal_is_replayed_only_into_the_file_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let binding = WalBinding {
+            file_id: [7; 16],
+            prev: 10,
+            session: 11,
+        };
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        wal.bind(binding);
+        log(&mut wal, &two_page_batch());
+        drop(wal);
+        assert_eq!(
+            wal_bytes(&db_path)[..WAL_HEADER_LEN],
+            encode_header(&binding)
+        );
+        let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+        assert!(pending.belongs_to([7; 16], 10), "as the crash left it");
+        assert!(pending.belongs_to([7; 16], 11), "written back already");
+        assert!(!pending.belongs_to([7; 16], 9), "an older copy");
+        assert!(!pending.belongs_to([7; 16], 12), "a newer one");
+        assert!(!pending.belongs_to([8; 16], 10), "another file");
+        assert!(!pending.belongs_to([0; 16], 0), "a file without an id");
+
+        // Version 3, as 0.37.0 wrote it: magic, version, records.
+        let mut old = WAL_MAGIC.to_vec();
+        old.extend_from_slice(&3u32.to_le_bytes());
+        let batch = two_page_batch();
+        old.extend(encode_batch(&borrowed(&batch), RECORD_PAGES));
+        set_wal_bytes(&db_path, &old);
+        let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+        assert_eq!(pending.images(), two_page_batch());
+        assert!(pending.belongs_to([8; 16], 12));
+
+        set_wal_bytes(&db_path, &[]);
+        let (_wal, pending) = WalDurability::open(&db_path).unwrap();
+        assert!(pending.belongs_to([8; 16], 12), "nothing to replay");
+
+        // A file without an id takes a WAL started on one without.
+        let first = WalBinding {
+            file_id: [7; 16],
+            prev: 0,
+            session: 1,
+        };
+        assert!(first.belongs_to([0; 16], 0));
+        assert!(first.belongs_to([7; 16], 1));
+        assert!(!first.belongs_to([7; 16], 2));
     }
 }

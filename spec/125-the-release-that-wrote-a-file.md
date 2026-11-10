@@ -19,6 +19,7 @@ the rest zeros. After them, little-endian like the others:
 |---|---|
 | `[32..34)` `[34..36)` `[36..38)` | created by: major, minor, patch, `u16` each |
 | `[38..40)` `[40..42)` `[42..44)` | last written by: major, minor, patch |
+| `[44..60)` `[60..68)` | the file's id and its WAL session, since §183 |
 
 From `CARGO_PKG_VERSION_MAJOR`, `_MINOR` and `_PATCH`, parsed at compile
 time (`release.rs`); no string in the file and none to parse. All three

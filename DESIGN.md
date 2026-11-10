@@ -176,9 +176,15 @@ anything is written [§55](spec/55-fuzzing.md). A checkpoint
 that fails keeps its pages waiting, and the next one tries again. A
 new file or WAL has its directory synced before the first batch is
 logged, so a power cut can't lose its name; the WAL is cut at a
-checkpoint, never removed [§182](spec/182-files-made-new-and-their-names-synced.md). The WAL doesn't yet name the file it
-belongs to, so one left beside another copy of the file is replayed
-into it (ROADMAP.md).
+checkpoint, never removed [§182](spec/182-files-made-new-and-their-names-synced.md).
+
+The WAL names the file it belongs to: the file's header holds a random
+id and a session, new each time the WAL starts again from empty, and
+the WAL's header holds the id, the session before and its own. An open
+replays a WAL only into the file with its id, at one of those two
+sessions; any other, an older copy of the file or another database's,
+is refused with `FormatError::WalNotThisFiles`, which says how to go on,
+before a page is written [§183](spec/183-a-wal-bound-to-its-file.md).
 
 A batch whose log fails is taken back alone: the WAL is cut to where
 it was before, which keeps the batches committed earlier and not yet

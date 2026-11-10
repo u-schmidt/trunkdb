@@ -40,9 +40,16 @@ pub fn unseal(file: &[u8]) -> Vec<u8> {
 /// A WAL file holding one valid batch of `pages`, each `(id, bytes)`
 /// with `USABLE_PAGE_SIZE` bytes — what a commit of them would log, in
 /// records of at most `record_pages` pages (SPEC §91); at least one.
-pub fn wal(pages: &[(PageId, Vec<u8>)], record_pages: usize) -> Vec<u8> {
+/// Its header names the file whose pages, unsealed, are `base` (SPEC
+/// §183), so recovery replays it into that file.
+pub fn wal(base: &[u8], pages: &[(PageId, Vec<u8>)], record_pages: usize) -> Vec<u8> {
     let pages: Vec<(PageId, &[u8])> = pages.iter().map(|(id, page)| (*id, &page[..])).collect();
-    let mut file = crate::durability::encode_header().to_vec();
+    let binding = crate::storage::WalBinding {
+        file_id: base[44..60].try_into().unwrap(),
+        prev: u64::from_le_bytes(base[60..68].try_into().unwrap()),
+        session: 1,
+    };
+    let mut file = crate::durability::encode_header(&binding).to_vec();
     file.extend_from_slice(&crate::durability::encode_batch(
         &pages,
         record_pages.max(1),

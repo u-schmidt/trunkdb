@@ -6,7 +6,7 @@ use super::pages::{
 use super::snapshot::Commit;
 #[cfg(test)]
 use super::snapshot::SnapshotStore;
-use super::{Page, PageId, PageStore, PageType, PendingPages, Scratch, SlottedPage};
+use super::{Page, PageId, PageStore, PageType, PendingPages, Scratch, SlottedPage, WalBinding};
 use crate::FormatError;
 use crate::release::{RELEASE, Release};
 use std::collections::BTreeMap;
@@ -84,6 +84,11 @@ const NO_FREE_PAGE: PageId = 0;
 //   [28..32) format_version: u32 (FORMAT_VERSION)
 //   [32..38) created_by: three u16s, major, minor, patch (SPEC §125)
 //   [38..44) written_by: the same, the release that wrote it last
+//   [44..60) file_id: 16 random bytes, the file's own, zeros until its
+//            first WAL session (SPEC §183)
+//   [60..68) session: u64, the WAL session whose batches the header
+//            has, 0 before the first (SPEC §183)
+// An older release leaves the last two zero and doesn't read them.
 #[derive(Clone, Copy)]
 pub(super) struct Header {
     page_size: u32,
@@ -100,6 +105,13 @@ pub(super) struct Header {
     /// until the next header write stamps `RELEASE`, as for
     /// `format_version`. `encode` always writes `RELEASE`.
     pub(super) written_by: Release,
+    /// The file's id (SPEC §183): random, made with its first WAL
+    /// session, kept by every header write after; zeros before.
+    file_id: [u8; 16],
+    /// The WAL session the header's batches were logged in: random,
+    /// new each time the WAL starts again from empty; 0 before the
+    /// first (SPEC §183).
+    session: u64,
 }
 
 impl Header {
@@ -119,6 +131,8 @@ impl Header {
         buf[28..32].copy_from_slice(&format_version.to_le_bytes());
         buf[32..38].copy_from_slice(&self.created_by.to_bytes());
         buf[38..44].copy_from_slice(&written_by.to_bytes());
+        buf[44..60].copy_from_slice(&self.file_id);
+        buf[60..68].copy_from_slice(&self.session.to_le_bytes());
         buf
     }
 
@@ -132,6 +146,8 @@ impl Header {
             format_version: FORMAT_VERSION,
             created_by: RELEASE,
             written_by: RELEASE,
+            file_id: [0; 16],
+            session: 0,
         }
     }
 
@@ -210,6 +226,7 @@ impl Header {
         // unknown.
         let created_by = Release::from_bytes(&buf[32..38]).unwrap_or(Release::UNKNOWN);
         let written_by = Release::from_bytes(&buf[38..44]).unwrap_or(Release::UNKNOWN);
+        let (file_id, session) = binding_of(buf);
         Ok(Header {
             page_size,
             page_count,
@@ -217,6 +234,8 @@ impl Header {
             format_version,
             created_by,
             written_by,
+            file_id,
+            session,
         })
     }
 }
@@ -520,6 +539,43 @@ impl FileStore {
         self.header.format_version = FORMAT_VERSION;
         self.header.written_by = RELEASE;
         Ok(())
+    }
+
+    /// Starts a WAL session, in the batch staged now, which is to be the
+    /// first logged since the WAL was last empty (SPEC §183): the
+    /// header gets a new session, and the file an id if it has none,
+    /// and is written in the batch, so that it is in the session's
+    /// first record. Returns what the WAL's header is to say: the
+    /// file's id, the session the file had before, and the new one.
+    pub(crate) fn start_session(&mut self) -> io::Result<WalBinding> {
+        assert!(
+            self.staging.is_some(),
+            "FileStore::start_session without begin"
+        );
+        let prev = self.header.session;
+        if self.header.file_id == [0; 16] {
+            self.header.file_id = random_bytes();
+        }
+        self.header.session = u64::from_le_bytes(random_bytes());
+        self.write_header()?;
+        Ok(WalBinding {
+            file_id: self.header.file_id,
+            prev,
+            session: self.header.session,
+        })
+    }
+
+    /// The file id and session the header on disk has (SPEC §183), read
+    /// from its bytes whether or not its checksum matches, as a crash
+    /// mid-write may have left it: what a WAL must match to be replayed
+    /// into it. Zeros for a file without a header yet, and one from
+    /// before.
+    pub(crate) fn disk_binding(&self) -> io::Result<([u8; 16], u64)> {
+        let file = self.pages.file();
+        if file.metadata()?.len() < PAGE_SIZE as u64 {
+            return Ok(([0; 16], 0));
+        }
+        Ok(binding_of(&read_disk_page(file, HEADER_PAGE)?))
     }
 
     /// A page's current bytes: from the dirty set if it's there, the
@@ -1063,6 +1119,27 @@ pub(super) fn free_list(
     Ok(pages)
 }
 
+/// A header page's file id and session (SPEC §183), as its bytes say,
+/// whatever else in it is valid.
+fn binding_of(buf: &[u8]) -> ([u8; 16], u64) {
+    let file_id = buf[44..60].try_into().unwrap();
+    let session = u64::from_le_bytes(buf[60..68].try_into().unwrap());
+    (file_id, session)
+}
+
+/// A new random value of `N` bytes, never all zeros: from UUID v7s'
+/// random bits, which the `uuid` crate draws from the OS.
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut out = [0u8; N];
+    for chunk in out.chunks_mut(8) {
+        // The last 8 bytes of a v7: 62 random bits beside its variant,
+        // which is never 0.
+        let uuid = uuid::Uuid::now_v7();
+        chunk.copy_from_slice(&uuid.as_bytes()[8..8 + chunk.len()]);
+    }
+    out
+}
+
 /// The header, from the file. Magic and format version come before the
 /// checksum: a file of another format may not have one where this
 /// format's goes, and saying "format 5, export it" beats "page 0 is
@@ -1088,6 +1165,22 @@ pub(crate) fn rewrite_format_version(path: &Path, version: u32) {
         .unwrap();
     let mut header = read_page_at(&file, HEADER_PAGE).unwrap();
     header.make_mut()[28..32].copy_from_slice(&version.to_le_bytes());
+    write_page_at(&file, HEADER_PAGE, &header).unwrap();
+}
+
+/// Rewrites a closed file's id and session to zeros (SPEC §183), with
+/// the header's checksum to match: a file as a release before them
+/// leaves it, for tests above this module.
+#[cfg(test)]
+pub(crate) fn clear_binding(path: &Path) {
+    use super::pages::{read_page_at, write_page_at};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut header = read_page_at(&file, HEADER_PAGE).unwrap();
+    header.make_mut()[44..68].fill(0);
     write_page_at(&file, HEADER_PAGE, &header).unwrap();
 }
 
