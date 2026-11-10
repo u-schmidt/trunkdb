@@ -1330,3 +1330,14 @@ limit, batches and a write-ahead log. Since then:
     `update_many` stores each match as its type, dropping the fields
     the type lacks: now said in its documentation and GUIDE.md, which
     point to `update_fields`.
+
+    Items 156–158 → 0.38.0, fixes from two reviews. **WAL version 4,**
+    which 0.37.0 and older refuse: a WAL a crash left under 0.38.0
+    needs 0.38.0 to recover it; after a clean close the WAL is empty,
+    and going back works. File format 16 and export version 4, as in
+    0.37.0, so no fixture: the file's id and session sit in header
+    bytes older releases leave zero. A WAL that isn't its file's is
+    refused with the new `FormatError::WalNotThisFiles` (the enum is
+    non-exhaustive). `trunkdb update --upsert` refuses a filter with a
+    sort, `limit` or `offset`, which the run ignored before. In .NET,
+    text with a NUL throws `ArgumentException`.

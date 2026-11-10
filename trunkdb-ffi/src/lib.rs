@@ -220,7 +220,7 @@ pub extern "C" fn trunkdb_abi_version() -> u32 {
     TRUNKDB_ABI_VERSION
 }
 
-/// trunkdb's release, "0.37.0": owned by the library, never freed.
+/// trunkdb's release, "0.38.0": owned by the library, never freed.
 #[unsafe(no_mangle)]
 pub extern "C" fn trunkdb_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
