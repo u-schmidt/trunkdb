@@ -581,9 +581,13 @@ struct UserSummary {
 let summaries = db.collection::<UserSummary>("users").find(Filter::new().eq("team", "core"))?;
 ```
 
-Read through it, never write: `update`, `upsert` and `insert` store the
-whole value, so a `UserSummary` written back replaces the user and
-drops every field it lacks. To change some fields, use `update_fields`.
+Read through it, never write: `update`, `upsert`, `insert` and the
+typed `update_many` store the whole value, so a `UserSummary` written
+back replaces the user and drops every field it lacks. `update_many`
+does so even where its closure changes nothing, and so does a full
+type of an older build of the application, which lacks a field a newer
+one added. To change some fields and keep the rest as stored, use
+`update_fields` (SPEC §184.3).
 A typed read decodes each document straight into the type, so the
 fields a summary doesn't declare are skipped, not built (SPEC §99).
 

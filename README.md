@@ -131,7 +131,8 @@ trunkdb drop app.trunkdb old_users
 `info`, `check`, `export`, `find`, `fields`, `count`, `get` and
 `aggregate` open the file read-only; `info`, `check` and `fields` print JSON with `--json`.
 An update or delete that would change every document of a collection
-asks for `--all`, and `--dry-run` says how many it would change.
+asks for `--all`, and `--dry-run` says how many it would change, or
+the error it would fail with, writing nothing.
 `trunkdb help` lists every command and option.
 
 ### For an AI agent

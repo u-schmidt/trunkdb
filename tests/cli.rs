@@ -1265,6 +1265,93 @@ fn update_and_delete_ask_for_all_and_can_run_dry() {
     assert!(stderr(&output).contains("nobody: no such collection"));
 }
 
+/// `--dry-run` rehearses the write the run would make, as a batch's
+/// dry run does (SPEC §184.2): the errors the run would fail with, the
+/// documents it would change and not those it would leave, and an upsert
+/// with the run's own filter. Nothing is written either way.
+#[test]
+fn a_dry_run_rehearses_the_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = users_db(dir.path());
+    let before = std::fs::read(&db).unwrap();
+    let fails = |args: &[&str], says: &str| {
+        let dry: Vec<&str> = args.iter().copied().chain(["--dry-run"]).collect();
+        for args in [&dry[..], args] {
+            let output = trunkdb(args);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{args:?}: {}",
+                stderr(&output)
+            );
+            assert!(
+                stderr(&output).contains(says),
+                "{args:?}: {}",
+                stderr(&output)
+            );
+        }
+    };
+    // A unique index broken; an operator that can't be made.
+    fails(
+        &[
+            "update",
+            &db,
+            "users",
+            "age > 40",
+            r#"{"$set": {"email": "a@x"}}"#,
+        ],
+        "email",
+    );
+    fails(
+        &[
+            "update",
+            &db,
+            "users",
+            r#"name = "Ada""#,
+            r#"{"$inc": {"name": 1}}"#,
+        ],
+        "name",
+    );
+    // An upsert that finds two; one whose filter pages, which an upsert
+    // doesn't: refused, where the count said "insert" and the run updated.
+    fails(
+        &[
+            "update",
+            &db,
+            "users",
+            "age > 0",
+            r#"{"$set": {"x": 1}}"#,
+            "--upsert",
+        ],
+        "2 documents match the filter",
+    );
+    fails(
+        &[
+            "update",
+            &db,
+            "users",
+            r#"name = "Ada" offset 1"#,
+            r#"{"$set": {"x": 1}}"#,
+            "--upsert",
+        ],
+        "an upsert's filter can't have a skip",
+    );
+    assert_eq!(std::fs::read(&db).unwrap(), before, "nothing written");
+
+    // Only what changes counts: Ada is 36 already.
+    let set = r#"{"$set": {"age": 36}}"#;
+    let output = trunkdb(&["update", &db, "users", "", set, "--all", "--dry-run"]);
+    assert_eq!(stderr(&output), "would update 1 document\n");
+    let upsert = ["update", &db, "users", r#"name = "Ada""#, set, "--upsert"];
+    let dry: Vec<&str> = upsert.iter().copied().chain(["--dry-run"]).collect();
+    assert_eq!(stderr(&trunkdb(&dry)), "would leave 1 document as it was\n");
+    assert_eq!(std::fs::read(&db).unwrap(), before, "nothing written");
+    let output = trunkdb(&upsert);
+    assert_eq!(stderr(&output), "left 1 document as it was\n");
+    let output = trunkdb(&["update", &db, "users", "", set, "--all"]);
+    assert_eq!(stderr(&output), "updated 1 document\n");
+}
+
 /// `--upsert`: the one match updated, or a document of the filter's `=`s
 /// and the update inserted, with `$setOnInsert`.
 #[test]

@@ -81,6 +81,7 @@ What it gets wrong most easily, it gets told before anything happens:
   and leave the documents where nobody looks.
 - **`--dry-run`:** what `update` or `delete` would change, counted, and
   nothing written; for `--upsert`, whether it would insert or update.
+  (Since §184.2 the write rehearsed as a batch's dry run, not counted.)
 
 Rejected:
 - **A question on the terminal, `y/n`:** an agent has no terminal, and

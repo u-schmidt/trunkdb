@@ -199,8 +199,10 @@ Each write is one atomic batch: it happens whole, or not at all. Work
 like this:
 
 1. **Count first.** Run the same filter with `count`, or the write with
-   `--dry-run`, which says how many documents it would change and writes
-   nothing. Tell the user the number if it isn't the one they expect.
+   `--dry-run`, which makes the write without keeping it: it says how
+   many documents it would change, or fails as the write would, and
+   writes nothing. Tell the user the number if it isn't the one they
+   expect.
 2. **Back up before a large change:** `trunkdb export <file>
    backup.jsonl`, then `trunkdb verify backup.jsonl`. `import` of that
    into a new file undoes anything.

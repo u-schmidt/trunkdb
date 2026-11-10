@@ -1315,3 +1315,18 @@ limit, batches and a write-ahead log. Since then:
     message says to move the WAL aside, or put back the copy it
     belongs to. Versions 2 and 3 are still replayed, unchecked. File
     format 16 still: the fields sit in bytes older releases leave zero.
+158. **Writes that do what they say** (§184), found in a review of
+    updates, deletes, batches and the .NET entry points. The C#
+    wrapper passed text with a NUL to the library, which read it up to
+    the NUL: a filter lost its last conditions, a name or a path named
+    another collection or file. Every call that takes text now refuses
+    one with `ArgumentException` first. `trunkdb update` and `delete`
+    with `--dry-run` counted the filter's matches, so a preview
+    succeeded where the write would fail, counted documents the write
+    would leave, and for `--upsert` with an `offset` said "insert"
+    where the run updated. Both now run as one op of a batch, its
+    `dry_run` or its `commit`; an upsert whose filter has a sort,
+    `limit` or `offset` is refused, as a batch's is. The typed
+    `update_many` stores each match as its type, dropping the fields
+    the type lacks: now said in its documentation and GUIDE.md, which
+    point to `update_fields`.

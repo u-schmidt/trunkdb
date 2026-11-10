@@ -490,4 +490,37 @@ public sealed class DatabaseTests : IDisposable
             Assert.Equal(thread + 9, e.Offset);
         });
     }
+
+    [Fact]
+    public void Text_with_a_nul_is_refused_before_it_reaches_the_library()
+    {
+        // The library reads up to the first NUL: "status = \"open\"" alone
+        // would delete every open task, and "tasks" would be another
+        // collection's name (SPEC §184.1).
+        using var db = Open();
+        var tasks = db.Collection<TaskItem>("tasks");
+        tasks.Insert(new TaskItem { Title = "a" });
+        tasks.Insert(new TaskItem { Title = "b" });
+        db.Collection<TaskItem>("tasks2").Insert(new TaskItem { Title = "c" });
+
+        void Refused(Action call)
+        {
+            var e = Assert.Throws<ArgumentException>(call);
+            Assert.Contains("NUL", e.Message);
+        }
+        Refused(() => tasks.DeleteMany("status = \"open\"\0 and title = \"a\""));
+        Refused(() => tasks.UpdateMany("title = \"a\"\0 or true", """{"$set": {"status": "done"}}"""));
+        Refused(() => db.Collection<TaskItem>("tasks\0 2").DeleteMany(null));
+        Refused(() => db.DropCollection("tasks2\0"));
+        Refused(() => db.Export(File("backup.jsonl\0.trunkdb")));
+        Refused(() => Database.Open(File("app.trunkdb\0x")));
+        Refused(() => db.Batch("{\"op\": \"delete_many\", \"collection\": \"tasks\"}\0"));
+
+        Assert.Equal(2ul, tasks.Count());
+        Assert.Equal(0ul, tasks.Count("status = \"done\""));
+        Assert.Equal(1ul, db.Collection<TaskItem>("tasks2").Count());
+        Assert.False(System.IO.File.Exists(File("backup.jsonl")));
+        // A NUL inside a value given as a parameter is kept, as JSON escapes it.
+        Assert.Equal(0ul, tasks.Count("title = :t", new { t = "a\0" }));
+    }
 }

@@ -118,7 +118,8 @@ writing (each command is one atomic batch; the file must exist but for insert --
   drop   <file> <collection>  the collection, its documents and indexes
 
 update and delete refuse to change every document of a collection unless
-given --all; --dry-run says how many they would change, writing nothing.
+given --all; --dry-run makes the write without keeping it: how many it
+would change, or the error it would fail with, writing nothing.
 The filter is one argument: quote it, '' for none.
 
 parameters (find, fields, count, aggregate, update, delete, batch):
@@ -1441,40 +1442,51 @@ fn update(file: &str, collection: &str, args: &[&str], values: &Given) -> Outcom
     };
     let failed = |e: trunkdb::Error| e.to_string();
     let dry_run = given.contains(&"--dry-run");
+    // One op in a batch, which `--dry-run` rehearses and a run commits:
+    // the same filter and the same checks either way, every error the
+    // run would meet met by the rehearsal too (SPEC §184.2).
+    let mut batch = db.batch();
     if given.contains(&"--upsert") {
-        let found = docs.count(filter.clone()).map_err(failed)?;
-        if dry_run {
-            eprintln!(
-                "would {}",
-                match found {
-                    0 => "insert 1 document".to_string(),
-                    n => format!("update {}", count(n, "document")),
-                }
-            );
-            return Ok(ExitCode::SUCCESS);
-        }
-        let upserted = docs.upsert_fields(filter, &update).map_err(failed)?;
-        println!("{}", upserted.id());
-        eprintln!(
-            "{} 1 document",
-            match upserted {
-                trunkdb::Upserted::Inserted(_) => "inserted",
-                _ => "updated",
+        batch
+            .upsert_fields(&docs, filter, &update)
+            .map_err(failed)?;
+        let written = run(batch, dry_run).map_err(failed)?;
+        let upserted = written.upserted(0).expect("an upsert's outcome");
+        // What it did to the one document: a match the operators leave
+        // as it was isn't written.
+        let (done, would) = match upserted {
+            trunkdb::Upserted::Inserted(_) => ("inserted 1 document", "insert 1 document"),
+            _ if written.total() == 0 => {
+                ("left 1 document as it was", "leave 1 document as it was")
             }
-        );
+            _ => ("updated 1 document", "update 1 document"),
+        };
+        if dry_run {
+            eprintln!("would {would}");
+        } else {
+            println!("{}", upserted.id());
+            eprintln!("{done}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     if let Some(refused) = touches_all(&docs, &filter, given.contains(&"--all"), "update")? {
         return Ok(refused);
     }
-    if dry_run {
-        let n = docs.count(filter).map_err(failed)?;
-        eprintln!("would update {}", count(n, "document"));
-        return Ok(ExitCode::SUCCESS);
-    }
-    let n = docs.update_fields(filter, &update).map_err(failed)?;
-    eprintln!("updated {}", count(n, "document"));
+    batch.update_many(&docs, filter, &update).map_err(failed)?;
+    let n = run(batch, dry_run).map_err(failed)?.total();
+    let verb = if dry_run { "would update" } else { "updated" };
+    eprintln!("{verb} {}", count(n, "document"));
     Ok(ExitCode::SUCCESS)
+}
+
+/// `batch` committed, or with `dry_run` rehearsed, writing nothing
+/// (SPEC §168.4): what it wrote, or would.
+fn run(batch: trunkdb::Batch, dry_run: bool) -> trunkdb::Result<trunkdb::Written> {
+    if dry_run {
+        batch.dry_run()
+    } else {
+        batch.commit()
+    }
 }
 
 /// `trunkdb delete` (SPEC §156): the documents the filter finds.
@@ -1495,13 +1507,13 @@ fn delete(file: &str, collection: &str, args: &[&str], values: &Given) -> Outcom
     if let Some(refused) = touches_all(&docs, &filter, given.contains(&"--all"), "delete")? {
         return Ok(refused);
     }
-    if given.contains(&"--dry-run") {
-        let n = docs.count(filter).map_err(failed)?;
-        eprintln!("would delete {}", count(n, "document"));
-        return Ok(ExitCode::SUCCESS);
-    }
-    let n = docs.delete_many(filter).map_err(failed)?;
-    eprintln!("deleted {}", count(n, "document"));
+    // As for `update`: one op, rehearsed or committed (SPEC §184.2).
+    let dry_run = given.contains(&"--dry-run");
+    let mut batch = db.batch();
+    batch.delete_many(&docs, filter);
+    let n = run(batch, dry_run).map_err(failed)?.total();
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    eprintln!("{verb} {}", count(n, "document"));
     Ok(ExitCode::SUCCESS)
 }
 

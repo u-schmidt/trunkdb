@@ -1,11 +1,13 @@
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.Marshalling;
 using Microsoft.Win32.SafeHandles;
 
 namespace TrunkDb;
 
 /// <summary>
 /// The 36 functions of trunkdb.h, as C# calls them (SPEC §179). Text
-/// going in is marshalled as UTF-8 for the call; text coming out is an
+/// going in is marshalled as UTF-8 for the call, by <see cref="NulFreeUtf8"/>,
+/// which refuses a NUL in it (SPEC §184.1); text coming out is an
 /// <see cref="IntPtr"/>, copied and freed at once by <see cref="Take"/>.
 /// </summary>
 internal static partial class Native
@@ -34,7 +36,7 @@ internal static partial class Native
 
     // ---- The database ----
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_open(string path, string? options, out DatabaseHandle db);
 
     [LibraryImport(Library)]
@@ -55,91 +57,91 @@ internal static partial class Native
     [LibraryImport(Library)]
     internal static partial int trunkdb_collections(DatabaseHandle db, out IntPtr names);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_drop_collection(
         DatabaseHandle db, string collection, [MarshalAs(UnmanagedType.U1)] out bool dropped);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_export(DatabaseHandle db, string path, out IntPtr summary);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_import(
         DatabaseHandle db, string path, string? options, out IntPtr summary);
 
     // ---- Indexes ----
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_index_ensure(
         DatabaseHandle db, string collection, string fields, string? options,
         [MarshalAs(UnmanagedType.U1)] out bool created);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_index_drop(
         DatabaseHandle db, string collection, string fields,
         [MarshalAs(UnmanagedType.U1)] out bool dropped);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_indexes(DatabaseHandle db, string collection, out IntPtr indexes);
 
     // ---- Reads, of the database now or of a snapshot ----
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_get(
         DatabaseHandle db, SnapshotHandle snapshot, string collection, string id, out IntPtr document);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_find(
         DatabaseHandle db, SnapshotHandle snapshot, string collection, string? filter, string? parameters,
         out IntPtr documents);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_find_one(
         DatabaseHandle db, SnapshotHandle snapshot, string collection, string? filter, string? parameters,
         out IntPtr document);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_count(
         DatabaseHandle db, SnapshotHandle snapshot, string collection, string? filter, string? parameters,
         out ulong count);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_aggregate(
         DatabaseHandle db, SnapshotHandle snapshot, string collection, string? filter, string aggregate,
         string? parameters, out IntPtr rows);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_explain(
         DatabaseHandle db, SnapshotHandle snapshot, string collection, string? filter, string? parameters,
         out IntPtr explained);
 
     // ---- Writes ----
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_insert(DatabaseHandle db, string collection, string document, out IntPtr id);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_replace(
         DatabaseHandle db, string collection, string id, string document,
         [MarshalAs(UnmanagedType.U1)] out bool found);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_delete(
         DatabaseHandle db, string collection, string id, [MarshalAs(UnmanagedType.U1)] out bool found);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_update(
         DatabaseHandle db, string collection, string? filter, string? parameters, string update, out ulong count);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_delete_many(
         DatabaseHandle db, string collection, string? filter, string? parameters, out ulong count);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_upsert(
         DatabaseHandle db, string collection, string? filter, string? parameters, string update,
         out IntPtr id, [MarshalAs(UnmanagedType.U1)] out bool inserted);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_batch(
         DatabaseHandle db, string lines, string? parameters, [MarshalAs(UnmanagedType.U1)] bool dryRun,
         out IntPtr written);
@@ -152,7 +154,7 @@ internal static partial class Native
     [LibraryImport(Library)]
     internal static partial int trunkdb_snapshot_close(IntPtr snapshot);
 
-    [LibraryImport(Library, StringMarshalling = StringMarshalling.Utf8)]
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
     internal static partial int trunkdb_cursor_open(
         DatabaseHandle db, SnapshotHandle snapshot, string collection, string? filter, string? parameters,
         out CursorHandle cursor);
@@ -226,4 +228,31 @@ internal sealed class CursorHandle : SafeHandleZeroOrMinusOneIsInvalid
     public CursorHandle() : base(true) { }
 
     protected override bool ReleaseHandle() => Native.trunkdb_cursor_close(handle) == Native.Ok;
+}
+
+/// <summary>
+/// Text going in, as UTF-8 with its NUL at the end, as
+/// <see cref="Utf8StringMarshaller"/> makes it, but refused if it holds a
+/// NUL of its own (SPEC §184.1). The library reads up to the first NUL, so
+/// such text would reach it cut short: a filter without its last
+/// conditions, another collection's name, another file's path.
+/// </summary>
+[CustomMarshaller(typeof(string), MarshalMode.ManagedToUnmanagedIn, typeof(NulFreeUtf8))]
+internal static unsafe class NulFreeUtf8
+{
+    /// <exception cref="ArgumentException"><paramref name="managed"/> holds a NUL.</exception>
+    public static byte* ConvertToUnmanaged(string? managed)
+    {
+        var at = managed?.IndexOf('\0') ?? -1;
+        if (at >= 0)
+        {
+            throw new ArgumentException(
+                $"text passed to trunkdb holds a NUL character (\\0) at {at}, where the library would end it: " +
+                "it could name another collection or file, or lose a filter's conditions. " +
+                "Remove it; a value from outside goes in through parameters, which keep it.");
+        }
+        return Utf8StringMarshaller.ConvertToUnmanaged(managed);
+    }
+
+    public static void Free(byte* unmanaged) => Utf8StringMarshaller.Free(unmanaged);
 }

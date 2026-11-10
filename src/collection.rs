@@ -675,6 +675,13 @@ where
     /// Whether a document changed is judged after the round trip through
     /// `T`, so one written before a field was added to `T` counts as
     /// changed — it gets the field.
+    ///
+    /// **Each match is stored as the `T` it became, whole: a stored field
+    /// `T` doesn't declare is dropped,** even where `change` does nothing
+    /// (SPEC §184.3). An older build of an application, its `T` without a
+    /// field a newer one added, erases that field from every document it
+    /// touches this way. To change some fields and keep every other as it
+    /// is stored, use `update_fields`, or the untyped `update_many`.
     pub fn update_many(
         &self,
         filter: Filter,
@@ -4658,6 +4665,49 @@ mod tests {
             title: title.to_string(),
             owner: None,
         }
+    }
+
+    /// SPEC §184.3: the typed `update_many` stores each match as the `T`
+    /// it became, so a field `T` doesn't declare is dropped, even by a
+    /// closure that changes nothing; `update_fields` keeps it.
+    #[test]
+    fn a_typed_update_many_drops_the_fields_its_type_lacks() {
+        #[derive(Serialize, Deserialize)]
+        struct Older {
+            name: String,
+            age: i64,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let users = db.collection::<Document>("users");
+        let doc = |text: &str| text.parse::<Document>().unwrap();
+        let ada = users
+            .insert(doc(r#"{"name": "Ada", "age": 36, "email": "a@x"}"#))
+            .unwrap();
+        let bob = users
+            .insert(doc(r#"{"name": "Bob", "age": 41, "email": "b@x"}"#))
+            .unwrap();
+        let email = |id: &DocId| {
+            let Document::Object(fields) = users.get(id).unwrap().unwrap() else {
+                panic!("an object");
+            };
+            fields.get("email").cloned()
+        };
+
+        let older = db.collection::<Older>("users");
+        let changed = older
+            .update_many(Filter::new().eq("name", "Ada"), |_| {})
+            .unwrap();
+        assert_eq!(changed, 1, "written, though nothing was changed");
+        assert_eq!(email(&ada), None, "dropped");
+
+        older
+            .update_fields(
+                Filter::new().eq("name", "Bob"),
+                &crate::query::Update::new().inc("age", 1),
+            )
+            .unwrap();
+        assert_eq!(email(&bob), Some(Document::from("b@x")), "kept");
     }
 
     /// SPEC §74: a type without an id field, say from another crate, gets
