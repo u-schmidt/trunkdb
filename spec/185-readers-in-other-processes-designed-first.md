@@ -122,8 +122,8 @@ The rules:
   lock for a short bound (`OpenOptions::checkpoint_wait`; its default
   set in step 2, tens of milliseconds). std's locks either wait for
   good or not at all, so a bounded wait is `try_lock` again and again,
-  with short pauses; the same for `wait_for_readers` below. Readers that read per call are
-  done within it, and the checkpoint runs. If one isn't, a kept
+  with short pauses; the same for `wait_for_readers` below. Readers
+  that read per call are done within it, and the checkpoint runs. If one isn't, a kept
   snapshot, the writer opens the gate and goes on without the
   checkpoint (185.5). A commit so waits at most the bound, once per
   checkpoint due, never for as long as a reader reads. The writer never
@@ -305,14 +305,18 @@ second, well under `wait_for_readers` as it is unless set: so the
 writer gets the lock, writes, lets go of the database file, and opens
 the gate. An open whose `wait_for_readers` is set shorter than the
 reader's bound may still fail beside a reader. A kept snapshot (step 4
-of 185.8) can't begin again; it fails with `Error::SnapshotTooOld`, as
-when 185.5 ends it.
+of 185.8) that reads in that moment can't begin again; it fails with
+`Error::SnapshotTooOld`, as when 185.5 ends it.
 
-So the two platforms differ beside a kept snapshot, when an open has
-to write the file: on Windows the snapshot is ended and the open goes
-on; elsewhere the snapshot stays and the open fails with `WouldBlock`
-(185.4). Until step 5, whose request to let go ends the snapshot
-everywhere.
+**Only a reader that reads meets the lock.** A kept snapshot that
+reads nothing while the open waits, the forgotten one most of all,
+gets no refused read, so it never reaches its bound: it holds the
+readers' lock, and the open fails with `WouldBlock` after
+`wait_for_readers`, on Windows as elsewhere (185.4). So the platforms
+differ only beside a kept snapshot that happens to read during the
+wait: on Windows it is ended and the open goes on; elsewhere it stays
+and the open fails. Step 5's request to let go ends every snapshot,
+reading or not, on every platform.
 
 An older release that comes after that finds 17 and refuses: the format
 is checked before the header's checksum and before the WAL is opened
@@ -354,8 +358,9 @@ the bump now. To decide when step 1 is built.
    Readers that take a snapshot per call hold the lock for
    milliseconds, so the wait is short in practice; long only beside a
    kept snapshot (step 4 of 185.8), and step 5's request to let go can
-   then serve the open too. On Windows the kept snapshot is ended
-   instead, and the open goes on (185.6).
+   then serve the open too. On Windows a kept snapshot that reads
+   during the wait is ended instead, and the open goes on; one that
+   doesn't read fails the open as elsewhere (185.6).
 
    **Later, if needed:** recovery into memory instead, as a read-only
    open does it (§88.2): the torn tail cut, the WAL's session continued
@@ -414,8 +419,10 @@ A second reading of the corrections added:
    too, or its threads would starve the checkpoint (185.4).
 9. **On Windows a reader gives up a snapshot it can't finish** while
    an open that has to write holds the file, so that open's wait for
-   readers can end in its favour; a kept snapshot is ended there,
-   where elsewhere the open fails (185.6, 185.7).
+   readers can end in its favour; a kept snapshot that reads during
+   the wait is ended there, where elsewhere the open fails. One that
+   reads nothing meets no lock and fails the open on every platform
+   (185.6, 185.7).
 10. **A log taken back is §81,** which §128 only corrected; and a
     bounded wait is `try_lock` repeated, std having no lock with a
     timeout (185.4).
