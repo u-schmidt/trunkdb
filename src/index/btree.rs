@@ -998,6 +998,21 @@ fn insert_into_leaf(
     // every leaf half empty, since nothing lands left of them again
     // (SPEC §41). Each half gets an anchor of its own, so the byte count
     // is only a guide: where a half doesn't fit, other points are tried.
+    //
+    // A half's own anchor, its middle key, can pack it worse than the
+    // leaf's anchor did: a half whose middle key is short, beside long
+    // keys that shared a prefix with the old anchor, fit no point in a
+    // leaf a fuzzed program built (SPEC §186). So where a half doesn't
+    // fit with its middle key, it is tried with the old anchor too. That
+    // always finds a point: everything but the new key fit with that
+    // anchor, so the half without the new key does; and of the two
+    // points beside it, one leaves the new key with at most half the old
+    // bytes, which leaves room for a key of up to `MAX_KEY_LEN`.
+    let old_anchor = leaf.anchor.map(<[u8]>::to_vec).unwrap_or_default();
+    let build = |entries: &[(Vec<u8>, RecordLocation)], next: PageId| {
+        build_leaf_page(entries, next)
+            .or_else(|| build_leaf_page_anchored(entries, next, &old_anchor))
+    };
     let appends = pos == entries.len() - 1 && next_page == 0;
     let n = entries.len();
     let by_bytes = byte_midpoint(entries.iter().map(|(k, _)| k.len() + 10));
@@ -1016,12 +1031,12 @@ fn insert_into_leaf(
     for mid in candidates.filter(|&mid| 0 < mid && mid < n) {
         let left = match &kept {
             Some(kept) if mid == pos => Some(kept.clone()),
-            _ => build_leaf_page(&entries[..mid], new_right_id),
+            _ => build(&entries[..mid], new_right_id),
         };
         let Some(left) = left else {
             continue;
         };
-        let Some(right) = build_leaf_page(&entries[mid..], next_page) else {
+        let Some(right) = build(&entries[mid..], next_page) else {
             continue;
         };
         // Smallest key of the right half, copied up (leaves keep it too).
@@ -1191,9 +1206,18 @@ fn build_leaf_page(
     entries: &[(Vec<u8>, RecordLocation)],
     next_page: PageId,
 ) -> Option<SlottedPage> {
+    build_leaf_page_anchored(entries, next_page, anchor_of(entries))
+}
+
+/// A packed leaf of `entries` around `anchor`, which needn't be one of
+/// their keys: entries keep only how much of it they share.
+fn build_leaf_page_anchored(
+    entries: &[(Vec<u8>, RecordLocation)],
+    next_page: PageId,
+    anchor: &[u8],
+) -> Option<SlottedPage> {
     let mut page = SlottedPage::new(PageType::IndexLeafPacked);
     page.set_next_page(next_page);
-    let anchor = anchor_of(entries);
     page.insert_cell(&encode_anchor(anchor))?;
     for (key, loc) in entries {
         page.insert_cell(&encode_packed(anchor, key, *loc))?;
@@ -2429,5 +2453,595 @@ mod tests {
             .map(|(_, loc)| loc.slot)
             .collect();
         assert_eq!(slots, vec![3, 4]);
+    }
+
+    /// A leaf a fuzzed program built (SPEC §186): short keys among long
+    /// ones that share long prefixes with the leaf's anchor. With its
+    /// middle key as its anchor no half fit at any point: the left half's
+    /// middle is a short key, and the right one's shares too little with
+    /// the longest keys. Each half fits with the old anchor.
+    #[test]
+    fn a_leaf_splits_where_no_half_fits_its_own_middle_key() {
+        enum Part<'a> {
+            B(&'a [u8]),
+            Y(usize),
+        }
+        use Part::{B, Y};
+        fn key(parts: &[Part]) -> Vec<u8> {
+            let mut key = Vec::new();
+            for part in parts {
+                match part {
+                    B(bytes) => key.extend_from_slice(bytes),
+                    Y(n) => key.extend(std::iter::repeat_n(b'y', *n)),
+                }
+            }
+            key
+        }
+        let anchor = key(&[
+            B(&[3]),
+            Y(501),
+            B(&[0, 0, 3]),
+            Y(501),
+            B(&[0, 0, 220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        ]);
+        let entries: Vec<(Vec<u8>, RecordLocation)> = vec![
+            (
+                key(&[B(&[
+                    0, 2, 191, 240, 0, 0, 0, 0, 0, 0, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    10,
+                ])]),
+                RecordLocation { page: 9, slot: 2 },
+            ),
+            (
+                key(&[B(&[
+                    0, 2, 192, 28, 0, 0, 0, 0, 0, 0, 163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    55,
+                ])]),
+                RecordLocation { page: 32, slot: 0 },
+            ),
+            (
+                key(&[B(&[
+                    0, 2, 192, 28, 0, 0, 0, 0, 0, 0, 253, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    6,
+                ])]),
+                RecordLocation { page: 8, slot: 1 },
+            ),
+            (
+                key(&[B(&[
+                    0, 3, 97, 98, 0, 0, 137, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65,
+                ])]),
+                RecordLocation { page: 35, slot: 2 },
+            ),
+            (
+                key(&[B(&[
+                    0, 3, 115, 52, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 11,
+                ])]),
+                RecordLocation { page: 9, slot: 3 },
+            ),
+            (
+                key(&[
+                    B(&[0, 3]),
+                    Y(400),
+                    B(&[
+                        50, 49, 0, 0, 233, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19,
+                    ]),
+                ]),
+                RecordLocation { page: 11, slot: 2 },
+            ),
+            (
+                key(&[
+                    B(&[0, 3]),
+                    Y(501),
+                    B(&[0, 0, 104, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 62]),
+                ]),
+                RecordLocation { page: 32, slot: 4 },
+            ),
+            (
+                key(&[
+                    B(&[0, 3]),
+                    Y(501),
+                    B(&[0, 0, 227, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 41]),
+                ]),
+                RecordLocation { page: 21, slot: 2 },
+            ),
+            (
+                key(&[B(&[
+                    2, 64, 15, 255, 255, 255, 255, 255, 255, 3, 115, 53, 0, 0, 167, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+                ])]),
+                RecordLocation { page: 8, slot: 0 },
+            ),
+            (
+                key(&[B(&[
+                    2, 192, 0, 0, 0, 0, 0, 0, 0, 3, 115, 50, 0, 0, 191, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 67,
+                ])]),
+                RecordLocation { page: 30, slot: 2 },
+            ),
+            (
+                key(&[B(&[
+                    2, 192, 8, 0, 0, 0, 0, 0, 0, 2, 128, 0, 0, 0, 0, 0, 0, 0, 240, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 69,
+                ])]),
+                RecordLocation { page: 35, slot: 3 },
+            ),
+            (
+                key(&[B(&[
+                    2, 192, 20, 0, 0, 0, 0, 0, 0, 0, 214, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    68,
+                ])]),
+                RecordLocation { page: 31, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[2, 192, 28, 0, 0, 0, 0, 0, 0, 3]),
+                    Y(400),
+                    B(&[
+                        50, 50, 52, 0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 27,
+                    ]),
+                ]),
+                RecordLocation { page: 13, slot: 3 },
+            ),
+            (
+                key(&[B(&[
+                    3, 83, 84, 82, 65, 83, 83, 69, 0, 0, 3, 83, 84, 82, 65, 83, 83, 69, 0, 0, 166,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61,
+                ])]),
+                RecordLocation { page: 32, slot: 3 },
+            ),
+            (
+                key(&[B(&[
+                    3, 115, 49, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37,
+                ])]),
+                RecordLocation { page: 20, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3, 115, 49, 0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64]),
+                ]),
+                RecordLocation { page: 35, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3, 115, 50, 0, 0, 3]),
+                    Y(400),
+                    B(&[57, 0, 0, 142, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 56]),
+                ]),
+                RecordLocation { page: 32, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3, 115, 50, 0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 240, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21]),
+                ]),
+                RecordLocation { page: 12, slot: 1 },
+            ),
+            (
+                key(&[B(&[
+                    3, 115, 51, 0, 0, 3, 97, 98, 0, 0, 157, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 22,
+                ])]),
+                RecordLocation { page: 6, slot: 3 },
+            ),
+            (
+                key(&[
+                    B(&[3, 115, 53, 0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 62, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52]),
+                ]),
+                RecordLocation { page: 20, slot: 3 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[
+                        49, 0, 0, 2, 192, 24, 0, 0, 0, 0, 0, 0, 172, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 31,
+                    ]),
+                ]),
+                RecordLocation { page: 14, slot: 3 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[49, 0, 0, 3]),
+                    Y(400),
+                    B(&[52, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50]),
+                ]),
+                RecordLocation { page: 27, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[49, 0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 191, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24]),
+                ]),
+                RecordLocation { page: 13, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[
+                        49, 57, 57, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 14,
+                    ]),
+                ]),
+                RecordLocation { page: 10, slot: 2 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[50, 0, 0, 3]),
+                    Y(340),
+                    B(&[50, 0, 0, 136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 54]),
+                ]),
+                RecordLocation { page: 31, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[
+                        50, 49, 48, 0, 0, 2, 192, 8, 0, 0, 0, 0, 0, 0, 191, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 40,
+                    ]),
+                ]),
+                RecordLocation { page: 21, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[50, 50, 52, 0, 0, 3]),
+                    Y(400),
+                    B(&[53, 0, 0, 158, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 71]),
+                ]),
+                RecordLocation { page: 36, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[
+                        51, 0, 0, 0, 185, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 38,
+                    ]),
+                ]),
+                RecordLocation { page: 20, slot: 2 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[54, 0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]),
+                ]),
+                RecordLocation { page: 7, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(400),
+                    B(&[
+                        55, 48, 0, 0, 0, 91, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+                    ]),
+                ]),
+                RecordLocation { page: 6, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8]),
+                ]),
+                RecordLocation { page: 9, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 0, 33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16]),
+                ]),
+                RecordLocation { page: 11, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 0, 57, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 43]),
+                ]),
+                RecordLocation { page: 22, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 0, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 33]),
+                ]),
+                RecordLocation { page: 19, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 0, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23]),
+                ]),
+                RecordLocation { page: 13, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 0, 244, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 26]),
+                ]),
+                RecordLocation { page: 13, slot: 2 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[
+                        0, 0, 2, 192, 16, 0, 0, 0, 0, 0, 0, 152, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 9,
+                    ]),
+                ]),
+                RecordLocation { page: 9, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[
+                        0, 0, 2, 192, 24, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 49,
+                    ]),
+                ]),
+                RecordLocation { page: 26, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[
+                        0, 0, 3, 83, 84, 82, 65, 83, 83, 69, 0, 0, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 20,
+                    ]),
+                ]),
+                RecordLocation { page: 12, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[
+                        0, 0, 3, 97, 98, 0, 0, 163, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 35,
+                    ]),
+                ]),
+                RecordLocation { page: 19, slot: 2 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[
+                        0, 0, 3, 115, 51, 0, 0, 185, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 48,
+                    ]),
+                ]),
+                RecordLocation { page: 26, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[
+                        0, 0, 3, 115, 51, 0, 0, 231, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30,
+                    ]),
+                ]),
+                RecordLocation { page: 14, slot: 2 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[
+                        0, 0, 3, 115, 55, 0, 0, 190, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36,
+                    ]),
+                ]),
+                RecordLocation { page: 20, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(400),
+                    B(&[
+                        49, 53, 55, 0, 0, 103, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 29,
+                    ]),
+                ]),
+                RecordLocation { page: 14, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 34]),
+                ]),
+                RecordLocation { page: 19, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 28]),
+                ]),
+                RecordLocation { page: 14, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12]),
+                ]),
+                RecordLocation { page: 10, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 39]),
+                ]),
+                RecordLocation { page: 21, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 94, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 59]),
+                ]),
+                RecordLocation { page: 30, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 105, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 47]),
+                ]),
+                RecordLocation { page: 23, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 123, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 45]),
+                ]),
+                RecordLocation { page: 22, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 168, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13]),
+                ]),
+                RecordLocation { page: 10, slot: 1 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 173, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 53]),
+                ]),
+                RecordLocation { page: 30, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 46]),
+                ]),
+                RecordLocation { page: 23, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 205, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32]),
+                ]),
+                RecordLocation { page: 14, slot: 4 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 206, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 63]),
+                ]),
+                RecordLocation { page: 35, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                ]),
+                RecordLocation { page: 6, slot: 0 },
+            ),
+            (
+                key(&[
+                    B(&[3]),
+                    Y(501),
+                    B(&[0, 0, 3]),
+                    Y(501),
+                    B(&[0, 0, 244, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]),
+                ]),
+                RecordLocation { page: 7, slot: 0 },
+            ),
+            (
+                key(&[B(&[
+                    255, 3, 115, 49, 0, 0, 94, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 51,
+                ])]),
+                RecordLocation { page: 27, slot: 1 },
+            ),
+        ];
+        // The leaf as it was, before the entry at 26 came.
+        let (new_key, new_loc) = entries[26].clone();
+        let old: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != 26)
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        let leaf = build_leaf_page_anchored(&old, 0, &anchor).expect("the leaf fit");
+        for mid in 1..entries.len() {
+            assert!(
+                build_leaf_page(&entries[..mid], 0).is_none()
+                    || build_leaf_page(&entries[mid..], 0).is_none(),
+                "a split at {mid} fits with the halves' own anchors: no longer the case"
+            );
+        }
+
+        let (_dir, mut store, mut index) = fresh();
+        store.write_page(index.root, leaf.into_page()).unwrap();
+        index.insert(&mut store, &new_key, new_loc).unwrap();
+
+        let root = SlottedPage::from_bytes(store.read_page(index.root).unwrap()).unwrap();
+        assert_eq!(root.page_type(), PageType::IndexBranch, "the leaf split");
+        for (key, loc) in &entries {
+            assert_eq!(index.lookup(&store, key).unwrap(), Some(*loc));
+        }
+        assert_eq!(index.scan(&store).unwrap(), entries);
     }
 }
