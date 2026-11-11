@@ -23,6 +23,9 @@ jobs:
       - run: cargo test --all-targets
       # `#[trunkdb::document]` and its compile-fail tests (SPEC §114).
       - run: cargo test --features derive
+      # What each platform's file locks do, as SPEC §185.6 assumes it,
+      # printed into the log.
+      - run: cargo test --test platform_locks -- --nocapture --test-threads 1
 
   ffi:
     name: C ABI and C# (${{ matrix.os }}; SPEC §179, §180)
