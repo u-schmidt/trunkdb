@@ -2,7 +2,8 @@
 
 **A draft, 2026-11-11: designed, not built.** Its four questions are
 decided (185.4, 185.5, 185.6; listed in 185.7). Reviewed against the
-code the same day, and corrected: 185.10 lists what changed.
+code the same day, and corrected: 185.10 lists what changed. What it
+assumes of the platforms' locks is tested, and holds (185.11).
 
 A database file has one process at a time (§21). A read-only open goes
 beside other read-only opens, but not beside a program that writes
@@ -163,8 +164,9 @@ reading one at an open, where nobody writes it (§19.3, §91):
 - **Damage may be the writer at work.** At an open, a bad checksum
   before the tail is an error, and so is a record that doesn't decode.
   Beside a writer, the end the reader took may lie in a record half
-  written; on Windows a file's new length may show before its bytes,
-  which read as zeros (to be confirmed in step 1's test), and a prefix
+  written; a file's new length may show before its bytes, which read
+  as zeros (not seen on any platform in step 1's test, 185.11, but
+  not ruled out, and reading again costs nothing), and a prefix
   of zeros passes the checksum of an empty body. And the WAL may be cut
   under the reader: by a failed log taken back, or by an open's cut of
   a torn tail. So a reader that finds damage, or the file shorter than
@@ -243,8 +245,9 @@ writing it, and a shared one keeps every process from writing it. A
 writer holding the database file, as today, would keep readers from
 reading it; readers holding it shared would keep the writer's
 checkpoint from writing it; a readers' lock on the WAL would keep the
-writer from appending. (To be confirmed by a test on Windows CI first,
-step 1 of 185.8.)
+writer from appending. (Confirmed on Windows CI, 185.11: every one of
+these refused with a lock violation, the shared lock's own handle
+included.)
 
 **Three lock files, with std's locks:** `<path>.writer`,
 `<path>.readers` and `<path>.gate`, one lock each, as std's locks are
@@ -261,8 +264,8 @@ whole-file. Another may come with 185.5's request to let go.
   its open, before it lets go of the database file (below): where a
   writer has been, they are there.
 - **Opened for reading only by a reader that may not write them.** A
-  lock needs a handle, not the right to write (`flock`; `LockFileEx`
-  wants read or write access, in step 1's test). So a reader in a
+  lock needs a handle, not the right to write: a read-only handle
+  takes both locks on Linux, macOS and Windows (185.11). So a reader in a
   directory it can't write still takes part, once the files are there.
 - **Never removed,** by anyone. A lock file removed while another
   process opens it leaves two files, and two "exclusive" locks.
@@ -292,7 +295,9 @@ free, and this one keeps a refused open from disturbing anyone. Between
 2 and 4 the file is locked on Windows, and a reader in the middle of a
 snapshot has its reads fail there for that moment: **a reader on
 Windows tries a read again that failed with a lock violation,** for a
-bounded time (in step 1's test).
+bounded time: the error is `ERROR_LOCK_VIOLATION` (33), which std
+reports as `ErrorKind::Uncategorized`, so the reader matches the raw
+code (185.11).
 
 That moment is long when the open has to write the file: in step 3 the
 writer holds the database file and waits for the readers' lock, up to
@@ -374,7 +379,7 @@ the bump now. To decide when step 1 is built.
 ## 185.8 Steps, a section each
 | Step | What | Seen from outside |
 |---|---|---|
-| 1 | Windows' lock behaviour tested on CI (what a lock keeps out, a lock through a read-only handle, a read that meets a lock, a length before its bytes); locks moved to the three lock files, the writer's first; format 17, stamped by a writer's open; a read-only open of a file at 16, or without lock files it can make, as §88 | older releases refuse a stamped file |
+| 1 | ~~Windows' lock behaviour tested on CI~~ (done, 185.11); locks moved to the three lock files, the writer's first; format 17, stamped by a writer's open; a read-only open of a file at 16, or without lock files it can make, as §88 | older releases refuse a stamped file |
 | 2 | A read-only open beside a writer: a snapshot per call, through the gate, built from the file and the WAL's batches under the readers' lock, read again where the writer was at work; checkpoints skipped while a reader holds it, tried again through the gate, and counted; an open that has to write the file waits `wait_for_readers` for readers | the feature, with the WAL and the writer's memory growing past a long reader |
 | 3 | The reader that catches up: same sessions and its last record as it was, the new records only; else start again | readers cheap to refresh |
 | 4 | A snapshot a reader keeps (`Database::snapshot` on a read-only open beside a writer) | as §82, across processes |
@@ -426,3 +431,35 @@ A second reading of the corrections added:
 10. **A log taken back is §81,** which §128 only corrected; and a
     bounded wait is `try_lock` repeated, std having no lock with a
     timeout (185.4).
+
+## 185.11 What the platforms' locks do, tested
+Before step 1, a test of what this design assumes of std's locks:
+`tests/platform_locks.rs`, run on CI on Linux, macOS and Windows,
+2026-11-11, and printed into the log. Two handles in one process stand
+for two processes: `flock` conflicts between two opens of a file, and
+`LockFileEx` applies to every handle but the one that took it.
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| another handle reads beside an exclusive lock | yes | yes | refused, 33 |
+| another handle writes beside an exclusive lock | yes | yes | refused, 33 |
+| another handle writes beside a shared lock | yes | yes | refused, 33 |
+| the shared lock's own handle writes | yes | yes | refused, 33 |
+| another handle reads beside a shared lock | yes | yes | yes |
+| a read-only handle takes a shared lock | yes | yes | yes |
+| a read-only handle takes an exclusive lock | yes | yes | yes |
+| a file's length seen before its bytes | 0 of 2,427 | 0 of 3,230 | 0 of 2,258 |
+
+33 is `ERROR_LOCK_VIOLATION`, which std reports as
+`ErrorKind::Uncategorized`. Locks on empty files exclude as the gate
+and the readers' lock need, on all three.
+
+So 185.6 stands as written: no lock on a file anyone reads or writes,
+and readers that can't write the directory still take part. The last
+row is a count, not a proof: a page-sized append was never seen
+before its bytes, by a reader looking at the end as fast as it could.
+The reader's rule to read again before it reports damage (185.4) stays,
+for a WAL cut back under it anyway.
+
+The test stays in the suite: the design rests on these answers, and a
+change in std's locks, `flock` or `LockFileEx` would fail it.
