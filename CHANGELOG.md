@@ -1341,3 +1341,18 @@ limit, batches and a write-ahead log. Since then:
     non-exhaustive). `trunkdb update --upsert` refuses a filter with a
     sort, `limit` or `offset`, which the run ignored before. In .NET,
     text with a NUL throws `ArgumentException`.
+159. **A leaf split around its old anchor** (§186), found by the
+    `queries` fuzz target's random programs on CI. An insert into a
+    full index leaf could fail with "index leaf can't be split so that
+    each half fits", refusing the batch, and every later insert into
+    that leaf with it. Each half of a split took its middle key as its
+    anchor (§171), which can pack it much worse than the leaf's anchor
+    did: in a leaf of short keys among long ones that share long
+    prefixes, no point fit. A half that doesn't fit around its middle
+    key is now built around the old anchor too, which always finds a
+    point. Nothing was ever damaged. Since 0.34.0, whose leaves are
+    stored after an anchor; it takes keys of hundreds of bytes sharing
+    long prefixes, with short ones between them.
+
+    Item 159 → 0.39.0, the fix alone. File format 16, WAL version 4
+    and export version 4, as in 0.38.0, so no fixture.
