@@ -51,7 +51,7 @@ files per inode.
   appending reads as a torn tail, which is ignored (§19.3, §88.2). So a
   snapshot in a reader is a length of the WAL: every whole batch
   before it. Two things a reader has to allow for, both in 185.4: the
-  WAL is cut back when a log fails (§128), and a record is in the file
+  WAL is cut back when a log fails (§81, §128), and a record is in the file
   before it is flushed.
 - **A change counter.** The `session` of §183 is new with the first
   batch logged after the WAL was empty: in the WAL's header at once, in
@@ -97,6 +97,14 @@ Three locks, besides what §21 and §88 take:
 - **The readers' lock:** shared, held by a reader for as long as a
   snapshot of its own is open, and only then. One lock for the process:
   its snapshots and threads count who holds it, and the last lets go.
+  **Every new snapshot passes the gate,** also one that only counts up
+  because the process holds the lock already: it takes the gate shared
+  and lets go of it, waiting while the writer has it shut. Otherwise
+  threads of one process, reading in turn, would keep the count above
+  zero, and starve the checkpoint as the gate is there to prevent. A
+  thread that holds a snapshot and begins another waits there too,
+  while the writer waits for the one it holds: neither for longer than
+  the writer's bound, after which the gate opens.
 - **The gate:** what a reader passes before it takes the readers' lock,
   and what the writer shuts to get a turn. Without it readers that each
   read for milliseconds, one overlapping the next, keep the readers'
@@ -112,7 +120,9 @@ The rules:
   next commit tries again, this time **through the gate**: it takes the
   gate exclusively, so no new reader begins, and waits for the readers'
   lock for a short bound (`OpenOptions::checkpoint_wait`; its default
-  set in step 2, tens of milliseconds). Readers that read per call are
+  set in step 2, tens of milliseconds). std's locks either wait for
+  good or not at all, so a bounded wait is `try_lock` again and again,
+  with short pauses; the same for `wait_for_readers` below. Readers that read per call are
   done within it, and the checkpoint runs. If one isn't, a kept
   snapshot, the writer opens the gate and goes on without the
   checkpoint (185.5). A commit so waits at most the bound, once per
@@ -162,7 +172,7 @@ reading one at an open, where nobody writes it (§19.3, §91):
   times, before it reports damage.
 - **A batch may be seen before it is durable.** `log` writes a record
   and then flushes it; if the flush fails, the record is cut off again
-  (§128), and the batch fails. A reader between the two sees a batch
+  (§81, §128), and the batch fails. A reader between the two sees a batch
   that never committed. For a snapshot per call that is a state no
   later snapshot shows, and it is said so in the docs. It is not made
   impossible: that would need the writer to say how far it flushed,
@@ -284,6 +294,26 @@ snapshot has its reads fail there for that moment: **a reader on
 Windows tries a read again that failed with a lock violation,** for a
 bounded time (in step 1's test).
 
+That moment is long when the open has to write the file: in step 3 the
+writer holds the database file and waits for the readers' lock, up to
+`wait_for_readers`. A reader can't finish its snapshot then, since every
+read fails, so the wait would only end with the writer's open failing.
+So **a reader that is still refused at its bound gives up its
+snapshot:** it lets go of the readers' lock and begins the call again,
+through the gate, which the writer has shut. Its bound is fixed, a
+second, well under `wait_for_readers` as it is unless set: so the
+writer gets the lock, writes, lets go of the database file, and opens
+the gate. An open whose `wait_for_readers` is set shorter than the
+reader's bound may still fail beside a reader. A kept snapshot (step 4
+of 185.8) can't begin again; it fails with `Error::SnapshotTooOld`, as
+when 185.5 ends it.
+
+So the two platforms differ beside a kept snapshot, when an open has
+to write the file: on Windows the snapshot is ended and the open goes
+on; elsewhere the snapshot stays and the open fails with `WouldBlock`
+(185.4). Until step 5, whose request to let go ends the snapshot
+everywhere.
+
 An older release that comes after that finds 17 and refuses: the format
 is checked before the header's checksum and before the WAL is opened
 (`Header::decode`), so even a header read while a checkpoint writes it
@@ -324,7 +354,8 @@ the bump now. To decide when step 1 is built.
    Readers that take a snapshot per call hold the lock for
    milliseconds, so the wait is short in practice; long only beside a
    kept snapshot (step 4 of 185.8), and step 5's request to let go can
-   then serve the open too.
+   then serve the open too. On Windows the kept snapshot is ended
+   instead, and the open goes on (185.6).
 
    **Later, if needed:** recovery into memory instead, as a read-only
    open does it (§88.2): the torn tail cut, the WAL's session continued
@@ -376,3 +407,15 @@ format 17 against older releases. What changed:
 7. **The session** is new with the first batch after an empty WAL, not
    after the checkpoint; a reader's index holds places, not images
    (185.2); the readers' lock is counted within a process (185.4).
+
+A second reading of the corrections added:
+
+8. **A snapshot in a process that reads already** passes the gate
+   too, or its threads would starve the checkpoint (185.4).
+9. **On Windows a reader gives up a snapshot it can't finish** while
+   an open that has to write holds the file, so that open's wait for
+   readers can end in its favour; a kept snapshot is ended there,
+   where elsewhere the open fails (185.6, 185.7).
+10. **A log taken back is §81,** which §128 only corrected; and a
+    bounded wait is `try_lock` repeated, std having no lock with a
+    timeout (185.4).
