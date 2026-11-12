@@ -75,6 +75,13 @@ impl SnapshotStore<'_> {
         self.pages.damaged(self.commit.header.page_count)
     }
 
+    /// Whether the snapshot has been ended, by the memory limit (SPEC
+    /// §83) or its process letting go when asked (§189): its reads fail
+    /// as too old from then on, and what it read may be half of it.
+    pub(crate) fn is_ended(&self) -> bool {
+        self.commit.seq < self.pages.ended_before() || self.pages.let_go()
+    }
+
     fn read_only<T>() -> io::Result<T> {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

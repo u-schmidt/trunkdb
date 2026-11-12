@@ -1595,8 +1595,8 @@ mod tests {
         let db = Database::open(&path).unwrap();
         assert_eq!(
             syncs() - before,
-            5,
-            "the file, its WAL and its three lock files"
+            6,
+            "the file, its WAL, its three lock files and the request to let go"
         );
         drop(db);
 

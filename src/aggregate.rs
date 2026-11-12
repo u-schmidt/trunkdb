@@ -879,24 +879,24 @@ impl Wide {
         let wide = u128::from(value) << bit;
         let parts = [wide as u64, (wide >> 64) as u64];
         let mut carry = false;
-        for i in limb..LIMBS {
-            let part = parts.get(i - limb).copied().unwrap_or(0);
-            if part == 0 && !carry && i >= limb + 2 {
+        for (j, limb) in self.0.iter_mut().skip(limb).enumerate() {
+            let part = parts.get(j).copied().unwrap_or(0);
+            if part == 0 && !carry && j >= 2 {
                 break;
             }
             let (sum, over) = match negative {
                 false => {
-                    let (a, o1) = self.0[i].overflowing_add(part);
+                    let (a, o1) = limb.overflowing_add(part);
                     let (b, o2) = a.overflowing_add(u64::from(carry));
                     (b, o1 || o2)
                 }
                 true => {
-                    let (a, o1) = self.0[i].overflowing_sub(part);
+                    let (a, o1) = limb.overflowing_sub(part);
                     let (b, o2) = a.overflowing_sub(u64::from(carry));
                     (b, o1 || o2)
                 }
             };
-            self.0[i] = sum;
+            *limb = sum;
             carry = over;
         }
     }

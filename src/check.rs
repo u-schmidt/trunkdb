@@ -91,7 +91,10 @@ impl Database {
     ///
     /// Problems are collected, not returned as errors: a damaged index
     /// doesn't stop the rest from being checked. A read like any other
-    /// on one snapshot (SPEC §80): reads and writes go on beside it.
+    /// on one snapshot (SPEC §80): reads and writes go on beside it. A
+    /// snapshot ended while it is checked, by the memory limit or as
+    /// asked by a writer in another process, is `Error::SnapshotTooOld`,
+    /// not a report (SPEC §189.7).
     pub fn check(&self) -> crate::Result<CheckReport> {
         Self::check_of(&self.read()?)
     }
@@ -156,6 +159,12 @@ impl Database {
 
         cells_apart(&mut check, store);
 
+        // Ended while it checked: what failed to read is no problem of the
+        // file, and a page the scan read may have been half written by a
+        // writer in another process (SPEC §189.7).
+        if store.is_ended() {
+            return Err(crate::Error::SnapshotTooOld);
+        }
         if check.incomplete {
             // Whatever couldn't be read may own pages: each would look
             // leaked.

@@ -266,7 +266,7 @@ fn info(file: &str, db: &Database) -> Outcome {
     let mut text = String::new();
     let gathered = info_text(file, db, &mut text);
     if let Err(e) = io::stdout().lock().write_all(text.as_bytes()) {
-        stopped_writing(e)?;
+        let _ = stopped_writing(e)?;
     }
     gathered.map(|()| ExitCode::SUCCESS)
 }
@@ -502,7 +502,7 @@ fn print_json(value: &serde_json::Value) -> Outcome {
 fn check(db: &Database, format: Format) -> Outcome {
     let report = db.check().map_err(|e| e.to_string())?;
     if format == Format::Json {
-        print_json(&serde_json::json!({
+        let _ = print_json(&serde_json::json!({
             "ok": report.is_ok(),
             "collections": report.collections,
             "documents": report.documents,

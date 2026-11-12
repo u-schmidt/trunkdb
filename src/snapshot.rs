@@ -102,18 +102,23 @@ pub struct SnapshotInfo {
     /// a reader: how far past `OpenOptions::checkpoint_wal_bytes` readers
     /// took it.
     pub largest_wal_skipped: u64,
+    /// How many times a checkpoint asked readers in other processes to
+    /// let go, the WAL past `OpenOptions::let_go_wal_bytes` (SPEC §189):
+    /// their snapshots were ended then.
+    pub readers_asked: u64,
 }
 
 impl Database {
     /// How much memory open snapshots take right now, and whether the
     /// limit on it has ended any (SPEC §83); and how often readers in
-    /// other processes kept a checkpoint out (SPEC §185.5). What is kept for a snapshot
+    /// other processes kept a checkpoint out (SPEC §185.5), and asked
+    /// them to let go (SPEC §189). What is kept for a snapshot
     /// that has been dropped is let go at the next write of each page, or
     /// the next checkpoint, so this can lag behind.
     pub fn snapshot_info(&self) -> SnapshotInfo {
         let (kept_pages, limit_pages, ended) = self.versions_kept();
         let bytes = |pages: usize| pages as u64 * crate::storage::PAGE_SIZE as u64;
-        let (checkpoints_skipped, largest_wal_skipped) = self.checkpoints_skipped();
+        let (checkpoints_skipped, largest_wal_skipped, readers_asked) = self.checkpoints_skipped();
         SnapshotInfo {
             kept_pages,
             kept_bytes: bytes(kept_pages),
@@ -121,6 +126,7 @@ impl Database {
             ended,
             checkpoints_skipped,
             largest_wal_skipped,
+            readers_asked,
         }
     }
 

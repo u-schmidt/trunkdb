@@ -49,6 +49,13 @@ pub(crate) struct Pages {
     /// (`TooOld`), so that the reader lets go of the readers' lock and
     /// the open waiting for it goes on.
     pub(super) beside_writer: bool,
+    /// A reader's beside a writer (SPEC §189): the count of the times its
+    /// process let go of the readers' lock when asked, and that count as
+    /// it was when these pages were built. Once it has moved, a writer
+    /// may be writing the file, and every read fails as too old: checked
+    /// before a read, and after a read of the file, which may have come
+    /// after the writer's.
+    pub(super) ended: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
     /// Test-only fault injection: while non-zero, each `checkpoint`
     /// writes `write_back_fails_after` pages, then fails (and decrements
     /// this) — leaving the file genuinely half-written, like a crash or a
@@ -215,6 +222,7 @@ impl Pages {
         Pages {
             file,
             beside_writer: false,
+            ended: None,
             memory: RwLock::new(Memory {
                 cache: PageCache::new(cache_pages),
                 versions: BTreeMap::new(),
@@ -282,6 +290,9 @@ impl Pages {
     /// the writer was told is open (`commit`, `checkpoint`). No bounds
     /// check — callers do that.
     pub(super) fn read_at(&self, id: PageId, seq: u64) -> io::Result<Page> {
+        if self.let_go() {
+            return Err(too_old());
+        }
         loop {
             let epoch = {
                 let memory = self.memory();
@@ -319,6 +330,10 @@ impl Pages {
             // page and a checkpoint written it: only a checkpoint begun
             // since can have, and that shows in the count.
             let read = self.read_file_page(id);
+            if self.let_go() {
+                // Maybe read after a writer wrote it.
+                return Err(too_old());
+            }
             let mut memory = self.memory_mut();
             if memory.file_epoch != epoch {
                 // Maybe half written, maybe too new: look again. The
@@ -330,6 +345,14 @@ impl Pages {
             memory.cache.put(id, page.clone());
             return Ok(page);
         }
+    }
+
+    /// Whether these are a reader's pages whose process has let go of
+    /// the readers' lock since they were built, as asked (SPEC §189).
+    pub(crate) fn let_go(&self) -> bool {
+        self.ended
+            .as_ref()
+            .is_some_and(|(count, at)| count.load(std::sync::atomic::Ordering::SeqCst) != *at)
     }
 
     /// A page from the file, for `read_at`; tried again where a writer's
@@ -362,7 +385,9 @@ impl Pages {
     /// change from outside trunkdb leaves. Reads the file itself. Pages
     /// not written back yet are skipped: the WAL holds them, and the
     /// file's copy is older or missing (SPEC §51). A page read while a
-    /// checkpoint began is read again, as in `read_at`.
+    /// checkpoint began is read again, as in `read_at`. `TooOld` once a
+    /// reader's process has let go (SPEC §189.7): a writer in another
+    /// process may be writing what it reads.
     pub(super) fn damaged(&self, page_count: u64) -> io::Result<Vec<PageId>> {
         let mut damaged = Vec::new();
         for id in 0..page_count {
@@ -380,7 +405,17 @@ impl Pages {
                     }
                     memory.file_epoch
                 };
+                #[cfg(test)]
+                {
+                    let hook = self.before_file_read.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
                 let disk = read_disk_page(&self.file, id);
+                if self.let_go() {
+                    return Err(too_old());
+                }
                 if self.memory().file_epoch != epoch {
                     continue;
                 }

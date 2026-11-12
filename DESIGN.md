@@ -89,7 +89,11 @@ number of read-only opens in other processes read beside it, each call
 on a snapshot of the file and the WAL as they are, holding `.readers`
 shared while it reads. A reader keeps what it built, and the next call
 reads only the batches the WAL gained since, starting again from the
-file after a checkpoint [§188](spec/188-a-reader-that-catches-up.md). Whatever writes the file, a
+file after a checkpoint [§188](spec/188-a-reader-that-catches-up.md).
+Past a second limit of the WAL's length, a checkpoint asks the readers
+to let go, through `<path>.letgo`; a watcher thread in each reading
+process ends its snapshots, a forgotten one too
+[§189](spec/189-a-reader-too-long-is-asked-to-let-go.md). Whatever writes the file, a
 checkpoint, `compact` or an open that recovers, takes `.readers`
 exclusively, and shuts `.gate` so that no new read begins: a checkpoint
 beside a reader is left for later, and the WAL grows meanwhile; an open
