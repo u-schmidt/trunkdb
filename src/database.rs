@@ -762,6 +762,7 @@ impl Database {
                     locks: Arc::new(locks),
                     cache_size: options.cache_size,
                     snapshot_memory: options.snapshot_memory,
+                    kept: Mutex::new(None),
                 };
                 // The first snapshot, to fail the open on what fails it,
                 // and for what needs none; its share of the lock let go.
@@ -785,7 +786,7 @@ impl Database {
                 looked_again = true;
                 continue;
             }
-            let (store, catalog, recovered) = read_only_state(store, &options, path)?;
+            let (store, catalog, recovered, _) = read_only_state(store, &options, path)?;
             return Ok(Self::from_parts(
                 store, None, None, catalog, options, path, recovered, None,
             ));
@@ -1454,21 +1455,21 @@ impl std::ops::DerefMut for TestState<'_> {
 /// How many symlinks `followed` goes through, as Linux's `open` does.
 const MAX_LINKS: usize = 40;
 
-/// `path`, or the file its symlinks lead to, so the WAL and the
-/// compaction's file beside it are the same for every name that reaches
-/// the database through a symlink (SPEC §127). Only the last part is
-/// followed: one directory reached by two names keeps one WAL already.
-/// A path that isn't there is left as it is, and so is a symlink's
-/// target that isn't there: the open creates it, and the WAL beside it.
 /// A read-only open's store loaded: the batches the WAL beside `path`
 /// holds read into memory over the file (SPEC §88.2), the header checked,
 /// and the catalog loaded, all of it committed in memory and none of it
-/// written. With what was read from the WAL, for `stats`.
+/// written. With what was read from the WAL, for `stats`, and where the
+/// reading stopped, for a reader beside a writer to read on (SPEC §188).
 fn read_only_state(
     mut store: FileStore,
     options: &OpenOptions,
     path: &Path,
-) -> crate::Result<(FileStore, Catalog, Option<crate::Recovered>)> {
+) -> crate::Result<(
+    FileStore,
+    Catalog,
+    Option<crate::Recovered>,
+    durability::WalPlace,
+)> {
     store.set_cache_size(options.cache_size);
     store.set_snapshot_memory(options.snapshot_memory);
     let pending = durability::read_pending(path)?;
@@ -1478,17 +1479,23 @@ fn read_only_state(
         store.restore_in_memory(&pending)?;
     }
     store.check_header()?;
-    let catalog = Database::load_catalog(&mut store)?;
+    let catalog = read_only_catalog(&mut store, &[])?;
+    Ok((store, catalog, recovered, pending.place()))
+}
+
+/// A read-only store's catalog, loaded as `Database::load_catalog` loads
+/// it. What the loading stages, a fresh file's catalog page or the index
+/// keys an old file lacks, is committed in memory beside the snapshots
+/// open at `live`, never logged nor written back, like the WAL's pages.
+fn read_only_catalog(store: &mut FileStore, live: &[u64]) -> crate::Result<Catalog> {
+    let catalog = Database::load_catalog(store)?;
     if store.dirty_pages().next().is_some() {
-        // A fresh file's catalog page, or the index keys an old file
-        // lacks: committed in memory, never logged nor written back, like
-        // the WAL's pages.
         store.check_staged();
-        store.commit();
+        store.commit_beside(live);
     } else {
         store.rollback();
     }
-    Ok((store, catalog, recovered))
+    Ok(catalog)
 }
 
 /// A read-only open beside a writer (SPEC §185): how it builds a snapshot
@@ -1499,6 +1506,70 @@ struct ReaderSide {
     locks: Arc<ReaderLocks>,
     cache_size: usize,
     snapshot_memory: usize,
+    /// The store the last snapshot was built on, for the next to catch
+    /// up from (SPEC §188): `None` before the first, and after a try
+    /// that failed.
+    kept: Mutex<Option<Kept>>,
+}
+
+/// A reader's store beside a writer, kept from one snapshot to the next
+/// (SPEC §188): the file, the cache of what was read of it, and the
+/// WAL's batches read so far, as commits in memory.
+struct Kept {
+    store: FileStore,
+    catalog: Catalog,
+    /// Where it stopped in the WAL.
+    place: durability::WalPlace,
+    /// The file's id and session, as its header on disk said when the
+    /// store was built (SPEC §183). Every checkpoint writes the header
+    /// first, with the session of the batches it writes back: from then
+    /// on the file isn't what the store read of it.
+    disk: ([u8; 16], u64),
+    /// The snapshots handed out, as `Writer::past`: the pages keep the
+    /// older versions those still open read.
+    past: Vec<Weak<CommittedInner>>,
+}
+
+impl Kept {
+    /// The commits of the snapshots still open, ascending, as
+    /// `Writer::live`; and whether any has ended since the last call.
+    fn live(&mut self) -> (Vec<u64>, bool) {
+        let before = self.past.len();
+        self.past.retain(|snapshot| snapshot.strong_count() > 0);
+        let ended_before = self.store.pages.ended_before();
+        let open = self.past.iter().filter_map(Weak::upgrade);
+        let mut live: Vec<u64> = open
+            .map(|snapshot| snapshot.commit.seq())
+            .filter(|&seq| seq >= ended_before)
+            .collect();
+        live.sort_unstable();
+        live.dedup();
+        (live, self.past.len() < before)
+    }
+
+    /// Reads on in the WAL beside `path` from where the store stopped,
+    /// the new batches the next commit (SPEC §188). `false`, having read
+    /// nothing in, where the store can't go on: a checkpoint has written
+    /// the file, or the WAL isn't the one it read.
+    fn catch_up(&mut self, path: &Path) -> crate::Result<bool> {
+        if self.store.disk_binding()? != self.disk {
+            return Ok(false);
+        }
+        let Some(pending) = durability::read_pending_since(path, &self.place)? else {
+            return Ok(false);
+        };
+        if !pending.is_empty() {
+            belongs(&self.store, &pending, path)?;
+            let (live, ended) = self.live();
+            if ended {
+                self.store.forget(&live);
+            }
+            self.store.catch_up_in_memory(&pending, &live)?;
+            self.catalog = read_only_catalog(&mut self.store, &live)?;
+        }
+        self.place = pending.place();
+        Ok(true)
+    }
 }
 
 /// How many times a reader beside a writer reads the WAL again before it
@@ -1513,38 +1584,69 @@ const BUILD_REFUSED_FOR: Duration = Duration::from_secs(30);
 
 impl ReaderSide {
     /// A snapshot of the database as it is now, holding the readers'
-    /// lock for as long as it lives.
+    /// lock for as long as it lives: the store kept from the last one,
+    /// caught up, or a new one where it can't be (SPEC §188).
     fn snapshot(&self) -> crate::Result<Committed> {
-        let ((store, catalog, _), hold) = self.build_holding()?;
-        Ok(Committed::beside(&store, catalog, hold))
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ((), hold) = self.holding(|| {
+            let caught_up = match kept.as_mut() {
+                Some(kept) => kept.catch_up(&self.path),
+                None => Ok(false),
+            };
+            let result = caught_up.and_then(|caught_up| {
+                if !caught_up {
+                    *kept = Some(self.kept_anew()?);
+                }
+                Ok(())
+            });
+            // Half caught up, maybe: the next try starts again.
+            if result.is_err() {
+                *kept = None;
+            }
+            result
+        })?;
+        let kept = kept.as_mut().expect("a snapshot built has its store kept");
+        let snapshot = Committed::beside(&kept.store, kept.catalog.clone(), hold);
+        kept.past.push(Arc::downgrade(&snapshot.0));
+        Ok(snapshot)
     }
 
     /// `snapshot`'s parts, the share of the lock let go: for the open.
     fn build(&self) -> crate::Result<(FileStore, Catalog, Option<crate::Recovered>)> {
-        Ok(self.build_holding()?.0)
+        let ((store, catalog, recovered, _), _hold) = self.holding(|| self.build_once())?;
+        Ok((store, catalog, recovered))
     }
 
-    fn options(&self) -> OpenOptions {
-        OpenOptions::default()
-            .cache_size(self.cache_size)
-            .snapshot_memory(self.snapshot_memory)
+    /// A store to keep, built anew from the file and the whole WAL.
+    fn kept_anew(&self) -> crate::Result<Kept> {
+        let (store, catalog, _, place) = self.build_once()?;
+        let disk = store.disk_binding()?;
+        Ok(Kept {
+            store,
+            catalog,
+            place,
+            disk,
+            past: Vec::new(),
+        })
     }
 
-    /// The gate passed, the readers' lock held, the snapshot built; read
+    /// The gate passed, the readers' lock held, and `once` done; done
     /// again where the writer may have been at work (SPEC §185.4), and
     /// begun again through the gate where a writer's open on Windows
     /// refuses it (SPEC §185.6).
-    #[allow(clippy::type_complexity)]
-    fn build_holding(
+    fn holding<T>(
         &self,
-    ) -> crate::Result<((FileStore, Catalog, Option<crate::Recovered>), ReadersHold)> {
-        let options = self.options();
+        mut once: impl FnMut() -> crate::Result<T>,
+    ) -> crate::Result<(T, ReadersHold)> {
         let since = Instant::now();
         let mut again = 0;
         loop {
             let hold = self.locks.hold()?;
-            match self.build_once(&options) {
-                Ok(built) => return Ok((built, hold)),
+            match once() {
+                Ok(done) => return Ok((done, hold)),
                 Err(e) if refused(&e) && since.elapsed() < BUILD_REFUSED_FOR => {
                     // Let go, and wait at the gate the open has shut.
                     drop(hold);
@@ -1560,13 +1662,17 @@ impl ReaderSide {
         }
     }
 
-    /// One try at a snapshot: the file opened without a lock, as it was
+    /// One try at a store: the file opened without a lock, as it was
     /// stamped (17, or the reader would have gone as §88 has it), and
     /// the WAL's whole batches read over it.
     fn build_once(
         &self,
-        options: &OpenOptions,
-    ) -> crate::Result<(FileStore, Catalog, Option<crate::Recovered>)> {
+    ) -> crate::Result<(
+        FileStore,
+        Catalog,
+        Option<crate::Recovered>,
+        durability::WalPlace,
+    )> {
         let store = FileStore::open_beside_writer(&self.path)?;
         let format = store.opened_format();
         if format != crate::storage::FORMAT_VERSION {
@@ -1580,7 +1686,10 @@ impl ReaderSide {
             )
             .into());
         }
-        read_only_state(store, options, &self.path)
+        let options = OpenOptions::default()
+            .cache_size(self.cache_size)
+            .snapshot_memory(self.snapshot_memory);
+        read_only_state(store, &options, &self.path)
     }
 }
 
@@ -1611,6 +1720,12 @@ fn belongs(store: &FileStore, pending: &durability::Pending, path: &Path) -> cra
     }))
 }
 
+/// `path`, or the file its symlinks lead to, so the WAL and the
+/// compaction's file beside it are the same for every name that reaches
+/// the database through a symlink (SPEC §127). Only the last part is
+/// followed: one directory reached by two names keeps one WAL already.
+/// A path that isn't there is left as it is, and so is a symlink's
+/// target that isn't there: the open creates it, and the WAL beside it.
 fn followed(given: &Path) -> std::io::Result<PathBuf> {
     let mut path = given.to_path_buf();
     for _ in 0..MAX_LINKS {
@@ -2331,6 +2446,84 @@ mod tests {
         assert_eq!(count(&reader, "posts"), 2, "after the writer is gone");
         assert_eq!(count(&other, "posts"), 2);
         let _ = dir;
+    }
+
+    /// The pages a reader beside a writer keeps from one snapshot to the
+    /// next (SPEC §188): the same as before where it caught up, others
+    /// where it started again.
+    fn kept_pages(reader: &Database) -> Arc<Pages> {
+        let side = reader.inner.beside.as_ref().expect("a reader beside");
+        let kept = side.kept.lock().unwrap();
+        kept.as_ref().expect("a store kept").store.pages.clone()
+    }
+
+    /// A reader catches up (SPEC §188): call by call it reads only the
+    /// batches new in the WAL, into the store it kept, from an empty WAL
+    /// on too. A snapshot it keeps reads its own state meanwhile, a page
+    /// the file holds and a batch changes included. After a checkpoint
+    /// it starts again from the file.
+    #[test]
+    fn a_reader_catches_up_with_the_new_batches_only() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        db.checkpoint().unwrap();
+        let reader = open_read_only(&path).unwrap();
+        assert_eq!(get(&reader, "posts", 1), Some(Document::Int(10)));
+        let kept_store = kept_pages(&reader);
+
+        // Another collection: the posts' page stays as the file has it.
+        db.write_batch(vec![insert("tags", 2, 20)]).unwrap();
+        assert_eq!(get(&reader, "tags", 2), Some(Document::Int(20)));
+        assert!(
+            Arc::ptr_eq(&kept_pages(&reader), &kept_store),
+            "caught up from an empty WAL"
+        );
+
+        let kept = reader.snapshot().unwrap();
+        let update = WriteOp::Update("posts".into(), DocId([1; 16]), value_doc(11));
+        db.write_batch(vec![update, insert("tags", 3, 30)]).unwrap();
+        assert_eq!(get(&reader, "posts", 1), Some(Document::Int(11)));
+        assert_eq!(get(&reader, "tags", 3), Some(Document::Int(30)));
+        assert!(Arc::ptr_eq(&kept_pages(&reader), &kept_store));
+        let posts = kept.collection::<Document>("posts");
+        let Some(Document::Object(mut fields)) = posts.get(&DocId([1; 16])).unwrap() else {
+            panic!("the kept snapshot's document");
+        };
+        assert_eq!(fields.remove("v"), Some(Document::Int(10)), "as it was");
+        let tags = kept.collection::<Document>("tags");
+        assert_eq!(tags.count(Filter::new()).unwrap(), 1);
+        assert_eq!(count(&reader, "tags"), 2);
+
+        drop((posts, tags, kept));
+        db.checkpoint().unwrap();
+        db.write_batch(vec![insert("posts", 4, 40)]).unwrap();
+        assert_eq!(count(&reader, "posts"), 2);
+        assert!(
+            !Arc::ptr_eq(&kept_pages(&reader), &kept_store),
+            "started again after the checkpoint"
+        );
+    }
+
+    /// A reader whose WAL was empty when it built its store reads the
+    /// WAL whole the next time; a checkpoint meanwhile has written the
+    /// file, and the reader starts again rather than read the pages it
+    /// kept of the file before (SPEC §188).
+    #[test]
+    fn a_reader_starts_again_after_a_checkpoint_it_could_not_see_in_the_wal() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        db.checkpoint().unwrap();
+        let reader = open_read_only(&path).unwrap();
+        // The document's page, read from the file into the reader's cache.
+        assert_eq!(get(&reader, "posts", 1), Some(Document::Int(10)));
+
+        let update = WriteOp::Update("posts".into(), DocId([1; 16]), value_doc(11));
+        db.write_batch(vec![update]).unwrap();
+        db.checkpoint().unwrap();
+        db.write_batch(vec![insert("tags", 2, 20)]).unwrap();
+        assert!(wal_len(&path) > 0, "a WAL after the checkpoint");
+        assert_eq!(get(&reader, "posts", 1), Some(Document::Int(11)));
+        assert_eq!(get(&reader, "tags", 2), Some(Document::Int(20)));
     }
 
     /// A snapshot a reader keeps keeps the writer's checkpoints out: they

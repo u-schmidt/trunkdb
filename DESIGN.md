@@ -86,8 +86,10 @@ From format 17 the locks are in three files beside the database,
 the database or its WAL, where on Windows a lock keeps other processes
 from reading or writing [§185](spec/185-readers-in-other-processes-designed-first.md). One process writes, holding `.writer`; any
 number of read-only opens in other processes read beside it, each call
-on a snapshot of its own built from the file and the WAL, holding
-`.readers` shared while it reads. Whatever writes the file, a
+on a snapshot of the file and the WAL as they are, holding `.readers`
+shared while it reads. A reader keeps what it built, and the next call
+reads only the batches the WAL gained since, starting again from the
+file after a checkpoint [§188](spec/188-a-reader-that-catches-up.md). Whatever writes the file, a
 checkpoint, `compact` or an open that recovers, takes `.readers`
 exclusively, and shuts `.gate` so that no new read begins: a checkpoint
 beside a reader is left for later, and the WAL grows meanwhile; an open

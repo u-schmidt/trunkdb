@@ -1,5 +1,6 @@
 mod wal;
 pub use wal::{Pending, WalDurability, read_pending};
+pub(crate) use wal::{WalPlace, read_pending_since};
 #[cfg(feature = "fuzzing")]
 pub(crate) use wal::{encode_batch, encode_header};
 pub(crate) use wal::{readable_wal_versions, wal_path};
