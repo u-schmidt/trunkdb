@@ -185,8 +185,9 @@ stamping 17; skips not counted; `verify_export` leaving the lock files.
 
 Not caught on Linux and macOS, by its nature: the open not letting go
 of the file at its end, which only Windows' locks show: there a
-reader's reads would be refused for as long as the writer runs, which
-the tests above should meet on Windows' CI. Not tried.
+reader's reads would be refused for as long as the writer runs. The
+tests above pass on Windows' CI, so the open does let go there; the
+mutation itself was not run on Windows.
 
 Not tested here: the Windows paths of 187.2, 5 (a read refused while a
 writer's open holds the file), which only Windows' CI reaches, and
