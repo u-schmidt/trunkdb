@@ -2809,7 +2809,9 @@ mod tests {
         );
 
         let before = files(&path);
-        let wait = Duration::from_millis(50);
+        // Long enough for the watcher to look many times, on a busy machine
+        // too: the `LET_GO_WAIT` a checkpoint's ask has.
+        let wait = crate::storage::lock_files::LET_GO_WAIT;
         let options = OpenOptions::default().wait_for_readers(wait);
         let start = Instant::now();
         let Err(crate::Error::Io(e)) = Database::open_with(&path, options.clone()) else {
