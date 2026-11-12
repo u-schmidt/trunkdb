@@ -5,7 +5,8 @@
 //! update and delete documents, add and drop indexes, drop a collection
 //! (§156), and write many ops as one batch, one op a line (§168).
 //! Looking, checking, exporting, finding, summing up, counting and
-//! getting open it read-only (SPEC §88). A filter's or an
+//! getting open it read-only (SPEC §88), beside a program that writes it
+//! (SPEC §185). A filter's or an
 //! aggregate's text takes parameters, their values given apart with
 //! `--param` (§163).
 //!

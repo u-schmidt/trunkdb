@@ -1,13 +1,14 @@
 mod cache;
 mod file;
+pub(crate) mod lock_files;
 mod page;
 mod pages;
 mod scratch;
 mod slotted;
 mod snapshot;
 
-pub(crate) use file::HEADER_PAGE;
 pub use file::{DEFAULT_CACHE_SIZE, FileStore};
+pub(crate) use file::{FORMAT_VERSION, HEADER_PAGE};
 #[cfg(test)]
 pub(crate) use file::{clear_binding, rewrite_format_version, rewrite_releases};
 pub use page::Page;

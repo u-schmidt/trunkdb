@@ -1356,3 +1356,20 @@ limit, batches and a write-ahead log. Since then:
 
     Item 159 → 0.39.0, the fix alone. File format 16, WAL version 4
     and export version 4, as in 0.38.0, so no fixture.
+160. **Readers in other processes** (§185, §187): one process writes,
+    and read-only opens in other processes read beside it, an admin
+    tool or an agent while the application runs. The locks move to
+    three files beside the database, `<path>.writer`, `<path>.readers`
+    and `<path>.gate`, since on Windows a lock on the database or its
+    WAL would keep the others from reading or writing them. File
+    format 17, which a writer's open stamps and 0.39.0 and older
+    refuse; no page changes. A reader builds each call's snapshot from
+    the file and the WAL, holding the readers' lock while it reads; a
+    `Snapshot` or a cursor keeps its own. A checkpoint beside a reader
+    is left for later and counted in `SnapshotInfo`, the next tried
+    through the gate, which no new read passes, waiting
+    `OpenOptions::checkpoint_wait`. `Database::checkpoint` beside a
+    reader fails with `WouldBlock`, `compact` with `SnapshotOpen`. An
+    open that has to write the file waits `wait_for_readers`, then
+    fails with `WouldBlock`. A file at 16, or one without lock files
+    a reader can make, is read as before.

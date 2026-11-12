@@ -81,6 +81,19 @@ lock: a database dropped in that moment is still held until the exec [§98](spec
 takes the lock shared: read-only opens go together, and none goes
 beside an open that writes [§88](spec/88-a-read-only-open.md).
 
+From format 17 the locks are in three files beside the database,
+`<path>.writer`, `<path>.readers` and `<path>.gate`, and none stays on
+the database or its WAL, where on Windows a lock keeps other processes
+from reading or writing [§185](spec/185-readers-in-other-processes-designed-first.md). One process writes, holding `.writer`; any
+number of read-only opens in other processes read beside it, each call
+on a snapshot of its own built from the file and the WAL, holding
+`.readers` shared while it reads. Whatever writes the file, a
+checkpoint, `compact` or an open that recovers, takes `.readers`
+exclusively, and shuts `.gate` so that no new read begins: a checkpoint
+beside a reader is left for later, and the WAL grows meanwhile; an open
+that has to write waits a bounded time, then fails. A file at 16, or
+one without lock files a reader can make, is read as §88 has it [§187](spec/187-readers-beside-a-writer-built.md).
+
 Between checkpoints the newest pages are only in the WAL. The main file
 is complete on its own after `db.checkpoint()`, and after the last
 handle is dropped [§51](spec/51-one-flush-per-commit.md).
@@ -542,7 +555,7 @@ are shared, each with a lock of its own [§79](spec/79-writers-beside-the-reader
 
 - **the writer**: the batch being staged and the WAL, behind a mutex.
   A batch holds it from staging to its checkpoint; readers never take
-  it. One writer at a time, and one process per file;
+  it. One writer at a time, and one process that writes per file;
 - **the last commit**: its catalog and its commit number [§78](spec/78-reads-through-a-snapshot.md), behind
   a read-write lock held only to take it or to replace it. A read
   (`get`, `find`, `count`, `cursor`, `export`, `check`) takes it when

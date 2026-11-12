@@ -125,14 +125,14 @@ fn a_file_it_cannot_read_is_reported_as_before() {
     std::fs::write(&input, EXPORT).unwrap();
     assert!(trunkdb(&["import", &newer, &input]).status.success());
     let mut bytes = std::fs::read(&newer).unwrap();
-    bytes[28..32].copy_from_slice(&17u32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&18u32.to_le_bytes());
     std::fs::write(&newer, &bytes).unwrap();
 
     for (file, message) in [
         (&notes, "not a trunkdb file (bad magic)".to_string()),
         (
             &newer,
-            "file has format 17, newer than this build's 16 — open it with a newer trunkdb"
+            "file has format 18, newer than this build's 17 — open it with a newer trunkdb"
                 .to_string(),
         ),
     ] {
@@ -167,7 +167,7 @@ fn import_info_check_and_export_round_trip() {
     let output = trunkdb(&["info", &db]);
     assert!(output.status.success());
     let info = stdout(&output);
-    assert!(info.contains("format 16"), "{info}");
+    assert!(info.contains("format 17"), "{info}");
     // The releases (SPEC §125), beside the format.
     let release = trunkdb::RELEASE;
     assert!(
@@ -286,24 +286,30 @@ fn compact_shrinks_a_file_once() {
     assert!(trunkdb(&["check", &db]).status.success());
 }
 
+/// A file another program writes: a write is refused, the file named as
+/// in use; looking into it goes beside that program (SPEC §185).
 #[test]
 fn a_file_in_use_is_named_as_such() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = path(dir.path(), "db.trunkdb");
     let db = trunkdb::Database::open(&db_path).unwrap();
-    let output = trunkdb(&["info", &db_path]);
+    let output = trunkdb(&["insert", &db_path, "users", "{}"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains("in use by another program"),
         "{}",
         stderr(&output)
     );
-    close(db);
     assert!(trunkdb(&["info", &db_path]).status.success());
+    close(db);
+    let output = trunkdb(&["insert", &db_path, "users", "{}", "--create"]);
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 /// `info`, `check` and `export` open the file read-only (SPEC §88), so
-/// they go beside a read-only open of it, and `compact` doesn't.
+/// they go beside a read-only open of it; and `compact` goes between its
+/// reads, as a reader beside a writer holds nothing between its calls
+/// (SPEC §185.4).
 #[test]
 fn looking_into_a_file_opens_it_read_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -345,9 +351,14 @@ fn looking_into_a_file_opens_it_read_only() {
     let id = id_in(&found);
     assert!(trunkdb(&["get", &db_path, "users", &id]).status.success());
     let output = trunkdb(&["compact", &db_path]);
-    assert!(stderr(&output).contains("in use by another program"));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        db.collection::<trunkdb::Document>("users")
+            .count(trunkdb::query::Filter::new())
+            .unwrap(),
+        1
+    );
     close(db);
-    assert!(trunkdb(&["compact", &db_path]).status.success());
 }
 
 /// `Command::output`, with something written to the child's stdin first.
@@ -1021,7 +1032,7 @@ fn info_and_fields_print_json_for_a_program() {
     let output = trunkdb(&["info", &db, "--json"]);
     assert!(output.status.success());
     let info: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
-    assert_eq!(info["format"], 16);
+    assert_eq!(info["format"], 17);
     assert_eq!(info["written_by"], trunkdb::RELEASE.to_string());
     let collections = info["collections"].as_array().unwrap();
     let users = collections.iter().find(|c| c["name"] == "users").unwrap();
@@ -1445,14 +1456,13 @@ fn indexes_and_collections_are_added_and_dropped() {
     assert_eq!(output.status.code(), Some(1));
 }
 
-/// A file another program has open: every write refused as in use,
-/// nothing changed (SPEC §88, §156).
+/// A file another program has open for writing: every write refused as
+/// in use, nothing changed (SPEC §156, §185.6).
 #[test]
 fn writes_refuse_a_file_in_use() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = users_db(dir.path());
-    let read_only = trunkdb::OpenOptions::default().read_only(true);
-    let held = trunkdb::Database::open_with(&db_path, read_only).unwrap();
+    let held = trunkdb::Database::open(&db_path).unwrap();
     for args in [
         &["insert", &db_path, "users", "{}"][..],
         &[

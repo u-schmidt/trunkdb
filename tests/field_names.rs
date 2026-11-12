@@ -62,7 +62,7 @@ fn names_survive_a_reopen_and_go_with_a_failed_batch() {
 
     let db = Database::open(&path).unwrap();
     assert_eq!((all(&db, "things"), all(&db, "others")), before);
-    assert_eq!(db.file_info().unwrap().format_version, 16);
+    assert_eq!(db.file_info().unwrap().format_version, 17);
     checked(&db);
 }
 

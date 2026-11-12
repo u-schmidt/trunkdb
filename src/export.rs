@@ -430,6 +430,14 @@ pub fn verify_export(input: impl Read, at: impl AsRef<Path>) -> crate::Result<Ve
     let mut remove = Remove(vec![at.to_path_buf()]);
     create(&wal)?;
     remove.0.push(wal);
+    // The lock files too (SPEC §185.6), which the open would otherwise
+    // make and leave: they are never removed where another process may
+    // open them, but nobody else opens a database that is being made
+    // here to be removed.
+    for lock in crate::storage::lock_files::lock_paths(at) {
+        create(&lock)?;
+        remove.0.push(lock);
+    }
     // An empty file opens as a new database (SPEC §22.1), an empty WAL
     // as one with nothing in it.
     let db = Database::open(at)?;
@@ -1569,6 +1577,9 @@ mod tests {
             assert!(verified.is_ok() && verified.documents == 1, "{verified:?}");
         });
         assert!(!at.exists() && !wal.exists());
+        for lock in crate::storage::lock_files::lock_paths(&at) {
+            assert!(!lock.exists(), "{} left", lock.display());
+        }
     }
 
     /// A new database's file and WAL, and an export renamed into place,
@@ -1582,7 +1593,11 @@ mod tests {
         let path = dir.path().join("app.trunkdb");
         let before = syncs();
         let db = Database::open(&path).unwrap();
-        assert_eq!(syncs() - before, 2, "the file and its WAL");
+        assert_eq!(
+            syncs() - before,
+            5,
+            "the file, its WAL and its three lock files"
+        );
         drop(db);
 
         let before = syncs();
