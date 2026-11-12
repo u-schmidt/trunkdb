@@ -986,37 +986,94 @@ impl FileStore {
             // Damaged fields, and nothing in the WAL to replace them.
             return Err(self.header_error.take().unwrap());
         }
-        let mut page_count = read_header(self.pages.file()).ok().map(|h| h.page_count);
+        let page_count = read_header(self.pages.file()).ok().map(|h| h.page_count);
         // The file grows by a page an allocation writes, and every page a
         // batch writes is in the WAL (SPEC §87): so no header there counts
         // more pages than the file has and the WAL holds. A WAL that says
         // otherwise would have the restore write at the other end of a
         // sparse file of any size.
         let room = self.pages.file().metadata()?.len() / PAGE_SIZE as u64 + pages.count();
-        pages.outline(&mut |id, header| {
-            if let Some(header) = header {
-                let counted = Header::decode(header)?.page_count;
-                if counted > room {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "the WAL's header counts {counted} pages, more than the file and \
-                             the WAL can account for ({room}) — it may be corrupt"
-                        ),
-                    ));
+        within(pages, page_count, room)
+    }
+
+    /// `restore_in_memory` for a reader beside a writer that catches up
+    /// (SPEC §188): `pages`, the batches the WAL holds past where it
+    /// stopped, as the next commit over those it read before, checked
+    /// as `restore_in_memory` checks them against the header it has now.
+    /// `live` is the commits of its snapshots still open, ascending: as
+    /// a writer's commit does, it keeps the pages as they were for them.
+    pub(crate) fn catch_up_in_memory(
+        &mut self,
+        pages: &dyn PendingPages,
+        live: &[u64],
+    ) -> io::Result<()> {
+        assert!(
+            self.staging.is_none(),
+            "FileStore::catch_up_in_memory while staging"
+        );
+        let count = self.header.page_count;
+        let on_disk = self.pages.file().metadata()?.len() / PAGE_SIZE as u64;
+        within(pages, Some(count), count.max(on_disk) + pages.count())?;
+        let mut latest: BTreeMap<PageId, Page> = BTreeMap::new();
+        pages.pages(&mut |id, page| {
+            latest.insert(id, Page::from(page));
+            Ok(())
+        })?;
+        let header = latest
+            .get(&HEADER_PAGE)
+            .map(|page| Header::decode(page))
+            .transpose()?;
+        // The pages as they were, for the snapshots open: read before the
+        // commit, as a batch reads them when it changes them. A page that
+        // can't be read is one they couldn't read either.
+        let mut before = BTreeMap::new();
+        if !live.is_empty() {
+            for &id in latest.keys().filter(|&&id| id < count) {
+                if let Ok(page) = self.pages.read(id) {
+                    before.insert(id, page);
                 }
-                page_count = Some(counted);
-            } else if page_count.is_none_or(|count| id >= count) {
+            }
+        }
+        self.pages.commit(latest, before, live);
+        if let Some(header) = header {
+            self.header = header;
+        }
+        Ok(())
+    }
+
+    /// Drops the versions no snapshot open at `live` would read
+    /// (`Pages::forget`): for a reader beside a writer whose snapshots
+    /// have ended (SPEC §188).
+    pub(crate) fn forget(&self, live: &[u64]) {
+        self.pages.forget(live);
+    }
+}
+
+/// Whether every page in `pages` lies within the file as the header
+/// before it counts them, `page_count` at first: no header among them
+/// may count more than `room`, the pages the file can have grown to.
+fn within(pages: &dyn PendingPages, mut page_count: Option<u64>, room: u64) -> io::Result<()> {
+    pages.outline(&mut |id, header| {
+        if let Some(header) = header {
+            let counted = Header::decode(header)?.page_count;
+            if counted > room {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "the WAL holds page {id}, past the end of the file — it may be corrupt"
+                        "the WAL's header counts {counted} pages, more than the file and \
+                             the WAL can account for ({room}) — it may be corrupt"
                     ),
                 ));
             }
-            Ok(())
-        })
-    }
+            page_count = Some(counted);
+        } else if page_count.is_none_or(|count| id >= count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the WAL holds page {id}, past the end of the file — it may be corrupt"),
+            ));
+        }
+        Ok(())
+    })
 }
 
 impl PageStore for FileStore {

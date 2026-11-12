@@ -1373,3 +1373,10 @@ limit, batches and a write-ahead log. Since then:
     open that has to write the file waits `wait_for_readers`, then
     fails with `WouldBlock`. A file at 16, or one without lock files
     a reader can make, is read as before.
+161. **A reader that catches up** (§188): a reader beside a writer
+    keeps the store it built, its cache of the file included, and each
+    call reads only the batches the WAL gained since, as one more
+    commit. It starts again from the file where a checkpoint has
+    written it, or where the WAL isn't the one it read. A reader's
+    snapshots share that store, and the snapshot memory limit ends the
+    oldest of them as in one process.

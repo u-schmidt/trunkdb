@@ -177,6 +177,9 @@ struct Records<R> {
     offset: u64,
     /// The record last read: its body.
     body: Vec<u8>,
+    /// The record last read: where it starts, and its first 8 bytes,
+    /// its length and checksum (`WalPlace::last`).
+    last: Option<(u64, [u8; 8])>,
 }
 
 /// One record, as `Records::next` hands it out.
@@ -233,7 +236,23 @@ impl<R: Read> Records<R> {
             left: len - header_len as u64,
             offset: header_len as u64,
             body: Vec::new(),
+            last: None,
         }))
+    }
+
+    /// The records of a WAL whose header said `version` and `binding`,
+    /// from `from` to `len`: `input` is there already. For a reader that
+    /// catches up (SPEC §188).
+    fn resume(input: R, version: u32, binding: Option<WalBinding>, from: u64, len: u64) -> Self {
+        Records {
+            input,
+            version,
+            binding,
+            left: len - from,
+            offset: from,
+            body: Vec::new(),
+            last: None,
+        }
     }
 
     /// The next record, or `None` at the end or at a torn tail.
@@ -259,6 +278,7 @@ impl<R: Read> Records<R> {
             }
             return Err(corrupt("WAL record checksum mismatch before the tail"));
         }
+        self.last = Some((self.offset, prefix));
         self.offset += 8 + body_len;
 
         let flags_len = if self.version == WAL_VERSION_WITHOUT_FLAGS {
@@ -305,6 +325,9 @@ impl<R: Read> Records<R> {
 pub struct Pending {
     /// The WAL, on a handle of its own; `None` when there is none.
     file: Option<File>,
+    /// Where the batches read begin: 0 for all the WAL holds, else where
+    /// a reader that catches up stopped before (SPEC §188).
+    from: u64,
     /// Where the last whole batch ends.
     end: u64,
     /// The page of every image in the whole batches, in log order —
@@ -316,16 +339,38 @@ pub struct Pending {
     /// What the WAL's header says of the file it belongs to (SPEC
     /// §183): `None` for a WAL before version 4, or with nothing in it.
     binding: Option<WalBinding>,
+    /// Its header's version: `None` for a WAL with nothing in it.
+    version: Option<u32>,
+    /// The last whole batch's records, each where it starts and its
+    /// first 8 bytes: empty for a WAL without a whole batch.
+    last: Vec<(u64, [u8; 8])>,
+}
+
+/// Where a reader beside a writer stopped in the WAL (SPEC §188), to
+/// read on from there next time: the WAL as its header was, where the
+/// last whole batch read ends, and that batch's records. All of them: a
+/// batch taken back may be logged again with other records before an
+/// identical last one, and every record but a batch's last is as long
+/// as the others (§91).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WalPlace {
+    version: Option<u32>,
+    binding: Option<WalBinding>,
+    end: u64,
+    last: Vec<(u64, [u8; 8])>,
 }
 
 impl Pending {
     fn nothing() -> Self {
         Pending {
             file: None,
+            from: 0,
             end: 0,
             ids: Vec::new(),
             headers: Vec::new(),
             binding: None,
+            version: None,
+            last: Vec::new(),
         }
     }
 
@@ -334,10 +379,25 @@ impl Pending {
     fn scan(file: File) -> io::Result<(Self, Option<u32>)> {
         let len = file.metadata()?.len();
         let input = BufReader::with_capacity(READ_BUFFER, &file);
-        let Some(mut records) = Records::new(input, len)? else {
+        let Some(records) = Records::new(input, len)? else {
             return Ok((Self::nothing(), None));
         };
-        let (version, binding) = (records.version, records.binding);
+        let version = records.version;
+        let mut pending = Self::scan_records(records, Vec::new())?;
+        // Read again from the start, header and all (`pages`).
+        pending.from = 0;
+        Ok((pending.on(file), Some(version)))
+    }
+
+    /// What `records` hold in whole batches, read through; `last` the
+    /// records of the last whole batch before them, if any.
+    fn scan_records<R: Read>(
+        mut records: Records<R>,
+        mut last: Vec<(u64, [u8; 8])>,
+    ) -> io::Result<Self> {
+        // The records of the batch read now, as far as it goes.
+        let mut batch = Vec::new();
+        let (version, binding, from) = (records.version, records.binding, records.offset);
         let (mut ids, mut headers) = (Vec::new(), Vec::new());
         // How much of `ids`, and of the file, whole batches make up.
         let (mut whole, mut end) = (0, records.offset);
@@ -348,8 +408,11 @@ impl Pending {
                 }
                 ids.push(id);
             }
-            if !record.more {
+            let more = record.more;
+            batch.extend(records.last);
+            if !more {
                 (whole, end) = (ids.len(), records.offset);
+                last = std::mem::take(&mut batch);
             }
         }
         // A batch without its last record: a crash mid-`log`. Its header
@@ -357,14 +420,32 @@ impl Pending {
         // go only to free them.
         ids.truncate(whole);
         headers.retain(|(at, _)| *at < whole);
-        let pending = Pending {
-            file: Some(file),
+        Ok(Pending {
+            file: None,
+            from,
             end,
             ids,
             headers,
             binding,
-        };
-        Ok((pending, Some(version)))
+            version: Some(version),
+            last,
+        })
+    }
+
+    /// With `file`, the WAL it was read from, to read the pages again.
+    fn on(mut self, file: File) -> Self {
+        self.file = Some(file);
+        self
+    }
+
+    /// Where a reader that read this stopped in the WAL (SPEC §188).
+    pub(crate) fn place(&self) -> WalPlace {
+        WalPlace {
+            version: self.version,
+            binding: self.binding,
+            end: self.end,
+            last: self.last.clone(),
+        }
     }
 
     /// Whether nothing is pending.
@@ -417,10 +498,25 @@ impl PendingPages for Pending {
         let Some(mut file) = self.file.as_ref() else {
             return Ok(());
         };
-        file.seek(SeekFrom::Start(0))?;
+        file.seek(SeekFrom::Start(self.from))?;
         let input = BufReader::with_capacity(READ_BUFFER, file);
         let mut taken = 0;
-        if let Some(mut records) = Records::new(input, self.end)? {
+        let records = match self.from {
+            0 => Records::new(input, self.end)?,
+            from => {
+                let version = self
+                    .version
+                    .expect("a WAL read on from a place has a header");
+                Some(Records::resume(
+                    input,
+                    version,
+                    self.binding,
+                    from,
+                    self.end,
+                ))
+            }
+        };
+        if let Some(mut records) = records {
             while let Some(record) = records.next()? {
                 for (id, page) in record.pages() {
                     take(id, page)?;
@@ -429,7 +525,8 @@ impl PendingPages for Pending {
             }
         }
         // As `scan` found them: we hold the database's lock, so nobody
-        // else writes this WAL.
+        // else writes this WAL; a reader beside a writer holds the
+        // readers' lock, so nobody cuts it.
         if taken != self.ids.len() {
             return Err(corrupt("the WAL changed while it was being recovered"));
         }
@@ -593,6 +690,55 @@ pub fn read_pending(db_path: &Path) -> io::Result<Pending> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Pending::nothing()),
         Err(e) => Err(e),
     }
+}
+
+/// For a reader beside a writer that catches up (SPEC §188): what the
+/// WAL beside the file at `db_path` holds past `place`, where the reader
+/// stopped. `None` where it isn't the WAL the reader read any more: its
+/// header changed, which a checkpoint and the next batch do; it is
+/// shorter, which a checkpoint does; or a record of the last batch read
+/// changed, which a log taken back and another in its place does. The reader then
+/// starts again from the file.
+///
+/// A place where nothing was read (`WalPlace::default`, or a WAL that
+/// had a header and no whole batch) says nothing of the WAL: then all of
+/// it is read, and the caller makes sure that the file was not written
+/// meanwhile.
+pub(crate) fn read_pending_since(db_path: &Path, place: &WalPlace) -> io::Result<Option<Pending>> {
+    let file = match File::open(wal_path(db_path)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(place.last.is_empty().then(Pending::nothing));
+        }
+        Err(e) => return Err(e),
+    };
+    if place.last.is_empty() {
+        return Ok(Some(Pending::scan(file)?.0));
+    }
+    let len = file.metadata()?.len();
+    if len < place.end {
+        return Ok(None);
+    }
+    let mut input = BufReader::with_capacity(READ_BUFFER, &file);
+    let Some(records) = Records::new(&mut input, len)? else {
+        return Ok(None);
+    };
+    if Some(records.version) != place.version || records.binding != place.binding {
+        return Ok(None);
+    }
+    let (version, binding) = (records.version, records.binding);
+    for &(at, prefix) in &place.last {
+        let mut was = [0u8; 8];
+        input.seek(SeekFrom::Start(at))?;
+        input.read_exact(&mut was)?;
+        if was != prefix {
+            return Ok(None);
+        }
+    }
+    input.seek(SeekFrom::Start(place.end))?;
+    let records = Records::resume(input, version, binding, place.end, len);
+    let pending = Pending::scan_records(records, place.last.clone())?;
+    Ok(Some(pending.on(file)))
 }
 
 impl Durability for WalDurability {
@@ -1136,6 +1282,105 @@ mod tests {
         let (_wal, recovered) = WalDurability::open(&db_path).unwrap();
         let recovered = recovered.images();
         assert_eq!(recovered, vec![(3, page(1)), (4, page(2)), (6, page(4))]);
+    }
+
+    /// A reader that catches up (SPEC §188) reads only the batches past
+    /// where it stopped, and none where the WAL isn't the one it read:
+    /// a record it read taken back and another in its place, a WAL cut
+    /// by a checkpoint, as long again with other records, or gone.
+    #[test]
+    fn a_reader_reads_on_only_in_the_wal_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let (mut wal, _) = WalDurability::open(&db_path).unwrap();
+        log(&mut wal, &[(3, page(1))]);
+        let place = read_pending(&db_path).unwrap().place();
+        log(&mut wal, &[(4, page(2)), (5, page(3))]);
+        let since = read_pending_since(&db_path, &place).unwrap().unwrap();
+        assert_eq!(since.images(), vec![(4, page(2)), (5, page(3))]);
+        let place = since.place();
+        let nothing_new = read_pending_since(&db_path, &place).unwrap().unwrap();
+        assert!(nothing_new.is_empty());
+        assert_eq!(nothing_new.place(), place);
+
+        // A batch read before its flush failed, then taken back.
+        wal.failing_logs = 1;
+        assert!(wal.log(&[(6, &page(4))]).is_err());
+        let read = read_pending_since(&db_path, &place).unwrap().unwrap();
+        assert_eq!(read.images(), vec![(6, page(4))]);
+        wal.undo_failed_log().unwrap();
+        assert!(
+            read_pending_since(&db_path, &read.place())
+                .unwrap()
+                .is_none(),
+            "shorter than where the reader stopped"
+        );
+        log(&mut wal, &[(6, page(5))]);
+        assert!(
+            read_pending_since(&db_path, &read.place())
+                .unwrap()
+                .is_none(),
+            "another record in its place"
+        );
+        let place = read_pending(&db_path).unwrap().place();
+        let mut other_file = wal_bytes(&db_path);
+        other_file[12] ^= 1;
+        let good = wal_bytes(&db_path);
+        set_wal_bytes(&db_path, &other_file);
+        assert!(
+            read_pending_since(&db_path, &place).unwrap().is_none(),
+            "a header that names another file"
+        );
+        set_wal_bytes(&db_path, &good);
+
+        wal.checkpoint().unwrap();
+        assert!(
+            read_pending_since(&db_path, &place).unwrap().is_none(),
+            "cut"
+        );
+        while wal.len() < place.end {
+            log(&mut wal, &[(7, page(6)), (8, page(7))]);
+        }
+        assert!(
+            read_pending_since(&db_path, &place).unwrap().is_none(),
+            "as long again after a checkpoint"
+        );
+        std::fs::remove_file(wal_path(&db_path)).unwrap();
+        assert!(read_pending_since(&db_path, &place).unwrap().is_none());
+        let empty = read_pending_since(&db_path, &WalPlace::default()).unwrap();
+        assert!(empty.unwrap().is_empty(), "nothing read, nothing there");
+    }
+
+    /// A batch of several records read, taken back, and logged again
+    /// with another first record and the same last one: the reader sees
+    /// it isn't the batch it read, though the last record is (SPEC
+    /// §188.2). Every record but a batch's last is as long as the others.
+    #[test]
+    fn a_batch_logged_again_with_only_its_first_record_changed_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let mut wal = open_with_small_records(&db_path);
+        log(&mut wal, &[(1, page(1))]);
+        let place = read_pending(&db_path).unwrap().place();
+
+        let batch = |first: u8| -> Vec<(PageId, Vec<u8>)> {
+            vec![(2, page(first)), (3, page(2)), (4, page(3)), (5, page(4))]
+        };
+        wal.failing_logs = 1;
+        let failed = batch(10);
+        let borrowed: Vec<(PageId, &[u8])> = failed.iter().map(|(id, p)| (*id, &p[..])).collect();
+        assert!(wal.log(&borrowed).is_err());
+        let read = read_pending_since(&db_path, &place).unwrap().unwrap();
+        assert_eq!(read.images().len(), 4, "in two records");
+        wal.undo_failed_log().unwrap();
+        log(&mut wal, &batch(11));
+        assert_eq!(wal.len(), read.place().end, "as long as the batch read");
+        assert!(
+            read_pending_since(&db_path, &read.place())
+                .unwrap()
+                .is_none(),
+            "its first record changed"
+        );
     }
 
     /// The first log after a checkpoint writes the file's header with
