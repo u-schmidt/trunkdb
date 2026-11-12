@@ -1526,16 +1526,20 @@ struct Kept {
     /// on the file isn't what the store read of it.
     disk: ([u8; 16], u64),
     /// The snapshots handed out, as `Writer::past`: the pages keep the
-    /// older versions those still open read.
+    /// older versions those still open read. Those ended are dropped
+    /// each time one is handed out, so a reader that polls a WAL that
+    /// doesn't change keeps one or two here, not one a call.
     past: Vec<Weak<CommittedInner>>,
+    /// Whether a snapshot has ended since the pages last forgot the
+    /// versions kept for it (`FileStore::forget`).
+    ended: bool,
 }
 
 impl Kept {
     /// The commits of the snapshots still open, ascending, as
     /// `Writer::live`; and whether any has ended since the last call.
     fn live(&mut self) -> (Vec<u64>, bool) {
-        let before = self.past.len();
-        self.past.retain(|snapshot| snapshot.strong_count() > 0);
+        self.prune();
         let ended_before = self.store.pages.ended_before();
         let open = self.past.iter().filter_map(Weak::upgrade);
         let mut live: Vec<u64> = open
@@ -1544,7 +1548,14 @@ impl Kept {
             .collect();
         live.sort_unstable();
         live.dedup();
-        (live, self.past.len() < before)
+        (live, std::mem::take(&mut self.ended))
+    }
+
+    /// Drops the snapshots ended from `past`, and says so in `ended`.
+    fn prune(&mut self) {
+        let before = self.past.len();
+        self.past.retain(|snapshot| snapshot.strong_count() > 0);
+        self.ended |= self.past.len() < before;
     }
 
     /// Reads on in the WAL beside `path` from where the store stopped,
@@ -1610,6 +1621,7 @@ impl ReaderSide {
         })?;
         let kept = kept.as_mut().expect("a snapshot built has its store kept");
         let snapshot = Committed::beside(&kept.store, kept.catalog.clone(), hold);
+        kept.prune();
         kept.past.push(Arc::downgrade(&snapshot.0));
         Ok(snapshot)
     }
@@ -1630,6 +1642,7 @@ impl ReaderSide {
             place,
             disk,
             past: Vec::new(),
+            ended: false,
         })
     }
 
@@ -2501,6 +2514,52 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&kept_pages(&reader), &kept_store),
             "started again after the checkpoint"
+        );
+    }
+
+    /// A reader that polls a WAL that doesn't change keeps no more of its
+    /// ended snapshots than it did after the first call (SPEC §188.1).
+    #[test]
+    fn a_reader_polling_an_unchanged_wal_keeps_no_more_with_each_call() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        let reader = open_read_only(&path).unwrap();
+        let kept_past = || {
+            let side = reader.inner.beside.as_ref().unwrap();
+            side.kept.lock().unwrap().as_ref().unwrap().past.len()
+        };
+        assert_eq!(count(&reader, "posts"), 1);
+        let after_one = kept_past();
+        for _ in 0..100 {
+            assert_eq!(count(&reader, "posts"), 1);
+        }
+        assert_eq!(kept_past(), after_one);
+    }
+
+    /// The versions a reader's pages kept for a snapshot are forgotten
+    /// once it has ended, at the next batch the reader catches up with,
+    /// though the reads in between dropped it from `past` (SPEC §188.5).
+    #[test]
+    fn a_readers_versions_for_an_ended_snapshot_are_forgotten() {
+        let (_dir, path, db) = open_temp();
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        let reader = open_read_only(&path).unwrap();
+        let kept = reader.snapshot().unwrap();
+        for value in 11..14 {
+            let update = WriteOp::Update("posts".into(), DocId([1; 16]), value_doc(value));
+            db.write_batch(vec![update]).unwrap();
+            assert_eq!(get(&reader, "posts", 1), Some(Document::Int(value)));
+        }
+        let (older, _, _) = kept_pages(&reader).versions_kept();
+        assert!(older > 0, "older versions kept for the snapshot");
+        drop(kept);
+        assert_eq!(count(&reader, "posts"), 1, "nothing new: dropped from past");
+        db.write_batch(vec![insert("tags", 2, 20)]).unwrap();
+        assert_eq!(count(&reader, "tags"), 1);
+        assert_eq!(
+            kept_pages(&reader).versions_kept().0,
+            0,
+            "the kept snapshot's versions forgotten"
         );
     }
 

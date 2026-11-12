@@ -14,12 +14,13 @@ to the next:
   WAL's batches read so far, as commits in memory;
 - **the catalog** of its last commit;
 - **where it stopped in the WAL** (`WalPlace`): the WAL's header as it
-  was, where the last whole batch read ends, and that batch's last
-  record, where it starts and its first 8 bytes, its length and
-  checksum (§185.4);
+  was, where the last whole batch read ends, and that batch's records,
+  each where it starts and its first 8 bytes, its length and checksum
+  (§185.4, which had the last record only; 188.5);
 - **the file's id and session,** as the header on disk said when the
   store was built (§183);
-- **the snapshots handed out,** weak, as `Writer::past` (§80).
+- **the snapshots handed out,** weak, as `Writer::past` (§80): those
+  ended are dropped each time one is handed out (188.5).
 
 Each snapshot holds the readers' lock as before (§187.1), and the
 store's pages; the mutex is held only while a snapshot is made.
@@ -34,7 +35,8 @@ Under the readers' lock, so nothing writes the file meanwhile:
    that failed halfway has written the header too.
 2. **The WAL** (`durability::read_pending_since`): start again if it is
    shorter than where the reader stopped, its header says another
-   version or binding, or the last record read has other bytes now.
+   version or binding, or a record of the last batch read has other
+   bytes now.
    Else its whole batches past that point are read, and nothing before.
 3. **The new batches** (`FileStore::catch_up_in_memory`): checked as a
    recovery checks them, every page within the file as the header
@@ -95,9 +97,15 @@ kept store, so the next try, through the gate as before (§187.2, 5 and
   then wrote, reads the new state, not the page it cached.
 - `a_reader_reads_on_only_in_the_wal_it_read` (`wal.rs`): only what is
   past the place; nothing new read as nothing; a record read and taken
-  back, the WAL shorter, then another in its place; a header naming another file; a WAL
-  cut, and as long again with other records under the same header; a
+  back, the WAL shorter, then another in its place; a header naming
+  another file; a WAL cut, and as long again with other records under the same header; a
   WAL gone.
+- `a_batch_logged_again_with_only_its_first_record_changed_is_seen`
+  (`wal.rs`): a batch of two records read, taken back, and logged again
+  with another first record and the same last one.
+- `a_reader_polling_an_unchanged_wal_keeps_no_more_with_each_call`
+  (`database.rs`): a hundred reads of a WAL that doesn't change keep no
+  more ended snapshots than the first did.
 
 The tests of §187 run against the reader that catches up as they stand.
 
@@ -113,3 +121,28 @@ batch's image.
 Not caught, by its nature: the place not moved on after reading. The
 batches are then read again next time, the same images over the same
 pages, which costs only time.
+
+## 188.5 Corrected after a review, 2026-11-12
+1. **Every record of the last batch is looked at again, not only the
+   last.** A batch of more than one record (§91) whose flush fails is
+   taken back to where it began. Logged again with another first record
+   and an identical last one, it was the same length, since every record
+   but a batch's last is full, and the reader took the batch for the
+   one it had read: it kept the pages of a batch that failed until it
+   next started again. Now the place keeps the length and checksum of
+   each record of the last batch, and a reader checks them all, one
+   8-byte read each.
+2. **A reader that polls a WAL that doesn't change no longer grows.**
+   Every snapshot was added to `past`, and those ended were dropped only
+   when new batches came; a weak reference keeps its allocation, so a
+   tool reading ten times a second beside an idle writer kept hundreds
+   of thousands a day. Now they are dropped each time a snapshot is
+   handed out, and a flag remembers that some ended, for the pages to
+   forget their versions at the next catching up.
+
+Mutations added, each caught: only the last record looked at again;
+ended snapshots not dropped each time; the flag not set, which left the
+versions kept for an ended snapshot in memory
+(`a_readers_versions_for_an_ended_snapshot_are_forgotten`: a kept
+snapshot's older versions, gone once it is dropped and the reader has
+caught up with a batch that doesn't touch their pages).
