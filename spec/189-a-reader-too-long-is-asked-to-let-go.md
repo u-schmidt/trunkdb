@@ -152,3 +152,36 @@ Not caught, by its nature: a snapshot whose building the process let go
 under not built again. It takes the moment of the build, which no test
 here can hold; its pages refuse every read anyway, so a snapshot built
 so fails as too old, where it would be built again.
+
+## 189.7 Corrected after a review, 2026-11-12
+1. **The watcher looks at the request again before it lets go,** under
+   the lock where a snapshot counts itself in
+   (`ReaderLocks::let_go_if_asked`). It looked once, then let go: a
+   writer that had waited in vain could withdraw the request and open
+   the gate in between, and a snapshot that came after was ended, though
+   189.1 has it not asked. Now a snapshot counted in while the watcher
+   looks again passed the gate before the writer shut it.
+2. **The scan for damaged pages stops once its process let go**
+   (`Pages::damaged`): it reads the file itself, past the checks of
+   189.3, and a page a writer in another process wrote meanwhile could
+   be read half old, half new, and called damaged. Each page read is
+   followed by the check `read_at` makes, and the scan fails as too old.
+3. **A check of a snapshot ended while it checks is
+   `Error::SnapshotTooOld`,** not a report: it collected every read that
+   failed as a problem, so a snapshot ended by letting go, or by the
+   memory limit (§83), gave `Ok` with problems the file doesn't have.
+   `Database::check_of` asks the snapshot at the end
+   (`SnapshotStore::is_ended`). A writer writes only once the reader
+   has counted its letting go, so a page called damaged because it was
+   half written can't come from a snapshot that isn't ended.
+
+Tests: `a_request_withdrawn_before_the_watcher_lets_go_ends_nobody`
+(`lock_files.rs`), with a hook between the watcher's two looks;
+`a_readers_scan_for_damage_stops_once_it_let_go` (`file.rs`);
+`a_check_whose_reader_lets_go_is_too_old` and
+`a_check_whose_snapshot_the_memory_limit_ends_is_too_old`
+(`database.rs`), each ended at the check's first read of the file.
+
+Mutations, each caught: no second look; no check after a page the scan
+read; no check at the end of `check_of`; `is_ended` without letting go,
+or without the memory limit.

@@ -3165,6 +3165,26 @@ mod tests {
         assert!(too_old(store.pages.at(open).read_page(3)), "from its cache");
     }
 
+    /// The scan for damaged pages of a reader whose process lets go while
+    /// it reads the file stops as too old (SPEC §189.7): the page it read
+    /// may be half of a writer's, and called damaged.
+    #[test]
+    fn a_readers_scan_for_damage_stops_once_it_let_go() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_dir, path) = open_temp();
+        drop(five_page_file(&path));
+        let ended = Arc::new(AtomicU64::new(0));
+        let store = FileStore::open_beside_writer(&path, Arc::clone(&ended), 0).unwrap();
+        assert_eq!(store.pages.damaged(6).unwrap(), Vec::<PageId>::new());
+
+        let during = Arc::clone(&ended);
+        store.pages.before_next_file_read(move || {
+            during.fetch_add(1, Ordering::SeqCst);
+        });
+        let e = store.pages.damaged(6).unwrap_err();
+        assert!(e.get_ref().unwrap().is::<crate::storage::TooOld>(), "{e}");
+    }
+
     /// The same, for the scan of damaged pages: a page written back
     /// under it isn't called damaged, nor skipped.
     #[test]

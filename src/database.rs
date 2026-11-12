@@ -2746,6 +2746,61 @@ mod tests {
         assert_eq!(count(&reader, "posts"), usize::from(n - 1));
     }
 
+    /// A check whose reader is asked to let go while it reads fails as too
+    /// old (SPEC §189.7), not a report of the reads that failed, nor of
+    /// pages the writer wrote meanwhile called damaged.
+    #[test]
+    fn a_check_whose_reader_lets_go_is_too_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let options = OpenOptions::default()
+            .checkpoint_pages(1)
+            .checkpoint_wait(Duration::from_millis(5))
+            .let_go_wal_bytes(1);
+        let db = Database::open_with(&path, options).unwrap();
+        fill(&db, "posts");
+        let reader = open_read_only(&path).unwrap();
+        drop(reader.snapshot().unwrap());
+
+        let writer = db.clone();
+        let asked_before = db.snapshot_info().readers_asked;
+        kept_pages(&reader).before_next_file_read(move || {
+            for n in 0..100 {
+                if writer.snapshot_info().readers_asked > asked_before {
+                    return;
+                }
+                writer
+                    .write_batch(vec![insert("other", n, i64::from(n))])
+                    .unwrap();
+            }
+            panic!("never asked");
+        });
+        assert!(matches!(reader.check(), Err(crate::Error::SnapshotTooOld)));
+        assert!(db.snapshot_info().readers_asked > asked_before);
+        assert!(reader.check().unwrap().is_ok(), "the next check reads on");
+    }
+
+    /// The same for a snapshot the memory limit ends while it is checked
+    /// (SPEC §83): too old, not a report of the reads that failed.
+    #[test]
+    fn a_check_whose_snapshot_the_memory_limit_ends_is_too_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = OpenOptions::default()
+            .cache_size(0)
+            .snapshot_memory(4 * PAGE_SIZE);
+        let db = Database::open_with(dir.path().join("test.trunkdb"), options).unwrap();
+        fill(&db, "posts");
+        db.checkpoint().unwrap();
+        let kept = db.snapshot().unwrap();
+
+        let writer = db.clone();
+        db.inner.pages.before_next_file_read(move || {
+            writer.drop_collection("posts").unwrap();
+        });
+        assert!(matches!(kept.check(), Err(crate::Error::SnapshotTooOld)));
+        assert!(db.check().unwrap().is_ok());
+    }
+
     /// Beside a kept snapshot, a checkpoint asked for fails with
     /// `WouldBlock` after its wait, and `compact` is refused at once, as
     /// beside a snapshot in the writer's own process (SPEC §185.4).

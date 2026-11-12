@@ -257,6 +257,10 @@ pub(crate) struct ReaderLocks {
     /// see whether a writer is asking now; `None` without the request's
     /// file, which every writer of this release makes.
     request: Option<(File, File)>,
+    /// Run by the watcher between seeing a request and letting go, for a
+    /// test to withdraw the request there.
+    #[cfg(test)]
+    before_let_go: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ReaderLocks {
@@ -284,6 +288,8 @@ impl ReaderLocks {
             held: Condvar::new(),
             ended: Arc::new(AtomicU64::new(0)),
             request,
+            #[cfg(test)]
+            before_let_go: Mutex::new(None),
         });
         if watched {
             let weak = Arc::downgrade(&locks);
@@ -320,16 +326,30 @@ impl ReaderLocks {
         }
     }
 
-    /// Lets go of the readers' lock for every snapshot holding it, as
-    /// asked (SPEC §189): they are ended from here, their holds no
-    /// longer count, and the next snapshot takes the lock anew.
-    fn let_go(&self) {
+    /// Lets go of the readers' lock for every snapshot holding it, if a
+    /// writer asks (SPEC §189): they are ended from here, their holds no
+    /// longer count, and the next snapshot takes the lock anew. The
+    /// request is looked at again under `holders`, where a snapshot
+    /// counts itself in: a writer may have withdrawn it since the first
+    /// look, and a snapshot that came after must not be ended (§189.7).
+    fn let_go_if_asked(&self) -> io::Result<()> {
+        if !self.asked_now()? {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            let hook = self.before_let_go.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut holders = self.holders.lock().unwrap_or_else(|p| p.into_inner());
-        if *holders > 0 {
+        if *holders > 0 && self.asked_now()? {
             self.ended.fetch_add(1, Ordering::SeqCst);
             *holders = 0;
             let _ = self.readers.unlock();
         }
+        Ok(())
     }
 
     /// Passes the gate, waiting while the writer has it shut, then holds
@@ -375,9 +395,7 @@ fn watch(locks: Weak<ReaderLocks>) {
             }
         }
         // Errors: looked at again next time.
-        if strong.asked_now().unwrap_or(false) {
-            strong.let_go();
-        }
+        let _ = strong.let_go_if_asked();
         drop(strong);
         std::thread::sleep(LET_GO_LOOK);
     }
@@ -487,6 +505,39 @@ mod tests {
             "the third holds it"
         );
         drop(third);
+        drop(writer.try_readers().unwrap().expect("nobody reads"));
+    }
+
+    /// A request withdrawn between the watcher's first look and its
+    /// letting go: a snapshot that came after the gate opened again is
+    /// not ended, nor the one under way (SPEC §189.7).
+    #[test]
+    fn a_request_withdrawn_before_the_watcher_lets_go_ends_nobody() {
+        let (_dir, path) = temp();
+        let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
+        let reader = ReaderLocks::open(&path).unwrap().unwrap();
+        let first = reader.hold().unwrap();
+        let (seen, seen_rx) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        *reader.before_let_go.lock().unwrap() = Some(Box::new(move || {
+            seen.send(()).unwrap();
+            go_rx.recv().unwrap();
+        }));
+
+        // The writer asks, as `readers_gate` does.
+        writer.gate.try_lock().unwrap();
+        ask(&writer.letgo, true).unwrap();
+        seen_rx.recv_timeout(Duration::from_secs(5)).expect("seen");
+        // ... and withdraws, having waited in vain; then a new snapshot.
+        ask(&writer.letgo, false).unwrap();
+        writer.gate.unlock().unwrap();
+        let second = reader.hold().unwrap();
+        go.send(()).unwrap();
+
+        std::thread::sleep(LET_GO_LOOK * 5);
+        assert!(!second.is_ended(), "came after the request");
+        assert!(!first.is_ended());
+        drop((first, second));
         drop(writer.try_readers().unwrap().expect("nobody reads"));
     }
 

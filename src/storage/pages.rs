@@ -385,7 +385,9 @@ impl Pages {
     /// change from outside trunkdb leaves. Reads the file itself. Pages
     /// not written back yet are skipped: the WAL holds them, and the
     /// file's copy is older or missing (SPEC §51). A page read while a
-    /// checkpoint began is read again, as in `read_at`.
+    /// checkpoint began is read again, as in `read_at`. `TooOld` once a
+    /// reader's process has let go (SPEC §189.7): a writer in another
+    /// process may be writing what it reads.
     pub(super) fn damaged(&self, page_count: u64) -> io::Result<Vec<PageId>> {
         let mut damaged = Vec::new();
         for id in 0..page_count {
@@ -403,7 +405,17 @@ impl Pages {
                     }
                     memory.file_epoch
                 };
+                #[cfg(test)]
+                {
+                    let hook = self.before_file_read.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
                 let disk = read_disk_page(&self.file, id);
+                if self.let_go() {
+                    return Err(too_old());
+                }
                 if self.memory().file_epoch != epoch {
                     continue;
                 }

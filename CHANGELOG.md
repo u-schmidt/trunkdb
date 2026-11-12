@@ -1389,3 +1389,6 @@ limit, batches and a write-ahead log. Since then:
     a forgotten one too; their reads fail with `Error::SnapshotTooOld`,
     a long scan at its next page. An open that has to write the file
     asks as well. `SnapshotInfo::readers_asked` counts the asks.
+    `check` of a snapshot ended while it checks, by this or by the
+    memory limit, fails with `Error::SnapshotTooOld`, where it reported
+    the reads that failed as problems (§189.7).
