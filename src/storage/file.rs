@@ -48,8 +48,11 @@ const MAGIC: &[u8; 8] = b"TRUNKDB1";
 /// of day in documents and index keys (SPEC §173), type tags a build
 /// before it can't decode; 16 = indexes that count the documents they
 /// leave out (SPEC §181), a catalog cell a build before it can't decode
-/// — and wouldn't keep the count of, if it could.
-const FORMAT_VERSION: u32 = 16;
+/// — and wouldn't keep the count of, if it could; 17 = whoever opens the
+/// file goes by the lock files beside it (SPEC §185.6), which a build
+/// before it doesn't know: no page changes, the number keeps those
+/// builds out.
+pub(crate) const FORMAT_VERSION: u32 = 17;
 /// Older formats this build opens as they are, because such a file *is*
 /// a valid `FORMAT_VERSION` file — one that uses none of what came since
 /// (for 4: unique indexes; for 8: a document's `_id` stored in it too,
@@ -60,14 +63,15 @@ const FORMAT_VERSION: u32 = 16;
 /// for 13: documents in the encoding before §170 and plain index
 /// leaves, which reads decode, §171; for 14: no date or time of day,
 /// §173; for 15: no index that counts what it leaves out, which reads
-/// take as not knowing, §181).
+/// take as not knowing, §181; for 16: no lock files, which a writer's
+/// open makes before it stamps 17, §185.6).
 /// Every header write stamps
 /// `FORMAT_VERSION`, and the first page written in a batch writes the
 /// header too if it's older (SPEC §59) — so a file that uses something
 /// newer always says so, and an older build refuses it instead of
 /// misreading it (SPEC §33.4). 4 and 5 aren't: every page of theirs lacks
 /// the checksum (6), and uses the bytes where it now goes.
-const COMPATIBLE_OLDER_FORMATS: [u32; 10] = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const COMPATIBLE_OLDER_FORMATS: [u32; 11] = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 /// The oldest format an open reads, for `FormatError::Older`.
 const OLDEST_READABLE_FORMAT: u32 = COMPATIBLE_OLDER_FORMATS[0];
 pub(crate) const HEADER_PAGE: PageId = 0;
@@ -292,6 +296,10 @@ enum Lock {
     Exclusive,
     /// For a read-only open (SPEC §88): other read-only opens beside it.
     Shared,
+    /// For a reader beside a writer (SPEC §185): no lock on the file, which
+    /// on Windows would keep the writer from writing it; the lock files
+    /// say who may read and write.
+    BesideWriter,
     /// For a test's second handle on a file it has open already.
     #[cfg(test)]
     None,
@@ -358,6 +366,56 @@ impl FileStore {
         Self::from_file(file, Lock::Shared)
     }
 
+    /// `open_read_only` for a reader beside a writer (SPEC §185): the
+    /// file not locked, its reads tried again where Windows refuses them
+    /// for a writer's lock (`Pages::beside_writer`). Only under the
+    /// readers' lock, which keeps every write of the file out.
+    pub(crate) fn open_beside_writer(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        Self::from_file(file, Lock::BesideWriter)
+    }
+
+    /// The format version the header on disk says, if `path` is a file
+    /// of ours with a header (`Header::is_ours`); `None` for one without
+    /// a whole header page, or of another program, which an open then
+    /// says what to make of. Read without a lock, for a read-only open to
+    /// choose its way (SPEC §185.6): on Windows a read a writer's lock
+    /// refuses is tried again, for a bounded time.
+    pub(crate) fn peek_format(path: impl AsRef<Path>) -> io::Result<Option<u32>> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        if file.metadata()?.len() < PAGE_SIZE as u64 {
+            return Ok(None);
+        }
+        let mut start = [0u8; 32];
+        let since = std::time::Instant::now();
+        loop {
+            match read_exact_at(&file, &mut start, 0) {
+                Err(e)
+                    if super::lock_files::is_lock_violation(&e)
+                        && since.elapsed() < super::lock_files::REFUSED_FOR =>
+                {
+                    std::thread::sleep(super::lock_files::REFUSED_PAUSE);
+                }
+                read => break read?,
+            }
+        }
+        let format = u32::from_le_bytes(start[28..32].try_into().unwrap());
+        Ok((&start[0..8] == MAGIC).then_some(format))
+    }
+
+    /// The format version the file said when it was opened, before
+    /// anything was restored or stamped.
+    pub(crate) fn opened_format(&self) -> u32 {
+        self.header.format_version
+    }
+
+    /// Lets go of the file's lock, for step 4 of a writer's open (SPEC
+    /// §185.6): from here the lock files say who may read and write, and
+    /// readers on Windows can read the file.
+    pub(crate) fn unlock_file(&self) -> io::Result<()> {
+        self.pages.file().unlock()
+    }
+
     /// `open` on an already-open file; `Lock::None` only for tests, which
     /// look at the file through a second handle (`on_disk`).
     fn from_file(file: File, lock: Lock) -> io::Result<Self> {
@@ -366,6 +424,7 @@ impl FileStore {
         let locked = match lock {
             Lock::Exclusive => file.try_lock(),
             Lock::Shared => file.try_lock_shared(),
+            Lock::BesideWriter => Ok(()),
             #[cfg(test)]
             Lock::None => Ok(()),
         };
@@ -417,14 +476,16 @@ impl FileStore {
             }
         };
 
+        let mut pages = Pages::new(file, DEFAULT_CACHE_SIZE / PAGE_SIZE);
+        pages.beside_writer = matches!(lock, Lock::BesideWriter);
         Ok(Self {
-            pages: Arc::new(Pages::new(file, DEFAULT_CACHE_SIZE / PAGE_SIZE)),
+            pages: Arc::new(pages),
             header,
             // A fresh file's header isn't on disk yet: nothing to check.
             header_checked: is_fresh,
             header_error,
             staging: None,
-            read_only: matches!(lock, Lock::Shared),
+            read_only: matches!(lock, Lock::Shared | Lock::BesideWriter),
         })
     }
 

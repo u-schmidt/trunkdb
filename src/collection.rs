@@ -9537,7 +9537,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 901, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 16);
+        assert_eq!(db.file_info().unwrap().format_version, 17);
         assert!(db.check().unwrap().is_ok());
         let cars = db.collection::<Document>("cars");
         assert_eq!(
@@ -9580,7 +9580,7 @@ mod tests {
         drop((notes, db));
         crate::storage::rewrite_format_version(&unkeyed, 9);
         let db = Database::open(&unkeyed).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 16);
+        assert_eq!(db.file_info().unwrap().format_version, 17);
         drop(db);
         let reads = records_read(|| drop(Database::open(&unkeyed).unwrap()));
         assert_eq!(reads, 0);
@@ -9595,7 +9595,7 @@ mod tests {
         drop(db);
         crate::storage::rewrite_format_version(&plain, 9);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 16);
+        assert_eq!(db.file_info().unwrap().format_version, 17);
     }
 
     /// Stores `doc` in `collection` past the check that it is an object,
@@ -9642,7 +9642,7 @@ mod tests {
         drop(read_only(&path).unwrap());
         assert_eq!(format_on_disk(&path), 11, "a read-only open writes nothing");
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 16);
+        assert_eq!(db.file_info().unwrap().format_version, 17);
         assert_eq!(
             db.collection::<Document>("docs")
                 .count(Filter::new())
@@ -9650,14 +9650,14 @@ mod tests {
             301
         );
         drop(db);
-        assert_eq!(format_on_disk(&path), 16);
+        assert_eq!(format_on_disk(&path), 17);
 
         // An empty file is stamped too.
         let empty = dir.path().join("empty.trunkdb");
         drop(Database::open(&empty).unwrap());
         crate::storage::rewrite_format_version(&empty, 11);
         drop(Database::open(&empty).unwrap());
-        assert_eq!(format_on_disk(&empty), 16);
+        assert_eq!(format_on_disk(&empty), 17);
     }
 
     /// SPEC §95: a file of a format before 12 that holds a document that
@@ -9900,7 +9900,7 @@ mod tests {
         let reads = records_read(|| opened = Some(Database::open(&path).unwrap()));
         assert!(reads >= 601, "every document checked, and read to rebuild");
         let db = opened.unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 16);
+        assert_eq!(db.file_info().unwrap().format_version, 17);
         assert!(db.check().unwrap().is_ok());
         let files = db.collection::<Document>("files");
         assert_eq!(
@@ -9932,7 +9932,7 @@ mod tests {
         drop(db);
         assert_eq!(format_on_disk(&plain), 12);
         let db = Database::open(&plain).unwrap();
-        assert_eq!(db.file_info().unwrap().format_version, 16);
+        assert_eq!(db.file_info().unwrap().format_version, 17);
     }
 
     /// Binary never collided in a unique index before format 13 (SPEC

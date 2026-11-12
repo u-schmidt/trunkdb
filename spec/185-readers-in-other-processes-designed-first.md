@@ -1,9 +1,11 @@
 # 185. Readers in other processes, designed first (`storage/file.rs`, `durability/wal.rs`, `database.rs`)
 
-**A draft, 2026-11-11: designed, not built.** Its four questions are
-decided (185.4, 185.5, 185.6; listed in 185.7). Reviewed against the
-code the same day, and corrected: 185.10 lists what changed. What it
-assumes of the platforms' locks is tested, and holds (185.11).
+**Designed 2026-11-11; steps 1 and 2 built 2026-11-12 (§187),** and
+step 4 came along with them. Its four questions are decided (185.4,
+185.5, 185.6; listed in 185.7). Reviewed against the code the same
+day, and corrected: 185.10 lists what changed. What it assumes of the
+platforms' locks is tested, and holds (185.11). Where building
+decided what this left open, or changed it, §187.2 says so.
 
 A database file has one process at a time (§21). A read-only open goes
 beside other read-only opens, but not beside a program that writes
@@ -270,7 +272,7 @@ whole-file. Another may come with 185.5's request to let go.
 - **Never removed,** by anyone. A lock file removed while another
   process opens it leaves two files, and two "exclusive" locks.
 
-**Releases up to 0.38.0 kept out by the format.** They don't know the
+**Releases up to 0.39.0 kept out by the format.** They don't know the
 lock files, and the new opens don't hold the database file. What every
 older release checks before it writes anything is the format version,
 right after its lock (§21.2): it refuses a higher one, writing and
@@ -379,10 +381,10 @@ the bump now. To decide when step 1 is built.
 ## 185.8 Steps, a section each
 | Step | What | Seen from outside |
 |---|---|---|
-| 1 | ~~Windows' lock behaviour tested on CI~~ (done, 185.11); locks moved to the three lock files, the writer's first; format 17, stamped by a writer's open; a read-only open of a file at 16, or without lock files it can make, as §88 | older releases refuse a stamped file |
-| 2 | A read-only open beside a writer: a snapshot per call, through the gate, built from the file and the WAL's batches under the readers' lock, read again where the writer was at work; checkpoints skipped while a reader holds it, tried again through the gate, and counted; an open that has to write the file waits `wait_for_readers` for readers | the feature, with the WAL and the writer's memory growing past a long reader |
+| 1 | ~~Windows' lock behaviour tested on CI~~ (done, 185.11); ~~locks moved to the three lock files, the writer's first; format 17, stamped by a writer's open; a read-only open of a file at 16, or without lock files it can make, as §88~~ (built, §187) | older releases refuse a stamped file |
+| 2 | ~~A read-only open beside a writer: a snapshot per call, through the gate, built from the file and the WAL's batches under the readers' lock, read again where the writer was at work; checkpoints skipped while a reader holds it, tried again through the gate, and counted; an open that has to write the file waits `wait_for_readers` for readers~~ (built, §187) | the feature, with the WAL and the writer's memory growing past a long reader |
 | 3 | The reader that catches up: same sessions and its last record as it was, the new records only; else start again | readers cheap to refresh |
-| 4 | A snapshot a reader keeps (`Database::snapshot` on a read-only open beside a writer) | as §82, across processes |
+| 4 | ~~A snapshot a reader keeps (`Database::snapshot` on a read-only open beside a writer)~~ (came with step 2, §187.3) | as §82, across processes |
 | 5 | A reader too long is ended (185.5, 3): a second limit, the request to let go, `Error::SnapshotTooOld` in the reader | a forgotten reader doesn't hold the WAL |
 
 ## 185.9 What it doesn't change

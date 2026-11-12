@@ -48,7 +48,8 @@ services, test data. One file, no setup, nothing to run beside it.
 
 It isn't the right choice (yet) for:
 
-- Several processes on one file, or several writers at once.
+- Several processes writing one file, or several writers at once.
+  One process writes, and others read beside it.
 - Encryption or schema validation in the database.
 - Joins, or a cost-based planner: the planner follows fixed rules, and
   `explain` says which one it took.

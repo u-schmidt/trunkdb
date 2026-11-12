@@ -43,6 +43,12 @@ pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - CHECKSUM_LEN;
 pub(crate) struct Pages {
     file: File,
     memory: RwLock<Memory>,
+    /// A reader's beside a writer (SPEC §185.6): on Windows a read the
+    /// writer's lock on the file refuses, while its open holds the file,
+    /// is tried again for `REFUSED_FOR`, then fails as a snapshot ended
+    /// (`TooOld`), so that the reader lets go of the readers' lock and
+    /// the open waiting for it goes on.
+    pub(super) beside_writer: bool,
     /// Test-only fault injection: while non-zero, each `checkpoint`
     /// writes `write_back_fails_after` pages, then fails (and decrements
     /// this) — leaving the file genuinely half-written, like a crash or a
@@ -208,6 +214,7 @@ impl Pages {
     pub(super) fn new(file: File, cache_pages: usize) -> Self {
         Pages {
             file,
+            beside_writer: false,
             memory: RwLock::new(Memory {
                 cache: PageCache::new(cache_pages),
                 versions: BTreeMap::new(),
@@ -311,7 +318,7 @@ impl Pages {
             // at the lookup. Since then a commit may have changed the
             // page and a checkpoint written it: only a checkpoint begun
             // since can have, and that shows in the count.
-            let read = read_page_at(&self.file, id);
+            let read = self.read_file_page(id);
             let mut memory = self.memory_mut();
             if memory.file_epoch != epoch {
                 // Maybe half written, maybe too new: look again. The
@@ -322,6 +329,24 @@ impl Pages {
             // Still what the file holds: no checkpoint began.
             memory.cache.put(id, page.clone());
             return Ok(page);
+        }
+    }
+
+    /// A page from the file, for `read_at`; tried again where a writer's
+    /// lock refuses it, beside a writer on Windows (`beside_writer`).
+    fn read_file_page(&self, id: PageId) -> io::Result<Page> {
+        use super::lock_files::{REFUSED_FOR, REFUSED_PAUSE, is_lock_violation};
+        let since = std::time::Instant::now();
+        loop {
+            match read_page_at(&self.file, id) {
+                Err(e) if self.beside_writer && is_lock_violation(&e) => {
+                    if since.elapsed() >= REFUSED_FOR {
+                        return Err(too_old());
+                    }
+                    std::thread::sleep(REFUSED_PAUSE);
+                }
+                read => return read,
+            }
         }
     }
 

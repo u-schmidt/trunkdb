@@ -10,11 +10,13 @@ use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
 use crate::live::{self, LiveAggregate, LiveQuery};
 use crate::query::Filter;
+use crate::storage::lock_files::{Exclusive, ReaderLocks, ReadersHold, WriterLocks};
 use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak, mpsc};
+use std::time::{Duration, Instant};
 
 /// Opens the file and owns the whole stack — as a cheap, cloneable,
 /// thread-safe handle (SPEC §27): every clone refers to the same open
@@ -78,6 +80,22 @@ struct Shared {
     scratch_path: PathBuf,
     /// What the open restored from the WAL, for `stats`.
     recovered: Option<crate::Recovered>,
+    /// A read-only open beside a writer in another process (SPEC §185):
+    /// every read builds a snapshot of its own. `None` for a writer, and
+    /// for a read-only open as §88 has it, which reads what it loaded.
+    beside: Option<ReaderSide>,
+    /// The checkpoints skipped for readers in other processes, for
+    /// `snapshot_info` (SPEC §185.5).
+    skipped: Arc<Skipped>,
+}
+
+/// How many checkpoints were skipped because a reader in another process
+/// held the readers' lock, and the longest the WAL was left at one
+/// (SPEC §185.5): what a long reader costs the writer.
+#[derive(Default)]
+pub(crate) struct Skipped {
+    checkpoints: AtomicU64,
+    largest_wal: AtomicU64,
 }
 
 /// What a batch works with, and nobody else: the staged pages and the
@@ -95,6 +113,19 @@ pub(crate) struct Writer {
     /// `OpenOptions::checkpoint_wal_bytes`, with its default worked out:
     /// how long the WAL may grow before a commit writes back.
     checkpoint_wal_bytes: u64,
+    /// The lock files (SPEC §185.6): `None` for a read-only open.
+    locks: Option<WriterLocks>,
+    /// `OpenOptions::checkpoint_wait`: how long a checkpoint waits for
+    /// readers in other processes, through the gate.
+    checkpoint_wait: Duration,
+    /// Whether the last checkpoint due was skipped for a reader: the
+    /// next goes through the gate (SPEC §185.4).
+    through_gate: bool,
+    /// When a checkpoint last waited at the gate and still found a
+    /// reader: the next due waits again only `GATE_AGAIN_AFTER` later.
+    gate_waited: Option<Instant>,
+    /// Shared with `Shared::skipped`.
+    skipped: Arc<Skipped>,
     /// The snapshots before the last commit that were still held when
     /// they were replaced, oldest first: the ones a reader may still be
     /// reading (SPEC §80). Weak, so a snapshot ends when its last reader
@@ -126,11 +157,39 @@ pub(crate) struct Committed(Arc<CommittedInner>);
 struct CommittedInner {
     commit: Commit,
     catalog: Catalog,
+    /// A reader's beside a writer (SPEC §185): the pages it built for
+    /// this snapshot from the file and the WAL. `None` where the
+    /// snapshot reads the database's own (`Shared::pages`).
+    own: Option<Arc<Pages>>,
+    /// Its share of the readers' lock (SPEC §185.4), held for as long as
+    /// the snapshot is: nothing writes the file meanwhile.
+    _hold: Option<ReadersHold>,
 }
 
 impl Committed {
     fn new(commit: Commit, catalog: Catalog) -> Self {
-        Committed(Arc::new(CommittedInner { commit, catalog }))
+        Committed(Arc::new(CommittedInner {
+            commit,
+            catalog,
+            own: None,
+            _hold: None,
+        }))
+    }
+
+    /// A reader's snapshot beside a writer (SPEC §185): `store`'s last
+    /// commit, read from its pages, under `hold`.
+    fn beside(store: &FileStore, catalog: Catalog, hold: ReadersHold) -> Self {
+        Committed(Arc::new(CommittedInner {
+            commit: store.last_commit(),
+            catalog,
+            own: Some(store.pages.clone()),
+            _hold: Some(hold),
+        }))
+    }
+
+    /// The pages it reads: its own, or the database's.
+    fn pages<'a>(&'a self, database: &'a Pages) -> &'a Pages {
+        self.0.own.as_deref().unwrap_or(database)
     }
 
     pub(crate) fn catalog(&self) -> &Catalog {
@@ -142,7 +201,7 @@ impl Committed {
     pub(crate) fn reading<'a>(&'a self, pages: &'a Pages) -> Reading<'a> {
         Reading {
             catalog: self.catalog(),
-            store: pages.at(self.0.commit),
+            store: self.pages(pages).at(self.0.commit),
         }
     }
 }
@@ -192,6 +251,8 @@ pub struct OpenOptions {
     checkpoint_wal_bytes: Option<u64>,
     snapshot_memory: usize,
     read_only: bool,
+    checkpoint_wait: Duration,
+    wait_for_readers: Duration,
 }
 
 impl Default for OpenOptions {
@@ -202,6 +263,8 @@ impl Default for OpenOptions {
             checkpoint_wal_bytes: None,
             snapshot_memory: crate::storage::DEFAULT_VERSION_LIMIT * crate::storage::PAGE_SIZE,
             read_only: false,
+            checkpoint_wait: DEFAULT_CHECKPOINT_WAIT,
+            wait_for_readers: DEFAULT_WAIT_FOR_READERS,
         }
     }
 }
@@ -259,23 +322,72 @@ impl OpenOptions {
         self
     }
 
-    /// Opens the database without writing to it (SPEC §88): for a tool
-    /// that looks into a file no application has open. Default: `false`.
+    /// Opens the database without writing to it (SPEC §88, §185): for a
+    /// tool that looks into a file, while an application has it open or
+    /// not. Default: `false`.
     ///
-    /// Nothing is written, not even what an open does by itself: the
-    /// batches a crash left in the WAL are read into memory, not written
-    /// back, and the WAL stays as it is for the next open that writes. A
-    /// missing file is an error, not a new database; a missing WAL is
-    /// none. The file only has to be readable.
+    /// Nothing is written to the database or its WAL, not even what an
+    /// open does by itself: the batches a crash left in the WAL are read
+    /// into memory, not written back, and the WAL stays as it is for the
+    /// next open that writes. A missing file is an error, not a new
+    /// database; a missing WAL is none. The file only has to be readable.
     ///
     /// Every write fails with `Error::ReadOnly`, `checkpoint` and
     /// `compact` too. Reads, snapshots, `check` and `export` work as ever.
     ///
-    /// The file's lock is shared: any number of read-only opens may hold
-    /// it together, but while one does, an open that writes fails, as it
-    /// does beside another one that writes — and the other way round.
+    /// **Beside a writer in another process** (SPEC §185): each call
+    /// reads the database as it is when the call begins, built again
+    /// from the file and the WAL, so it sees every batch committed
+    /// before. A `Snapshot`, or a cursor, keeps the one it took. While a
+    /// read is under way the writer doesn't write its pages back to the
+    /// file: they wait in its WAL and its memory, which grow past their
+    /// limits for a reader that reads long (`snapshot_info` counts it).
+    /// So drop a snapshot when its reads are done. A batch may be seen
+    /// a moment before it is durable, if the writer's flush then fails.
+    ///
+    /// This needs the file at format 17, which a writer of this release
+    /// stamps at its open, and the lock files beside it: `<path>.readers`
+    /// and `<path>.gate`, which are made here if they aren't there. Where
+    /// neither holds, as for a file an older release wrote last, or in a
+    /// directory the reader may not write before any writer has been
+    /// there, the open takes the file's lock, shared, as before: other
+    /// read-only opens go beside it, but an open that writes fails.
+    ///
+    /// On Windows a read is refused for a moment while a writer opens
+    /// the file; it is tried again, for up to a second. A read still
+    /// refused then, while that open waits for readers to finish, fails
+    /// with `Error::SnapshotTooOld`; tried again, it waits for the open.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// How long a checkpoint waits for readers in other processes to
+    /// finish (SPEC §185.4). Default: 50 ms.
+    ///
+    /// A checkpoint writes pages back to the file, which it can't do
+    /// beneath a reader. One a commit finds due beside a reader is first
+    /// left for later; the next commit shuts the gate, so that no new
+    /// read begins, and waits up to this long for those under way. A
+    /// reader that keeps its snapshot longer, the checkpoint is left again,
+    /// and a commit waits at the gate at most once a second for it.
+    pub fn checkpoint_wait(mut self, wait: Duration) -> Self {
+        self.checkpoint_wait = wait;
+        self
+    }
+
+    /// How long an open that has to write the file waits for readers in
+    /// other processes to finish (SPEC §185.4). Default: 5 seconds.
+    ///
+    /// An open writes the file when the WAL holds batches, after a crash
+    /// or after a close whose last checkpoint was left for a reader, and
+    /// once in the file's life, to stamp format 17. It shuts the gate, so
+    /// that no new read begins, and waits up to this long. Readers still
+    /// there then, the open fails with an `Error::Io` of kind
+    /// `WouldBlock`, having written nothing; it succeeds once they are
+    /// done. An open with nothing to write waits for nobody.
+    pub fn wait_for_readers(mut self, wait: Duration) -> Self {
+        self.wait_for_readers = wait;
         self
     }
 }
@@ -286,6 +398,74 @@ impl OpenOptions {
 /// 800–1,250 pages waiting, so the 1,000 of SQLite's WAL mode, the
 /// default until SPEC §123, made most such commits checkpoint.
 const DEFAULT_CHECKPOINT_PAGES: usize = 4000;
+
+/// How long a checkpoint waits at the gate for readers in other
+/// processes, unless `OpenOptions::checkpoint_wait` says otherwise (SPEC
+/// §185.4): a reader that reads per call is done within it.
+const DEFAULT_CHECKPOINT_WAIT: Duration = Duration::from_millis(50);
+
+/// How long an open that has to write the file waits for readers in
+/// other processes, unless `OpenOptions::wait_for_readers` says otherwise
+/// (SPEC §185.4).
+const DEFAULT_WAIT_FOR_READERS: Duration = Duration::from_secs(5);
+
+/// How long after a checkpoint waited at the gate in vain the next one
+/// waits there again (SPEC §185.4): until then, a due checkpoint only
+/// tries, so that a reader that keeps its snapshot slows the writer's
+/// commits by `checkpoint_wait` at most once in this time.
+const GATE_AGAIN_AFTER: Duration = Duration::from_secs(1);
+
+/// How a checkpoint goes about readers in other processes (SPEC §185.4).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Turn {
+    /// One a commit found due: tried at once, or through the gate after
+    /// one was left for a reader; left again, quietly, if a reader stays.
+    Due,
+    /// `Database::checkpoint`, or the last handle's: through the gate at
+    /// once; if a reader stays, left, and said so with `WouldBlock`.
+    Asked,
+    /// Whoever calls holds the readers' lock already: `compact`.
+    Held,
+}
+
+/// The error of a checkpoint asked for, that a reader in another
+/// process kept out (SPEC §185.4).
+fn readers_kept_the_checkpoint_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "a reader in another process holds a snapshot: the pages wait in the WAL, and a later \
+         checkpoint writes them back",
+    )
+}
+
+/// The error of an open that has to write the file, and that readers in
+/// other processes kept out for `OpenOptions::wait_for_readers` (SPEC
+/// §185.4).
+fn readers_kept_the_open_out() -> crate::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "the database has to be written as it opens, to recover what its WAL holds or to \
+         stamp its format, and another process is reading it: try again once it is done",
+    )
+    .into()
+}
+
+/// The readers' lock, exclusively, through the gate, for an open that
+/// writes the file: `held` once had, so it is taken once.
+fn readers_gone(
+    locks: &WriterLocks,
+    held: &mut Option<Exclusive>,
+    bound: Duration,
+) -> crate::Result<()> {
+    if held.is_none() {
+        *held = Some(
+            locks
+                .readers_through_gate(bound)?
+                .ok_or_else(readers_kept_the_open_out)?,
+        );
+    }
+    Ok(())
+}
 
 impl Writer {
     /// Sends a commit's changes to every subscriber, dropping those
@@ -311,13 +491,59 @@ impl Writer {
     /// be emptied, its records are written back once more at the next
     /// open: harmless, page images are idempotent. One cut whose flush
     /// failed is empty all the same, and logged after as such (SPEC
-    /// §128). Beside the readers
-    /// (`Pages::checkpoint`).
-    fn checkpoint(&mut self) -> std::io::Result<()> {
+    /// §128). Beside the readers in this process (`Pages::checkpoint`);
+    /// left for later beside a reader in another one, as `turn` says
+    /// (SPEC §185.4).
+    fn checkpoint(&mut self, turn: Turn) -> std::io::Result<()> {
+        let _readers = match self.readers_turn(turn)? {
+            Some(readers) => readers,
+            None => return self.skip(turn),
+        };
         let live = self.live();
         self.store.checkpoint_beside(&live)?;
         let _ = wal(&mut self.durability).checkpoint();
+        self.through_gate = false;
         Ok(())
+    }
+
+    /// The readers' lock for a checkpoint (SPEC §185.4): `Some` to go
+    /// on, holding it if it was taken here; `None` where a reader in
+    /// another process kept it.
+    fn readers_turn(&mut self, turn: Turn) -> std::io::Result<Option<Option<Exclusive>>> {
+        let Some(locks) = &self.locks else {
+            return Ok(Some(None));
+        };
+        let gate_again = self
+            .gate_waited
+            .is_none_or(|at| at.elapsed() >= GATE_AGAIN_AFTER);
+        let readers = match turn {
+            Turn::Held => return Ok(Some(None)),
+            Turn::Due if !(self.through_gate && gate_again) => {
+                let readers = locks.try_readers()?;
+                self.through_gate |= readers.is_none();
+                readers
+            }
+            Turn::Due | Turn::Asked => {
+                let readers = locks.readers_through_gate(self.checkpoint_wait)?;
+                self.gate_waited = readers.is_none().then(Instant::now);
+                readers
+            }
+        };
+        Ok(readers.map(Some))
+    }
+
+    /// A checkpoint left for a reader in another process: counted, with
+    /// the WAL it left (SPEC §185.5); an error where it was asked for.
+    fn skip(&mut self, turn: Turn) -> std::io::Result<()> {
+        let wal_len = wal(&mut self.durability).len();
+        self.skipped.checkpoints.fetch_add(1, Ordering::Relaxed);
+        self.skipped
+            .largest_wal
+            .fetch_max(wal_len, Ordering::Relaxed);
+        match turn {
+            Turn::Asked => Err(readers_kept_the_checkpoint_out()),
+            _ => Ok(()),
+        }
     }
 
     /// The commits of the snapshots still open among those replaced,
@@ -356,7 +582,9 @@ impl Drop for Shared {
             // Read-only (SPEC §88): what's in memory stays there.
             && writer.durability.is_some()
         {
-            let _ = writer.checkpoint();
+            // Beside a reader in another process, the WAL is left as it
+            // is, for the next open to write back (SPEC §185.4).
+            let _ = writer.checkpoint(Turn::Asked);
         }
     }
 }
@@ -384,11 +612,12 @@ impl Database {
     /// time) or a WAL record that completes it — never a file with a
     /// header but no catalog page.
     ///
-    /// The store is opened first: it takes the file's exclusive lock
-    /// (`FileStore::open`), so a second `open` of a database in use fails
-    /// before it reads anything — not even the WAL, which the running
-    /// instance may be halfway through writing. To share one database
-    /// within a process, clone the handle instead of opening it again.
+    /// The writer's lock is taken first (`<path>.writer`, SPEC §185.6),
+    /// so a second `open` of a database in use fails before it reads
+    /// anything — not even the WAL, which the running instance may be
+    /// halfway through writing. To share one database within a process,
+    /// clone the handle instead of opening it again. Read-only opens in
+    /// other processes may read beside it (`OpenOptions::read_only`).
     ///
     /// `path` may be a symlink: it is followed to the file it names, and
     /// the WAL is that file's, beside it, whichever name opened it (SPEC
@@ -400,8 +629,11 @@ impl Database {
     /// - `Error::Format`: the file, or the WAL beside it, is not one this
     ///   build can read at all — another program's file, or a format it
     ///   doesn't read. Nothing was changed.
-    /// - `Error::Io` of kind `WouldBlock`: another open holds the file,
-    ///   in this process or another one. On Unix, also for a moment after
+    /// - `Error::Io` of kind `WouldBlock`: another open that writes holds
+    ///   the file, in this process or another one; or a read-only open of
+    ///   a file at format 16 holds it; or the open has to write the file
+    ///   and readers stayed longer than `OpenOptions::wait_for_readers`
+    ///   (SPEC §185.4). On Unix, also for a moment after
     ///   the last handle was dropped, if another thread of this process
     ///   was starting a process then: the child holds a copy of the file,
     ///   and its lock, until its exec (SPEC §98). Keep or clone the
@@ -434,31 +666,16 @@ impl Database {
         // named after it (SPEC §127).
         let path = &followed(path.as_ref())?;
         if options.read_only {
-            let mut store = FileStore::open_read_only(path)?;
-            store.set_cache_size(options.cache_size);
-            store.set_snapshot_memory(options.snapshot_memory);
-            let pending = durability::read_pending(path)?;
-            belongs(&store, &pending, path)?;
-            let recovered = crate::Recovered::of(&pending, true);
-            if !pending.is_empty() {
-                store.restore_in_memory(&pending)?;
-            }
-            store.check_header()?;
-            let catalog = Self::load_catalog(&mut store)?;
-            if store.dirty_pages().next().is_some() {
-                // A fresh file's catalog page, or the index keys an old
-                // file lacks: committed in memory, never logged nor
-                // written back, like the WAL's pages.
-                store.check_staged();
-                store.commit();
-            } else {
-                store.rollback();
-            }
-            return Ok(Self::from_parts(
-                store, None, catalog, options, path, recovered,
-            ));
+            return Self::open_read_only(path, options);
         }
+        // The writer's lock first (SPEC §185.6): a second writer is
+        // refused before it touches the database file. Then the file,
+        // exclusively, as before 17: an older release is kept out, and a
+        // reader of a file still at 16, which holds the file itself, keeps
+        // this open out. Then the other two lock files.
+        let writer_lock = WriterLocks::writer(path)?;
         let mut store = FileStore::open_before_recovery(path)?;
+        let locks = WriterLocks::new(writer_lock, path)?;
         store.set_cache_size(options.cache_size);
         store.set_snapshot_memory(options.snapshot_memory);
         let (mut durability, pending) = WalDurability::open(path)?;
@@ -466,7 +683,14 @@ impl Database {
         // copy of this one, is refused (SPEC §183).
         belongs(&store, &pending, path)?;
         let recovered = crate::Recovered::of(&pending, false);
+        // Taken before the first write of the file, and held to the end
+        // of the open: readers in other processes read the file and the
+        // WAL as they are, so neither changes beneath them (SPEC §185.4).
+        // A WAL with only a torn tail is cut without it: no reader read
+        // anything from it.
+        let mut readers = None;
         if !pending.is_empty() {
+            readers_gone(&locks, &mut readers, options.wait_for_readers)?;
             store.restore_pages(&pending)?;
         }
         // After recovery, which rewrites a header a crash tore (SPEC
@@ -481,6 +705,12 @@ impl Database {
         if store.dirty_pages().next().is_none() {
             store.rollback(); // an existing file: nothing was bootstrapped
         } else {
+            // A fresh file's catalog, an old file's keys, or its format
+            // stamped: written to the file, so not beneath a reader.
+            if let Err(e) = readers_gone(&locks, &mut readers, options.wait_for_readers) {
+                store.rollback();
+                return Err(e);
+            }
             // The WAL was just emptied: this batch starts a session
             // (SPEC §183).
             let binding = match store.start_session() {
@@ -499,14 +729,67 @@ impl Database {
             store.write_back()?;
             durability.checkpoint()?;
         }
+        drop(readers);
+        // Step 4 of SPEC §185.6: the file let go of, so readers on
+        // Windows can read it; the lock files say who may from here.
+        store.unlock_file()?;
         Ok(Self::from_parts(
             store,
+            Some(locks),
             Some(durability),
             catalog,
             options,
             path,
             recovered,
+            None,
         ))
+    }
+
+    /// `open_with` for `OpenOptions::read_only` (SPEC §88, §185.6): by
+    /// the lock files, beside a writer, for a file at format 17 whose
+    /// lock files are there or can be made; else as §88 has it, holding
+    /// the file shared. Having the file, it looks again: a writer that
+    /// came in between has stamped 17 and made the lock files first, and
+    /// the open lets go and goes by them, at most once.
+    fn open_read_only(path: &Path, options: OpenOptions) -> crate::Result<Self> {
+        let mut looked_again = false;
+        loop {
+            if FileStore::peek_format(path)? == Some(crate::storage::FORMAT_VERSION)
+                && let Some(locks) = ReaderLocks::open(path)?
+            {
+                let side = ReaderSide {
+                    path: path.to_path_buf(),
+                    locks: Arc::new(locks),
+                    cache_size: options.cache_size,
+                    snapshot_memory: options.snapshot_memory,
+                };
+                // The first snapshot, to fail the open on what fails it,
+                // and for what needs none; its share of the lock let go.
+                let (store, catalog, recovered) = side.build()?;
+                return Ok(Self::from_parts(
+                    store,
+                    None,
+                    None,
+                    catalog,
+                    options,
+                    path,
+                    recovered,
+                    Some(side),
+                ));
+            }
+            let store = FileStore::open_read_only(path)?;
+            if !looked_again
+                && store.opened_format() == crate::storage::FORMAT_VERSION
+                && ReaderLocks::open(path)?.is_some()
+            {
+                looked_again = true;
+                continue;
+            }
+            let (store, catalog, recovered) = read_only_state(store, &options, path)?;
+            return Ok(Self::from_parts(
+                store, None, None, catalog, options, path, recovered, None,
+            ));
+        }
     }
 
     /// The catalog, loaded in a batch begun here and left staged: on a
@@ -536,16 +819,21 @@ impl Database {
     }
 
     /// The handle, on a store recovered and loaded with `catalog`, all of
-    /// it committed; `durability` is `None` for a read-only open.
+    /// it committed; `locks` and `durability` are `None` for a read-only
+    /// open, and `beside` is `Some` for one beside a writer.
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         store: FileStore,
+        locks: Option<WriterLocks>,
         durability: Option<WalDurability>,
         catalog: Catalog,
         options: OpenOptions,
         path: &Path,
         recovered: Option<crate::Recovered>,
+        beside: Option<ReaderSide>,
     ) -> Self {
         let current = Committed::new(store.last_commit(), catalog);
+        let skipped = Arc::new(Skipped::default());
         Self {
             inner: Arc::new(Shared {
                 pages: store.pages.clone(),
@@ -562,6 +850,11 @@ impl Database {
                         (options.checkpoint_pages as u64)
                             .saturating_mul(2 * crate::storage::PAGE_SIZE as u64),
                     ),
+                    locks,
+                    checkpoint_wait: options.checkpoint_wait,
+                    through_gate: false,
+                    gate_waited: None,
+                    skipped: skipped.clone(),
                     past: Vec::new(),
                     subscribers: Vec::new(),
                     watchers: Vec::new(),
@@ -575,6 +868,8 @@ impl Database {
                 wal_path: durability::wal_path(path),
                 scratch_path: crate::storage::scratch_path(path),
                 recovered,
+                beside,
+                skipped,
             }),
         }
     }
@@ -699,7 +994,12 @@ impl Database {
         if self.inner.poisoned.load(Ordering::Relaxed) {
             return Err(crate::Error::Poisoned);
         }
-        let current = self.current();
+        // Beside a writer in another process, the database as it is now,
+        // not as the open found it (SPEC §185).
+        let current = match &self.inner.beside {
+            Some(side) => side.snapshot()?,
+            None => self.current(),
+        };
         let (watcher, receiver) = live::AggregateWatcher::start(
             &current.reading(&self.inner.pages),
             collection,
@@ -746,6 +1046,13 @@ impl Database {
         if self.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
+        if let Some(side) = &self.inner.beside {
+            return Ok(ReadGuard {
+                pages: &self.inner.pages,
+                snapshot: side.snapshot()?,
+                _gate: None,
+            });
+        }
         let gate = self.inner.gate.read().map_err(|_| crate::Error::Poisoned)?;
         Ok(ReadGuard {
             pages: &self.inner.pages,
@@ -763,7 +1070,7 @@ impl Database {
         }
         // Ended by the memory limit (SPEC §83): said here, before a read
         // that needs no page, or only the catalog, goes through.
-        if kept.0.commit.seq() < self.inner.pages.ended_before() {
+        if kept.0.commit.seq() < kept.pages(&self.inner.pages).ended_before() {
             return Err(crate::Error::SnapshotTooOld);
         }
         Ok(ReadGuard {
@@ -781,6 +1088,9 @@ impl Database {
     pub(crate) fn pin(&self) -> crate::Result<Committed> {
         if self.is_poisoned() {
             return Err(crate::Error::Poisoned);
+        }
+        if let Some(side) = &self.inner.beside {
+            return side.snapshot();
         }
         let _gate = self.inner.gate.read().map_err(|_| crate::Error::Poisoned)?;
         Ok(self.current())
@@ -928,9 +1238,27 @@ impl Database {
                 writer.store.rollback();
                 return Err(crate::Error::SnapshotOpen);
             }
-            Some(gate)
+            // Nor a reader in another process (SPEC §185.4): refused at
+            // once too, and kept out until the image is in the file.
+            let readers = match writer.locks.as_ref().map(WriterLocks::try_readers) {
+                None => None,
+                Some(Ok(Some(readers))) => Some(readers),
+                Some(Ok(None)) => {
+                    writer.store.rollback();
+                    return Err(crate::Error::SnapshotOpen);
+                }
+                Some(Err(e)) => {
+                    writer.store.rollback();
+                    return Err(e.into());
+                }
+            };
+            Some((gate, readers))
         } else {
             None
+        };
+        let (alone, readers) = match alone {
+            Some((gate, readers)) => (Some(gate), readers),
+            None => (None, None),
         };
 
         // The first batch since the WAL was empty starts a session: the
@@ -1017,8 +1345,13 @@ impl Database {
         {
             // Not an error for this batch if it fails: it's durable, and
             // reads find its pages in memory. The next one tries again.
-            let _ = writer.checkpoint();
+            let turn = match readers {
+                Some(_) => Turn::Held,
+                None => Turn::Due,
+            };
+            let _ = writer.checkpoint(turn);
         }
+        drop(readers);
         Ok(result)
     }
 
@@ -1036,6 +1369,16 @@ impl Database {
         self.inner.pages.versions_kept()
     }
 
+    /// How many checkpoints readers in other processes kept out, and the
+    /// longest WAL one left, for `snapshot_info` (SPEC §185.5).
+    pub(crate) fn checkpoints_skipped(&self) -> (u64, u64) {
+        let skipped = &self.inner.skipped;
+        (
+            skipped.checkpoints.load(Ordering::Relaxed),
+            skipped.largest_wal.load(Ordering::Relaxed),
+        )
+    }
+
     /// The last commit, to replace, with no read taking it meanwhile.
     fn current_locked(&self) -> std::sync::RwLockWriteGuard<'_, Committed> {
         self.inner
@@ -1048,8 +1391,13 @@ impl Database {
     /// WAL (SPEC §51) — which a commit does by itself once enough pages
     /// wait, and dropping the last handle does too. For a file that is
     /// complete on its own: before copying it, say.
+    ///
+    /// Beside a reader in another process (SPEC §185.4) it waits up to
+    /// `OpenOptions::checkpoint_wait` for the reader to finish, and fails
+    /// with an `Error::Io` of kind `WouldBlock` if it doesn't: the pages
+    /// stay in the WAL, safe, and a later checkpoint writes them back.
     pub fn checkpoint(&self) -> crate::Result<()> {
-        Ok(self.write()?.checkpoint()?)
+        Ok(self.write()?.checkpoint(Turn::Asked)?)
     }
 
     /// Direct access to the writer for tests, bypassing the poisoned
@@ -1112,6 +1460,142 @@ const MAX_LINKS: usize = 40;
 /// followed: one directory reached by two names keeps one WAL already.
 /// A path that isn't there is left as it is, and so is a symlink's
 /// target that isn't there: the open creates it, and the WAL beside it.
+/// A read-only open's store loaded: the batches the WAL beside `path`
+/// holds read into memory over the file (SPEC §88.2), the header checked,
+/// and the catalog loaded, all of it committed in memory and none of it
+/// written. With what was read from the WAL, for `stats`.
+fn read_only_state(
+    mut store: FileStore,
+    options: &OpenOptions,
+    path: &Path,
+) -> crate::Result<(FileStore, Catalog, Option<crate::Recovered>)> {
+    store.set_cache_size(options.cache_size);
+    store.set_snapshot_memory(options.snapshot_memory);
+    let pending = durability::read_pending(path)?;
+    belongs(&store, &pending, path)?;
+    let recovered = crate::Recovered::of(&pending, true);
+    if !pending.is_empty() {
+        store.restore_in_memory(&pending)?;
+    }
+    store.check_header()?;
+    let catalog = Database::load_catalog(&mut store)?;
+    if store.dirty_pages().next().is_some() {
+        // A fresh file's catalog page, or the index keys an old file
+        // lacks: committed in memory, never logged nor written back, like
+        // the WAL's pages.
+        store.check_staged();
+        store.commit();
+    } else {
+        store.rollback();
+    }
+    Ok((store, catalog, recovered))
+}
+
+/// A read-only open beside a writer (SPEC §185): how it builds a snapshot
+/// for each read, from the file and the WAL as they are, under the
+/// readers' lock.
+struct ReaderSide {
+    path: PathBuf,
+    locks: Arc<ReaderLocks>,
+    cache_size: usize,
+    snapshot_memory: usize,
+}
+
+/// How many times a reader beside a writer reads the WAL again before it
+/// reports damage (SPEC §185.4): the writer may be at work at its end, or
+/// have cut it back.
+const READ_AGAIN: usize = 3;
+
+/// How long a reader beside a writer goes on beginning its snapshot
+/// again while a writer's open on Windows refuses its reads (SPEC
+/// §185.6): more than any `wait_for_readers` it lets win.
+const BUILD_REFUSED_FOR: Duration = Duration::from_secs(30);
+
+impl ReaderSide {
+    /// A snapshot of the database as it is now, holding the readers'
+    /// lock for as long as it lives.
+    fn snapshot(&self) -> crate::Result<Committed> {
+        let ((store, catalog, _), hold) = self.build_holding()?;
+        Ok(Committed::beside(&store, catalog, hold))
+    }
+
+    /// `snapshot`'s parts, the share of the lock let go: for the open.
+    fn build(&self) -> crate::Result<(FileStore, Catalog, Option<crate::Recovered>)> {
+        Ok(self.build_holding()?.0)
+    }
+
+    fn options(&self) -> OpenOptions {
+        OpenOptions::default()
+            .cache_size(self.cache_size)
+            .snapshot_memory(self.snapshot_memory)
+    }
+
+    /// The gate passed, the readers' lock held, the snapshot built; read
+    /// again where the writer may have been at work (SPEC §185.4), and
+    /// begun again through the gate where a writer's open on Windows
+    /// refuses it (SPEC §185.6).
+    #[allow(clippy::type_complexity)]
+    fn build_holding(
+        &self,
+    ) -> crate::Result<((FileStore, Catalog, Option<crate::Recovered>), ReadersHold)> {
+        let options = self.options();
+        let since = Instant::now();
+        let mut again = 0;
+        loop {
+            let hold = self.locks.hold()?;
+            match self.build_once(&options) {
+                Ok(built) => return Ok((built, hold)),
+                Err(e) if refused(&e) && since.elapsed() < BUILD_REFUSED_FOR => {
+                    // Let go, and wait at the gate the open has shut.
+                    drop(hold);
+                    std::thread::sleep(crate::storage::lock_files::REFUSED_PAUSE);
+                }
+                Err(e) if !refused(&e) && again < READ_AGAIN => {
+                    again += 1;
+                    drop(hold);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One try at a snapshot: the file opened without a lock, as it was
+    /// stamped (17, or the reader would have gone as §88 has it), and
+    /// the WAL's whole batches read over it.
+    fn build_once(
+        &self,
+        options: &OpenOptions,
+    ) -> crate::Result<(FileStore, Catalog, Option<crate::Recovered>)> {
+        let store = FileStore::open_beside_writer(&self.path)?;
+        let format = store.opened_format();
+        if format != crate::storage::FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the database file says format {format} now, not {}: it was replaced; open it \
+                     again",
+                    crate::storage::FORMAT_VERSION
+                ),
+            )
+            .into());
+        }
+        read_only_state(store, options, &self.path)
+    }
+}
+
+/// Whether a reader's read failed because a writer's open on Windows has
+/// the file locked (SPEC §185.6): refused for longer than a page read
+/// tries again, which says so as a snapshot ended, or at once, where the
+/// header is read.
+fn refused(error: &crate::Error) -> bool {
+    match error {
+        crate::Error::SnapshotTooOld => true,
+        crate::Error::Io(e) => crate::storage::lock_files::is_lock_violation(e),
+        _ => false,
+    }
+}
+
 /// Whether what the WAL beside the file at `path` holds may be replayed
 /// into it (SPEC §183): `FormatError::WalNotThisFiles` if it belongs to
 /// another file, or to another copy of this one. Before anything is
@@ -1772,21 +2256,266 @@ mod tests {
         }
     }
 
-    /// The lock is shared: read-only opens go together, an open that
-    /// writes goes with none of them, nor they with it.
+    /// Whether `result` is an open refused for one that holds the file.
+    fn in_use(result: crate::Result<Database>) -> bool {
+        matches!(result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock)
+    }
+
+    /// The documents in `name`, counted by a read of its own.
+    fn count(db: &Database, name: &str) -> usize {
+        db.collection::<Document>(name)
+            .count(Filter::new())
+            .unwrap()
+    }
+
+    /// A file still at 16 (SPEC §185.6): a reader holds the file itself,
+    /// as §88 has it, read-only opens go together, and a writer's open
+    /// fails beside them. Alone, a writer stamps 17 into the file, and
+    /// readers go beside it from then on.
     #[test]
-    fn read_only_opens_share_the_lock_that_an_open_that_writes_keeps() {
+    fn a_file_at_16_is_read_as_before_until_a_writer_stamps_17() {
         let (_dir, path, db) = open_temp();
-        let in_use = |result: crate::Result<Database>| matches!(result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock);
-        assert!(in_use(open_read_only(&path)), "read-only beside a writer");
+        db.write_batch(two_collection_batch()).unwrap();
         drop(db);
+        crate::storage::rewrite_format_version(&path, 16);
 
         let first = open_read_only(&path).unwrap();
         let second = open_read_only(&path).unwrap();
         assert!(in_use(Database::open(&path)), "a writer beside read-only");
         drop(first);
         assert!(in_use(Database::open(&path)), "a writer beside the other");
+        assert_two_collection_batch_present(&second);
         drop(second);
+
+        let db = Database::open(&path).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk[28..32], 17u32.to_le_bytes(), "in the file itself");
+        let reader = open_read_only(&path).unwrap();
+        assert_two_collection_batch_present(&reader);
+        drop(db);
+        assert_two_collection_batch_present(&reader);
+    }
+
+    /// A read-only open beside a writer reads, call by call, what the
+    /// writer committed before the call: from the WAL, and from the file
+    /// after a checkpoint. A second writer is refused at the writer's
+    /// lock, and the reader reads on after the writer is gone.
+    #[test]
+    fn a_reader_beside_a_writer_reads_what_was_committed_before_each_call() {
+        let (dir, path, db) = open_temp();
+        for lock in crate::storage::lock_files::lock_paths(&path) {
+            assert!(lock.exists(), "{} made at the open", lock.display());
+        }
+        let reader = open_read_only(&path).unwrap();
+        assert_eq!(get(&reader, "posts", 1), None);
+        db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        assert!(wal_len(&path) > 0);
+        assert_eq!(
+            get(&reader, "posts", 1),
+            Some(Document::Int(10)),
+            "from the WAL"
+        );
+        db.checkpoint().unwrap();
+        assert_eq!(wal_len(&path), 0);
+        db.write_batch(vec![insert("posts", 2, 20)]).unwrap();
+        assert_eq!(
+            get(&reader, "posts", 1),
+            Some(Document::Int(10)),
+            "from the file"
+        );
+        assert_eq!(get(&reader, "posts", 2), Some(Document::Int(20)));
+
+        assert!(in_use(Database::open(&path)), "a second writer");
+        let other = open_read_only(&path).unwrap();
+        drop(db);
+        assert_eq!(count(&reader, "posts"), 2, "after the writer is gone");
+        assert_eq!(count(&other, "posts"), 2);
+        let _ = dir;
+    }
+
+    /// A snapshot a reader keeps keeps the writer's checkpoints out: they
+    /// are left, and counted, and the WAL grows; the snapshot reads what
+    /// it took, a new read what is committed. Once it is dropped, the
+    /// next commit checkpoints.
+    #[test]
+    fn a_kept_snapshot_keeps_checkpoints_out_and_the_wal_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let options = OpenOptions::default()
+            .checkpoint_pages(1)
+            .checkpoint_wait(Duration::from_millis(5));
+        let db = Database::open_with(&path, options).unwrap();
+        db.write_batch(vec![insert("posts", 1, 1)]).unwrap();
+        assert_eq!(wal_len(&path), 0, "checkpointed at once");
+
+        let reader = open_read_only(&path).unwrap();
+        let kept = reader.snapshot().unwrap();
+        for n in 2..10 {
+            db.write_batch(vec![insert("posts", n, i64::from(n))])
+                .unwrap();
+        }
+        let info = db.snapshot_info();
+        assert_eq!(info.checkpoints_skipped, 8);
+        assert!(wal_len(&path) > 0);
+        assert_eq!(info.largest_wal_skipped, wal_len(&path));
+        assert_eq!(
+            kept.collection::<Document>("posts")
+                .count(Filter::new())
+                .unwrap(),
+            1
+        );
+        assert_eq!(count(&reader, "posts"), 9);
+
+        drop(kept);
+        db.write_batch(vec![insert("posts", 10, 10)]).unwrap();
+        assert_eq!(wal_len(&path), 0, "the next commit checkpoints");
+        assert_eq!(db.snapshot_info().checkpoints_skipped, 8);
+        assert_eq!(count(&reader, "posts"), 10);
+    }
+
+    /// Beside a kept snapshot, a checkpoint asked for fails with
+    /// `WouldBlock` after its wait, and `compact` is refused at once, as
+    /// beside a snapshot in the writer's own process (SPEC §185.4).
+    #[test]
+    fn a_checkpoint_asked_for_and_compact_are_refused_beside_a_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let wait = Duration::from_millis(30);
+        let db = Database::open_with(&path, OpenOptions::default().checkpoint_wait(wait)).unwrap();
+        // Pages freed, for a compaction that changes the file.
+        fill(&db, "gone");
+        db.drop_collection("gone").unwrap();
+        db.write_batch(two_collection_batch()).unwrap();
+        let reader = open_read_only(&path).unwrap();
+        let kept = reader.snapshot().unwrap();
+
+        let start = Instant::now();
+        let Err(crate::Error::Io(e)) = db.checkpoint() else {
+            panic!("a checkpoint beneath a reader");
+        };
+        assert!(start.elapsed() >= wait);
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+        assert!(wal_len(&path) > 0, "the pages wait in the WAL");
+        assert!(matches!(db.compact(), Err(crate::Error::SnapshotOpen)));
+        assert_two_collection_batch_present(&reader);
+
+        drop(kept);
+        db.checkpoint().unwrap();
+        assert_eq!(wal_len(&path), 0);
+        db.compact().unwrap();
+        assert_two_collection_batch_present(&reader);
+    }
+
+    /// The last handle's checkpoint left for a reader leaves the WAL; the
+    /// next open has to write it back, so it waits `wait_for_readers`,
+    /// then fails with `WouldBlock`, having written nothing. The reader
+    /// reads on meanwhile, and once it is done the open recovers.
+    #[test]
+    fn an_open_that_has_to_write_waits_for_readers_then_fails() {
+        let (_dir, path, db) = open_temp();
+        let reader = open_read_only(&path).unwrap();
+        let kept = reader.snapshot().unwrap();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        assert!(
+            wal_len(&path) > 0,
+            "the last checkpoint left for the reader"
+        );
+
+        let before = files(&path);
+        let wait = Duration::from_millis(50);
+        let options = OpenOptions::default().wait_for_readers(wait);
+        let start = Instant::now();
+        let Err(crate::Error::Io(e)) = Database::open_with(&path, options.clone()) else {
+            panic!("an open that recovers beneath a reader");
+        };
+        assert!(start.elapsed() >= wait);
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            e.to_string().contains("another process is reading it"),
+            "{e}"
+        );
+        assert_eq!(files(&path), before, "nothing written");
+        assert_two_collection_batch_present(&reader);
+
+        drop(kept);
+        let db = Database::open_with(&path, options).unwrap();
+        assert_eq!(wal_len(&path), 0, "written back");
+        assert_two_collection_batch_present(&db);
+        assert_two_collection_batch_present(&reader);
+    }
+
+    /// Readers that each read for a moment, one overlapping the next,
+    /// don't keep the checkpoint out: the gate gives it a turn, so no two
+    /// commits in a row leave it. Every read sees a whole commit, and
+    /// none an older one than the read before it.
+    #[test]
+    fn readers_in_turn_let_the_checkpoint_through_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let options = OpenOptions::default()
+            .checkpoint_pages(1)
+            .checkpoint_wait(Duration::from_secs(10));
+        let db = Database::open_with(&path, options).unwrap();
+        db.write_batch(vec![insert("posts", 0, 0)]).unwrap();
+        let reader = open_read_only(&path).unwrap();
+        let stop = AtomicBool::new(false);
+        let commits = 20;
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut last = 0;
+                        while !stop.load(Ordering::Relaxed) {
+                            let seen = count(&reader, "posts");
+                            assert!(seen >= last, "{seen} after {last}");
+                            last = seen;
+                        }
+                    })
+                })
+                .collect();
+            for n in 1..=commits {
+                db.write_batch(vec![insert("posts", n, i64::from(n))])
+                    .unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            for reader in readers {
+                reader.join().unwrap();
+            }
+        });
+        let skipped = db.snapshot_info().checkpoints_skipped;
+        assert!(skipped <= u64::from(commits) / 2, "{skipped} skipped");
+        assert_eq!(count(&reader, "posts"), commits as usize + 1);
+    }
+
+    /// A reader in a directory it may not write, where no writer has made
+    /// the lock files, holds the file itself, as §88 has it: a writer's
+    /// open fails beside it (SPEC §185.6).
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_without_lock_files_it_can_make_holds_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, path, db) = open_temp();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        // A file that came without them: copied, say.
+        for lock in crate::storage::lock_files::lock_paths(&path) {
+            std::fs::remove_file(lock).unwrap();
+        }
+        let set = |mode| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(0o555);
+        let root = std::fs::File::create(dir.path().join("probe")).is_ok();
+        let reader = open_read_only(&path);
+        set(0o755);
+        if root {
+            return;
+        }
+        let reader = reader.unwrap();
+        assert!(in_use(Database::open(&path)), "the writer's step 2");
+        assert_two_collection_batch_present(&reader);
+        drop(reader);
         Database::open(&path).unwrap();
     }
 
@@ -1881,21 +2610,21 @@ mod tests {
                  development build), which this build can't read",
             ),
             (
-                17,
+                18,
                 crate::FormatError::Newer {
-                    found: 17,
-                    current: 16,
+                    found: 18,
+                    current: 17,
                 },
-                "file has format 17, newer than this build's 16 — open it with a newer trunkdb",
+                "file has format 18, newer than this build's 17 — open it with a newer trunkdb",
             ),
             (
                 5,
                 crate::FormatError::Older {
                     found: 5,
                     oldest: 6,
-                    current: 16,
+                    current: 17,
                 },
-                "file has format 5, older than this build's 16: export it with the trunkdb \
+                "file has format 5, older than this build's 17: export it with the trunkdb \
                  version that wrote it (`trunkdb export`), and import the export into a new \
                  file with this one",
             ),
@@ -2032,7 +2761,9 @@ mod tests {
 
     /// What isn't a format question stays `Error::Io`: damage is
     /// `InvalidData` — a page size not this build's among it, as trunkdb
-    /// has only ever had one — and a held file is `WouldBlock`.
+    /// has only ever had one — and a file held by a writer is
+    /// `WouldBlock` for another writer; a reader opens beside it (SPEC
+    /// §185).
     #[test]
     fn damage_and_a_held_file_are_not_format_errors() {
         let (_dir, path, db) = open_temp();
@@ -2062,13 +2793,13 @@ mod tests {
 
         std::fs::write(&path, &database).unwrap();
         let _held = Database::open(&path).unwrap();
-        for result in both_opens(&path) {
-            assert!(
-                matches!(&result, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock),
-                "{:?}",
-                result.err()
-            );
-        }
+        let [writing, reading] = both_opens(&path);
+        assert!(
+            matches!(&writing, Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{:?}",
+            writing.err()
+        );
+        assert_two_collection_batch_present(&reading.unwrap());
     }
 
     #[test]
