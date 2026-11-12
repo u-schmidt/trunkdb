@@ -10,7 +10,7 @@ use crate::id::UuidV7Generator;
 use crate::index::{BTreeIndex, Index};
 use crate::live::{self, LiveAggregate, LiveQuery};
 use crate::query::Filter;
-use crate::storage::lock_files::{Exclusive, ReaderLocks, ReadersHold, WriterLocks};
+use crate::storage::lock_files::{Exclusive, LET_GO_WAIT, ReaderLocks, ReadersHold, WriterLocks};
 use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
 use std::path::{Path, PathBuf};
@@ -96,6 +96,9 @@ struct Shared {
 pub(crate) struct Skipped {
     checkpoints: AtomicU64,
     largest_wal: AtomicU64,
+    /// How many times a checkpoint asked the readers to let go (SPEC
+    /// §189).
+    asked: AtomicU64,
 }
 
 /// What a batch works with, and nobody else: the staged pages and the
@@ -118,9 +121,16 @@ pub(crate) struct Writer {
     /// `OpenOptions::checkpoint_wait`: how long a checkpoint waits for
     /// readers in other processes, through the gate.
     checkpoint_wait: Duration,
+    /// `OpenOptions::let_go_wal_bytes`, with its default worked out: how
+    /// long the WAL may grow beside readers before a checkpoint asks them
+    /// to let go; `u64::MAX` for never.
+    let_go_wal_bytes: u64,
     /// Whether the last checkpoint due was skipped for a reader: the
     /// next goes through the gate (SPEC §185.4).
     through_gate: bool,
+    /// When a checkpoint last asked the readers to let go and still found
+    /// one: the next asks again only `ASK_AGAIN_AFTER` later (SPEC §189).
+    asked_in_vain: Option<Instant>,
     /// When a checkpoint last waited at the gate and still found a
     /// reader: the next due waits again only `GATE_AGAIN_AFTER` later.
     gate_waited: Option<Instant>,
@@ -253,6 +263,7 @@ pub struct OpenOptions {
     read_only: bool,
     checkpoint_wait: Duration,
     wait_for_readers: Duration,
+    let_go_wal_bytes: Option<u64>,
 }
 
 impl Default for OpenOptions {
@@ -265,6 +276,7 @@ impl Default for OpenOptions {
             read_only: false,
             checkpoint_wait: DEFAULT_CHECKPOINT_WAIT,
             wait_for_readers: DEFAULT_WAIT_FOR_READERS,
+            let_go_wal_bytes: None,
         }
     }
 }
@@ -342,8 +354,11 @@ impl OpenOptions {
     /// read is under way the writer doesn't write its pages back to the
     /// file: they wait in its WAL and its memory, which grow past their
     /// limits for a reader that reads long (`snapshot_info` counts it).
-    /// So drop a snapshot when its reads are done. A batch may be seen
-    /// a moment before it is durable, if the writer's flush then fails.
+    /// So drop a snapshot when its reads are done. Past
+    /// `let_go_wal_bytes` the writer asks the readers to let go, and a
+    /// thread this open starts ends every snapshot it holds then: their
+    /// reads fail with `Error::SnapshotTooOld`. A batch may be seen a
+    /// moment before it is durable, if the writer's flush then fails.
     ///
     /// This needs the file at format 17, which a writer of this release
     /// stamps at its open, and the lock files beside it: `<path>.readers`
@@ -382,12 +397,31 @@ impl OpenOptions {
     /// An open writes the file when the WAL holds batches, after a crash
     /// or after a close whose last checkpoint was left for a reader, and
     /// once in the file's life, to stamp format 17. It shuts the gate, so
-    /// that no new read begins, and waits up to this long. Readers still
-    /// there then, the open fails with an `Error::Io` of kind
+    /// that no new read begins, asks the readers under way to let go
+    /// (SPEC §189), which ends their snapshots, and waits up to this
+    /// long. Readers still there then, the open fails with an `Error::Io`
+    /// of kind
     /// `WouldBlock`, having written nothing; it succeeds once they are
     /// done. An open with nothing to write waits for nobody.
     pub fn wait_for_readers(mut self, wait: Duration) -> Self {
         self.wait_for_readers = wait;
+        self
+    }
+
+    /// Once the WAL has grown this long beside readers in other
+    /// processes, a commit asks them to let go (SPEC §189); 0 never asks.
+    /// Default: four times `checkpoint_wal_bytes`.
+    ///
+    /// A reader that keeps a snapshot keeps every checkpoint out, and
+    /// the WAL and the writer's memory grow for as long as it does, a
+    /// snapshot forgotten in a tool for good. Past this length the next
+    /// checkpoint shuts the gate and asks: each reading process ends
+    /// every snapshot it holds within a few milliseconds, and lets the
+    /// checkpoint through. Their reads fail with `Error::SnapshotTooOld`
+    /// from then on, and a new read takes the database as it is then.
+    /// `snapshot_info` counts the times it asked.
+    pub fn let_go_wal_bytes(mut self, bytes: u64) -> Self {
+        self.let_go_wal_bytes = Some(bytes);
         self
     }
 }
@@ -408,6 +442,11 @@ const DEFAULT_CHECKPOINT_WAIT: Duration = Duration::from_millis(50);
 /// other processes, unless `OpenOptions::wait_for_readers` says otherwise
 /// (SPEC §185.4).
 const DEFAULT_WAIT_FOR_READERS: Duration = Duration::from_secs(5);
+
+/// How long after a checkpoint asked readers to let go in vain the next
+/// one asks again (SPEC §189): a reader that doesn't let go slows the
+/// writer's commits by `LET_GO_WAIT` at most once in this time.
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(10);
 
 /// How long after a checkpoint waited at the gate in vain the next one
 /// waits there again (SPEC §185.4): until then, a due checkpoint only
@@ -451,7 +490,9 @@ fn readers_kept_the_open_out() -> crate::Error {
 }
 
 /// The readers' lock, exclusively, through the gate, for an open that
-/// writes the file: `held` once had, so it is taken once.
+/// writes the file: `held` once had, so it is taken once. The readers
+/// are asked to let go (SPEC §189): an application that starts goes
+/// before a tool that looks.
 fn readers_gone(
     locks: &WriterLocks,
     held: &mut Option<Exclusive>,
@@ -460,7 +501,7 @@ fn readers_gone(
     if held.is_none() {
         *held = Some(
             locks
-                .readers_through_gate(bound)?
+                .readers_asked(bound)?
                 .ok_or_else(readers_kept_the_open_out)?,
         );
     }
@@ -516,8 +557,21 @@ impl Writer {
         let gate_again = self
             .gate_waited
             .is_none_or(|at| at.elapsed() >= GATE_AGAIN_AFTER);
+        let ask_again = self
+            .asked_in_vain
+            .is_none_or(|at| at.elapsed() >= ASK_AGAIN_AFTER);
+        let over = wal(&mut self.durability).len() >= self.let_go_wal_bytes;
         let readers = match turn {
             Turn::Held => return Ok(Some(None)),
+            Turn::Due if over && ask_again => {
+                // Past the second limit: the readers asked to let go
+                // (SPEC §189), waiting long enough for their watchers.
+                self.skipped.asked.fetch_add(1, Ordering::Relaxed);
+                let bound = self.checkpoint_wait.max(LET_GO_WAIT);
+                let readers = locks.readers_asked(bound)?;
+                self.asked_in_vain = readers.is_none().then(Instant::now);
+                readers
+            }
             Turn::Due if !(self.through_gate && gate_again) => {
                 let readers = locks.try_readers()?;
                 self.through_gate |= readers.is_none();
@@ -759,7 +813,7 @@ impl Database {
             {
                 let side = ReaderSide {
                     path: path.to_path_buf(),
-                    locks: Arc::new(locks),
+                    locks,
                     cache_size: options.cache_size,
                     snapshot_memory: options.snapshot_memory,
                     kept: Mutex::new(None),
@@ -835,6 +889,11 @@ impl Database {
     ) -> Self {
         let current = Committed::new(store.last_commit(), catalog);
         let skipped = Arc::new(Skipped::default());
+        // Saturating: a `checkpoint_pages` past 2^50 would overflow, and
+        // wrap to a limit of next to nothing (SPEC §89).
+        let checkpoint_wal_bytes = options.checkpoint_wal_bytes.unwrap_or(
+            (options.checkpoint_pages as u64).saturating_mul(2 * crate::storage::PAGE_SIZE as u64),
+        );
         Self {
             inner: Arc::new(Shared {
                 pages: store.pages.clone(),
@@ -844,17 +903,17 @@ impl Database {
                     store,
                     durability,
                     checkpoint_pages: options.checkpoint_pages,
-                    // Saturating: a `checkpoint_pages` past 2^50 would
-                    // overflow, and wrap to a limit of next to nothing
-                    // (SPEC §89).
-                    checkpoint_wal_bytes: options.checkpoint_wal_bytes.unwrap_or(
-                        (options.checkpoint_pages as u64)
-                            .saturating_mul(2 * crate::storage::PAGE_SIZE as u64),
-                    ),
+                    checkpoint_wal_bytes,
                     locks,
                     checkpoint_wait: options.checkpoint_wait,
+                    let_go_wal_bytes: match options.let_go_wal_bytes {
+                        Some(0) => u64::MAX,
+                        Some(bytes) => bytes,
+                        None => checkpoint_wal_bytes.saturating_mul(4),
+                    },
                     through_gate: false,
                     gate_waited: None,
+                    asked_in_vain: None,
                     skipped: skipped.clone(),
                     past: Vec::new(),
                     subscribers: Vec::new(),
@@ -1071,7 +1130,10 @@ impl Database {
         }
         // Ended by the memory limit (SPEC §83): said here, before a read
         // that needs no page, or only the catalog, goes through.
-        if kept.0.commit.seq() < kept.pages(&self.inner.pages).ended_before() {
+        // Or by a writer that asked readers in other processes to let go
+        // (SPEC §189).
+        let pages = kept.pages(&self.inner.pages);
+        if kept.0.commit.seq() < pages.ended_before() || pages.let_go() {
             return Err(crate::Error::SnapshotTooOld);
         }
         Ok(ReadGuard {
@@ -1372,11 +1434,12 @@ impl Database {
 
     /// How many checkpoints readers in other processes kept out, and the
     /// longest WAL one left, for `snapshot_info` (SPEC §185.5).
-    pub(crate) fn checkpoints_skipped(&self) -> (u64, u64) {
+    pub(crate) fn checkpoints_skipped(&self) -> (u64, u64, u64) {
         let skipped = &self.inner.skipped;
         (
             skipped.checkpoints.load(Ordering::Relaxed),
             skipped.largest_wal.load(Ordering::Relaxed),
+            skipped.asked.load(Ordering::Relaxed),
         )
     }
 
@@ -1520,6 +1583,10 @@ struct Kept {
     catalog: Catalog,
     /// Where it stopped in the WAL.
     place: durability::WalPlace,
+    /// `ReadersHold::ended_at` of the hold it was built under: the store
+    /// is ended with its snapshots once the process lets go as asked
+    /// (SPEC §189).
+    at: u64,
     /// The file's id and session, as its header on disk said when the
     /// store was built (SPEC §183). Every checkpoint writes the header
     /// first, with the session of the batches it writes back: from then
@@ -1602,14 +1669,16 @@ impl ReaderSide {
             .kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ((), hold) = self.holding(|| {
+        let ((), hold) = self.holding(|hold| {
             let caught_up = match kept.as_mut() {
-                Some(kept) => kept.catch_up(&self.path),
-                None => Ok(false),
+                // A store built before the process let go when asked is
+                // ended with its snapshots (SPEC §189).
+                Some(kept) if kept.at == hold.ended_at() => kept.catch_up(&self.path),
+                _ => Ok(false),
             };
             let result = caught_up.and_then(|caught_up| {
                 if !caught_up {
-                    *kept = Some(self.kept_anew()?);
+                    *kept = Some(self.kept_anew(hold)?);
                 }
                 Ok(())
             });
@@ -1628,19 +1697,20 @@ impl ReaderSide {
 
     /// `snapshot`'s parts, the share of the lock let go: for the open.
     fn build(&self) -> crate::Result<(FileStore, Catalog, Option<crate::Recovered>)> {
-        let ((store, catalog, recovered, _), _hold) = self.holding(|| self.build_once())?;
+        let ((store, catalog, recovered, _), _hold) = self.holding(|hold| self.build_once(hold))?;
         Ok((store, catalog, recovered))
     }
 
     /// A store to keep, built anew from the file and the whole WAL.
-    fn kept_anew(&self) -> crate::Result<Kept> {
-        let (store, catalog, _, place) = self.build_once()?;
+    fn kept_anew(&self, hold: &ReadersHold) -> crate::Result<Kept> {
+        let (store, catalog, _, place) = self.build_once(hold)?;
         let disk = store.disk_binding()?;
         Ok(Kept {
             store,
             catalog,
             place,
             disk,
+            at: hold.ended_at(),
             past: Vec::new(),
             ended: false,
         })
@@ -1649,16 +1719,23 @@ impl ReaderSide {
     /// The gate passed, the readers' lock held, and `once` done; done
     /// again where the writer may have been at work (SPEC §185.4), and
     /// begun again through the gate where a writer's open on Windows
-    /// refuses it (SPEC §185.6).
+    /// refuses it (SPEC §185.6), or where the process let go of the lock
+    /// meanwhile, as asked: what was read may be the writer's (SPEC
+    /// §189).
     fn holding<T>(
         &self,
-        mut once: impl FnMut() -> crate::Result<T>,
+        mut once: impl FnMut(&ReadersHold) -> crate::Result<T>,
     ) -> crate::Result<(T, ReadersHold)> {
         let since = Instant::now();
         let mut again = 0;
         loop {
             let hold = self.locks.hold()?;
-            match once() {
+            let done = once(&hold);
+            if hold.is_ended() && since.elapsed() < BUILD_REFUSED_FOR {
+                drop(hold);
+                continue;
+            }
+            match done {
                 Ok(done) => return Ok((done, hold)),
                 Err(e) if refused(&e) && since.elapsed() < BUILD_REFUSED_FOR => {
                     // Let go, and wait at the gate the open has shut.
@@ -1680,13 +1757,15 @@ impl ReaderSide {
     /// the WAL's whole batches read over it.
     fn build_once(
         &self,
+        hold: &ReadersHold,
     ) -> crate::Result<(
         FileStore,
         Catalog,
         Option<crate::Recovered>,
         durability::WalPlace,
     )> {
-        let store = FileStore::open_beside_writer(&self.path)?;
+        let ended = Arc::clone(self.locks.ended());
+        let store = FileStore::open_beside_writer(&self.path, ended, hold.ended_at())?;
         let format = store.opened_format();
         if format != crate::storage::FORMAT_VERSION {
             return Err(std::io::Error::new(
@@ -2595,7 +2674,9 @@ mod tests {
         let path = dir.path().join("test.trunkdb");
         let options = OpenOptions::default()
             .checkpoint_pages(1)
-            .checkpoint_wait(Duration::from_millis(5));
+            .checkpoint_wait(Duration::from_millis(5))
+            // Never asked to let go (SPEC §189).
+            .let_go_wal_bytes(0);
         let db = Database::open_with(&path, options).unwrap();
         db.write_batch(vec![insert("posts", 1, 1)]).unwrap();
         assert_eq!(wal_len(&path), 0, "checkpointed at once");
@@ -2623,6 +2704,46 @@ mod tests {
         assert_eq!(wal_len(&path), 0, "the next commit checkpoints");
         assert_eq!(db.snapshot_info().checkpoints_skipped, 8);
         assert_eq!(count(&reader, "posts"), 10);
+    }
+
+    /// A snapshot a reader keeps, forgotten, keeps checkpoints out until
+    /// the WAL passes `let_go_wal_bytes`: then a commit asks the readers
+    /// to let go (SPEC §189). The snapshot is ended, the checkpoint goes
+    /// through, and the reader reads on, the newest. With 0, never.
+    #[test]
+    fn a_forgotten_snapshot_is_ended_past_the_second_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let options = OpenOptions::default()
+            .checkpoint_pages(1)
+            .checkpoint_wait(Duration::from_millis(5));
+        let db = Database::open_with(&path, options.clone().let_go_wal_bytes(0)).unwrap();
+        let reader = open_read_only(&path).unwrap();
+        let kept = reader.snapshot().unwrap();
+        for n in 1..6 {
+            db.write_batch(vec![insert("posts", n, i64::from(n))])
+                .unwrap();
+        }
+        assert_eq!(db.snapshot_info().readers_asked, 0, "never, with 0");
+        let first_wal = wal_len(&path);
+        assert!(first_wal > 0);
+        drop((kept, db));
+
+        let db = Database::open_with(&path, options.let_go_wal_bytes(2 * first_wal)).unwrap();
+        let kept = reader.snapshot().unwrap();
+        let mut n = 6;
+        while db.snapshot_info().readers_asked == 0 {
+            assert!(n < 100, "asked at last");
+            db.write_batch(vec![insert("posts", n, i64::from(n))])
+                .unwrap();
+            n += 1;
+        }
+        assert_eq!(wal_len(&path), 0, "checkpointed when asked");
+        assert!(matches!(
+            kept.collection::<Document>("posts").count(Filter::new()),
+            Err(crate::Error::SnapshotTooOld)
+        ));
+        assert_eq!(count(&reader, "posts"), usize::from(n - 1));
     }
 
     /// Beside a kept snapshot, a checkpoint asked for fails with
@@ -2658,17 +2779,30 @@ mod tests {
         assert_two_collection_batch_present(&reader);
     }
 
+    /// The readers' lock held shared the way a reader of another kind
+    /// would hold it, one that never looks at the request to let go (SPEC
+    /// §189): a release of this format whose watcher is stuck, say.
+    fn a_reader_that_does_not_let_go(path: &Path) -> std::fs::File {
+        let [_, readers, _, _] = crate::storage::lock_files::lock_paths(path);
+        let file = std::fs::File::open(readers).unwrap();
+        file.lock_shared().unwrap();
+        file
+    }
+
     /// The last handle's checkpoint left for a reader leaves the WAL; the
-    /// next open has to write it back, so it waits `wait_for_readers`,
-    /// then fails with `WouldBlock`, having written nothing. The reader
-    /// reads on meanwhile, and once it is done the open recovers.
+    /// next open has to write it back, so it asks the readers to let go
+    /// and waits `wait_for_readers`. A reader that doesn't, the open
+    /// fails with `WouldBlock`, having written nothing; once it is done
+    /// the open recovers.
     #[test]
     fn an_open_that_has_to_write_waits_for_readers_then_fails() {
         let (_dir, path, db) = open_temp();
         let reader = open_read_only(&path).unwrap();
-        let kept = reader.snapshot().unwrap();
+        let stuck = a_reader_that_does_not_let_go(&path);
         db.write_batch(two_collection_batch()).unwrap();
         drop(db);
+        assert_two_collection_batch_present(&reader);
+        let kept = reader.snapshot().unwrap();
         assert!(
             wal_len(&path) > 0,
             "the last checkpoint left for the reader"
@@ -2688,13 +2822,75 @@ mod tests {
             "{e}"
         );
         assert_eq!(files(&path), before, "nothing written");
+        // The reader that let go when the open asked reads on, with
+        // nothing new to read: a store built anew (SPEC §189).
+        assert!(matches!(
+            kept.collection::<Document>("posts").count(Filter::new()),
+            Err(crate::Error::SnapshotTooOld)
+        ));
+        drop(kept);
         assert_two_collection_batch_present(&reader);
 
-        drop(kept);
+        drop(stuck);
         let db = Database::open_with(&path, options).unwrap();
         assert_eq!(wal_len(&path), 0, "written back");
         assert_two_collection_batch_present(&db);
+    }
+
+    /// Beside a reader that doesn't let go, a commit asks in vain, and
+    /// asks again only `ASK_AGAIN_AFTER` later; a reader that did let go
+    /// reads on all the same, with a store built anew (SPEC §189).
+    #[test]
+    fn a_reader_that_does_not_let_go_is_asked_once_in_a_while() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.trunkdb");
+        let options = OpenOptions::default()
+            .checkpoint_pages(1)
+            .checkpoint_wait(Duration::from_millis(5))
+            .let_go_wal_bytes(1);
+        let db = Database::open_with(&path, options).unwrap();
+        let reader = open_read_only(&path).unwrap();
+        let kept = reader.snapshot().unwrap();
+        let stuck = a_reader_that_does_not_let_go(&path);
+        for n in 1..5 {
+            db.write_batch(vec![insert("posts", n, i64::from(n))])
+                .unwrap();
+        }
+        assert_eq!(db.snapshot_info().readers_asked, 1, "once in ten seconds");
+        assert!(wal_len(&path) > 0, "left for the reader that stays");
+        assert!(matches!(
+            kept.collection::<Document>("posts").count(Filter::new()),
+            Err(crate::Error::SnapshotTooOld)
+        ));
+        assert_eq!(
+            count(&reader, "posts"),
+            4,
+            "read on, though nothing was written"
+        );
+        drop(stuck);
+    }
+
+    /// An open that has to write asks the readers to let go (SPEC §189):
+    /// a snapshot a reader keeps is ended, the open recovers, and the
+    /// reader's next read sees what it recovered.
+    #[test]
+    fn an_open_that_has_to_write_asks_readers_to_let_go() {
+        let (_dir, path, db) = open_temp();
+        let reader = open_read_only(&path).unwrap();
+        let kept = reader.snapshot().unwrap();
+        db.write_batch(two_collection_batch()).unwrap();
+        drop(db);
+        assert!(wal_len(&path) > 0);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(wal_len(&path), 0, "written back");
+        let posts = kept.collection::<Document>("posts");
+        assert!(matches!(
+            posts.count(Filter::new()),
+            Err(crate::Error::SnapshotTooOld)
+        ));
         assert_two_collection_batch_present(&reader);
+        assert_two_collection_batch_present(&db);
     }
 
     /// Readers that each read for a moment, one overlapping the next,

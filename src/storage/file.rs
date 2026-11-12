@@ -369,10 +369,20 @@ impl FileStore {
     /// `open_read_only` for a reader beside a writer (SPEC §185): the
     /// file not locked, its reads tried again where Windows refuses them
     /// for a writer's lock (`Pages::beside_writer`). Only under the
-    /// readers' lock, which keeps every write of the file out.
-    pub(crate) fn open_beside_writer(path: impl AsRef<Path>) -> io::Result<Self> {
+    /// readers' lock, which keeps every write of the file out; `ended`
+    /// counts the times the reader let go of it when asked, `at` is the
+    /// count its hold was taken at (`Pages::ended`, SPEC §189).
+    pub(crate) fn open_beside_writer(
+        path: impl AsRef<Path>,
+        ended: Arc<std::sync::atomic::AtomicU64>,
+        at: u64,
+    ) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new().read(true).open(path)?;
-        Self::from_file(file, Lock::BesideWriter)
+        let mut store = Self::from_file(file, Lock::BesideWriter)?;
+        Arc::get_mut(&mut store.pages)
+            .expect("a store just opened shares its pages with nobody")
+            .ended = Some((ended, at));
+        Ok(store)
     }
 
     /// The format version the header on disk says, if `path` is a file
@@ -3123,6 +3133,36 @@ mod tests {
         assert_eq!(store.read_page(3).unwrap(), filled(9));
         assert_eq!(store.cached(3).unwrap(), filled(9));
         assert_eq!(store.pages.at(open).read_page(3).unwrap(), filled(3));
+    }
+
+    /// A reader's pages beside a writer, once its process has let go of
+    /// the readers' lock as asked (SPEC §189): a page it had in its
+    /// cache is refused as too old, and so is one read from the file
+    /// while it let go, which may be the writer's.
+    #[test]
+    fn a_readers_pages_refuse_every_read_once_it_let_go() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (_dir, path) = open_temp();
+        drop(five_page_file(&path));
+        let ended = Arc::new(AtomicU64::new(0));
+        let store = FileStore::open_beside_writer(&path, Arc::clone(&ended), 0).unwrap();
+        let open = store.last_commit();
+        assert_eq!(store.pages.at(open).read_page(3).unwrap(), filled(3));
+
+        let during = Arc::clone(&ended);
+        store.pages.before_next_file_read(move || {
+            during.fetch_add(1, Ordering::SeqCst);
+        });
+        let too_old = |read: io::Result<Page>| {
+            let e = read.unwrap_err();
+            e.get_ref()
+                .is_some_and(|inner| inner.is::<crate::storage::TooOld>())
+        };
+        assert!(
+            too_old(store.pages.at(open).read_page(4)),
+            "let go while it read"
+        );
+        assert!(too_old(store.pages.at(open).read_page(3)), "from its cache");
     }
 
     /// The same, for the scan of damaged pages: a page written back

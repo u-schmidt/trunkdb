@@ -1380,3 +1380,12 @@ limit, batches and a write-ahead log. Since then:
     written it, or where the WAL isn't the one it read. A reader's
     snapshots share that store, and the snapshot memory limit ends the
     oldest of them as in one process.
+162. **A reader too long is asked to let go** (§189): past a second
+    limit, `OpenOptions::let_go_wal_bytes` (four times
+    `checkpoint_wal_bytes` unless set, 0 never), a commit's checkpoint
+    shuts the gate and asks the readers to let go, through a fourth
+    file beside the database, `<path>.letgo`. A watcher thread in each
+    reading process lets go for all its snapshots within milliseconds,
+    a forgotten one too; their reads fail with `Error::SnapshotTooOld`,
+    a long scan at its next page. An open that has to write the file
+    asks as well. `SnapshotInfo::readers_asked` counts the asks.

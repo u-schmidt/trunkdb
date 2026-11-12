@@ -2,7 +2,9 @@
 //! §185.4, §185.6): `<path>.writer`, `<path>.readers` and `<path>.gate`,
 //! one lock each, as std's locks cover a whole file. No lock stays on
 //! the database file or the WAL, where on Windows it would keep others
-//! from reading or writing them.
+//! from reading or writing them. And a fourth file, never locked:
+//! `<path>.letgo`, the writer's request to readers to let go (SPEC
+//! §189).
 //!
 //! - The writer's lock: exclusive, for as long as the writer has the
 //!   database open.
@@ -10,6 +12,9 @@
 //!   its own is open; exclusive for whatever writes the database file.
 //! - The gate: passed by a reader before it takes the readers' lock, and
 //!   shut by the writer to get a turn between readers that overlap.
+//! - The request: one byte, 1 while the writer, its gate shut, asks the
+//!   readers to let go, 0 else. Each reader's watcher looks at it while
+//!   its process holds the readers' lock (SPEC §189).
 //!
 //! Made by whoever needs one first, and never removed: a lock file
 //! removed while another process opens it leaves two files, and two
@@ -18,12 +23,36 @@
 use std::fs::{File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-/// The three lock files of the database at `db`.
-pub(crate) fn lock_paths(db: &Path) -> [PathBuf; 3] {
-    [".writer", ".readers", ".gate"].map(|suffix| lock_path(db, suffix))
+/// The lock files of the database at `db`, the request among them.
+pub(crate) fn lock_paths(db: &Path) -> [PathBuf; 4] {
+    [".writer", ".readers", ".gate", ".letgo"].map(|suffix| lock_path(db, suffix))
+}
+
+/// How often a reader's watcher looks at the request to let go, while
+/// its process holds the readers' lock (SPEC §189).
+pub(crate) const LET_GO_LOOK: Duration = Duration::from_millis(20);
+
+/// How long a writer that asks readers to let go waits for them, at
+/// least (SPEC §189): many times `LET_GO_LOOK`.
+pub(crate) const LET_GO_WAIT: Duration = Duration::from_secs(1);
+
+/// The request to let go, as `<path>.letgo` holds it: 1 while asked.
+fn asked(letgo: &File) -> io::Result<bool> {
+    let mut byte = [0u8];
+    match super::pages::read_exact_at(letgo, &mut byte, 0) {
+        Ok(()) => Ok(byte[0] == 1),
+        // Not written yet: nobody has asked.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn ask(letgo: &File, asking: bool) -> io::Result<()> {
+    super::pages::write_all_at(letgo, &[u8::from(asking)], 0)
 }
 
 /// `<path>` with `suffix` after it, as the WAL is named (`wal_path`).
@@ -116,6 +145,8 @@ pub(crate) struct WriterLocks {
     _writer: File,
     readers: Arc<File>,
     gate: Arc<File>,
+    /// The request to let go (SPEC §189).
+    letgo: File,
 }
 
 impl WriterLocks {
@@ -137,15 +168,19 @@ impl WriterLocks {
         Ok(file)
     }
 
-    /// Step 3 of a writer's open: the readers' lock file and the gate,
-    /// made if they aren't there, beside `writer`, the lock of step 1.
-    /// Where a writer has been, all three are there.
+    /// Step 3 of a writer's open: the readers' lock file, the gate and
+    /// the request, made if they aren't there, beside `writer`, the lock
+    /// of step 1. Where a writer has been, all four are there. The
+    /// request is withdrawn, should a writer have ended while it asked.
     pub(crate) fn new(writer: File, db: &Path) -> io::Result<Self> {
-        let made = |suffix| super::open_or_create(&lock_path(db, suffix)).map(Arc::new);
+        let made = |suffix| super::open_or_create(&lock_path(db, suffix));
+        let letgo = made(".letgo")?;
+        ask(&letgo, false)?;
         Ok(WriterLocks {
             _writer: writer,
-            readers: made(".readers")?,
-            gate: made(".gate")?,
+            readers: made(".readers").map(Arc::new)?,
+            gate: made(".gate").map(Arc::new)?,
+            letgo,
         })
     }
 
@@ -165,20 +200,44 @@ impl WriterLocks {
     /// there at the bound. The readers' lock isn't held while waiting
     /// for the gate, so the writer and a reader can't hold each other.
     pub(crate) fn readers_through_gate(&self, bound: Duration) -> io::Result<Option<Exclusive>> {
+        self.readers_gate(bound, false)
+    }
+
+    /// `readers_through_gate`, asking the readers under way to let go
+    /// (SPEC §189): with the gate shut, the request is made, and
+    /// withdrawn again before the gate opens, had or not. A reader's
+    /// watcher ends its process's snapshots then, within `LET_GO_LOOK`.
+    pub(crate) fn readers_asked(&self, bound: Duration) -> io::Result<Option<Exclusive>> {
+        self.readers_gate(bound, true)
+    }
+
+    fn readers_gate(&self, bound: Duration, asking: bool) -> io::Result<Option<Exclusive>> {
         let deadline = Instant::now() + bound;
         if !try_until(deadline, || self.gate.try_lock())? {
             return Ok(None);
         }
         let gate = Exclusive(Arc::clone(&self.gate));
-        let had = try_until(deadline, || self.readers.try_lock())?;
+        if asking {
+            ask(&self.letgo, true)?;
+        }
+        let had = try_until(deadline, || self.readers.try_lock());
+        let withdrawn = if asking {
+            ask(&self.letgo, false)
+        } else {
+            Ok(())
+        };
         drop(gate);
-        Ok(had.then(|| Exclusive(Arc::clone(&self.readers))))
+        let had = had?;
+        let readers = had.then(|| Exclusive(Arc::clone(&self.readers)));
+        withdrawn?;
+        Ok(readers)
     }
 }
 
 /// A reader's two lock files (SPEC §185.4), and who in this process
 /// holds the readers' lock: one lock for the open, which its snapshots
-/// and threads count, and the last lets go.
+/// and threads count, and the last lets go. With the request to let go
+/// and the watcher that looks at it (SPEC §189).
 pub(crate) struct ReaderLocks {
     readers: File,
     gate: File,
@@ -188,25 +247,89 @@ pub(crate) struct ReaderLocks {
     passing: Mutex<()>,
     /// How many snapshots hold the readers' lock now.
     holders: Mutex<usize>,
+    /// Woken when the readers' lock is taken, for the watcher to look.
+    held: Condvar,
+    /// Counts the times this process let go of the readers' lock when
+    /// asked (SPEC §189). A snapshot taken before is ended: its hold no
+    /// longer counts, and its reads fail as too old (`Pages::beside`).
+    ended: Arc<AtomicU64>,
+    /// The request to let go, and a handle of the gate of its own, to
+    /// see whether a writer is asking now; `None` without the request's
+    /// file, which every writer of this release makes.
+    request: Option<(File, File)>,
 }
 
 impl ReaderLocks {
     /// The readers' lock file and the gate, made if they aren't there;
     /// `None` if either isn't there and can't be made, as in a
-    /// directory the reader may not write (SPEC §185.6).
-    pub(crate) fn open(db: &Path) -> io::Result<Option<Self>> {
+    /// directory the reader may not write (SPEC §185.6). With a watcher
+    /// of the request to let go, where the request is there (SPEC §189).
+    pub(crate) fn open(db: &Path) -> io::Result<Option<Arc<Self>>> {
         let Some(readers) = open_lock_file(db, ".readers")? else {
             return Ok(None);
         };
         let Some(gate) = open_lock_file(db, ".gate")? else {
             return Ok(None);
         };
-        Ok(Some(ReaderLocks {
+        let request = match (open_lock_file(db, ".letgo")?, open_lock_file(db, ".gate")?) {
+            (Some(letgo), Some(gate)) => Some((letgo, gate)),
+            _ => None,
+        };
+        let watched = request.is_some();
+        let locks = Arc::new(ReaderLocks {
             readers,
             gate,
             passing: Mutex::new(()),
             holders: Mutex::new(0),
-        }))
+            held: Condvar::new(),
+            ended: Arc::new(AtomicU64::new(0)),
+            request,
+        });
+        if watched {
+            let weak = Arc::downgrade(&locks);
+            std::thread::Builder::new()
+                .name("trunkdb-reader-watch".into())
+                .spawn(move || watch(weak))?;
+        }
+        Ok(Some(locks))
+    }
+
+    /// How many times this process has let go when asked: what a
+    /// snapshot's pages compare with (`Pages::beside`).
+    pub(crate) fn ended(&self) -> &Arc<AtomicU64> {
+        &self.ended
+    }
+
+    /// Whether a writer asks the readers to let go now: the request made,
+    /// and the gate shut. A request a writer that ended left behind has
+    /// the gate open, and is not one.
+    fn asked_now(&self) -> io::Result<bool> {
+        let Some((letgo, gate)) = &self.request else {
+            return Ok(false);
+        };
+        if !asked(letgo)? {
+            return Ok(false);
+        }
+        match gate.try_lock_shared() {
+            Ok(()) => {
+                let _ = gate.unlock();
+                Ok(false)
+            }
+            Err(TryLockError::WouldBlock) => Ok(true),
+            Err(TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// Lets go of the readers' lock for every snapshot holding it, as
+    /// asked (SPEC §189): they are ended from here, their holds no
+    /// longer count, and the next snapshot takes the lock anew.
+    fn let_go(&self) {
+        let mut holders = self.holders.lock().unwrap_or_else(|p| p.into_inner());
+        if *holders > 0 {
+            self.ended.fetch_add(1, Ordering::SeqCst);
+            *holders = 0;
+            let _ = self.readers.unlock();
+        }
     }
 
     /// Passes the gate, waiting while the writer has it shut, then holds
@@ -223,22 +346,74 @@ impl ReaderLocks {
         let mut holders = self.holders.lock().unwrap_or_else(|p| p.into_inner());
         if *holders == 0 {
             self.readers.lock_shared()?;
+            self.held.notify_all();
         }
         *holders += 1;
-        Ok(ReadersHold(Arc::clone(self)))
+        Ok(ReadersHold {
+            locks: Arc::clone(self),
+            ended: self.ended.load(Ordering::SeqCst),
+        })
+    }
+}
+
+/// The watcher of a reader's process (SPEC §189): asleep while nothing
+/// holds the readers' lock; while something does, it looks at the
+/// request to let go every `LET_GO_LOOK`, and lets go when asked. Ends
+/// with the reader's locks.
+fn watch(locks: Weak<ReaderLocks>) {
+    loop {
+        let Some(strong) = locks.upgrade() else {
+            return;
+        };
+        {
+            let holders = strong.holders.lock().unwrap_or_else(|p| p.into_inner());
+            if *holders == 0 {
+                // Woken when a snapshot takes the lock; else once a second
+                // or so, to end with the locks.
+                let _ = strong.held.wait_timeout(holders, Duration::from_secs(1));
+                continue;
+            }
+        }
+        // Errors: looked at again next time.
+        if strong.asked_now().unwrap_or(false) {
+            strong.let_go();
+        }
+        drop(strong);
+        std::thread::sleep(LET_GO_LOOK);
     }
 }
 
 /// One snapshot's share of the readers' lock (`ReaderLocks::hold`): the
-/// last to go lets go of the lock.
-pub(crate) struct ReadersHold(Arc<ReaderLocks>);
+/// last to go lets go of the lock. One taken before the process let go
+/// when asked (SPEC §189) counts no more.
+pub(crate) struct ReadersHold {
+    locks: Arc<ReaderLocks>,
+    /// `ReaderLocks::ended` when it was taken.
+    ended: u64,
+}
+
+impl ReadersHold {
+    /// `ReaderLocks::ended` when it was taken: what the pages of the
+    /// snapshot it holds for compare with.
+    pub(crate) fn ended_at(&self) -> u64 {
+        self.ended
+    }
+
+    /// Whether the process has let go since it was taken, as asked.
+    pub(crate) fn is_ended(&self) -> bool {
+        self.locks.ended.load(Ordering::SeqCst) != self.ended
+    }
+}
 
 impl Drop for ReadersHold {
     fn drop(&mut self) {
-        let mut holders = self.0.holders.lock().unwrap_or_else(|p| p.into_inner());
+        let mut holders = self.locks.holders.lock().unwrap_or_else(|p| p.into_inner());
+        if self.is_ended() {
+            return;
+        }
         *holders -= 1;
         if *holders == 0 {
-            let _ = self.0.readers.unlock();
+            let _ = self.locks.readers.unlock();
         }
     }
 }
@@ -271,7 +446,7 @@ mod tests {
     fn readers_hold_the_lock_until_the_last_lets_go() {
         let (_dir, path) = temp();
         let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
-        let reader = Arc::new(ReaderLocks::open(&path).unwrap().unwrap());
+        let reader = ReaderLocks::open(&path).unwrap().unwrap();
         let first = reader.hold().unwrap();
         let second = reader.hold().unwrap();
         assert!(writer.try_readers().unwrap().is_none());
@@ -283,13 +458,64 @@ mod tests {
         drop(reader.hold().unwrap());
     }
 
+    /// Asked to let go (SPEC §189), a reader's watcher lets go of the
+    /// readers' lock for every snapshot of its process, within a few
+    /// looks: the writer gets it, the holds are ended and count no more,
+    /// and the next snapshot takes the lock anew. The request is
+    /// withdrawn before the gate opens again.
+    #[test]
+    fn a_reader_asked_to_let_go_lets_go() {
+        let (_dir, path) = temp();
+        let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
+        let reader = ReaderLocks::open(&path).unwrap().unwrap();
+        // The watcher asleep, so that the hold has to wake it.
+        std::thread::sleep(Duration::from_millis(100));
+        let first = reader.hold().unwrap();
+        let second = reader.hold().unwrap();
+        let start = Instant::now();
+        let turn = writer.readers_asked(LET_GO_WAIT).unwrap().expect("let go");
+        assert!(start.elapsed() < LET_GO_WAIT / 2);
+        assert!(first.is_ended() && second.is_ended());
+        assert!(!asked(&writer.letgo).unwrap(), "withdrawn");
+        drop(turn);
+
+        let third = reader.hold().unwrap();
+        assert!(!third.is_ended());
+        drop((first, second));
+        assert!(
+            writer.try_readers().unwrap().is_none(),
+            "the third holds it"
+        );
+        drop(third);
+        drop(writer.try_readers().unwrap().expect("nobody reads"));
+    }
+
+    /// A request with the gate open is one a writer left as it ended:
+    /// the readers hold on (SPEC §189).
+    #[test]
+    fn a_request_left_behind_is_no_request() {
+        let (_dir, path) = temp();
+        let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
+        let reader = ReaderLocks::open(&path).unwrap().unwrap();
+        let hold = reader.hold().unwrap();
+        ask(&writer.letgo, true).unwrap();
+        std::thread::sleep(LET_GO_LOOK * 5);
+        assert!(!hold.is_ended());
+        assert!(writer.try_readers().unwrap().is_none());
+        drop(writer);
+        // The next writer withdraws it at its open.
+        let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
+        assert!(!asked(&writer.letgo).unwrap());
+        drop(hold);
+    }
+
     /// Through the gate: a reader under way is waited for up to the
     /// bound, and the gate is open again either way.
     #[test]
     fn the_gate_waits_a_bounded_time_and_opens_again() {
         let (_dir, path) = temp();
         let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
-        let reader = Arc::new(ReaderLocks::open(&path).unwrap().unwrap());
+        let reader = ReaderLocks::open(&path).unwrap().unwrap();
         let hold = reader.hold().unwrap();
         let start = Instant::now();
         let bound = Duration::from_millis(30);
@@ -316,8 +542,8 @@ mod tests {
     fn no_new_reader_begins_while_the_writer_waits_at_the_gate() {
         let (_dir, path) = temp();
         let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
-        let reading = Arc::new(ReaderLocks::open(&path).unwrap().unwrap());
-        let other = Arc::new(ReaderLocks::open(&path).unwrap().unwrap());
+        let reading = ReaderLocks::open(&path).unwrap().unwrap();
+        let other = ReaderLocks::open(&path).unwrap().unwrap();
         let hold = reading.hold().unwrap();
         let bound = Duration::from_millis(300);
         let start = Instant::now();
@@ -341,7 +567,7 @@ mod tests {
     fn a_new_snapshot_waits_at_a_shut_gate() {
         let (_dir, path) = temp();
         let writer = WriterLocks::new(WriterLocks::writer(&path).unwrap(), &path).unwrap();
-        let reader = Arc::new(ReaderLocks::open(&path).unwrap().unwrap());
+        let reader = ReaderLocks::open(&path).unwrap().unwrap();
         let held = reader.hold().unwrap();
         writer.gate.try_lock().unwrap();
         let gate = Exclusive(Arc::clone(&writer.gate));
