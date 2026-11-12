@@ -1392,3 +1392,17 @@ limit, batches and a write-ahead log. Since then:
     `check` of a snapshot ended while it checks, by this or by the
     memory limit, fails with `Error::SnapshotTooOld`, where it reported
     the reads that failed as problems (§189.7).
+
+    Items 160–162 → 0.40.0. Nothing a program has to change; one
+    changed answer, `check` of a snapshot ended while it checks (162).
+    **File format 17,** which 0.39.0 and older refuse once
+    0.40.0 has opened a file for writing; keep an export or a copy
+    from before to go back. A format 16 file opens as it is, stamped
+    17 by its first writer's open; read-only, it is read as before.
+    Beside the database there are now four lock files, `.writer`,
+    `.readers`, `.gate` and `.letgo`, made where missing and never
+    removed. A read-only open beside a writer reads, where it was
+    refused before, and starts a thread of its own; an open that has
+    to write beside readers waits up to `wait_for_readers`. WAL
+    version 4 and export version 4, as in 0.39.0. With its fixture
+    (§120.9), its generator as before.

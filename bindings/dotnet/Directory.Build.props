@@ -7,6 +7,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- trunkdb's release; a test holds it equal to the library's. -->
-    <Version>0.39.0</Version>
+    <Version>0.40.0</Version>
   </PropertyGroup>
 </Project>

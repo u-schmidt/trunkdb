@@ -1,6 +1,6 @@
 [package]
 name = "trunkdb-ffi"
-version = "0.39.0"
+version = "0.40.0"
 edition = "2024"
 rust-version = "1.89"
 description = "trunkdb's C ABI: the library as plain C functions, for every language that calls C."
