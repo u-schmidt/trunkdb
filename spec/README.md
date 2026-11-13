@@ -204,3 +204,4 @@ say what changed, and DESIGN.md says what is true now.
 187. [Readers beside a writer, built (`storage/lock_files.rs`, `database.rs`)](187-readers-beside-a-writer-built.md)
 188. [A reader that catches up (`database.rs`, `durability/wal.rs`)](188-a-reader-that-catches-up.md)
 189. [A reader too long is asked to let go (`storage/lock_files.rs`, `database.rs`)](189-a-reader-too-long-is-asked-to-let-go.md)
+190. [0.40.0 measured against 0.34.0 (`bench/`)](190-0-40-measured-against-0-34.md)

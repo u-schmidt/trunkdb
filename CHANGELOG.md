@@ -1406,3 +1406,10 @@ limit, batches and a write-ahead log. Since then:
     to write beside readers waits up to `wait_for_readers`. WAL
     version 4 and export version 4, as in 0.39.0. With its fixture
     (§120.9), its generator as before.
+163. **0.40.0 measured against 0.34.0** (§190): the comparison's 22
+    rows within noise, six runs each; readers beside a writer as fast
+    as before, with 1, 2 or 4 of them. Two readers sometimes run a
+    case at 2.3 µs instead of 1.5 µs, more often on 0.40.0, from where
+    the threads land rather than from the code. Four readers now do
+    1.9 times one, not §65's 3.2: one reader got more than twice as
+    fast since. Nothing in the library changed.
