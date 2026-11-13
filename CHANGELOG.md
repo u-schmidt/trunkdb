@@ -1413,3 +1413,15 @@ limit, batches and a write-ahead log. Since then:
     the threads land rather than from the code. Four readers now do
     1.9 times one, not §65's 3.2: one reader got more than twice as
     fast since. Nothing in the library changed.
+164. **Measured again, against SQLite, redb and sled** (§191): all four
+    side by side, three runs each, and the tables in DESIGN and the
+    README from them instead of trunkdb from §172 and the others from
+    §153. The machine gives the others' numbers within a tenth, but
+    single commits 5–14% slower and redb's and sled's lookups by id;
+    trunkdb's batched inserts 43–45k/s, where the tables had 48k/s,
+    as 0.34.0 gives the same day. Reads ahead or level but the count
+    of all, "first 50 by id" and two tenants' first 20, behind redb;
+    readers beside a writer with a p99 half of redb's. A snapshot
+    beside single writes keeps 1.4 MiB on the M1 Pro, where §83 had
+    13 MiB on Linux with ten times the commits. Nothing in the library
+    changed.

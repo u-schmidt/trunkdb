@@ -623,7 +623,9 @@ reads fail with `Error::SnapshotTooOld`, and the writer goes on.
 [§77](spec/77-the-committed-pages-apart-from-the-writers.md): §57 deferred snapshots until a workload asked, and many small
 writes beside reads of up to 15 seconds did. Measured for it
 (`bench/`, `long_read`): single writes back to back take the same time
-with a snapshot open for 15 seconds as with none, and it kept 13 MiB.
+with a snapshot open for 15 seconds as with none. It kept 13 MiB over
+34,000 commits on Linux, 1.4 MiB over the 3,300 an M1 Pro's slower
+flush allows ([§191.6](spec/191-measured-again-against-sqlite-redb-and-sled.md)).
 
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
 once or ten times a second costs readers nothing measurable. One that
@@ -633,8 +635,8 @@ p99.9 under 100 µs [§79.7](spec/79-writers-beside-the-readers.md). A writer be
 stops waited up to 132 s for a commit; since §80, 24 ms, as fast as
 without the export [§80.6](spec/80-older-versions-kept-for-open-snapshots.md). The price: two readers do a tenth fewer
 short reads than before §80. Readers run in parallel since pages are shared [§64](spec/64-shared-pages.md) and looked up
-under a read lock [§65](spec/65-a-read-lock-for-the-page-cache.md): four do 3.2 times the work of one. Eight do no
-more than four.
+under a read lock [§65](spec/65-a-read-lock-for-the-page-cache.md): four did 3.2 times the work of one then, 1.9 times
+now that one is more than twice as fast [§190](spec/190-0-40-measured-against-0-34.md). Eight do no more than four.
 
 ## 10. The API
 
@@ -757,29 +759,29 @@ checks that all four give the same answers [§48](spec/48-benchmarks-against-sql
 Reads are level with SQLite, redb and sled or ahead of them, and so
 are batched inserts and updates in these runs, and the file is the
 smallest; compaction is still behind. On an M1 Pro with 100,000
-documents, the median of three runs (trunkdb with §172, the others as
-of §153):
+documents, the median of three runs of all four side by side, trunkdb
+0.40.0, on 2026-11-13 [§191](spec/191-measured-again-against-sqlite-redb-and-sled.md):
 
 | | trunkdb | SQLite | redb | sled |
 |---|---:|---:|---:|---:|
-| insert, 1000 per commit | 48k/s | 40k/s | 41k/s | 27k/s |
-| one commit | 4.8 ms | 4.7 ms | 5.0 ms | 10.1 ms |
-| get by id | 2–4 µs | 16 µs | 2.0 µs | 2.3 µs |
-| 1000 documents by index | 0.92 ms | 1.8 ms | 1.0 ms | 1.9 ms |
-| count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.26 ms |
-| count of a range of 1000 | 0.01 ms | 0.02 ms | 0.04 ms | 0.34 ms |
-| count of all 100,000 | 0.07 ms | 0.01 ms | 0.00 ms | 24 ms |
-| oldest 20 of a status | 19.1 µs | 23.4 µs | 16.5 µs | 21.7 µs |
-| page 50 of 20 of a status | 21 µs | 54 µs | 45 µs | 252 µs |
-| first 50 by id | 33 µs | 36 µs | 27 µs | 30 µs |
-| 50 by id after skipping 5000 | 35 µs | 126 µs | 228 µs | 0.97 ms |
-| a tenant's first 20 by id | 23 µs | 1.2 ms | 20 µs | 27 µs |
-| two tenants' first 20 by id | 28 µs | 2.6 ms | 21 µs | 29 µs |
-| two tenants by id, page 25 of 20 | 69 µs | 3.0 ms | 67 µs | 291 µs |
-| scan, 100,000 for a fifth | 41 ms | 43 ms | 54 ms | 67 ms |
-| update, 1000 per commit | 22k/s | 14k/s | 18k/s | 23k/s |
-| delete, 1000 per commit | 36k/s | 19k/s | 25k/s | 36k/s |
-| compact | 0.62 s | 0.20 s | 0.41 s | — |
+| insert, 1000 per commit | 43k/s | 40k/s | 44k/s | 29k/s |
+| one commit | 5.0 ms | 5.2 ms | 5.7 ms | 10.7 ms |
+| get by id | 2–4 µs | 18 µs | 3.5 µs | 3.2 µs |
+| 1000 documents by index | 0.89 ms | 1.8 ms | 1.1 ms | 2.0 ms |
+| count of 1000 by index | 0.01 ms | 0.03 ms | 0.04 ms | 0.27 ms |
+| count of a range of 1000 | 0.02 ms | 0.02 ms | 0.04 ms | 0.34 ms |
+| count of all 100,000 | 0.07 ms | 0.01 ms | 0.00 ms | 25 ms |
+| oldest 20 of a status | 18.6 µs | 23.0 µs | 16.3 µs | 21.2 µs |
+| page 50 of 20 of a status | 21 µs | 53 µs | 43 µs | 251 µs |
+| first 50 by id | 36 µs | 38 µs | 26 µs | 29 µs |
+| 50 by id after skipping 5000 | 36 µs | 126 µs | 226 µs | 0.92 ms |
+| a tenant's first 20 by id | 22 µs | 1.3 ms | 21 µs | 25 µs |
+| two tenants' first 20 by id | 29 µs | 2.5 ms | 20 µs | 26 µs |
+| two tenants by id, page 25 of 20 | 73 µs | 2.8 ms | 68 µs | 291 µs |
+| scan, 100,000 for a fifth | 39 ms | 45 ms | 53 ms | 69 ms |
+| update, 1000 per commit | 20k/s | 14k/s | 18k/s | 22k/s |
+| delete, 1000 per commit | 34k/s | 19k/s | 24k/s | 34k/s |
+| compact | 0.64 s | 0.18 s | 0.45 s | — |
 | file size after compact | 18 MB | 22 MB | 30 MB | — |
 
 Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
@@ -791,14 +793,17 @@ Both counts by index take about 15 µs (SPEC §104.8). Where reads stand:
 - **Still behind:**
   - the count of all documents, which trunkdb counts leaf by leaf where
     the others keep a total;
-  - "first 50 by id", 1.2× redb.
+  - "first 50 by id", 1.4× redb, and "two tenants' first 20 by id",
+    1.5× (§191.4).
 
-  A scan, 41 ms, is level with SQLite's 43.
-- **Writes:** inserts 1.2× SQLite's in these runs (0.88× before §151,
-  1.05× before §170, and SQLite's own runs vary by a tenth from day to
-  day), updates 1.6×: 1.07× once a grown document was made room for
+  A scan, 39 ms, is a little ahead of SQLite's 45.
+- **Writes:** inserts 1.08× SQLite's in these runs, level with redb
+  (1.2× in §172's, 0.88× before §151, 1.05× before §170; trunkdb's own
+  runs vary by a tenth from day to day, §190, §191.3), updates 1.4×:
+  1.07× once a grown document was made room for
   in place ([§153](spec/153-a-grown-cell-made-room-for-in-place.md)), and more since a document stores less (§170);
-  deletes ahead. redb's updates are behind now, sled's a little ahead.
+  deletes ahead of SQLite and redb, level with sled. redb's updates are
+  behind now, sled's a little ahead.
   A batch of updates writes 2.7× the pages of one of inserts,
   each whole in the WAL (§153).
   The checkpoint threshold was raised to 4,000 pages ([§123](spec/123-batched-writes-checkpoint-less-often.md)): before, 59
