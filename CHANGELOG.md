@@ -1425,3 +1425,10 @@ limit, batches and a write-ahead log. Since then:
     beside single writes keeps 1.4 MiB on the M1 Pro, where §83 had
     13 MiB on Linux with ten times the commits. Nothing in the library
     changed.
+165. **A reader reads only what it checks** (§192): a read-only open
+    beside a writer took 79 µs a lookup once the writer's WAL held
+    anything, now 18 µs. Each call read the WAL's header and the last
+    batch's record heads through a 1 MiB buffer, which every seek threw
+    away, so a call read up to a megabyte for each; they are now read
+    as they are. Opens measured too: a writer's 4.6 ms, a read-only
+    one 0.14 ms, each call on it about 15 µs.
