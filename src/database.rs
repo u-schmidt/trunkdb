@@ -13,9 +13,10 @@ use crate::query::Filter;
 use crate::storage::lock_files::{Exclusive, LET_GO_WAIT, ReaderLocks, ReadersHold, WriterLocks};
 use crate::storage::{Commit, FileStore, PageId, Pages, SnapshotStore};
 use crate::txn::{GlobalLockTxnManager, TransactionManager, WriteOp};
+use crossbeam_utils::sync::{ShardedLock, ShardedLockReadGuard, ShardedLockWriteGuard};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 /// Opens the file and owns the whole stack — as a cheap, cloneable,
@@ -56,14 +57,15 @@ struct Shared {
     /// catalog. Replaced by every commit, never changed. The lock is held
     /// only to take it, by a read, or to replace it, by a commit: a read
     /// keeps the snapshot, not the lock, and reads it whatever is
-    /// committed meanwhile (SPEC §80).
-    current: RwLock<Committed>,
+    /// committed meanwhile (SPEC §80). Each thread takes it through a
+    /// lock of its own, as `gate` and the pages' lock (SPEC §193).
+    current: ShardedLock<Committed>,
     /// Held shared by every read for as long as it reads, and alone by a
     /// batch that replaces the whole file (`compact`), from before its
     /// commit to after it: the one kind of batch that can't keep the
     /// pages as they were for the reads under way, so it waits for them
     /// (rule 6 of SPEC §57.3, §80.5). No other batch takes it.
-    gate: RwLock<()>,
+    gate: ShardedLock<()>,
     /// The writer's own, and the lock that makes it one writer at a
     /// time. Held for a whole batch, from staging to its checkpoint;
     /// readers never take it.
@@ -235,7 +237,7 @@ pub(crate) struct ReadGuard<'a> {
     /// this read (`Shared::gate`). Not held by a read of a snapshot
     /// somebody keeps (SPEC §82): that snapshot refuses such a batch
     /// altogether, for as long as it's kept.
-    _gate: Option<RwLockReadGuard<'a, ()>>,
+    _gate: Option<ShardedLockReadGuard<'a, ()>>,
 }
 
 impl ReadGuard<'_> {
@@ -897,8 +899,8 @@ impl Database {
         Self {
             inner: Arc::new(Shared {
                 pages: store.pages.clone(),
-                current: RwLock::new(current),
-                gate: RwLock::new(()),
+                current: ShardedLock::new(current),
+                gate: ShardedLock::new(()),
                 writer: Mutex::new(Writer {
                     store,
                     durability,
@@ -1444,7 +1446,7 @@ impl Database {
     }
 
     /// The last commit, to replace, with no read taking it meanwhile.
-    fn current_locked(&self) -> std::sync::RwLockWriteGuard<'_, Committed> {
+    fn current_locked(&self) -> ShardedLockWriteGuard<'_, Committed> {
         self.inner
             .current
             .write()

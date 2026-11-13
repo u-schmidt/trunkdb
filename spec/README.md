@@ -207,3 +207,4 @@ say what changed, and DESIGN.md says what is true now.
 190. [0.40.0 measured against 0.34.0 (`bench/`)](190-0-40-measured-against-0-34.md)
 191. [Measured again, against SQLite, redb and sled (`bench/`, `DESIGN.md`, `README.md`)](191-measured-again-against-sqlite-redb-and-sled.md)
 192. [A reader reads only what it checks (`durability/wal.rs`)](192-a-reader-reads-only-what-it-checks.md)
+193. [Readers in parallel past four (`storage/pages.rs`, `database.rs`)](193-readers-in-parallel-past-four.md)

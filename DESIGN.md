@@ -638,7 +638,9 @@ stops waited up to 132 s for a commit; since §80, 24 ms, as fast as
 without the export [§80.6](spec/80-older-versions-kept-for-open-snapshots.md). The price: two readers do a tenth fewer
 short reads than before §80. Readers run in parallel since pages are shared [§64](spec/64-shared-pages.md) and looked up
 under a read lock [§65](spec/65-a-read-lock-for-the-page-cache.md): four did 3.2 times the work of one then, 1.9 times
-now that one is more than twice as fast [§190](spec/190-0-40-measured-against-0-34.md). Eight do no more than four.
+now that one is more than twice as fast [§190](spec/190-0-40-measured-against-0-34.md), and eight no more than four.
+Since the locks a read takes are a thread's own [§193](spec/193-readers-in-parallel-past-four.md), four do 2.7 times one and
+eight 3.5 times.
 
 ## 10. The API
 

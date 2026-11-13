@@ -1432,3 +1432,12 @@ limit, batches and a write-ahead log. Since then:
     away, so a call read up to a megabyte for each; they are now read
     as they are. Opens measured too: a writer's 4.6 ms, a read-only
     one 0.14 ms, each call on it about 15 µs.
+166. **Readers in parallel past four** (§193): every lookup took three
+    read locks, the gate, the last commit's and the pages' (that one
+    for each page), and every reader changed the same counts in them,
+    so eight readers did fewer lookups than four. They are now
+    `crossbeam-utils`' `ShardedLock`, a lock per thread that a writer
+    takes all of: four readers do 2.7 times one (1.9 before), eight
+    3.5 times (1.3); beside a writer, eight read three times as often,
+    p99 6 µs instead of 20. Writes as fast as before. `crossbeam-utils`
+    is a new dependency, with none of its own.

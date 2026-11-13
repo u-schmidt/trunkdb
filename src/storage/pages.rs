@@ -2,12 +2,13 @@ use super::cache::PageCache;
 use super::scratch::Scratch;
 use super::{Page, PageId};
 use crate::crc32::Crc32;
+use crossbeam_utils::sync::{ShardedLock, ShardedLockReadGuard, ShardedLockWriteGuard};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A page's size in the file. Matches LiteDB's page size, partly so
 /// numbers stay comparable to it later, and because a document DB's
@@ -42,7 +43,7 @@ pub const USABLE_PAGE_SIZE: usize = PAGE_SIZE - CHECKSUM_LEN;
 /// `write_through`: the writer, which `Database` makes sure of.
 pub(crate) struct Pages {
     file: File,
-    memory: RwLock<Memory>,
+    memory: ShardedLock<Memory>,
     /// A reader's beside a writer (SPEC §185.6): on Windows a read the
     /// writer's lock on the file refuses, while its open holds the file,
     /// is tried again for `REFUSED_FOR`, then fails as a snapshot ended
@@ -223,7 +224,7 @@ impl Pages {
             file,
             beside_writer: false,
             ended: None,
-            memory: RwLock::new(Memory {
+            memory: ShardedLock::new(Memory {
                 cache: PageCache::new(cache_pages),
                 versions: BTreeMap::new(),
                 replacement: None,
@@ -250,20 +251,22 @@ impl Pages {
         &self.file
     }
 
-    /// The pages in memory, to look one up: readers share it (SPEC §65).
+    /// The pages in memory, to look one up: readers share it (SPEC §65),
+    /// each thread through a lock of its own, so that readers on
+    /// different cores don't write the same count (SPEC §193).
     /// A panic while the lock was held can't have left them half-changed
     /// in a way that matters — at worst a page is missing from the cache
     /// — so a poisoned lock is taken over, not passed on.
-    pub(super) fn memory(&self) -> RwLockReadGuard<'_, Memory> {
+    pub(super) fn memory(&self) -> ShardedLockReadGuard<'_, Memory> {
         self.memory
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The pages in memory, to change: one thread at a time, and no
-    /// reader meanwhile. A read that misses the cache takes it to put
-    /// the page in.
-    fn memory_mut(&self) -> RwLockWriteGuard<'_, Memory> {
+    /// reader meanwhile, every reader's lock taken. A read that misses
+    /// the cache takes it to put the page in.
+    fn memory_mut(&self) -> ShardedLockWriteGuard<'_, Memory> {
         self.memory
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

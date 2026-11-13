@@ -59,6 +59,7 @@ All of it is done:
 | 0.38.0 | **Files made new, and their names synced** (found in a review): an export's temporary file always a new one, `<out>.tmp<pid>-<n>`, never one that was there nor through a link, and never shared by two exports at once; `verify_export` creates its files and removes only those; a new database's file and WAL, and an export renamed into place, have their directory synced, so a power cut can't lose their names. **A WAL bound to its file:** the file's header holds a random id and a session, new each time the WAL starts again from empty, the WAL's header (version 4) the id and both sessions; an open replays a WAL only into the file it names, at either session, and refuses another's or an older copy's, writing nothing, with `FormatError::WalNotThisFiles`, which says to move the WAL aside or put its file back; a WAL of version 2 or 3 replayed as before; file format 16 still. **Writes that do what they say:** the C# wrapper refuses text with a NUL, which the library would read cut short, before it calls the library; `trunkdb update` and `delete` run their `--dry-run` as a batch's dry run, so it fails as the write would and counts only what would change, and an upsert with a `limit` or `offset` is refused by both; the typed `update_many`'s field loss documented | §182–§184 |
 | 0.39.0 | **A leaf split around its old anchor** (found by fuzzing): an insert into a full index leaf could fail, refusing its batch, where no half of a split fit around its own middle key, keys of hundreds of bytes sharing long prefixes with short ones between them (since 0.34.0); a half that doesn't fit is now built around the leaf's old anchor too, which always finds a point; file format 16 still. **What the platforms' file locks do,** tested on CI for the design of readers in other processes (§185, a draft) | §186 |
 | 0.40.0 | **Readers in other processes,** beside the one that writes: an admin tool or an agent reads the file while the application runs. The locks in three files beside the database, `.writer`, `.readers` and `.gate`, none on the database or its WAL; file format 17, which a writer's open stamps and 0.39.0 and older refuse; a read-only open beside a writer reads, each call, what was committed before it, a `Snapshot` or cursor what it took; a checkpoint beside a reader left for later and counted (`SnapshotInfo::checkpoints_skipped`, `largest_wal_skipped`), tried again through the gate, waiting `OpenOptions::checkpoint_wait`; `Database::checkpoint` beside a reader fails with `WouldBlock`, `compact` with `Error::SnapshotOpen`; an open that has to write the file waits `OpenOptions::wait_for_readers`, then fails with `WouldBlock`; a file at 16, or without lock files a reader can make, read as before; the `trunkdb` command looks into a file the application has open; a reader catches up, each call reading only the batches the WAL gained since, into the store it kept; past a second limit (`OpenOptions::let_go_wal_bytes`, 4× `checkpoint_wal_bytes`) a commit asks readers to let go, and a watcher thread in each reading process ends its snapshots with `Error::SnapshotTooOld`, a forgotten one too; an open that has to write asks as well (`SnapshotInfo::readers_asked`) | §187, §188, §189 |
+| next | **Measured again:** 0.40.0 against 0.34.0, every row of the comparison within noise, two readers sometimes slower by where macOS puts their threads, four readers 1.9 times one now that one is faster; all four stores again, side by side, the tables in DESIGN and the README from those runs, the machine found hardly changed. **A reader reads only what it checks:** a read-only open beside a writer read up to a megabyte for each of the WAL's header and records it checks, on every call; now those few bytes, and the buffer only for what the WAL gained, so a call beside a non-empty WAL takes 18 µs instead of 79. **Readers in parallel past four:** the gate, the last commit and the pages in memory each behind a lock per thread (`crossbeam-utils`' `ShardedLock`, the one new dependency), so readers on different cores no longer write the same lock's count; four readers do 2.7 times one, where they did 1.9, eight 3.5 times, where they did 1.3; beside a writer, eight read three times as often, with a p99 of 6 µs instead of 20, and the writer as fast | §190–§193 |
 
 ## A settled API and format
 trunkdb aims for an API and a file format that stay put. It doesn't
@@ -107,9 +108,10 @@ uses trunkdb asking for it.
 - Leaves decided whole for filters that accept several intervals of
   keys (`ne`, an OR, a NOT), each leaf checked against the intervals'
   bounds; they decide entry by entry, on bytes, since §104 (§104.6).
-- A scan, 1.3× SQLite's: each document's filtered fields are decoded
-  into a small object to be checked (§99); checking them as they are
-  decoded would save that.
+- A faster scan: now a little ahead of SQLite's (38.6 ms against 44.8,
+  §191.2), but each document's filtered fields are still decoded into a
+  small object to be checked (§99); checking them as they are decoded
+  would save that.
 
 **Changes as they happen** ([§140](spec/140-changes-as-they-happen.md))
 - A window counted back from the clock, with a timer to run the
@@ -135,9 +137,10 @@ uses trunkdb asking for it.
   recovery now take memory that doesn't grow with the file (§90, §91,
   §108), but for each index's keys, sorted in memory while it is
   rebuilt: an external sort, if real files ask for it (§108.8).
-- Batched writes: inserts level with SQLite's (43k/s against 39k/s,
-  §152.2), updates too (15k/s against 14k/s, §153), still behind redb
-  and sled: a batch of 1,000 updates writes about 2,160 whole pages.
+- Batched writes: inserts level with SQLite's and redb's (43k/s
+  against 40k/s and 44k/s), updates ahead of SQLite's and redb's but a
+  little behind sled's (20k/s against 22k/s), deletes level with sled's
+  (§191.2): a batch of 1,000 updates writes about 2,160 whole pages.
   Next, the WAL record written from the pages instead of copied into
   one buffer (4–5%); then a checkpoint without the WAL's own flush, a
   generation number in its header and records. WAL records of a page's
@@ -152,19 +155,20 @@ uses trunkdb asking for it.
   when asked.
 
 **Concurrency**
-- Readers that run in parallel past four: four do 3.2 times the work
-  of one, eight no more than four, and nobody waits in the kernel. Most
-  likely the atomic writes every page read makes to shared memory (the
-  cache's read lock, the page's reference count): the lock taken once
-  per operation instead of once per page, or cached pages borrowed
-  instead of counted (§65.3).
+- Readers nearer eight times one: eight do 3.5 times one since §193,
+  each lookup still writing two counts every reader shares, the last
+  commit's reference count and the root page's (§193.4); cached pages
+  borrowed instead of counted would take the second (§65.3). If a
+  program reads from many threads at once.
 - The full `reader_wait` (§58) with redb beside it, on the machine of
   §58, for the snapshot build: §79.7 and §80.6 measured a cut-down one
   on two cores.
-- Short reads on several threads: a tenth fewer with two readers since
-  §80, each read now writing to three shared places instead of one
-  (§80.6). With §82's kept snapshots counted, `compact` could do
-  without the gate on the read path (§80.8).
+- `compact` without the gate on the read path, with §82's kept
+  snapshots counted (§80.8): §80 cost two readers a tenth of their
+  short reads, three shared writes where there was one (§80.6); since
+  §193 the gate's and the last commit's locks are a thread's own, and
+  two readers do more than before it (§193.3). If a measurement shows
+  the gate still costs.
 
 **API**
 - An unwind read from a multikey index (§147.5), "tasks per tag" on
