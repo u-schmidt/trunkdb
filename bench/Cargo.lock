@@ -584,6 +584,7 @@ dependencies = [
 name = "trunkdb"
 version = "0.40.0"
 dependencies = [
+ "crossbeam-utils",
  "indexmap",
  "regex",
  "regex-syntax",

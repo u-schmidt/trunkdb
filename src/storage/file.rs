@@ -2620,6 +2620,49 @@ mod tests {
         });
     }
 
+    /// Each thread reads through a lock of its own (SPEC §193), and a
+    /// change takes every one: while readers on three threads hold the
+    /// pages, a change on a fourth waits for the last of them.
+    #[test]
+    fn a_change_to_the_pages_waits_for_readers_on_every_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Barrier, mpsc};
+        use std::time::Duration;
+        let (_dir, path) = open_temp();
+        let store = five_page_file(&path);
+        let held = Barrier::new(4);
+        let changed = AtomicBool::new(false);
+        let while_held = || {
+            std::thread::sleep(Duration::from_millis(200));
+            !changed.load(Ordering::Acquire)
+        };
+        std::thread::scope(|scope| {
+            let lets_go: Vec<mpsc::Sender<()>> = (0..3)
+                .map(|_| {
+                    let (let_go, wait) = mpsc::channel::<()>();
+                    let (store, held) = (&store, &held);
+                    scope.spawn(move || {
+                        let memory = store.pages.memory();
+                        held.wait();
+                        wait.recv().unwrap();
+                        drop(memory);
+                    });
+                    let_go
+                })
+                .collect();
+            held.wait();
+            scope.spawn(|| {
+                store.pages.set_cache_pages(3);
+                changed.store(true, Ordering::Release);
+            });
+            for let_go in &lets_go {
+                assert!(while_held(), "changed beside a reader");
+                let_go.send(()).unwrap();
+            }
+        });
+        assert!(changed.load(Ordering::Acquire));
+    }
+
     /// Staged pages never reach the cache: a rolled-back write isn't read
     /// back, a written-back one is, from the cache.
     #[test]
