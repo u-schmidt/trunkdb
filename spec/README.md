@@ -206,3 +206,4 @@ say what changed, and DESIGN.md says what is true now.
 189. [A reader too long is asked to let go (`storage/lock_files.rs`, `database.rs`)](189-a-reader-too-long-is-asked-to-let-go.md)
 190. [0.40.0 measured against 0.34.0 (`bench/`)](190-0-40-measured-against-0-34.md)
 191. [Measured again, against SQLite, redb and sled (`bench/`, `DESIGN.md`, `README.md`)](191-measured-again-against-sqlite-redb-and-sled.md)
+192. [A reader reads only what it checks (`durability/wal.rs`)](192-a-reader-reads-only-what-it-checks.md)

@@ -89,7 +89,9 @@ number of read-only opens in other processes read beside it, each call
 on a snapshot of the file and the WAL as they are, holding `.readers`
 shared while it reads. A reader keeps what it built, and the next call
 reads only the batches the WAL gained since, starting again from the
-file after a checkpoint [§188](spec/188-a-reader-that-catches-up.md).
+file after a checkpoint [§188](spec/188-a-reader-that-catches-up.md). A read-only open takes 0.14 ms, and
+each call about 15 µs on top of its lookup, for the locks and the look
+at the WAL [§192](spec/192-a-reader-reads-only-what-it-checks.md).
 Past a second limit of the WAL's length, a checkpoint asks the readers
 to let go, through `<path>.letgo`; a watcher thread in each reading
 process ends its snapshots, a forgotten one too

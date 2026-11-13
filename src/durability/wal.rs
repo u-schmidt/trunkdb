@@ -719,7 +719,12 @@ pub(crate) fn read_pending_since(db_path: &Path, place: &WalPlace) -> io::Result
     if len < place.end {
         return Ok(None);
     }
-    let mut input = BufReader::with_capacity(READ_BUFFER, &file);
+    // The header and the checks below are a few bytes each, read from
+    // the file as they are: through a buffer, each seek would throw away
+    // what it read ahead, and every call would read up to a buffer's
+    // worth of the WAL for each, a megabyte (SPEC §192). The buffer is
+    // for what the WAL gained since.
+    let mut input = source(&file);
     let Some(records) = Records::new(&mut input, len)? else {
         return Ok(None);
     };
@@ -736,9 +741,57 @@ pub(crate) fn read_pending_since(db_path: &Path, place: &WalPlace) -> io::Result
         }
     }
     input.seek(SeekFrom::Start(place.end))?;
+    let input = BufReader::with_capacity(READ_BUFFER, input);
     let records = Records::resume(input, version, binding, place.end, len);
     let pending = Pending::scan_records(records, place.last.clone())?;
     Ok(Some(pending.on(file)))
+}
+
+/// What `read_pending_since` reads a WAL through: the file itself.
+#[cfg(not(test))]
+fn source(file: &File) -> &File {
+    file
+}
+
+/// What `read_pending_since` reads a WAL through: in tests, the file
+/// with the bytes read from it counted (`counted::read`).
+#[cfg(test)]
+fn source(file: &File) -> counted::Counted<'_> {
+    counted::Counted(file)
+}
+
+/// Bytes read from a WAL by `read_pending_since`, counted per thread,
+/// for the tests of SPEC §192.
+#[cfg(test)]
+mod counted {
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io::{self, Read, Seek, SeekFrom};
+
+    thread_local! {
+        static READ: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The bytes read on this thread since the last call.
+    pub(super) fn read() -> u64 {
+        READ.with(|read| read.replace(0))
+    }
+
+    pub(super) struct Counted<'a>(pub(super) &'a File);
+
+    impl Read for Counted<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(buf)?;
+            READ.with(|read| read.set(read.get() + n as u64));
+            Ok(n)
+        }
+    }
+
+    impl Seek for Counted<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
 }
 
 impl Durability for WalDurability {
@@ -1349,6 +1402,43 @@ mod tests {
         assert!(read_pending_since(&db_path, &place).unwrap().is_none());
         let empty = read_pending_since(&db_path, &WalPlace::default()).unwrap();
         assert!(empty.unwrap().is_empty(), "nothing read, nothing there");
+    }
+
+    /// A reader that catches up reads the header, the last batch's
+    /// records' first 8 bytes and what the WAL gained, not a buffer's
+    /// worth for each (SPEC §192): it does so at every call beside a
+    /// writer.
+    #[test]
+    fn a_reader_reads_only_what_it_checks_and_what_was_gained() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.trunkdb");
+        let mut wal = open_with_small_records(&db_path);
+        // Some megabytes, the last batch in two records.
+        let batch: Vec<(PageId, Vec<u8>)> = (10..610).map(|i| (i, page(i as u8))).collect();
+        log(&mut wal, &batch);
+        log(
+            &mut wal,
+            &[(1, page(1)), (2, page(2)), (3, page(3)), (4, page(4))],
+        );
+        assert!(wal.len() > 2 * READ_BUFFER as u64);
+        let place = read_pending(&db_path).unwrap().place();
+        assert_eq!(place.last.len(), 2);
+
+        counted::read();
+        let nothing_new = read_pending_since(&db_path, &place).unwrap().unwrap();
+        assert!(nothing_new.is_empty());
+        let read = counted::read();
+        assert!(read <= (WAL_HEADER_LEN + 2 * 8) as u64, "{read} bytes");
+
+        log(&mut wal, &[(5, page(5))]);
+        let gained = wal.len() - place.end;
+        let since = read_pending_since(&db_path, &place).unwrap().unwrap();
+        assert_eq!(since.images(), vec![(5, page(5))]);
+        let read = counted::read();
+        assert!(
+            read <= (WAL_HEADER_LEN + 2 * 8) as u64 + gained,
+            "{read} bytes"
+        );
     }
 
     /// A batch of several records read, taken back, and logged again
