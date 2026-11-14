@@ -77,6 +77,10 @@ await foreach (var e in inDepot.ReadAllAsync(token))
   missed between two reads; events wait until read.
 - **Dispose** the feed to stop it. Disposing the database ends it too,
   once the events before are read: `Ended` is then true.
+- **Opened read-only beside the application** (`ReadOnly = true`, while
+  another process writes the file), `Watch` and `WatchAggregate` report
+  that process's commits too, read again every 100 ms: several commits
+  between two looks come as one. `Subscribe` reports nothing there.
 
 ## The library
 

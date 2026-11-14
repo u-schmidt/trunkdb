@@ -2256,3 +2256,204 @@ fn find_takes_a_regex() {
         stderr(&output)
     );
 }
+
+/// `trunkdb watch` running (SPEC §196): its lines as they come, read on a
+/// thread; killed when dropped.
+struct Watching {
+    child: Child,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Watching {
+    fn start(args: &[&str]) -> Watching {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_trunkdb"));
+        command
+            .arg("watch")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = spawn(&mut command);
+        let out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in out.lines().map_while(Result::ok) {
+                if send.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Watching { child, lines }
+    }
+
+    /// The next line, as JSON.
+    fn next(&self) -> serde_json::Value {
+        let line = (self.lines)
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a line in time");
+        serde_json::from_str(&line).unwrap()
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A document as `find` prints it: `fields` with its `_id`.
+fn printed(id: &str, fields: serde_json::Value) -> serde_json::Value {
+    let mut doc = serde_json::json!({"_id": {"$id": id}});
+    doc.as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    doc
+}
+
+/// What the program that has the file open commits, one event a line as
+/// the C ABI hands them out (SPEC §196, §194.2).
+#[test]
+fn watch_prints_what_the_program_with_the_file_open_commits() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = path(dir.path(), "db.trunkdb");
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    let vans = db.collection::<trunkdb::Document>("vans");
+    let van = |name: &str, zone: &str| -> trunkdb::Document {
+        format!(r#"{{"name": "{name}", "zone": "{zone}"}}"#)
+            .parse()
+            .unwrap()
+    };
+    let a = vans.insert(van("a", "depot")).unwrap().to_string();
+    let watching = Watching::start(&[&db_path, "vans", "zone = :z", "--param", "z=depot"]);
+    assert_eq!(
+        watching.next(),
+        json!({"event": "entered", "id": a, "doc": printed(&a, json!({"name": "a", "zone": "depot"})), "at": null})
+    );
+    let b = vans.insert(van("b", "depot")).unwrap();
+    let b_text = b.to_string();
+    assert_eq!(watching.next()["id"], json!(b_text));
+    vans.update(&a.parse().unwrap(), van("a", "road")).unwrap();
+    assert_eq!(
+        watching.next(),
+        json!({"event": "left", "id": a, "doc": printed(&a, json!({"name": "a", "zone": "road"})), "from": null})
+    );
+    vans.update(&b, van("b2", "depot")).unwrap();
+    assert_eq!(
+        watching.next(),
+        json!({"event": "changed", "id": b_text, "doc": printed(&b_text, json!({"name": "b2", "zone": "depot"})), "from": null, "at": null})
+    );
+    vans.delete(&b).unwrap();
+    assert_eq!(
+        watching.next(),
+        json!({"event": "left", "id": b_text, "doc": null, "from": null})
+    );
+    drop(watching);
+    close(db);
+}
+
+/// A sorted list's places, and an aggregate's rows.
+#[test]
+fn watch_prints_places_and_rows() {
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = path(dir.path(), "db.trunkdb");
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    let vans = db.collection::<trunkdb::Document>("vans");
+    let van = |zone: &str, speed: i64| -> trunkdb::Document {
+        format!(r#"{{"zone": "{zone}", "speed": {speed}}}"#)
+            .parse()
+            .unwrap()
+    };
+    let slow = vans.insert(van("depot", 1)).unwrap().to_string();
+    let fastest = Watching::start(&[&db_path, "vans", "order by speed desc limit 1"]);
+    let rows = Watching::start(&[
+        &db_path,
+        "vans",
+        "",
+        "--aggregate",
+        "count() as n group by zone",
+    ]);
+    let first = fastest.next();
+    assert_eq!(
+        (&first["event"], &first["id"], &first["at"]),
+        (&json!("entered"), &json!(slow), &json!(0))
+    );
+    assert_eq!(
+        rows.next(),
+        json!({"event": "entered", "group": {"zone": "depot"}, "row": {"zone": "depot", "n": 1}})
+    );
+    let fast = vans.insert(van("road", 9)).unwrap().to_string();
+    let events = [fastest.next(), fastest.next()];
+    assert_eq!(
+        (&events[0]["event"], &events[0]["id"], &events[0]["from"]),
+        (&json!("left"), &json!(slow), &json!(0))
+    );
+    assert_eq!(
+        (&events[1]["event"], &events[1]["id"], &events[1]["at"]),
+        (&json!("entered"), &json!(fast), &json!(0))
+    );
+    assert_eq!(
+        rows.next(),
+        json!({"event": "entered", "group": {"zone": "road"}, "row": {"zone": "road", "n": 1}})
+    );
+    drop((fastest, rows));
+    close(db);
+}
+
+/// What can't be watched is refused before anything is printed; and a
+/// reader that goes away, as `| head -1` does, ends it without an error.
+#[test]
+fn watch_refuses_what_it_cant_watch_and_ends_with_its_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = path(dir.path(), "db.trunkdb");
+    let db = trunkdb::Database::open(&db_path).unwrap();
+    let vans = db.collection::<trunkdb::Document>("vans");
+    vans.insert(object("speed", trunkdb::Document::Int(1)))
+        .unwrap();
+
+    let output = trunkdb(&["watch", &db_path, "vans", "order by speed limit 5 offset 1"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("a skip"), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    let output = trunkdb(&["watch", &db_path, "vams"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("vams: no such collection"),
+        "{}",
+        stderr(&output)
+    );
+    let output = trunkdb(&["watch", &db_path, "vans", "", "--aggregate", "count( as n"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trunkdb"));
+    command
+        .args(["watch", &db_path, "vans"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn(&mut command);
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut out, &mut first).unwrap();
+    assert!(first.starts_with(r#"{"event":"entered""#), "{first}");
+    drop(out);
+    // Its next line has nowhere to go.
+    vans.insert(object("speed", trunkdb::Document::Int(2)))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watch went on without a reader"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success(), "{status}");
+    close(db);
+}
