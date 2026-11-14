@@ -121,6 +121,9 @@ trunkdb find app.trunkdb users 'name = :name' --param "name=$NAME"
                                          # a value apart from the text
 trunkdb get app.trunkdb users 0192f0c4-7d7a-7c43-9e0b-1f6d1b8f0a11
 trunkdb aggregate app.trunkdb users 'age >= 30' 'count() as n, avg(age) as mean group by team'
+trunkdb watch app.trunkdb users 'team = "ops"'
+                                         # what the running app commits,
+                                         # one JSON event a line, until stopped
 trunkdb insert app.trunkdb users '{"name": "Ada", "age": 36}'
 trunkdb update app.trunkdb users 'name = "Ada"' '{"$inc": {"age": 1}}'
 trunkdb delete app.trunkdb users 'age < 18' --dry-run
@@ -129,8 +132,8 @@ trunkdb index app.trunkdb users add team age
 trunkdb drop app.trunkdb old_users
 ```
 
-`info`, `check`, `export`, `find`, `fields`, `count`, `get` and
-`aggregate` open the file read-only; `info`, `check` and `fields` print JSON with `--json`.
+`info`, `check`, `export`, `find`, `fields`, `count`, `get`,
+`aggregate` and `watch` open the file read-only; `info`, `check` and `fields` print JSON with `--json`.
 An update or delete that would change every document of a collection
 asks for `--all`, and `--dry-run` says how many it would change, or
 the error it would fail with, writing nothing.

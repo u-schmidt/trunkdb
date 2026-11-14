@@ -467,6 +467,13 @@ std::thread::spawn(move || {
 - **Yours to handle:** GPS noise flipping a position in and out at a
   fence's edge, and pings that arrive late after a tracker was offline
   (apply them in the order of their time).
+- **In another process,** opened read-only beside the application (an
+  admin tool, a dashboard), `watch` and `watch_aggregate` report its
+  commits too: they are read again every `OpenOptions::watch_every`
+  (100 ms) and compared, so several commits between two looks come as
+  one, and a van that came and went between them isn't seen (SPEC
+  §195). `trunkdb watch app.trunkdb vans 'zone = "depot"'` prints them
+  as JSON lines.
 
 ### A list in order
 

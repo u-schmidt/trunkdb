@@ -3,10 +3,11 @@
 //! sum up the fields its documents have (§121), count them and get one by
 //! id, with JSON for a program or an agent to read (§155); insert,
 //! update and delete documents, add and drop indexes, drop a collection
-//! (§156), and write many ops as one batch, one op a line (§168).
-//! Looking, checking, exporting, finding, summing up, counting and
-//! getting open it read-only (SPEC §88), beside a program that writes it
-//! (SPEC §185). A filter's or an
+//! (§156), and write many ops as one batch, one op a line (§168);
+//! watch what a program that has it open commits (§196).
+//! Looking, checking, exporting, finding, summing up, counting, getting
+//! and watching open it read-only (SPEC §88), beside a program that
+//! writes it (SPEC §185). A filter's or an
 //! aggregate's text takes parameters, their values given apart with
 //! `--param` (§163).
 //!
@@ -75,6 +76,19 @@ commands:
                               (where …)` if it takes in only some
                               documents; `unwind items` and `window at
                               5m` before them. --explain says how
+  watch  <file> <collection> [filter] [--aggregate <aggregate>]
+                              what the filter finds, then what changes as
+                              the program that has the file open
+                              commits, one JSON event a line, until
+                              stopped: {\"event\": \"entered\", \"id\": …,
+                              \"doc\": {…}, \"at\": …}; \"left\", \"doc\" null
+                              if it's gone, with \"from\"; \"changed\" with
+                              both. \"at\" and \"from\" are places in a
+                              sorted list, null without a sort. With
+                              --aggregate, its rows: {\"event\": …,
+                              \"group\": {…}, \"row\": {…}}. It looks every
+                              100 ms; several commits between two looks
+                              come as one
 
 --json prints what a program reads: info and check one JSON object, fields
 one JSON object per path.
@@ -123,7 +137,7 @@ given --all; --dry-run makes the write without keeping it: how many it
 would change, or the error it would fail with, writing nothing.
 The filter is one argument: quote it, '' for none.
 
-parameters (find, fields, count, aggregate, update, delete, batch):
+parameters (find, fields, count, aggregate, watch, update, delete, batch):
   --param <name>=<value>      a value for `:name` in the filter or the
                               aggregate, where a value or a count stands:
                               'status = :s limit :n' --param s=open
@@ -135,7 +149,7 @@ parameters (find, fields, count, aggregate, update, delete, batch):
                               string that would read as one of those is
                               given as JSON: n='\"20\"' is a string
 
-info, check, export, find, fields, count, get and aggregate only read: they change
+info, check, export, find, fields, count, get, aggregate and watch only read: they change
 nothing in the file or its log, not even what a crash of the program that
 had it open left there.
 ";
@@ -155,6 +169,7 @@ fn main() -> ExitCode {
         "fields",
         "count",
         "aggregate",
+        "watch",
         "update",
         "delete",
         "batch",
@@ -190,6 +205,18 @@ fn main() -> ExitCode {
             .and_then(|db| aggregate(&db, collection, filter, text, given, Show::Documents)),
         ["aggregate", file, collection, filter, text, "--explain"] => read_only(file)
             .and_then(|db| aggregate(&db, collection, filter, text, given, Show::Explained)),
+        [
+            "watch",
+            file,
+            collection,
+            ref filter @ ..,
+            "--aggregate",
+            text,
+        ] => read_only(file)
+            .and_then(|db| watch(&db, collection, &filter.join(" "), Some(text), given)),
+        ["watch", file, collection, ref filter @ ..] => {
+            read_only(file).and_then(|db| watch(&db, collection, &filter.join(" "), None, given))
+        }
         ["insert", file, collection, ref rest @ ..] => insert(file, collection, rest),
         ["update", file, collection, ref rest @ ..] => update(file, collection, rest, given),
         ["delete", file, collection, ref rest @ ..] => delete(file, collection, rest, given),
@@ -742,6 +769,144 @@ fn aggregate(
     }
     eprintln!("{}", count(rows.len(), "row"));
     Ok(ExitCode::SUCCESS)
+}
+
+/// `trunkdb watch` (SPEC §196): what `filter` finds, then what changes as
+/// the program that has the file open commits, one JSON event a line as
+/// the C ABI hands them out (§194.2); with `aggregate`, its rows. It runs
+/// until stopped, its reader gone, or an error ends the live query.
+fn watch(
+    db: &Database,
+    collection: &str,
+    filter: &str,
+    aggregate: Option<&str>,
+    given: &Given,
+) -> Outcome {
+    let failed = |e: trunkdb::Error| e.to_string();
+    let aggregate = match aggregate.map(|text| {
+        bound(
+            "aggregate",
+            text,
+            given,
+            Template::<trunkdb::query::Aggregate>::bind,
+        )
+    }) {
+        None => None,
+        Some(Ok(aggregate)) => Some(aggregate),
+        Some(Err(usage)) => return Ok(usage),
+    };
+    let (docs, filter) = match query(db, collection, filter, given)? {
+        Ok(query) => query,
+        Err(usage) => return Ok(usage),
+    };
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    let written = match aggregate {
+        None => {
+            let live = docs.watch(filter).map_err(failed)?;
+            print_events(&mut out, || live.try_recv(), || live.recv(), live_line)
+        }
+        Some(aggregate) => {
+            let live = docs.watch_aggregate(filter, &aggregate).map_err(failed)?;
+            print_events(&mut out, || live.try_recv(), || live.recv(), row_line)
+        }
+    };
+    match written {
+        Ok(Ok(())) => Ok(ExitCode::SUCCESS),
+        Ok(Err(e)) => Err(e),
+        Err(e) => stopped_writing(e),
+    }
+}
+
+/// Each event a line, flushed once none is waiting: as it comes. The
+/// outer error is standard output's; the inner, what ended the events.
+fn print_events<E>(
+    out: &mut impl Write,
+    waiting: impl Fn() -> Option<trunkdb::Result<E>>,
+    next: impl Fn() -> Option<trunkdb::Result<E>>,
+    line: fn(E) -> Option<String>,
+) -> io::Result<Result<(), String>> {
+    loop {
+        let event = match waiting() {
+            Some(event) => event,
+            None => {
+                out.flush()?;
+                match next() {
+                    Some(event) => event,
+                    None => return Ok(Ok(())),
+                }
+            }
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(e) => {
+                out.flush()?;
+                return Ok(Err(e.to_string()));
+            }
+        };
+        match line(event) {
+            Some(line) => writeln!(out, "{line}")?,
+            None => return Ok(Err("an event of a kind this command can't write".into())),
+        }
+    }
+}
+
+/// An id as a JSON string.
+fn id_json(id: trunkdb::DocId) -> String {
+    serde_json::Value::String(id.to_string()).to_string()
+}
+
+/// A place in a sorted list, or null.
+fn place_json(place: Option<usize>) -> String {
+    place.map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
+/// A document as `find` prints it, or null.
+fn doc_json(doc: Option<&Document>) -> String {
+    doc.map_or_else(|| "null".to_string(), Document::to_string)
+}
+
+/// A live query's event (SPEC §194.2); `None` for one of a kind added
+/// after this code, which a command built with its library never meets.
+fn live_line(event: trunkdb::Live<Document>) -> Option<String> {
+    Some(match event {
+        trunkdb::Live::Entered { id, doc, at, .. } => format!(
+            r#"{{"event":"entered","id":{},"doc":{},"at":{}}}"#,
+            id_json(id),
+            doc_json(Some(&doc)),
+            place_json(at)
+        ),
+        trunkdb::Live::Left { id, doc, from, .. } => format!(
+            r#"{{"event":"left","id":{},"doc":{},"from":{}}}"#,
+            id_json(id),
+            doc_json(doc.as_ref()),
+            place_json(from)
+        ),
+        trunkdb::Live::Changed {
+            id, doc, from, at, ..
+        } => format!(
+            r#"{{"event":"changed","id":{},"doc":{},"from":{},"at":{}}}"#,
+            id_json(id),
+            doc_json(Some(&doc)),
+            place_json(from),
+            place_json(at)
+        ),
+        _ => return None,
+    })
+}
+
+/// A live aggregate's event (SPEC §194.2), as `live_line`.
+fn row_line(event: trunkdb::LiveRow) -> Option<String> {
+    let (kind, group, row) = match &event {
+        trunkdb::LiveRow::Entered { group, row, .. } => ("entered", group, Some(row)),
+        trunkdb::LiveRow::Left { group, row, .. } => ("left", group, row.as_ref()),
+        trunkdb::LiveRow::Changed { group, row, .. } => ("changed", group, Some(row)),
+        _ => return None,
+    };
+    Some(format!(
+        r#"{{"event":"{kind}","group":{},"row":{}}}"#,
+        doc_json(Some(group)),
+        doc_json(row)
+    ))
 }
 
 /// `trunkdb count` (SPEC §155): how many documents the filter finds, the

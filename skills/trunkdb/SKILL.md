@@ -59,6 +59,11 @@ narrow questions:
    written bare (`0192f0c4-…`) or as `id("…")`; exit code 1 if there is
    none.
 
+`trunkdb watch <file> <collection> '<filter>'` prints what matches,
+then what the running app changes, one JSON event a line, and **doesn't
+end on its own**: run it only when the user wants to follow changes,
+and end it after a few lines (`| head -n 5`) or let the user stop it.
+
 `info`, `fields` and `check` take `--json` at the end: `info` and
 `check` print one JSON object, `fields` one per path (`path`,
 `documents`, `kinds`). Use it when you go on with `jq` or code; the
@@ -185,8 +190,8 @@ collection is an error (exit 1), not an empty result.
 - **Don't write unless the user asked for that change.** `insert`,
   `update`, `delete`, `index`, `drop`, `compact` and `import` write to
   the file (see "Changing documents" below). `info`, `check`, `export`,
-  `find`, `fields`, `count`, `get` and `aggregate` only read it and
-  can't damage it.
+  `find`, `fields`, `count`, `get`, `aggregate` and `watch` only read
+  it and can't damage it.
 - **"in use by another program"** means an app has the database open,
   which locks it: for a write, against every other open; for a read,
   against writes. Tell the user, and ask them to close the app. Don't

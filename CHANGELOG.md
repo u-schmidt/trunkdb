@@ -1451,3 +1451,16 @@ limit, batches and a write-ahead log. Since then:
     `await foreach` over `ReadAllAsync(token)`. In Rust, `has_ended()`
     on `Changes`, `LiveQuery` and `LiveAggregate`: whether a
     `recv_timeout` that returned `None` met the end.
+168. **Live queries beside a writer** (§195): a read-only open's
+    `watch` and `watch_aggregate`, beside the application in another
+    process, reported their first state and nothing after. Now a
+    thread looks every `OpenOptions::watch_every` (default 100 ms)
+    whether the WAL gained a commit; where it did, each live query
+    reads its matches again and reports what changed as a commit's
+    changes would be, places and `select` included, and each live
+    aggregate runs again. Several commits between two looks come as
+    one. `subscribe` beside a writer still reports nothing.
+169. **`trunkdb watch`** (§196): a live query, or with `--aggregate` a
+    live aggregate, on a file the application has open: the first
+    state, then each change, one JSON event a line as the C ABI hands
+    them out, until stopped. `--param` for its texts.

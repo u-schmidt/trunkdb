@@ -261,6 +261,14 @@ its result, and after the live queries runs it again, whole, on the
 same snapshot, for each commit that changed its collection; rows known
 by their canonical group values are compared with those before
 [§139](spec/139-live-aggregates-and-a-window.md).
+In a read-only open beside a writer in another process, which sees
+the WAL grow but not which documents a commit changed, a thread looks
+every `watch_every`; where the writer committed, each live query reads
+its matches whole, compares them with the last look's encoded
+documents, and hands those that changed to the same `changed` and
+`settle` a commit's go through; live aggregates run again. Several
+commits between two looks come as one
+[§195](spec/195-live-queries-beside-a-writer.md).
 
 ## 6. Documents and data pages
 
@@ -677,7 +685,9 @@ eight 3.5 times.
   &aggregate)`, a `LiveAggregate` reporting its rows `Entered`, `Left`
   or `Changed`, and `Aggregate::window` [§139](spec/139-live-aggregates-and-a-window.md); rows of the
   application's own, `aggregate_as::<R>` and `watch_aggregate_as::<R>`
-  [§148](spec/148-rows-of-the-applications-own.md).
+  [§148](spec/148-rows-of-the-applications-own.md); in a read-only open beside a writer, read
+  again as it commits, every `OpenOptions::watch_every`
+  [§195](spec/195-live-queries-beside-a-writer.md).
 - **Batches:** `db.batch()` across collections, typed and untyped alike
   [§24](spec/24-typed-batches.md) [§60](spec/60-a-smaller-public-api.md); all or nothing.
 - **Filters** through `Filter`'s methods; `limit` takes an `Option`
@@ -729,7 +739,7 @@ eight 3.5 times.
 ## 11. Tools
 
 - **`trunkdb` command:** `info`, `check`, `compact`, `export`, `import`
-  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `batch`, a file of ops, one JSON object a line, committed as one batch [§168](spec/168-a-batch-through-the-command.md), read by the library's `BatchLines`, as updates by `Update`'s `FromStr`, so a program reads them as the command does [§178](spec/178-text-a-program-passes-read-by-the-library.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `verify`, whether an export restores [§165](spec/165-backups-a-user-can-trust.md); `info`, `check`, `export`, `find`, `fields`, `count` and `get` open the file read-only [§88](spec/88-a-read-only-open.md).
+  [§39](spec/39-the-trunkdb-command-and-database-check.md), and `find`, a filter's matches as JSON lines [§112](spec/112-trunkdb-find.md), or with `--explain` how it ran [§113](spec/113-trunkdb-find-explain.md), and `fields`, every path a collection's documents have, in how many and as which kinds [§121](spec/121-trunkdb-fields.md); `count` and `get`, and `--json` for `info`, `check` and `fields` [§155](spec/155-trunkdb-count-get-and-json.md); `insert`, `update` with MongoDB's operators as JSON, `delete`, `index add`/`drop` and `drop`, a write that would change every document asking for `--all` [§156](spec/156-trunkdb-insert-update-delete-and-indexes.md); `batch`, a file of ops, one JSON object a line, committed as one batch [§168](spec/168-a-batch-through-the-command.md), read by the library's `BatchLines`, as updates by `Update`'s `FromStr`, so a program reads them as the command does [§178](spec/178-text-a-program-passes-read-by-the-library.md); `aggregate`, an aggregate as text, `count() as n group by team`, which `Aggregate` reads and writes too [§157](spec/157-aggregates-as-text.md); `--param name=value` for a text's parameters [§163](spec/163-parameters-in-a-filter-s-text.md); `verify`, whether an export restores [§165](spec/165-backups-a-user-can-trust.md); `watch`, a live query or aggregate beside the program that has the file open, one JSON event a line [§196](spec/196-trunkdb-watch.md); `info`, `check`, `export`, `find`, `fields`, `count`, `get` and `watch` open the file read-only [§88](spec/88-a-read-only-open.md).
 - **The C ABI,** `trunkdb-ffi/`: trunkdb as a C library and its header, 41 functions; documents as tagged JSON, filters and aggregates as text with their parameters apart, batches as JSON lines; opaque handles checked by a tag, an error code from each call and the thread's last error as text and JSON, no panic across [§177](spec/177-a-c-abi-the-design.md) [§179](spec/179-the-c-abi.md). What it reads, updates, parameters and a batch's lines, the library reads, the command through it too [§178](spec/178-text-a-program-passes-read-by-the-library.md). From C#, `bindings/dotnet/`: `Database`, `Collection<T>`, `Snapshot` and `Cursor<T>` over safe handles, documents through System.Text.Json with a converter per tag, errors as exceptions with their details [§180](spec/180-the-csharp-wrapper.md). Changes, live queries and live aggregates through one kind of handle, polled with a timeout, each event JSON; in C#, feeds read with `Next`, `foreach` or `await foreach`, their events records [§194](spec/194-changes-as-they-happen-through-the-c-abi.md).
 - **An Agent Skill**, `skills/trunkdb/`: how an AI agent uses the command on a file it meets, in the order that keeps its context small [§122](spec/122-a-skill-for-ai-agents.md).
 - **`Database::check`** reads the whole file and reports what doesn't

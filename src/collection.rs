@@ -204,7 +204,9 @@ impl<T> Collection<T> {
     /// few documents, not the collection. Everything `aggregate` takes
     /// goes, the filter's and the rows' sort, skip and limit among it;
     /// refused as `aggregate` refuses. It waits for a batch being
-    /// committed to finish, as `Database::subscribe` does.
+    /// committed to finish, as `Database::subscribe` does. Opened
+    /// read-only beside a writer, it runs again as that writer commits,
+    /// as `watch` does there (SPEC §195).
     pub fn watch_aggregate(
         &self,
         filter: Filter,
@@ -823,6 +825,13 @@ impl Collection<Document> {
     /// skip, or a limit without a sort, is refused with
     /// `Error::NotLive`. It waits for a batch being committed to finish,
     /// as `Database::subscribe` does.
+    ///
+    /// **Opened read-only beside a writer in another process,** it is
+    /// read again as that writer commits (SPEC §195): every
+    /// `OpenOptions::watch_every`, where the WAL gained a commit, what
+    /// changed since the last look is reported as one commit's would be.
+    /// Several commits between two looks come as one, and a document that
+    /// came and went between them isn't seen.
     pub fn watch(&self, filter: Filter) -> crate::Result<LiveQuery<Document>> {
         self.db.watch(&self.name, filter, Ok)
     }

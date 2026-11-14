@@ -154,6 +154,15 @@ pub(crate) struct Writer {
     /// The live aggregates (SPEC §139), run again after each commit to
     /// their collection. Batches record their changes for them too.
     aggregates: Vec<live::AggregateWatcher>,
+    /// `OpenOptions::watch_every`: how often a read-only open beside a
+    /// writer reads its live queries and aggregates again (SPEC §195).
+    watch_every: Duration,
+    /// Whether the thread that does that runs: from the first live query
+    /// or aggregate until a look finds none.
+    watching: bool,
+    /// The state it last read them on: the next look reads again only
+    /// where the writer committed since.
+    watched: Option<Watched>,
     /// Test-only: called once, by the next batch, when it is logged and
     /// flushed and not yet published — to see what goes on beside it.
     #[cfg(test)]
@@ -208,6 +217,17 @@ impl Committed {
         &self.0.catalog
     }
 
+    /// Which state it is, to tell a later one from it without keeping it
+    /// (SPEC §195): its pages and its commit. A reader beside a writer
+    /// keeps its pages from one snapshot to the next and builds new ones
+    /// after a checkpoint.
+    fn watched(&self) -> Watched {
+        Watched {
+            pages: self.0.own.as_ref().map(Arc::downgrade),
+            seq: self.0.commit.seq(),
+        }
+    }
+
     /// The snapshot, to read from `pages`: its catalog, and the pages as
     /// of its commit.
     pub(crate) fn reading<'a>(&'a self, pages: &'a Pages) -> Reading<'a> {
@@ -215,6 +235,25 @@ impl Committed {
             catalog: self.catalog(),
             store: self.pages(pages).at(self.0.commit),
         }
+    }
+}
+
+/// A state a read-only open beside a writer read its live queries on
+/// (SPEC §195): `Committed::watched`. Weak, so the pages go when the
+/// reader builds new ones, and aren't mistaken for any built later.
+struct Watched {
+    pages: Option<Weak<Pages>>,
+    seq: u64,
+}
+
+impl Watched {
+    fn is(&self, other: &Watched) -> bool {
+        let pages = match (&self.pages, &other.pages) {
+            (Some(a), Some(b)) => a.ptr_eq(b),
+            (None, None) => true,
+            _ => false,
+        };
+        pages && self.seq == other.seq
     }
 }
 
@@ -266,6 +305,7 @@ pub struct OpenOptions {
     checkpoint_wait: Duration,
     wait_for_readers: Duration,
     let_go_wal_bytes: Option<u64>,
+    watch_every: Duration,
 }
 
 impl Default for OpenOptions {
@@ -279,6 +319,7 @@ impl Default for OpenOptions {
             checkpoint_wait: DEFAULT_CHECKPOINT_WAIT,
             wait_for_readers: DEFAULT_WAIT_FOR_READERS,
             let_go_wal_bytes: None,
+            watch_every: DEFAULT_WATCH_EVERY,
         }
     }
 }
@@ -426,7 +467,26 @@ impl OpenOptions {
         self.let_go_wal_bytes = Some(bytes);
         self
     }
+
+    /// How often a read-only open beside a writer in another process
+    /// looks whether the writer committed, for its live queries and
+    /// aggregates (SPEC §195). Default: 100 ms.
+    ///
+    /// Each look reads the few bytes the WAL gained; where it gained a
+    /// commit, each live query and aggregate reads its matches again and
+    /// reports what changed since the last look, several commits as one.
+    /// A thread of trunkdb's (`trunkdb-live`) looks, while the open has
+    /// one. Shorter reports sooner, longer reads less.
+    pub fn watch_every(mut self, every: Duration) -> Self {
+        self.watch_every = every;
+        self
+    }
 }
+
+/// How often a read-only open beside a writer looks for its live
+/// queries, unless `OpenOptions::watch_every` says otherwise (SPEC
+/// §195): a screen updated ten times a second.
+const DEFAULT_WATCH_EVERY: Duration = Duration::from_millis(100);
 
 /// How many committed pages may wait in memory, logged but not written
 /// back, before a commit writes them back (SPEC §51): 4,000 pages of 8 KB
@@ -921,6 +981,9 @@ impl Database {
                     subscribers: Vec::new(),
                     watchers: Vec::new(),
                     aggregates: Vec::new(),
+                    watch_every: options.watch_every,
+                    watching: false,
+                    watched: None,
                     #[cfg(test)]
                     after_log: None,
                 }),
@@ -992,7 +1055,9 @@ impl Database {
     ///
     /// It waits for a batch being committed to finish, so the first
     /// report is of the first batch after. A database opened read-only
-    /// commits nothing, so reports nothing. `Err(Error::Poisoned)` as
+    /// commits nothing, so reports nothing; beside a writer in another
+    /// process neither, as the WAL doesn't say which documents a commit
+    /// changed (SPEC §195), where a live query does. `Err(Error::Poisoned)` as
     /// for any other call.
     pub fn subscribe(&self) -> crate::Result<Changes> {
         let mut writer = self
@@ -1027,15 +1092,30 @@ impl Database {
         if self.inner.poisoned.load(Ordering::Relaxed) {
             return Err(crate::Error::Poisoned);
         }
-        let now = Collection::<Document>::new(self.clone(), collection)
-            .matches_with_ids(&live::first_read(&filter))?;
         let (sender, receiver) = mpsc::channel();
-        writer.watchers.push(live::Watcher::start(
-            collection.to_string(),
-            filter,
-            now,
-            sender,
-        )?);
+        let watcher = match &self.inner.beside {
+            None => {
+                let now = Collection::<Document>::new(self.clone(), collection)
+                    .matches_with_ids(&live::first_read(&filter))?;
+                live::Watcher::start(collection.to_string(), filter, now, sender)?
+            }
+            // Beside a writer in another process, read again as it
+            // commits (SPEC §195): the first matches whole, to compare,
+            // the hint steering this read as it does the first anywhere.
+            Some(side) => {
+                let current = side.snapshot()?;
+                let at = current.reading(&self.inner.pages);
+                let first = Filter {
+                    hint: filter.hint.clone(),
+                    ..live::whole_read(&filter)
+                };
+                let now = crate::collection::find_at(&at, collection, &first)?;
+                let seen = live::seen(&now);
+                live::Watcher::start(collection.to_string(), filter, now, sender)?.polled(seen)
+            }
+        };
+        self.watch_beside(&mut writer)?;
+        writer.watchers.push(watcher);
         Ok(LiveQuery::new(receiver, convert))
     }
 
@@ -1068,8 +1148,79 @@ impl Database {
             filter,
             aggregate.clone(),
         )?;
+        self.watch_beside(&mut writer)?;
         writer.aggregates.push(watcher);
         Ok(LiveAggregate::new(receiver, convert))
+    }
+
+    /// A read-only open beside a writer (SPEC §195): starts the thread
+    /// that reads its live queries and aggregates again, unless it runs.
+    /// It holds the database weakly, and ends with it, or at the first
+    /// look that finds none left. Nothing for any other open, whose
+    /// commits say what changed.
+    fn watch_beside(&self, writer: &mut Writer) -> crate::Result<()> {
+        if self.inner.beside.is_none() || writer.watching {
+            return Ok(());
+        }
+        let shared = Arc::downgrade(&self.inner);
+        let every = writer.watch_every;
+        std::thread::Builder::new()
+            .name("trunkdb-live".to_string())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    let Some(inner) = shared.upgrade() else {
+                        return;
+                    };
+                    if !(Database { inner }).look() {
+                        return;
+                    }
+                }
+            })?;
+        writer.watching = true;
+        Ok(())
+    }
+
+    /// One look of `watch_beside`'s thread: where the writer committed
+    /// since the last, each live query and aggregate read again, and what
+    /// changed reported. `false`, the thread to end, once none is left.
+    fn look(&self) -> bool {
+        let Some(side) = &self.inner.beside else {
+            return false;
+        };
+        let Ok(mut writer) = self.inner.writer.lock() else {
+            return false;
+        };
+        let writer = &mut *writer;
+        if writer.watchers.is_empty() && writer.aggregates.is_empty() {
+            writer.watching = false;
+            writer.watched = None;
+            return false;
+        }
+        let current = match side.snapshot() {
+            Ok(current) => current,
+            // Let go when asked, or a writer's open at work: the next
+            // look reads again.
+            Err(crate::Error::SnapshotTooOld) => return true,
+            Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(e) => {
+                live::end_all(&mut writer.watchers, &mut writer.aggregates, &e);
+                return true;
+            }
+        };
+        let watched = current.watched();
+        if writer
+            .watched
+            .as_ref()
+            .is_some_and(|last| last.is(&watched))
+        {
+            return true;
+        }
+        let at = current.reading(&self.inner.pages);
+        if live::poll(&mut writer.watchers, &mut writer.aggregates, &at) {
+            writer.watched = Some(watched);
+        }
+        true
     }
 
     /// Starts a typed, atomic multi-op write — see `Batch`.
