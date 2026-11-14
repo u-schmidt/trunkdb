@@ -1464,3 +1464,15 @@ limit, batches and a write-ahead log. Since then:
     live aggregate, on a file the application has open: the first
     state, then each change, one JSON event a line as the C ABI hands
     them out, until stopped. `--param` for its texts.
+
+    Items 163–169 → 0.41.0. Additions only: nothing a program has to
+    change. **The C ABI is version 2** (§194): a C program built
+    against version 1 runs on this library, but the C# wrapper wants
+    its own version exactly, so a 0.41.0 wrapper refuses a 0.40.0
+    library at `Database.Open`, and the other way round. A read-only
+    open beside a writer whose `watch` or `watch_aggregate` is in use
+    runs a second thread of trunkdb's (`trunkdb-live`), and those now
+    report the writer's commits. `crossbeam-utils` is a new
+    dependency. File format 17, WAL version 4 and export version 4, as
+    in 0.40.0; no fixture, as nothing writes a file differently
+    (§120.9).
