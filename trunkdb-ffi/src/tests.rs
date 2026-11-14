@@ -3,7 +3,7 @@
 //! JSON, and misuse that can be caught.
 
 use super::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::ffi::{CStr, CString};
 use std::ptr::{null, null_mut};
 
@@ -1076,6 +1076,330 @@ fn threads_share_a_handle() {
     all.dedup();
     assert_eq!(all.len(), 200, "each once");
     ok(unsafe { trunkdb_cursor_close(cursor.0) });
+}
+
+/// The next event of a live handle, waiting at most `ms`, and whether
+/// it has ended.
+fn next(live: *const trunkdb_live, ms: i64) -> (Option<Value>, bool) {
+    let mut event = null_mut();
+    let mut ended = true;
+    ok(unsafe { trunkdb_live_next(live, ms, &mut event, &mut ended) });
+    (
+        take(event).map(|e| serde_json::from_str(&e).unwrap()),
+        ended,
+    )
+}
+
+/// The next event, which must have come by now.
+#[track_caller]
+fn event(live: *const trunkdb_live) -> Value {
+    match next(live, 0) {
+        (Some(event), false) => event,
+        other => panic!("no event: {other:?}"),
+    }
+}
+
+/// Nothing waiting, and not ended.
+#[track_caller]
+fn quiet(live: *const trunkdb_live) {
+    assert_eq!(next(live, 0), (None, false));
+}
+
+impl Open {
+    fn update(&self, collection: &str, filter: &str, update: &str) {
+        let mut n = 0;
+        ok(unsafe {
+            trunkdb_update(
+                self.db,
+                c(collection).as_ptr(),
+                c(filter).as_ptr(),
+                null(),
+                c(update).as_ptr(),
+                &mut n,
+            )
+        });
+    }
+
+    fn watch(&self, collection: &str, filter: &str, params: Option<&str>) -> *mut trunkdb_live {
+        let params = params.map(c);
+        let mut live = null_mut();
+        ok(unsafe {
+            trunkdb_watch(
+                self.db,
+                c(collection).as_ptr(),
+                c(filter).as_ptr(),
+                params.as_ref().map_or(null(), |p| p.as_ptr()),
+                &mut live,
+            )
+        });
+        assert!(!live.is_null());
+        live
+    }
+}
+
+#[test]
+fn changes_are_polled_from_a_live_handle() {
+    let db = Open::new();
+    let mut live = null_mut();
+    ok(unsafe { trunkdb_subscribe(db.db, &mut live) });
+    quiet(live);
+    let started = std::time::Instant::now();
+    assert_eq!(next(live, 30), (None, false), "none came in time");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+
+    let a = db.insert("tasks", r#"{"title": "a"}"#);
+    assert_eq!(
+        event(live),
+        json!({"event": "commit", "changes": [
+            {"change": "inserted", "collection": "tasks", "id": a}
+        ]})
+    );
+    db.update("tasks", "", r#"{"$set": {"done": true}}"#);
+    assert_eq!(event(live)["changes"][0]["change"], "updated");
+    let mut dropped = false;
+    ok(unsafe { trunkdb_drop_collection(db.db, c("tasks").as_ptr(), &mut dropped) });
+    assert_eq!(
+        event(live)["changes"],
+        json!([{"change": "dropped", "collection": "tasks"}])
+    );
+    quiet(live);
+    ok(unsafe { trunkdb_live_close(live) });
+}
+
+#[test]
+fn live_queries_report_what_enters_leaves_and_changes() {
+    let db = Open::new();
+    let a = db.insert("vans", r#"{"name": "a", "zone": "depot", "speed": 0}"#);
+    let b = db.insert("vans", r#"{"name": "b", "zone": "road", "speed": 0}"#);
+    let live = db.watch("vans", "zone = :z", Some(r#"{"z": "depot"}"#));
+    // What matches now, first.
+    let first = event(live);
+    assert_eq!(first["event"], "entered");
+    assert_eq!(first["id"], a);
+    assert_eq!(first["doc"]["name"], "a");
+    assert_eq!(first["doc"]["_id"]["$id"], a);
+    assert_eq!(first["at"], Value::Null, "no place without a sort");
+    quiet(live);
+
+    db.update("vans", r#"name = "b""#, r#"{"$set": {"zone": "depot"}}"#);
+    let entered = event(live);
+    assert_eq!(
+        (&entered["event"], &entered["id"]),
+        (&json!("entered"), &json!(b))
+    );
+    db.update("vans", r#"name = "a""#, r#"{"$set": {"speed": 5}}"#);
+    let changed = event(live);
+    assert_eq!(changed["event"], "changed");
+    assert_eq!(changed["doc"]["speed"], 5);
+    assert_eq!(
+        (&changed["from"], &changed["at"]),
+        (&Value::Null, &Value::Null)
+    );
+    db.update("vans", r#"name = "a""#, r#"{"$set": {"zone": "road"}}"#);
+    let left = event(live);
+    assert_eq!((&left["event"], &left["id"]), (&json!("left"), &json!(a)));
+    assert_eq!(left["doc"]["zone"], "road", "as the commit left it");
+    let mut found = false;
+    ok(unsafe { trunkdb_delete(db.db, c("vans").as_ptr(), c(&b).as_ptr(), &mut found) });
+    let gone = event(live);
+    assert_eq!(
+        (&gone["event"], &gone["doc"]),
+        (&json!("left"), &Value::Null)
+    );
+    quiet(live);
+    ok(unsafe { trunkdb_live_close(live) });
+
+    // With a sort and a limit, a list: each event says where.
+    let fastest = db.watch("vans", "order by speed desc limit 1", None);
+    let top = event(fastest);
+    assert_eq!((&top["id"], &top["at"]), (&json!(a), &json!(0)));
+    let c_id = db.insert("vans", r#"{"name": "c", "zone": "road", "speed": 9}"#);
+    let out = event(fastest);
+    assert_eq!(
+        (&out["event"], &out["id"], &out["from"]),
+        (&json!("left"), &json!(a), &json!(0))
+    );
+    let into = event(fastest);
+    assert_eq!(
+        (&into["event"], &into["id"], &into["at"]),
+        (&json!("entered"), &json!(c_id), &json!(0))
+    );
+    ok(unsafe { trunkdb_live_close(fastest) });
+
+    // What can't be kept live, and texts that don't read.
+    let mut live = null_mut();
+    let refused = fails(
+        unsafe {
+            trunkdb_watch(
+                db.db,
+                c("vans").as_ptr(),
+                c("order by speed limit 5 offset 1").as_ptr(),
+                null(),
+                &mut live,
+            )
+        },
+        TRUNKDB_INVALID_ARGUMENT,
+    );
+    assert_eq!(refused["reason"], "a skip");
+    assert!(live.is_null());
+    fails(
+        unsafe {
+            trunkdb_watch(
+                db.db,
+                c("vans").as_ptr(),
+                c("zone =").as_ptr(),
+                null(),
+                &mut live,
+            )
+        },
+        TRUNKDB_PARSE,
+    );
+    fails(
+        unsafe {
+            trunkdb_watch(
+                db.db,
+                c("vans").as_ptr(),
+                null(),
+                c(r#"{"z": 1}"#).as_ptr(),
+                &mut live,
+            )
+        },
+        TRUNKDB_PARSE,
+    );
+}
+
+#[test]
+fn live_aggregates_report_their_rows() {
+    let db = Open::new();
+    db.insert("vans", r#"{"zone": "depot"}"#);
+    let mut live = null_mut();
+    ok(unsafe {
+        trunkdb_watch_aggregate(
+            db.db,
+            c("vans").as_ptr(),
+            c("zone != :skip").as_ptr(),
+            c("count() as n group by zone having n >= :least").as_ptr(),
+            c(r#"{"skip": "none", "least": 1}"#).as_ptr(),
+            &mut live,
+        )
+    });
+    assert_eq!(
+        event(live),
+        json!({"event": "entered", "group": {"zone": "depot"}, "row": {"zone": "depot", "n": 1}})
+    );
+    quiet(live);
+    db.insert("vans", r#"{"zone": "depot"}"#);
+    assert_eq!(
+        event(live),
+        json!({"event": "changed", "group": {"zone": "depot"}, "row": {"zone": "depot", "n": 2}})
+    );
+    db.insert("vans", r#"{"zone": "road"}"#);
+    assert_eq!(event(live)["event"], "entered");
+    db.update("vans", r#"zone = "road""#, r#"{"$set": {"zone": "depot"}}"#);
+    let mut got = vec![event(live), event(live)];
+    got.sort_by_key(|e| e["event"].to_string());
+    assert_eq!(got[0]["row"]["n"], 3);
+    assert_eq!(
+        got[1],
+        json!({"event": "left", "group": {"zone": "road"}, "row": null})
+    );
+    ok(unsafe { trunkdb_live_close(live) });
+
+    fails(
+        unsafe {
+            trunkdb_watch_aggregate(
+                db.db,
+                c("vans").as_ptr(),
+                null(),
+                c("count() as n").as_ptr(),
+                c(r#"{"unused": 1}"#).as_ptr(),
+                &mut live,
+            )
+        },
+        TRUNKDB_PARSE,
+    );
+}
+
+#[test]
+fn a_live_handle_ends_with_its_database() {
+    // Not `Open`, which closes the database as it drops.
+    let dir = tempfile::tempdir().unwrap();
+    let path = c(dir.path().join("app.trunkdb").to_str().unwrap());
+    let mut db = null_mut();
+    ok(unsafe { trunkdb_open(path.as_ptr(), null(), &mut db) });
+    let mut changes = null_mut();
+    ok(unsafe { trunkdb_subscribe(db, &mut changes) });
+    let mut query = null_mut();
+    ok(unsafe { trunkdb_watch(db, c("t").as_ptr(), null(), null(), &mut query) });
+    let mut id = null_mut();
+    ok(unsafe { trunkdb_insert(db, c("t").as_ptr(), c("{}").as_ptr(), &mut id) });
+    take(id);
+    ok(unsafe { trunkdb_close(db) });
+
+    // The events before the end, then the end, for good.
+    for live in [changes, query] {
+        assert!(matches!(next(live, 0), (Some(_), false)));
+        assert_eq!(next(live, 0), (None, true));
+        assert_eq!(next(live, -1), (None, true), "no wait once ended");
+        assert_eq!(next(live, 50), (None, true));
+        ok(unsafe { trunkdb_live_close(live) });
+    }
+}
+
+#[test]
+fn a_live_handle_waits_on_another_thread() {
+    let db = Open::new();
+    let mut live = null_mut();
+    ok(unsafe { trunkdb_subscribe(db.db, &mut live) });
+    let shared = Shared(live);
+    let waiter = std::thread::spawn(move || {
+        let shared = shared;
+        next(shared.0, -1)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let id = db.insert("t", "{}");
+    let (event, ended) = waiter.join().unwrap();
+    assert!(!ended);
+    assert_eq!(event.unwrap()["changes"][0]["id"], id);
+    ok(unsafe { trunkdb_live_close(live) });
+}
+
+#[test]
+fn live_handles_refuse_what_isnt_one() {
+    let db = Open::new();
+    let mut event = null_mut();
+    let mut ended = true;
+    let other = fails(
+        unsafe { trunkdb_live_next(db.db.cast(), 0, &mut event, &mut ended) },
+        TRUNKDB_INVALID_ARGUMENT,
+    );
+    assert_eq!(other["message"], "live is not an open live handle");
+    assert!(event.is_null());
+    assert!(!ended, "set to false before anything else");
+    fails(
+        unsafe { trunkdb_live_next(null(), 0, &mut event, &mut ended) },
+        TRUNKDB_INVALID_ARGUMENT,
+    );
+    let mut live = null_mut();
+    ok(unsafe { trunkdb_subscribe(db.db, &mut live) });
+    fails(
+        unsafe { trunkdb_live_next(live, 0, null_mut(), &mut ended) },
+        TRUNKDB_INVALID_ARGUMENT,
+    );
+    fails(
+        unsafe { trunkdb_live_next(live, 0, &mut event, null_mut()) },
+        TRUNKDB_INVALID_ARGUMENT,
+    );
+    fails(
+        unsafe { trunkdb_cursor_close(live.cast()) },
+        TRUNKDB_INVALID_ARGUMENT,
+    );
+    fails(
+        unsafe { trunkdb_subscribe(null(), &mut live) },
+        TRUNKDB_INVALID_ARGUMENT,
+    );
+    assert!(live.is_null(), "an error leaves it null");
+    ok(unsafe { trunkdb_live_close(null_mut()) });
 }
 
 /// `include/trunkdb.h` is what the code says: made by cbindgen and

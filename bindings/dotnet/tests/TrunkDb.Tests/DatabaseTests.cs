@@ -48,7 +48,7 @@ public sealed class DatabaseTests : IDisposable
     [Fact]
     public void The_library_is_trunkdbs_release_and_speaks_its_abi()
     {
-        Assert.Equal(1u, Database.AbiVersion);
+        Assert.Equal(2u, Database.AbiVersion);
         var version = typeof(Database).Assembly.GetName().Version!;
         Assert.Equal($"{version.Major}.{version.Minor}.{version.Build}", Database.LibraryVersion);
     }

@@ -16,11 +16,16 @@
  *   A `char *` handed out is the caller's: give it back with
  *   trunkdb_string_free(), never with free().
  * - Handles (trunkdb_db, trunkdb_snapshot, trunkdb_cursor) come from an
- *   _open function and go back to its _close. A handle of another kind,
- *   or a closed one, is refused where it can be told, never trusted:
- *   don't pass one. Closing NULL does nothing.
+ *   _open function and go back to its _close; a trunkdb_live comes from
+ *   trunkdb_subscribe, trunkdb_watch or trunkdb_watch_aggregate and goes
+ *   back to trunkdb_live_close. A handle of another kind, or a closed
+ *   one, is refused where it can be told, never trusted: don't pass
+ *   one, nor close one another thread is in a call with. Closing NULL
+ *   does nothing.
  * - A database handle, or a snapshot, may be used from any number of
- *   threads at once; a cursor from one at a time.
+ *   threads at once; a cursor or a live handle from one at a time.
+ *   Closing the database ends its live handles, once their events are
+ *   read.
  * - No panic crosses into C: one is TRUNKDB_PANIC.
  */
 
@@ -34,7 +39,8 @@
 
 // The version of these functions: a library whose `trunkdb_abi_version`
 // differs from the header's is not the one the program was built for.
-#define TRUNKDB_ABI_VERSION 1
+// 2 added the live handles (SPEC §194).
+#define TRUNKDB_ABI_VERSION 2
 
 // The call did what it says.
 #define TRUNKDB_OK 0
@@ -107,6 +113,11 @@ typedef struct trunkdb_cursor trunkdb_cursor;
 // An open database: from `trunkdb_open`, closed by `trunkdb_close`. Any
 // number of threads may use one at once.
 typedef struct trunkdb_db trunkdb_db;
+
+// Changes as they happen, handed out by `trunkdb_live_next` an event at
+// a time: from `trunkdb_subscribe`, `trunkdb_watch` or
+// `trunkdb_watch_aggregate`, closed by `trunkdb_live_close`.
+typedef struct trunkdb_live trunkdb_live;
 
 // The database as it was at one commit: from `trunkdb_snapshot_open`,
 // closed by `trunkdb_snapshot_close`. Any number of threads may read it
@@ -353,6 +364,52 @@ int32_t trunkdb_cursor_next(const trunkdb_cursor *cursor,
 
 // Closes a cursor. Null does nothing.
 int32_t trunkdb_cursor_close(trunkdb_cursor *cursor);
+
+// Every commit from now on: each event `{"event": "commit", "changes":
+// [{"change": "inserted", "collection": …, "id": …}, …]}`, a change
+// `inserted`, `updated`, `deleted`, or `dropped` without an id.
+int32_t trunkdb_subscribe(const trunkdb_db *db,
+                          trunkdb_live **live);
+
+// `filter` kept as a live query: first an `entered` for every document
+// it matches now, then, as each commit commits, the documents that
+// came to match it, left it, or were written and still match.
+// `{"event": "entered", "id": …, "doc": {…}, "at": …}`, `{"event":
+// "left", "id": …, "doc": … or null, "from": …}`, `{"event":
+// "changed", "id": …, "doc": {…}, "from": …, "at": …}`; `from` and
+// `at` are places in the list with a sort, null without. A skip, or a
+// limit without a sort, is refused.
+int32_t trunkdb_watch(const trunkdb_db *db,
+                      const char *collection,
+                      const char *filter,
+                      const char *params,
+                      trunkdb_live **live);
+
+// An aggregate kept live, as `trunkdb_aggregate` takes it: first an
+// `entered` for every row, then, as each commit to the collection
+// commits, the rows that came, left or changed. `{"event": "entered",
+// "group": {…}, "row": {…}}`, `{"event": "left", "group": {…}, "row":
+// … or null}`, `{"event": "changed", "group": {…}, "row": {…}}`;
+// `group` is the row's `group by` values, `{}` without.
+int32_t trunkdb_watch_aggregate(const trunkdb_db *db,
+                                const char *collection,
+                                const char *filter,
+                                const char *aggregate,
+                                const char *params,
+                                trunkdb_live **live);
+
+// The next event, as JSON, waiting at most `timeout_ms`: 0 not at all,
+// a negative one until an event comes or it ends. Null if none came in
+// time, or it has ended: `ended` says which. Ended is for good: the
+// handle was ended by its database closing, every event before read,
+// or by an error, returned once by this call.
+int32_t trunkdb_live_next(const trunkdb_live *live,
+                          int64_t timeout_ms,
+                          char **event,
+                          bool *ended);
+
+// Closes a live handle: it receives nothing more. Null does nothing.
+int32_t trunkdb_live_close(trunkdb_live *live);
 
 #ifdef __cplusplus
 }  // extern "C"

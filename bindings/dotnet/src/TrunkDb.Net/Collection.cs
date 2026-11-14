@@ -221,6 +221,35 @@ public sealed class Collection<T> : CollectionView<T>
         return new Upserted(DocId.Parse(Native.TakeText(made)), inserted);
     }
 
+    /// <summary>
+    /// Keeps <paramref name="filter"/> live (SPEC §138, §194): what it
+    /// matches now, then what comes to match it, what leaves, and what is
+    /// written and still matches, as each commit commits. A sort makes it
+    /// a list, with a limit or without; an <c>offset</c>, or a limit
+    /// without a sort, is refused.
+    /// </summary>
+    /// <exception cref="TrunkDbException">The filter can't be kept live (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public LiveQuery<T> Watch(string? filter = null, object? parameters = null)
+    {
+        Native.Check(Native.trunkdb_watch(Database.Handle, Name, filter, Database.Params(parameters), out var live));
+        return new LiveQuery<T>(live, Database.JsonOptions);
+    }
+
+    /// <summary>
+    /// Keeps <paramref name="aggregate"/> live (SPEC §139, §194), as
+    /// <see cref="CollectionView{T}.Aggregate{TRow}"/> takes it: its rows,
+    /// then those that come, leave or change as each commit to the
+    /// collection commits. It runs again whole at each such commit: a
+    /// window or an index keeps that cheap.
+    /// </summary>
+    public LiveAggregate<TRow> WatchAggregate<TRow>(string? filter, string aggregate, object? parameters = null)
+    {
+        ArgumentNullException.ThrowIfNull(aggregate);
+        Native.Check(Native.trunkdb_watch_aggregate(
+            Database.Handle, Name, filter, aggregate, Database.Params(parameters), out var live));
+        return new LiveAggregate<TRow>(live, Database.JsonOptions);
+    }
+
     /// <summary>Makes an index on <paramref name="field"/> if there is none; true if it made one.</summary>
     public bool EnsureIndex(string field, bool unique = false, bool sparse = false) =>
         EnsureIndex([field], unique, sparse);

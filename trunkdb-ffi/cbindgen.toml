@@ -31,11 +31,16 @@ header = """/*
  *   A `char *` handed out is the caller's: give it back with
  *   trunkdb_string_free(), never with free().
  * - Handles (trunkdb_db, trunkdb_snapshot, trunkdb_cursor) come from an
- *   _open function and go back to its _close. A handle of another kind,
- *   or a closed one, is refused where it can be told, never trusted:
- *   don't pass one. Closing NULL does nothing.
+ *   _open function and go back to its _close; a trunkdb_live comes from
+ *   trunkdb_subscribe, trunkdb_watch or trunkdb_watch_aggregate and goes
+ *   back to trunkdb_live_close. A handle of another kind, or a closed
+ *   one, is refused where it can be told, never trusted: don't pass
+ *   one, nor close one another thread is in a call with. Closing NULL
+ *   does nothing.
  * - A database handle, or a snapshot, may be used from any number of
- *   threads at once; a cursor from one at a time.
+ *   threads at once; a cursor or a live handle from one at a time.
+ *   Closing the database ends its live handles, once their events are
+ *   read.
  * - No panic crosses into C: one is TRUNKDB_PANIC.
  */"""
 autogen_warning = "/* Made by cbindgen from trunkdb-ffi/src: change the Rust, not this file. */"

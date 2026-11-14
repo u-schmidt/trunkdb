@@ -9,7 +9,7 @@
 //! after each commit to their collection, and `LiveAggregate`.
 
 use crate::aggregate::Aggregate;
-use crate::changes::Change;
+use crate::changes::{Change, Inbox};
 use crate::collection::aggregate_in;
 use crate::database::Reading;
 use crate::document::{DocId, Document, encode_document};
@@ -141,7 +141,7 @@ pub(crate) type Sent = Result<Live<Document>, crate::Error>;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct LiveQuery<T> {
-    receiver: mpsc::Receiver<Sent>,
+    inbox: Inbox<Sent>,
     /// `Ok` for a `Document`, `from_document` for a `T`: on the reader's
     /// thread, not under the writer's lock.
     convert: fn(Document) -> crate::Result<T>,
@@ -158,7 +158,10 @@ impl<T> LiveQuery<T> {
         receiver: mpsc::Receiver<Sent>,
         convert: fn(Document) -> crate::Result<T>,
     ) -> Self {
-        LiveQuery { receiver, convert }
+        LiveQuery {
+            inbox: Inbox::new(receiver),
+            convert,
+        }
     }
 
     fn converted(&self, sent: Sent) -> crate::Result<Live<T>> {
@@ -169,21 +172,30 @@ impl<T> LiveQuery<T> {
     /// the query has ended, by an error or by the database being dropped,
     /// and every report before has been read.
     pub fn recv(&self) -> Option<crate::Result<Live<T>>> {
-        let sent = self.receiver.recv().ok()?;
+        let sent = self.inbox.recv()?;
         Some(self.converted(sent))
     }
 
     /// The next report if one is waiting, without waiting.
     pub fn try_recv(&self) -> Option<crate::Result<Live<T>>> {
-        let sent = self.receiver.try_recv().ok()?;
+        let sent = self.inbox.try_recv()?;
         Some(self.converted(sent))
     }
 
     /// The next report, waiting at most `timeout`. `None` if none came,
-    /// or the query has ended.
+    /// or the query has ended; [`has_ended`](Self::has_ended) tells
+    /// which.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<crate::Result<Live<T>>> {
-        let sent = self.receiver.recv_timeout(timeout).ok()?;
+        let sent = self.inbox.recv_timeout(timeout)?;
         Some(self.converted(sent))
+    }
+
+    /// Whether the query has ended, every report read (SPEC §194): true
+    /// once a `recv`, `try_recv` or `recv_timeout` returned `None`
+    /// because it ended, by an error or by the database being dropped,
+    /// not because none had come yet.
+    pub fn has_ended(&self) -> bool {
+        self.inbox.has_ended()
     }
 }
 
@@ -771,7 +783,7 @@ pub(crate) type SentRow = Result<LiveRow, crate::Error>;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct LiveAggregate<R = Document> {
-    receiver: mpsc::Receiver<SentRow>,
+    inbox: Inbox<SentRow>,
     /// `Ok` for a `Document`, `from_document` for an `R`: on the
     /// reader's thread, not under the writer's lock.
     convert: fn(Document) -> crate::Result<R>,
@@ -788,7 +800,10 @@ impl<R> LiveAggregate<R> {
         receiver: mpsc::Receiver<SentRow>,
         convert: fn(Document) -> crate::Result<R>,
     ) -> Self {
-        LiveAggregate { receiver, convert }
+        LiveAggregate {
+            inbox: Inbox::new(receiver),
+            convert,
+        }
     }
 
     fn converted(&self, sent: SentRow) -> crate::Result<LiveRow<R>> {
@@ -799,21 +814,28 @@ impl<R> LiveAggregate<R> {
     /// it has ended, by an error or by the database being dropped, and
     /// every report before has been read.
     pub fn recv(&self) -> Option<crate::Result<LiveRow<R>>> {
-        let sent = self.receiver.recv().ok()?;
+        let sent = self.inbox.recv()?;
         Some(self.converted(sent))
     }
 
     /// The next report if one is waiting, without waiting.
     pub fn try_recv(&self) -> Option<crate::Result<LiveRow<R>>> {
-        let sent = self.receiver.try_recv().ok()?;
+        let sent = self.inbox.try_recv()?;
         Some(self.converted(sent))
     }
 
     /// The next report, waiting at most `timeout`. `None` if none came,
-    /// or it has ended.
+    /// or it has ended; [`has_ended`](Self::has_ended) tells which.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<crate::Result<LiveRow<R>>> {
-        let sent = self.receiver.recv_timeout(timeout).ok()?;
+        let sent = self.inbox.recv_timeout(timeout)?;
         Some(self.converted(sent))
+    }
+
+    /// Whether the live aggregate has ended, every report read (SPEC
+    /// §194): true once a `recv`, `try_recv` or `recv_timeout` returned
+    /// `None` because it ended, not because none had come yet.
+    pub fn has_ended(&self) -> bool {
+        self.inbox.has_ended()
     }
 }
 

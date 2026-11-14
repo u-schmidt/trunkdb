@@ -1441,3 +1441,13 @@ limit, batches and a write-ahead log. Since then:
     3.5 times (1.3); beside a writer, eight read three times as often,
     p99 6 µs instead of 20. Writes as fast as before. `crossbeam-utils`
     is a new dependency, with none of its own.
+167. **Changes as they happen, through the C ABI and in C#** (§194):
+    `trunkdb_subscribe`, `trunkdb_watch` and `trunkdb_watch_aggregate`
+    hand out a `trunkdb_live`, polled with `trunkdb_live_next` and a
+    timeout, each event as JSON; `TRUNKDB_ABI_VERSION` is 2. In C#,
+    `Database.Subscribe()`, `Collection<T>.Watch(filter)` and
+    `WatchAggregate<TRow>(filter, aggregate)`, their events records,
+    read with `Next(timeout)`, `foreach` over `ReadAll()` or
+    `await foreach` over `ReadAllAsync(token)`. In Rust, `has_ended()`
+    on `Changes`, `LiveQuery` and `LiveAggregate`: whether a
+    `recv_timeout` that returned `None` met the end.

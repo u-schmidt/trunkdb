@@ -775,3 +775,22 @@ fn a_live_aggregate_hands_out_rows_of_its_own() {
         }
     );
 }
+
+#[test]
+fn a_wait_with_a_timeout_tells_an_end_from_nothing_yet() {
+    // SPEC §194: `recv_timeout`'s `None` is either; `has_ended` says which.
+    let (_dir, db) = open();
+    let readings = readings(&db);
+    readings.insert(reading("a", 0.5, 10)).unwrap();
+    let live = readings
+        .watch_aggregate(Filter::new(), &mean_per_server())
+        .unwrap();
+    assert!(matches!(live.try_recv(), Some(Ok(LiveRow::Entered { .. }))));
+    assert!(live.recv_timeout(Duration::from_millis(10)).is_none());
+    assert!(!live.has_ended(), "nothing yet is not an end");
+
+    drop(readings);
+    drop(db);
+    assert!(live.recv().is_none());
+    assert!(live.has_ended());
+}
