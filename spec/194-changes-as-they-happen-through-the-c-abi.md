@@ -119,6 +119,11 @@ by a `break`, the code after a `try`/`finally` nested in that `finally`
 test that leaves a loop early failed every time. It runs in a method of
 its own now, where the `finally` only calls it.
 
+**`Ended` counts what is kept.** The loop's reader may meet the end
+while events wait in the channel: `Ended` is true only once the handle
+has ended and nothing is kept, so a `while (!feed.Ended)` after the loop
+reads them. (A reviewer found it: `Ended` had been the handle's alone.)
+
 ## 194.6 Rejected
 - **A callback the library calls,** as SQLite's `sqlite3_update_hook`:
   it would run under the writer's lock, where a callback that writes
@@ -175,8 +180,9 @@ its own now, where the `finally` only calls it.
   events as records; a sorted query's places; `Ended` after the
   database is disposed, and `Next` refused after the feed is; an
   `await foreach` that reads as commits come, keeps what it read ahead
-  when left, and stops when cancelled; a `foreach` on another thread
-  that ends when the feed is disposed.
+  when left, and stops when cancelled; a feed whose loop met its end
+  and was left, not ended while it keeps events; a `foreach` on another
+  thread that ends when the feed is disposed.
 
 ## 194.9 Mutations
 Each alone, its tests run, the file restored:
@@ -195,5 +201,6 @@ Each alone, its tests run, the file restored:
 | C#: `Next` after `Dispose` not refused | caught: `A_feed_ends_with_its_database…` |
 | C#: `Left` without its document | caught: `A_live_query_reports…` |
 | C#: `Ended` never set | caught: `A_feed_ends_with_its_database…` |
+| C#: `Ended` the handle's alone, what is kept left out | caught: `A_feed_left_by_a_loop…` |
 | C#: a loop that doesn't look whether the feed was disposed | caught: `A_foreach_on_another_thread…` |
 | a `timeout_ms` of 0 waiting 1 ms | passes: no test can tell, and no program would |

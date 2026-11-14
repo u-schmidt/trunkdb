@@ -33,9 +33,19 @@ public abstract class LiveFeed<TEvent> : IDisposable
     /// <summary>
     /// True once it has ended, every event read: the database was disposed,
     /// or an error ended it. A <see cref="Next"/> that returned null before
-    /// its time was up says so here.
+    /// its time was up says so here. Events a loop read ahead and kept
+    /// (<see cref="ReadAllAsync"/>) count as not yet read.
     /// </summary>
-    public bool Ended => ended;
+    public bool Ended
+    {
+        get
+        {
+            lock (kept)
+            {
+                return ended && kept.Count == 0;
+            }
+        }
+    }
 
     /// <summary>
     /// The next event, waiting at most <paramref name="timeout"/>:

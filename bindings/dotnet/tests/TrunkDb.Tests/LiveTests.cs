@@ -202,6 +202,35 @@ public sealed class LiveTests : IDisposable
     }
 
     [Fact]
+    public async Task A_feed_left_by_a_loop_has_not_ended_while_it_keeps_events()
+    {
+        var db = Open();
+        using var changes = db.Subscribe();
+        var vans = db.Collection<Van>("vans");
+        foreach (var name in new[] { "a", "b", "c" })
+        {
+            vans.Insert(new Van { Name = name });
+        }
+        db.Dispose();
+        await foreach (var _ in changes.ReadAllAsync())
+        {
+            // Time for the loop's reader to take the rest and meet the end.
+            Thread.Sleep(TimeSpan.FromMilliseconds(500));
+            break;
+        }
+        Assert.False(changes.Ended, "two events are kept");
+        var rest = new List<Commit>();
+        while (!changes.Ended)
+        {
+            if (changes.Next(Timeout.InfiniteTimeSpan) is { } commit)
+            {
+                rest.Add(commit);
+            }
+        }
+        Assert.Equal(2, rest.Count);
+    }
+
+    [Fact]
     public void A_foreach_on_another_thread_ends_when_the_feed_is_disposed()
     {
         using var db = Open();

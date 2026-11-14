@@ -1296,7 +1296,7 @@ fn live_aggregates_report_their_rows() {
     db.insert("vans", r#"{"zone": "road"}"#);
     assert_eq!(event(live)["event"], "entered");
     db.update("vans", r#"zone = "road""#, r#"{"$set": {"zone": "depot"}}"#);
-    let mut got = vec![event(live), event(live)];
+    let mut got = [event(live), event(live)];
     got.sort_by_key(|e| e["event"].to_string());
     assert_eq!(got[0]["row"]["n"], 3);
     assert_eq!(
