@@ -57,6 +57,12 @@ database ends them at the next look.
 - **A snapshot ended under a look** (`Error::SnapshotTooOld`, asked to
   let go, §189), and a writer's open at work (`WouldBlock`): the look
   reports nothing, and the next tries again.
+- **Every read comes first,** for every live query and aggregate,
+  before any reports: so that one ended under the reads changes nothing.
+  A sorted list's settling, where the writer's process may read the
+  filter again (§145.2), takes the list the look read, from the same
+  snapshot. The first version read it again there, and a let-go between
+  the two ended the live query; a reviewer found it.
 - **Any other error taking the snapshot,** a damaged WAL say, ends every
   live query and aggregate of the open, each with an I/O error of the
   same kind and message, as a document that can't be read does (§138.5).
@@ -110,7 +116,11 @@ in one process as two would be:
 - a panic in a `custom` condition ends that query alone;
 - a live query after the last one ended starts the looks again;
 - a commit after a checkpoint, before the next look, read though the
-  reader's new pages count it as the last look's was.
+  reader's new pages count it as the last look's was;
+- `live.rs`, `a_sorted_list_beside_a_writer_settles_without_reading`:
+  a full list losing its first member, settled against an empty
+  database's reading, still reports the member that came in; read
+  again there, it would find none.
 
 ## 195.7 Mutations
 Each alone, its tests run, the file restored:
@@ -128,6 +138,7 @@ Each alone, its tests run, the file restored:
 | the first read not kept, its matches reported again | caught: `quiet` after the first state |
 | a snapshot let go (`SnapshotTooOld`) ending the queries | passes: no test lets go of a snapshot during a look, which holds one for microseconds |
 | reads ended under a look reported as an error | passes: the same |
+| a sorted list settled by reading again, not from the look's list | caught: `a_sorted_list_beside_a_writer_settles_without_reading` |
 | `watch`: no flush before it waits | caught: every `watch` test hangs, killed |
 | `watch`: a reader gone an error | caught: `watch_refuses_…_and_ends_with_its_reader` |
 | `watch`: `left` without its document | caught: `watch_prints_what_the_program…` |

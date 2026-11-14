@@ -340,6 +340,10 @@ pub(crate) fn seen(found: &[(DocId, Document)]) -> Seen {
 pub(crate) struct Reread {
     seen: Seen,
     changed: Vec<(DocId, Option<Document>)>,
+    /// A sorted one's new list, as read: what settling it would read
+    /// again, read with the rest, so that nothing after the reads can
+    /// fail as the snapshot is let go (§189).
+    list: Option<Vec<(Member, Option<Document>)>>,
 }
 
 impl Watcher {
@@ -432,6 +436,18 @@ impl Watcher {
             .as_ref()
             .expect("only one kept beside a writer is read again");
         let found = crate::collection::find_at(at, &self.collection, &whole_read(&self.filter))?;
+        let list = match &self.kept {
+            Kept::Matching(_) => None,
+            Kept::Window(_) => {
+                let mut list = Vec::new();
+                for (id, doc) in &found {
+                    if let Some(member) = Member::of(&self.filter, *id, doc)? {
+                        list.push((member, Some(doc.clone())));
+                    }
+                }
+                Some(list)
+            }
+        };
         let mut seen = Seen::new();
         let mut changed = Vec::new();
         for (id, doc) in found {
@@ -447,7 +463,11 @@ impl Watcher {
                 crate::collection::document_at(at, &self.collection, id)?,
             ));
         }
-        Ok(Reread { seen, changed })
+        Ok(Reread {
+            seen,
+            changed,
+            list,
+        })
     }
 
     /// What `reread` found, reported as if one commit had written each
@@ -472,7 +492,7 @@ impl Watcher {
             }
         }
         self.seen = Some(reread.seen);
-        self.settle(at)
+        self.settle(at, reread.list)
     }
 
     /// One change of a commit to its collection, `now` the document as
@@ -544,7 +564,10 @@ impl Watcher {
     /// A sorted one, once the whole commit is seen (SPEC §145.2): its list
     /// made anew, and the steps from the old one sent. `false` once it has
     /// ended.
-    fn settle(&mut self, at: &Reading<'_>) -> bool {
+    ///
+    /// `list`, where it is known, is the new list, read as `read_again`
+    /// would read it: beside a writer (SPEC §195).
+    fn settle(&mut self, at: &Reading<'_>, list: Option<Vec<(Member, Option<Document>)>>) -> bool {
         let Kept::Window(window) = &mut self.kept else {
             return true;
         };
@@ -553,7 +576,7 @@ impl Watcher {
         }
         let pending: BTreeMap<DocId, Option<Document>> =
             std::mem::take(&mut window.pending).into_iter().collect();
-        match self.reorder(at, &pending) {
+        match self.reorder(at, &pending, list) {
             Ok(events) => events.into_iter().all(|live| self.send(live)),
             Err(e) => {
                 // A panic, or a document that couldn't be read: the list
@@ -564,15 +587,15 @@ impl Watcher {
         }
     }
 
-    /// The list after this commit, `pending` the documents it wrote, and
-    /// the events that take the old list to it: those that left first,
-    /// then those written or come in, in their new order.
-    fn reorder(
-        &mut self,
+    /// The list after this commit, worked out from the old one and the
+    /// documents the commit wrote, `pending`; read again where they can't
+    /// tell (SPEC §145.2).
+    fn new_list(
+        &self,
         at: &Reading<'_>,
         pending: &BTreeMap<DocId, Option<Document>>,
-    ) -> crate::Result<Vec<Live<Document>>> {
-        let Kept::Window(window) = &mut self.kept else {
+    ) -> crate::Result<Vec<(Member, Option<Document>)>> {
+        let Kept::Window(window) = &self.kept else {
             unreachable!("only a sorted live query settles");
         };
         let sort = &orders(&self.filter);
@@ -592,7 +615,7 @@ impl Watcher {
             }
         }
         known.sort_by(|(a, _), (b, _)| order(sort, a, b));
-        let new = match (window.limit, window.members.last()) {
+        Ok(match (window.limit, window.members.last()) {
             (Some(limit), Some(last)) if window.full() => {
                 // A match left out of a full list comes after its last,
                 // unwritten: what is known up to there is the list's
@@ -607,6 +630,26 @@ impl Watcher {
             }
             (Some(limit), _) => known.into_iter().take(limit).collect(),
             (None, _) => known,
+        })
+    }
+
+    /// The list after this commit, `pending` the documents it wrote, and
+    /// the events that take the old list to it: those that left first,
+    /// then those written or come in, in their new order. `list`, where
+    /// it is known, is the new list, read already (SPEC §195).
+    fn reorder(
+        &mut self,
+        at: &Reading<'_>,
+        pending: &BTreeMap<DocId, Option<Document>>,
+        list: Option<Vec<(Member, Option<Document>)>>,
+    ) -> crate::Result<Vec<Live<Document>>> {
+        let new = match list {
+            Some(list) => list,
+            None => self.new_list(at, pending)?,
+        };
+        let sort = &orders(&self.filter);
+        let Kept::Window(window) = &mut self.kept else {
+            unreachable!("only a sorted live query settles");
         };
 
         let staying: BTreeSet<DocId> = new.iter().map(|(member, _)| member.id).collect();
@@ -764,7 +807,7 @@ pub(crate) fn check(watchers: &mut Vec<Watcher>, changes: &[Change], at: &Readin
         });
     }
     // A sorted one reports once it has seen the whole commit (§145.2).
-    watchers.retain_mut(|w| w.settle(at));
+    watchers.retain_mut(|w| w.settle(at, None));
 }
 
 /// What a live aggregate reports (SPEC §139): a row that came to be in
@@ -1148,5 +1191,63 @@ pub(crate) fn end_all(
     }
     for a in aggregates.drain(..) {
         let _ = a.sender.send(Err(error()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+
+    /// A sorted list beside a writer settles from what its look read
+    /// (SPEC §195): nothing after the reads can fail as the snapshot is
+    /// let go. Settled here against an empty database's reading, it
+    /// still reports what the look found; one that read again there
+    /// would find nothing.
+    #[test]
+    fn a_sorted_list_beside_a_writer_settles_without_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("vans.trunkdb")).unwrap();
+        let empty = Database::open(dir.path().join("empty.trunkdb")).unwrap();
+        let vans = db.collection::<Document>("vans");
+        let van = |speed: i64| -> Document { format!(r#"{{"speed": {speed}}}"#).parse().unwrap() };
+        let slow = vans.insert(van(1)).unwrap();
+        vans.insert(van(2)).unwrap();
+        let fast = vans.insert(van(3)).unwrap();
+        let filter = Filter::new().sort_desc("speed").limit(2);
+
+        let state = db.read().unwrap();
+        let found =
+            crate::collection::find_at(&state.snapshot(), "vans", &whole_read(&filter)).unwrap();
+        drop(state);
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher = Watcher::start("vans".into(), filter, found.clone(), sender)
+            .unwrap()
+            .polled(seen(&found));
+        assert_eq!(receiver.try_iter().count(), 2);
+
+        // The fastest gone: a full list short of one, which the
+        // writer's own process would read again for.
+        vans.delete(&fast).unwrap();
+        let state = db.read().unwrap();
+        let reread = watcher.reread(&state.snapshot());
+        let nowhere = empty.read().unwrap();
+        assert!(watcher.reread_into(reread, &nowhere.snapshot()));
+        let events: Vec<_> = receiver.try_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            events,
+            [
+                Live::Left {
+                    id: fast,
+                    doc: None,
+                    from: Some(0)
+                },
+                Live::Entered {
+                    id: slow,
+                    doc: vans.get(&slow).unwrap().unwrap(),
+                    at: Some(1)
+                },
+            ]
+        );
     }
 }
