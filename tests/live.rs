@@ -972,3 +972,39 @@ fn the_kept_list_is_find_s_after_every_commit() {
         }
     }
 }
+
+#[test]
+fn a_wait_with_a_timeout_tells_an_end_from_nothing_yet() {
+    // SPEC §194: `recv_timeout`'s `None` is either; `has_ended` says which.
+    let (_dir, db) = open();
+    let vans = vans(&db);
+    let a = vans.insert(van("a", "depot")).unwrap();
+    let fragile = in_depot().and(Condition::custom(["speed"], |doc| {
+        doc.get("speed").and_then(Document::as_i64) != Some(13) || panic!("unlucky speed")
+    }));
+    let doomed = vans.watch(fragile).unwrap();
+    let steady = vans.watch(in_depot()).unwrap();
+    assert_eq!(waiting(&doomed), [ev("entered", a, Some("depot"))]);
+    assert_eq!(waiting(&steady), [ev("entered", a, Some("depot"))]);
+    assert!(doomed.recv_timeout(Duration::from_millis(10)).is_none());
+    assert!(!doomed.has_ended(), "nothing yet is not an end");
+
+    // Ended by an error: the error, then the end.
+    vans.update_fields(Filter::new(), &Update::new().set("speed", 13))
+        .unwrap();
+    assert!(!doomed.has_ended(), "not before the error is read");
+    assert!(matches!(
+        doomed.try_recv(),
+        Some(Err(Error::ClosurePanicked { .. }))
+    ));
+    assert!(doomed.recv_timeout(Duration::from_millis(10)).is_none());
+    assert!(doomed.has_ended());
+
+    // Ended by the database dropped: what was sent before, then the end.
+    drop(vans);
+    drop(db);
+    assert!(matches!(steady.try_recv(), Some(Ok(Live::Changed { .. }))));
+    assert!(!steady.has_ended());
+    assert!(steady.try_recv().is_none());
+    assert!(steady.has_ended());
+}

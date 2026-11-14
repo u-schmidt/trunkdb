@@ -10,6 +10,9 @@ pub(crate) const DATABASE: u32 = 0x7472_6462;
 pub(crate) const SNAPSHOT: u32 = 0x7472_736e;
 /// A cursor handle's tag, "trcu".
 pub(crate) const CURSOR: u32 = 0x7472_6375;
+/// A live handle's tag, "trlv": changes, a live query or a live
+/// aggregate (SPEC §194).
+pub(crate) const LIVE: u32 = 0x7472_6c76;
 /// What a handle's tag is overwritten with when it is closed.
 const CLOSED: u32 = 0;
 
@@ -30,6 +33,7 @@ fn kind(tag: u32) -> &'static str {
     match tag {
         DATABASE => "database",
         SNAPSHOT => "snapshot",
+        LIVE => "live",
         _ => "cursor",
     }
 }

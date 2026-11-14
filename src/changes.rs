@@ -6,8 +6,9 @@
 
 use crate::document::DocId;
 use crate::txn::WriteOp;
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
 /// What one committed batch changed (SPEC §135): each document it
@@ -121,29 +122,91 @@ impl Change {
 /// ```
 #[derive(Debug)]
 pub struct Changes {
-    receiver: mpsc::Receiver<Commit>,
+    inbox: Inbox<Commit>,
 }
 
 impl Changes {
     pub(crate) fn new(receiver: mpsc::Receiver<Commit>) -> Self {
-        Changes { receiver }
+        Changes {
+            inbox: Inbox::new(receiver),
+        }
     }
 
     /// The next report, waiting for one as long as it takes. `None` once
     /// the database is dropped and every report before has been read.
     pub fn recv(&self) -> Option<Commit> {
-        self.receiver.recv().ok()
+        self.inbox.recv()
     }
 
     /// The next report if one is waiting, without waiting.
     pub fn try_recv(&self) -> Option<Commit> {
-        self.receiver.try_recv().ok()
+        self.inbox.try_recv()
     }
 
     /// The next report, waiting at most `timeout`. `None` if none came,
-    /// or the database is dropped.
+    /// or the database is dropped; [`has_ended`](Self::has_ended) tells
+    /// which.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<Commit> {
-        self.receiver.recv_timeout(timeout).ok()
+        self.inbox.recv_timeout(timeout)
+    }
+
+    /// Whether the subscription has ended, every report read (SPEC
+    /// §194): true once a `recv`, `try_recv` or `recv_timeout` returned
+    /// `None` because the database was dropped, not because none had
+    /// come yet.
+    pub fn has_ended(&self) -> bool {
+        self.inbox.has_ended()
+    }
+}
+
+/// A receiver that remembers it found its sender gone (SPEC §194), so
+/// a `None` from a wait with a timeout can be told from an end.
+#[derive(Debug)]
+pub(crate) struct Inbox<M> {
+    receiver: mpsc::Receiver<M>,
+    ended: Cell<bool>,
+}
+
+impl<M> Inbox<M> {
+    pub(crate) fn new(receiver: mpsc::Receiver<M>) -> Self {
+        Inbox {
+            receiver,
+            ended: Cell::new(false),
+        }
+    }
+
+    pub(crate) fn recv(&self) -> Option<M> {
+        let got = self.receiver.recv().ok();
+        if got.is_none() {
+            self.ended.set(true);
+        }
+        got
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<M> {
+        match self.receiver.try_recv() {
+            Ok(message) => Some(message),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.ended.set(true);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Option<M> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(message) => Some(message),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.ended.set(true);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn has_ended(&self) -> bool {
+        self.ended.get()
     }
 }
 

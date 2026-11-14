@@ -5,7 +5,7 @@ using Microsoft.Win32.SafeHandles;
 namespace TrunkDb;
 
 /// <summary>
-/// The 36 functions of trunkdb.h, as C# calls them (SPEC §179). Text
+/// The 41 functions of trunkdb.h, as C# calls them (SPEC §179). Text
 /// going in is marshalled as UTF-8 for the call, by <see cref="NulFreeUtf8"/>,
 /// which refuses a NUL in it (SPEC §184.1); text coming out is an
 /// <see cref="IntPtr"/>, copied and freed at once by <see cref="Take"/>.
@@ -15,7 +15,7 @@ internal static partial class Native
     private const string Library = "trunkdb";
 
     /// <summary>The ABI this wrapper is written against.</summary>
-    internal const uint AbiVersion = 1;
+    internal const uint AbiVersion = 2;
 
     internal const int Ok = 0;
 
@@ -165,6 +165,27 @@ internal static partial class Native
     [LibraryImport(Library)]
     internal static partial int trunkdb_cursor_close(IntPtr cursor);
 
+    // ---- Changes as they happen (SPEC §194) ----
+
+    [LibraryImport(Library)]
+    internal static partial int trunkdb_subscribe(DatabaseHandle db, out LiveHandle live);
+
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
+    internal static partial int trunkdb_watch(
+        DatabaseHandle db, string collection, string? filter, string? parameters, out LiveHandle live);
+
+    [LibraryImport(Library, StringMarshalling = StringMarshalling.Custom, StringMarshallingCustomType = typeof(NulFreeUtf8))]
+    internal static partial int trunkdb_watch_aggregate(
+        DatabaseHandle db, string collection, string? filter, string aggregate, string? parameters,
+        out LiveHandle live);
+
+    [LibraryImport(Library)]
+    internal static partial int trunkdb_live_next(
+        LiveHandle live, long timeoutMs, out IntPtr @event, [MarshalAs(UnmanagedType.U1)] out bool ended);
+
+    [LibraryImport(Library)]
+    internal static partial int trunkdb_live_close(IntPtr live);
+
     // ---- Helpers ----
 
     /// <summary>Throws the calling thread's last error if <paramref name="code"/> isn't OK.</summary>
@@ -228,6 +249,17 @@ internal sealed class CursorHandle : SafeHandleZeroOrMinusOneIsInvalid
     public CursorHandle() : base(true) { }
 
     protected override bool ReleaseHandle() => Native.trunkdb_cursor_close(handle) == Native.Ok;
+}
+
+/// <summary>
+/// A live handle, closed by <c>trunkdb_live_close</c>. A call that holds it
+/// keeps it open: a dispose during a wait closes it once the wait returns.
+/// </summary>
+internal sealed class LiveHandle : SafeHandleZeroOrMinusOneIsInvalid
+{
+    public LiveHandle() : base(true) { }
+
+    protected override bool ReleaseHandle() => Native.trunkdb_live_close(handle) == Native.Ok;
 }
 
 /// <summary>

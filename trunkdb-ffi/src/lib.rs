@@ -11,6 +11,7 @@
 
 mod error;
 mod handle;
+mod live;
 mod report;
 mod text;
 
@@ -20,7 +21,8 @@ mod tests;
 use db::query::{Aggregate, Filter};
 use db::{BatchLineError, BatchLines, Database, DocId, Document, OpKind, Snapshot, Upserted};
 use error::{Fail, run};
-use handle::{CURSOR, DATABASE, SNAPSHOT, close, hand_out, value};
+use handle::{CURSOR, DATABASE, LIVE, SNAPSHOT, close, hand_out, value};
+use live::Live;
 use serde_json::{Value, json};
 use std::ffi::c_char;
 use std::sync::Mutex;
@@ -28,7 +30,8 @@ use text::{optional, owned, text};
 
 /// The version of these functions: a library whose `trunkdb_abi_version`
 /// differs from the header's is not the one the program was built for.
-pub const TRUNKDB_ABI_VERSION: u32 = 1;
+/// 2 added the live handles (SPEC §194).
+pub const TRUNKDB_ABI_VERSION: u32 = 2;
 
 /// The call did what it says.
 pub const TRUNKDB_OK: i32 = 0;
@@ -91,6 +94,13 @@ pub struct trunkdb_snapshot {
 /// A read handed out a document at a time: from `trunkdb_cursor_open`,
 /// closed by `trunkdb_cursor_close`.
 pub struct trunkdb_cursor {
+    _opaque: [u8; 0],
+}
+
+/// Changes as they happen, handed out by `trunkdb_live_next` an event at
+/// a time: from `trunkdb_subscribe`, `trunkdb_watch` or
+/// `trunkdb_watch_aggregate`, closed by `trunkdb_live_close`.
+pub struct trunkdb_live {
     _opaque: [u8; 0],
 }
 
@@ -204,6 +214,29 @@ unsafe fn writer(
 /// A file system error about `path`.
 fn io(path: &str, e: std::io::Error) -> Fail {
     Fail::new(TRUNKDB_IO, format!("{path}: {e}")).with("io", format!("{:?}", e.kind()))
+}
+
+/// An aggregate's filter and text bound to `params`, each taking its
+/// own, a value neither has a parameter of refused.
+unsafe fn aggregate_args(
+    filter: *const c_char,
+    aggregate: *const c_char,
+    params: *const c_char,
+) -> Result<(Filter, Aggregate), Fail> {
+    // SAFETY: by the rules.
+    unsafe {
+        let params = text::params(optional(params, "params")?)?;
+        let filter_text = optional(filter, "filter")?;
+        let aggregate_text = text(aggregate, "aggregate")?;
+        let filter = text::filter(filter_text, &params, true)?;
+        let aggregate = text::aggregate(aggregate_text, &params, true)?;
+        let filter_names = text::names_in::<Filter>(filter_text.unwrap_or(""));
+        let aggregate_names = text::names_in::<Aggregate>(aggregate_text);
+        let filter_names: Vec<&str> = filter_names.iter().map(String::as_str).collect();
+        let aggregate_names: Vec<&str> = aggregate_names.iter().map(String::as_str).collect();
+        text::unused(&params, &[&filter_names, &aggregate_names])?;
+        Ok((filter, aggregate))
+    }
 }
 
 /// JSON's text, to hand out.
@@ -605,16 +638,7 @@ pub unsafe extern "C" fn trunkdb_aggregate(
     run(|| unsafe {
         let rows = out(rows, std::ptr::null_mut(), "rows")?;
         let reader = reader(db, snapshot, collection)?;
-        let params = text::params(optional(params, "params")?)?;
-        let filter_text = optional(filter, "filter")?;
-        let aggregate_text = text(aggregate, "aggregate")?;
-        let filter = text::filter(filter_text, &params, true)?;
-        let aggregate = text::aggregate(aggregate_text, &params, true)?;
-        let filter_names = text::names_in::<Filter>(filter_text.unwrap_or(""));
-        let aggregate_names = text::names_in::<Aggregate>(aggregate_text);
-        let filter_names: Vec<&str> = filter_names.iter().map(String::as_str).collect();
-        let aggregate_names: Vec<&str> = aggregate_names.iter().map(String::as_str).collect();
-        text::unused(&params, &[&filter_names, &aggregate_names])?;
+        let (filter, aggregate) = aggregate_args(filter, aggregate, params)?;
         *rows = owned(Document::Array(reader.aggregate(filter, &aggregate)?).to_string());
         Ok(())
     })
@@ -932,4 +956,103 @@ pub unsafe extern "C" fn trunkdb_cursor_next(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn trunkdb_cursor_close(cursor: *mut trunkdb_cursor) -> i32 {
     run(|| unsafe { close::<Mutex<db::Cursor<Document>>, _>(cursor, CURSOR, "cursor") })
+}
+
+// ---- Changes as they happen ----
+
+/// Every commit from now on: each event `{"event": "commit", "changes":
+/// [{"change": "inserted", "collection": …, "id": …}, …]}`, a change
+/// `inserted`, `updated`, `deleted`, or `dropped` without an id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trunkdb_subscribe(
+    db: *const trunkdb_db,
+    live: *mut *mut trunkdb_live,
+) -> i32 {
+    run(|| unsafe {
+        let live = out(live, std::ptr::null_mut(), "live")?;
+        *live = hand_out(LIVE, Mutex::new(Live::Changes(database(db)?.subscribe()?)));
+        Ok(())
+    })
+}
+
+/// `filter` kept as a live query: first an `entered` for every document
+/// it matches now, then, as each commit commits, the documents that
+/// came to match it, left it, or were written and still match.
+/// `{"event": "entered", "id": …, "doc": {…}, "at": …}`, `{"event":
+/// "left", "id": …, "doc": … or null, "from": …}`, `{"event":
+/// "changed", "id": …, "doc": {…}, "from": …, "at": …}`; `from` and
+/// `at` are places in the list with a sort, null without. A skip, or a
+/// limit without a sort, is refused.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trunkdb_watch(
+    db: *const trunkdb_db,
+    collection: *const c_char,
+    filter: *const c_char,
+    params: *const c_char,
+    live: *mut *mut trunkdb_live,
+) -> i32 {
+    run(|| unsafe {
+        let live = out(live, std::ptr::null_mut(), "live")?;
+        let collection = writer(db, collection)?;
+        let params = text::params(optional(params, "params")?)?;
+        let filter = text::filter(optional(filter, "filter")?, &params, false)?;
+        *live = hand_out(LIVE, Mutex::new(Live::Query(collection.watch(filter)?)));
+        Ok(())
+    })
+}
+
+/// An aggregate kept live, as `trunkdb_aggregate` takes it: first an
+/// `entered` for every row, then, as each commit to the collection
+/// commits, the rows that came, left or changed. `{"event": "entered",
+/// "group": {…}, "row": {…}}`, `{"event": "left", "group": {…}, "row":
+/// … or null}`, `{"event": "changed", "group": {…}, "row": {…}}`;
+/// `group` is the row's `group by` values, `{}` without.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trunkdb_watch_aggregate(
+    db: *const trunkdb_db,
+    collection: *const c_char,
+    filter: *const c_char,
+    aggregate: *const c_char,
+    params: *const c_char,
+    live: *mut *mut trunkdb_live,
+) -> i32 {
+    run(|| unsafe {
+        let live = out(live, std::ptr::null_mut(), "live")?;
+        let collection = writer(db, collection)?;
+        let (filter, aggregate) = aggregate_args(filter, aggregate, params)?;
+        let watched = collection.watch_aggregate(filter, &aggregate)?;
+        *live = hand_out(LIVE, Mutex::new(Live::Aggregate(watched)));
+        Ok(())
+    })
+}
+
+/// The next event, as JSON, waiting at most `timeout_ms`: 0 not at all,
+/// a negative one until an event comes or it ends. Null if none came in
+/// time, or it has ended: `ended` says which. Ended is for good: the
+/// handle was ended by its database closing, every event before read,
+/// or by an error, returned once by this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trunkdb_live_next(
+    live: *const trunkdb_live,
+    timeout_ms: i64,
+    event: *mut *mut c_char,
+    ended: *mut bool,
+) -> i32 {
+    run(|| unsafe {
+        let event = out(event, std::ptr::null_mut(), "event")?;
+        let ended = out(ended, false, "ended")?;
+        let live = value::<Mutex<Live>, _>(live, LIVE, "live")?;
+        let live = live.lock().unwrap_or_else(|e| e.into_inner());
+        match live.next(timeout_ms)? {
+            Some(next) => *event = owned(next),
+            None => *ended = live.has_ended(),
+        }
+        Ok(())
+    })
+}
+
+/// Closes a live handle: it receives nothing more. Null does nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trunkdb_live_close(live: *mut trunkdb_live) -> i32 {
+    run(|| unsafe { close::<Mutex<Live>, _>(live, LIVE, "live") })
 }

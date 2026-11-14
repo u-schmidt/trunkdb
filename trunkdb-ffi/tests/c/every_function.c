@@ -131,6 +131,31 @@ int main(int argc, char **argv) {
     OK(trunkdb_index_drop(db, "tasks", "[\"status\", \"due\"]", &flag));
     EXPECT(flag);
 
+    /* Changes as they happen: handles polled, each event JSON. */
+    trunkdb_live *changes, *query, *rows;
+    bool ended;
+    OK(trunkdb_subscribe(db, &changes));
+    OK(trunkdb_watch(db, "tasks", "status = :s", "{\"s\": \"live\"}", &query));
+    OK(trunkdb_watch_aggregate(db, "tasks", "status = :s", "count() as n", "{\"s\": \"live\"}", &rows));
+    OK(trunkdb_live_next(rows, 0, &text, &ended));
+    EXPECT(!ended);
+    has(text, "\"n\":0");
+    OK(trunkdb_live_next(query, 0, &text, &ended));
+    EXPECT(text == NULL && !ended);
+    char *made;
+    OK(trunkdb_insert(db, "tasks", "{\"status\": \"live\"}", &made));
+    OK(trunkdb_live_next(changes, 1000, &text, &ended));
+    has(text, made);
+    OK(trunkdb_live_next(query, -1, &text, &ended));
+    has(text, "\"event\":\"entered\"");
+    OK(trunkdb_live_next(rows, 0, &text, &ended));
+    has(text, "\"n\":1");
+    OK(trunkdb_live_next(changes, 10, &text, &ended));
+    EXPECT(text == NULL && !ended);
+    trunkdb_string_free(made);
+    OK(trunkdb_live_close(query));
+    OK(trunkdb_live_close(rows));
+
     /* An error: its code, its message, and its details. */
     int32_t code = trunkdb_count(db, NULL, "tasks", "hours = = 1", NULL, &n);
     called++;
@@ -142,6 +167,11 @@ int main(int argc, char **argv) {
     trunkdb_string_free(id);
     trunkdb_string_free(NULL);
     OK(trunkdb_close(db));
+
+    /* Closing the database ended the subscription, for good. */
+    OK(trunkdb_live_next(changes, -1, &text, &ended));
+    EXPECT(text == NULL && ended);
+    OK(trunkdb_live_close(changes));
 
     /* Every function, each at least once. */
     printf("ok: %d calls\n", called);

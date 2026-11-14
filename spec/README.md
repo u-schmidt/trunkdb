@@ -208,3 +208,4 @@ say what changed, and DESIGN.md says what is true now.
 191. [Measured again, against SQLite, redb and sled (`bench/`, `DESIGN.md`, `README.md`)](191-measured-again-against-sqlite-redb-and-sled.md)
 192. [A reader reads only what it checks (`durability/wal.rs`)](192-a-reader-reads-only-what-it-checks.md)
 193. [Readers in parallel past four (`storage/pages.rs`, `database.rs`)](193-readers-in-parallel-past-four.md)
+194. [Changes as they happen, through the C ABI and in C# (`trunkdb-ffi/`, `bindings/dotnet/`, `changes.rs`, `live.rs`)](194-changes-as-they-happen-through-the-c-abi.md)

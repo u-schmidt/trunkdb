@@ -397,3 +397,21 @@ fn a_commit_is_a_plain_value() {
     assert_eq!(commit.clone(), commit);
     assert!(format!("{commit:?}").contains("Inserted"));
 }
+
+#[test]
+fn a_wait_with_a_timeout_tells_an_end_from_nothing_yet() {
+    // SPEC §194: `recv_timeout`'s `None` is either; `has_ended` says which.
+    let (_dir, db) = open();
+    let changes = db.subscribe().unwrap();
+    assert_eq!(changes.recv_timeout(Duration::from_millis(10)), None);
+    assert_eq!(changes.try_recv(), None);
+    assert!(!changes.has_ended(), "nothing yet is not an end");
+
+    tasks(&db).insert(doc(r#"{"title": "a"}"#)).unwrap();
+    drop(db);
+    // What came before the end is read first, and only then is it one.
+    assert!(changes.recv_timeout(Duration::from_millis(10)).is_some());
+    assert!(!changes.has_ended());
+    assert_eq!(changes.recv_timeout(Duration::from_millis(10)), None);
+    assert!(changes.has_ended());
+}

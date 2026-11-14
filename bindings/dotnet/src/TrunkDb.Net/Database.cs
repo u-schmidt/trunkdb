@@ -100,6 +100,16 @@ public sealed class Database : IDisposable
         return dropped;
     }
 
+    /// <summary>
+    /// Every commit from now on (SPEC §135, §194): the documents it
+    /// inserted, updated or deleted, and the collections it dropped.
+    /// </summary>
+    public Changes Subscribe()
+    {
+        Native.Check(Native.trunkdb_subscribe(handle, out var live));
+        return new Changes(live);
+    }
+
     /// <summary>Takes a snapshot: reads of it see the database as it is now.</summary>
     public Snapshot OpenSnapshot()
     {

@@ -140,8 +140,10 @@ impl From<db::Error> for Fail {
                 .with("collection", collection.as_str())
                 .with("index", index.as_str()),
             Error::Import { line, .. } => fail(TRUNKDB_IMPORT).with("line", *line),
-            // A closure's panic, a live query: none of them made through
-            // these functions; and kinds added later.
+            // A filter `watch` can't keep live: the call's mistake.
+            Error::NotLive { reason, .. } => fail(TRUNKDB_INVALID_ARGUMENT).with("reason", *reason),
+            // A closure's panic: none made through these functions; and
+            // kinds added later.
             _ => fail(TRUNKDB_OTHER),
         }
     }
