@@ -309,15 +309,12 @@ fn info_json(file: &str, db: &Database) -> Outcome {
     for name in db.collections().map_err(failed)? {
         let collection = db.collection::<Document>(&name);
         let documents = collection.count(Filter::new()).map_err(failed)?;
+        // Each the library's shape (SPEC §198), read into the object
+        // this command makes: a document's JSON always reads.
         let indexes: Vec<serde_json::Value> = (collection.indexes().map_err(failed)?.iter())
-            .map(|index| {
-                serde_json::json!({
-                    "fields": index.fields(),
-                    "unique": index.is_unique(),
-                    "sparse": index.is_sparse(),
-                })
-            })
-            .collect();
+            .map(|index| serde_json::from_str(&index.to_document().to_string()))
+            .collect::<Result<_, _>>()
+            .expect("a document's JSON reads");
         let sizes = (stats.as_ref())
             .and_then(|stats| stats.collections.iter().find(|c| c.name == name))
             .map(|sizes| {
@@ -519,7 +516,7 @@ enum Format {
 }
 
 /// One JSON value on its own line, to standard output.
-fn print_json(value: &serde_json::Value) -> Outcome {
+fn print_json(value: &impl std::fmt::Display) -> Outcome {
     match writeln!(io::stdout().lock(), "{value}") {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(e) => stopped_writing(e),
@@ -529,13 +526,8 @@ fn print_json(value: &serde_json::Value) -> Outcome {
 fn check(db: &Database, format: Format) -> Outcome {
     let report = db.check().map_err(|e| e.to_string())?;
     if format == Format::Json {
-        let _ = print_json(&serde_json::json!({
-            "ok": report.is_ok(),
-            "collections": report.collections,
-            "documents": report.documents,
-            "pages": report.pages,
-            "problems": report.problems,
-        }))?;
+        // The library's shape, as the C ABI hands it out (SPEC §198).
+        let _ = print_json(&report.to_document())?;
         return Ok(match report.is_ok() {
             true => ExitCode::SUCCESS,
             false => ExitCode::FAILURE,

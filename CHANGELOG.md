@@ -1476,3 +1476,10 @@ limit, batches and a write-ahead log. Since then:
     dependency. File format 17, WAL version 4 and export version 4, as
     in 0.40.0; no fixture, as nothing writes a file differently
     (§120.9).
+170. **Reports as documents, in the library** (§198, step 1 of the
+    Python bindings designed in §197): `to_document` on `CheckReport`,
+    `Compacted`, `Summary`, `IndexInfo`, `FileInfo`, `IndexStats` and
+    `Stats`; `BatchLines::report` for what a batch's ops wrote;
+    `OpKind::name`; `Params::unused`, the value a call's texts have no
+    parameter of. The C ABI's JSON and the command's `--json` are made
+    from them now, unchanged byte for byte.
