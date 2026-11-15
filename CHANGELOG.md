@@ -1516,3 +1516,13 @@ limit, batches and a write-ahead log. Since then:
     module's README; Python in the README, the GUIDE's opening and the
     agent skill, with `references/python.md` mapping each command to
     its call.
+
+    Items 170–173 → 0.42.0. Additions only: nothing a program has to
+    change. **Python bindings** (§197–§201): `import trunkdb`, a module
+    built on the library, one wheel per system for Python 3.11 and
+    after, kept by each CI run; not on PyPI. In the library, the
+    reports' `to_document`, `BatchLines::report`, `OpKind::name` and
+    `Params::unused` are new; the C ABI's and the command's output are
+    unchanged, byte for byte, and the C ABI is still version 2. File
+    format 17, WAL version 4 and export version 4, as in 0.41.0; no
+    fixture, as nothing writes a file differently (§120.9).

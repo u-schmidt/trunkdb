@@ -48,7 +48,8 @@ The module is Rust, built with PyO3 against the `trunkdb` crate, as
   builds against the stable ABI of 3.11, and one wheel serves every
   version after. 3.11 is the oldest still maintained, 3.10's support
   having ended in October 2026.
-- **The package's version is trunkdb's,** 0.41.0 the first.
+- **The package's version is trunkdb's,** 0.42.0 the first release
+  with it.
 
 ## 197.3 The API, by example
 ```python

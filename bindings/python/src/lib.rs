@@ -12,7 +12,7 @@ mod text;
 
 use pyo3::prelude::*;
 
-/// trunkdb's release, as `"0.41.0"`.
+/// trunkdb's release, as `"0.42.0"`.
 #[pyfunction]
 fn version() -> String {
     db::RELEASE.to_string()
