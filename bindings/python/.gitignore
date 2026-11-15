@@ -1,0 +1,5 @@
+# What `maturin develop` and Python leave here.
+/python/trunkdb/*.so
+/python/trunkdb/*.pyd
+__pycache__/
+.pytest_cache/

@@ -211,5 +211,6 @@ say what changed, and DESIGN.md says what is true now.
 194. [Changes as they happen, through the C ABI and in C# (`trunkdb-ffi/`, `bindings/dotnet/`, `changes.rs`, `live.rs`)](194-changes-as-they-happen-through-the-c-abi.md)
 195. [Live queries beside a writer (`live.rs`, `database.rs`)](195-live-queries-beside-a-writer.md)
 196. [`trunkdb watch` (`bin/trunkdb.rs`)](196-trunkdb-watch.md)
-197. [Python bindings, designed first (`bindings/python/`)](197-python-bindings-designed-first.md) — step 1 built (§198)
+197. [Python bindings, designed first (`bindings/python/`)](197-python-bindings-designed-first.md) — steps 1 and 2 built (§198, §199)
 198. [Reports as documents, in the library (`reports.rs`, `query_text.rs`, `trunkdb-ffi/`, `bin/trunkdb.rs`)](198-reports-as-documents-in-the-library.md)
+199. [The Python module (`bindings/python/`)](199-the-python-module.md)

@@ -1483,3 +1483,14 @@ limit, batches and a write-ahead log. Since then:
     `OpKind::name`; `Params::unused`, the value a call's texts have no
     parameter of. The C ABI's JSON and the command's `--json` are made
     from them now, unchanged byte for byte.
+171. **The Python module** (§199, step 2 of §197): `import trunkdb`,
+    in `bindings/python/`, built with PyO3 on the library and maturin,
+    one `abi3` wheel for Python 3.11 and after; not on PyPI. Documents
+    as dicts of Python's own types both ways, `DocId` for ids,
+    `datetime` in UTC with a naive one refused, nanoseconds cut to
+    microseconds; `Database`, `Collection`, `Snapshot` and its `View`s,
+    `Cursor`, `Upserted`; batches as op dicts or JSON lines, reports as
+    dicts; `trunkdb.Error` and a class per kind, their details as
+    attributes; the GIL let go around every call; closing as a file
+    closes, with a `ResourceWarning` for one left open; type stubs.
+    Live queries are the next step.

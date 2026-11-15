@@ -1,0 +1,23 @@
+[package]
+name = "trunkdb-python"
+version = "0.41.0"
+edition = "2024"
+rust-version = "1.89"
+description = "trunkdb for Python: the library as a module, documents as dicts (SPEC §197)."
+license = "MIT"
+repository = "https://github.com/u-schmidt/trunkdb"
+publish = false
+
+# The compiled half of the `trunkdb` package, `trunkdb._trunkdb`, built
+# by maturin (pyproject.toml).
+[lib]
+name = "_trunkdb"
+crate-type = ["cdylib"]
+doc = false
+# Its tests are Python's, in tests/, against the built module.
+test = false
+doctest = false
+
+[dependencies]
+db = { package = "trunkdb", path = "../.." }
+pyo3 = { version = "0.30", features = ["abi3-py311"] }
