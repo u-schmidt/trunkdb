@@ -218,8 +218,8 @@ async for event in in_depot:                   # in asyncio
   (§195), `watch_every` an option of `open`.
 
 ## 197.9 Built and tested
-- **Locally:** `maturin develop` in a virtual environment, then
-  `pytest bindings/python/tests`.
+- **Locally:** in `bindings/python`, `maturin develop` in a virtual
+  environment, then `pytest`.
 - **CI:** on Linux, macOS and Windows, a wheel built with maturin, put
   into a fresh virtual environment, and the tests run against it; on
   the oldest Python (3.11) and the newest. The wheels are kept as the

@@ -117,9 +117,11 @@ with vans.watch("zone = :z", {"z": "depot"}) as in_depot:
 
 ## Testing it
 
-In a virtual environment, with Rust and [maturin](https://www.maturin.rs):
+In a virtual environment, with Rust, [maturin](https://www.maturin.rs)
+and pytest, from the repository's root:
 
 ```bash
+cd bindings/python
 maturin develop
-pytest bindings/python/tests
+pytest
 ```
