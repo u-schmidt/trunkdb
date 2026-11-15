@@ -284,6 +284,24 @@ def test_a_close_lets_go_of_a_kept_event(tasks):
     assert live.next(0) is None and live.ended
 
 
+def test_a_wait_cancelled_after_a_close_doesnt_bring_its_event_back(tasks):
+    async def main(live):
+        waiting = asyncio.ensure_future(anext(aiter(live)))
+        await asyncio.sleep(0.05)
+        tasks.insert({"n": 1})
+        time.sleep(0.3)
+        # The event came for the wait; the feed closes before the cancel.
+        live.close()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+
+    live = tasks.watch()
+    asyncio.run(main(live))
+    assert live.closed and live.ended
+    assert live.next(0) is None
+
+
 def test_an_event_that_comes_for_a_cancelled_wait_is_kept(tasks):
     # The wait is cancelled while the reader's thread waits in a slice;
     # the event comes within that slice, for a wait no one awaits.

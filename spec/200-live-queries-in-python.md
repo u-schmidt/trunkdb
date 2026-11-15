@@ -66,6 +66,12 @@ was left; here there is nothing to give back.
   thread hands an event over while it still holds the feed, so no read
   after it overtakes it; a cancel marks the wait abandoned, and an event
   that comes for an abandoned wait goes back too.
+- **A closed feed takes nothing back:** a wait whose event came, then
+  cancelled after its feed closed, lets the event go. `close` marks the
+  feed closed while it holds what is kept, and putting an event back
+  looks at that mark under the same lock, so none is kept after the
+  close. Found in review: before, the event came back, `ended` false
+  again and a read handing it out, though `closed` was true.
 - **`ended` counts what is kept:** true only once the source ended and
   nothing is kept, so a feed whose last event came back after a cancel
   hasn't ended (the lesson of §194.5's review, kept from the start).
@@ -100,7 +106,7 @@ events:
   exception (§199.4); the feed has ended after it.
 
 ## 200.5 Checked
-- **pytest, 85 tests,** 21 of them live, on Python 3.11 and 3.14,
+- **pytest, 86 tests,** 22 of them live, on Python 3.11 and 3.14,
   three runs each.
 - **The stubs against the module:** `stubtest` finds nothing; `mypy
   --strict` on the package, and `mypy` on the tests, none. The wait
@@ -120,7 +126,8 @@ on another thread; a closed database's three feeds read to their end; a
 feed freed without a warning; `async for`, a `break` and a second loop
 going on where the first stopped; a wait cancelled after its event came,
 the source ending meanwhile, the event kept and `ended` false until it
-is read; a kept event let go by a close; an event that comes for a wait
+is read; a kept event let go by a close; a wait cancelled after its
+feed closed, its event not brought back; an event that comes for a wait
 already cancelled, kept; `async for` stopping at the end; the loop running while it
 waits; a read-only open beside a writer in another process, at 20 ms
 and at 30 s; `watch_every`'s refusals.
@@ -145,6 +152,7 @@ killed at 90 s:
 | a close leaving the source open | caught, hung: a `for` ended by a close on another thread |
 | `watch_every` not passed on | caught: the reader at 30 s seeing the commit |
 | a cancelled wait not abandoned | caught: a wait cancelled after its event came |
+| an event kept after the close | caught: a wait cancelled after its feed closed |
 
 ## 200.8 Rejected
 - **One `Feed` class for the three:** its `next` would return any event,

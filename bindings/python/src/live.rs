@@ -161,11 +161,25 @@ impl Core {
         self.source_ended.load(Ordering::Relaxed) && lock(&self.kept).is_empty()
     }
 
+    /// `got` put back in front, read first by the next read; let go if
+    /// the feed has closed.
+    fn keep(&self, got: Got) {
+        let mut kept = lock(&self.kept);
+        if !self.closed.load(Ordering::Relaxed) {
+            kept.push_front(got);
+        }
+    }
+
     fn close(&self, py: Python<'_>) {
         py.detach(|| {
             let source = lock(&self.source).take();
-            lock(&self.kept).clear();
-            self.closed.store(true, Ordering::Relaxed);
+            {
+                // Closed with what is kept held, so that a wait's event
+                // can't be kept after it (`keep`).
+                let mut kept = lock(&self.kept);
+                kept.clear();
+                self.closed.store(true, Ordering::Relaxed);
+            }
             self.source_ended.store(true, Ordering::Relaxed);
             drop(source);
         });
@@ -275,7 +289,7 @@ impl Wait {
         let offer = |got: Got| {
             let mut state = lock(&self.state);
             if state.abandoned {
-                lock(&self.core.kept).push_front(got);
+                self.core.keep(got);
             } else {
                 state.came = Some(Came::Got(got));
             }
@@ -303,7 +317,7 @@ impl Wait {
         let mut state = lock(&self.state);
         state.abandoned = true;
         if let Some(Came::Got(got)) = state.came.take() {
-            lock(&self.core.kept).push_front(got);
+            self.core.keep(got);
         }
     }
 
