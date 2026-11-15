@@ -148,7 +148,27 @@ trunkdb file with this command, and change it: shape first, then
 narrow queries, and never the whole file into its context; a write
 counted with `--dry-run` and confirmed before it runs. Copy the folder
 to where your agent reads skills. The file must not be open in another
-program meanwhile: one that writes holds it locked.
+program meanwhile: one that writes holds it locked. For Python code on
+a trunkdb file, the skill maps each command to the module's call.
+
+### From Python
+
+[bindings/python/](bindings/python/README.md) is trunkdb as a Python
+module, built on the library itself: documents as dicts of Python's own
+types, `datetime` and `DocId` included, errors as exceptions, live
+queries read with `for` and `async for`. One wheel for Python 3.11 and
+after; not on PyPI: each CI run keeps a wheel per system, or `pip
+install` from the repository builds one with Rust.
+
+```python
+import trunkdb
+
+with trunkdb.open("app.trunkdb") as db:
+    tasks = db.collection("tasks")
+    tasks.insert({"title": "Write it", "status": "open"})
+    for task in tasks.find("status = :s limit 10", {"s": "open"}):
+        print(task["_id"], task["title"])
+```
 
 ### From C and other languages
 

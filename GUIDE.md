@@ -2,7 +2,9 @@
 
 How to use trunkdb from Rust, by example. The [README](README.md) has
 the short version; [DESIGN.md](DESIGN.md) says how each part works, and
-the API documentation (`cargo doc --open`) lists every method.
+the API documentation (`cargo doc --open`) lists every method. From
+Python, [bindings/python/](bindings/python/README.md) shows the same
+by example, documents as dicts; from C#, [bindings/dotnet/](bindings/dotnet/README.md).
 
 ## Getting started
 

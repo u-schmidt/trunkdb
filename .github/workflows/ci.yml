@@ -51,6 +51,48 @@ jobs:
       - run: cargo build -p trunkdb-ffi
       - run: dotnet test bindings/dotnet/tests/TrunkDb.Tests
 
+  python:
+    name: Python ${{ matrix.python }} (${{ matrix.os }}; SPEC §201)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # The oldest Python the wheel serves and the newest.
+        python: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # One abi3 wheel, for 3.11 and every version after (SPEC §197.2).
+      - run: |
+          python -m pip install "maturin>=1.9,<2"
+          maturin build --release -m bindings/python/Cargo.toml -o dist
+      # Into a fresh virtual environment, and the tests against it, not
+      # against the source.
+      - run: |
+          python -m venv .venv
+          if [ "$RUNNER_OS" = Windows ]; then py=.venv/Scripts/python; else py=.venv/bin/python; fi
+          "$py" -m pip install dist/*.whl pytest mypy
+          cd bindings/python
+          "$py" -c 'import trunkdb, sys; assert "site-packages" in trunkdb.__file__, trunkdb.__file__; print(trunkdb.__file__)'
+          "$py" -m pytest -q -p no:cacheprovider
+          # The type stubs against the module, and strict on the package.
+          cd tests
+          "$py" -m mypy.stubtest trunkdb
+          "$py" -m mypy --strict -p trunkdb
+      - if: matrix.python == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trunkdb-wheel-${{ matrix.os }}
+          path: dist/*.whl
+
   lint:
     name: Clippy and rustfmt
     runs-on: ubuntu-latest
@@ -80,8 +122,10 @@ jobs:
       - run: cargo test --all-targets
       # `#[trunkdb::document]` and its compile-fail tests (SPEC §114).
       - run: cargo test --features derive
-      # The C ABI's library builds with it too (SPEC §179).
+      # The C ABI's library builds with it too (SPEC §179), and the
+      # Python module (SPEC §197.2).
       - run: cargo build -p trunkdb-ffi
+      - run: cargo build -p trunkdb-python
 
   bench:
     name: Benchmark (builds, lints, runs small)

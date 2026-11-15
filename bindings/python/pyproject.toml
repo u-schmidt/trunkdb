@@ -7,6 +7,7 @@ build-backend = "maturin"
 [project]
 name = "trunkdb"
 description = "An embedded, single-file document database: documents as dicts, a text query language, snapshots."
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dynamic = ["version"]

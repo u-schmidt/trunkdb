@@ -279,3 +279,11 @@ trunkdb index app.trunkdb users add email --unique
 code 1 if there are any. Run it when the user suspects damage, or
 before trusting a file that came from elsewhere. `info` also shows
 where the pages go and how much `compact` would save.
+
+## From Python
+
+When the task is Python code that uses a trunkdb file, or the `trunkdb`
+command isn't there and `python -c "import trunkdb"` works, the module
+does what the command does: `references/python.md` maps each command to
+its call. The same care holds: `count` before `find`, a `limit` on
+every `find`, and a write tried with `dry_run=True` and confirmed first.

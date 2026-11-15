@@ -1504,3 +1504,12 @@ limit, batches and a write-ahead log. Since then:
     frozen dataclasses for `match`: `Entered`, `Left`, `Changed`,
     `RowEntered`, `RowLeft`, `RowChanged`, `Commit` of `Change`s;
     `open(..., watch_every=)` for a read-only open beside a writer.
+173. **Python wheels in CI** (§201, step 4 of §197): on Linux, macOS
+    and Windows, a wheel built in release, installed into a fresh
+    environment and tested on Python 3.11 and 3.14, the stubs checked
+    against it with `stubtest` and `mypy --strict`, kept as the run's
+    artifact; not on PyPI. The test that the GIL is let go grows its
+    data until a release build's `count` is long enough to time. The
+    module's README; Python in the README, the GUIDE's opening and the
+    agent skill, with `references/python.md` mapping each command to
+    its call.

@@ -341,8 +341,14 @@ def test_the_gil_is_let_go_while_trunkdb_works(tasks):
     # While one call reads, another thread runs Python: it notes the
     # time each millisecond, and some of those times fall inside the
     # call, well away from its ends, where Python could switch threads
-    # on its own.
-    tasks.insert_many([{"n": n, "text": "x" * 500} for n in range(40000)])
+    # on its own. A release build reads fast: documents are added until
+    # the call takes long enough to tell.
+    for _ in range(6):
+        tasks.insert_many([{"text": "x" * 500} for _ in range(40000)])
+        start = time.perf_counter()
+        tasks.count("text = :t", {"t": "y"})
+        if time.perf_counter() - start > 0.08:
+            break
     stop = threading.Event()
     ticks = []
 
