@@ -78,7 +78,8 @@ jobs:
       # against the source.
       - run: |
           python -m venv .venv
-          if [ "$RUNNER_OS" = Windows ]; then py=.venv/Scripts/python; else py=.venv/bin/python; fi
+          # An absolute path: the tests run from bindings/python.
+          if [ "$RUNNER_OS" = Windows ]; then py="$PWD/.venv/Scripts/python"; else py="$PWD/.venv/bin/python"; fi
           "$py" -m pip install dist/*.whl pytest mypy
           cd bindings/python
           "$py" -c 'import trunkdb, sys; assert "site-packages" in trunkdb.__file__, trunkdb.__file__; print(trunkdb.__file__)'
