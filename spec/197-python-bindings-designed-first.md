@@ -1,6 +1,6 @@
 # 197. Python bindings, designed first (`bindings/python/`)
 
-**Designed 2026-11-14; step 1 built the same day (§198), steps 2 and 3 on 2026-11-15 (§199, §200).** Four choices were made
+**Designed 2026-11-14; step 1 built the same day (§198), steps 2 to 4 on 2026-11-15 (§199–§201).** Four choices were made
 before it was written: design first, as §177 was for the C ABI and
 §185 for readers in other processes; documents as dicts of Python's own
 types; live queries read by iteration and by `asyncio`; wheels built
@@ -218,8 +218,8 @@ async for event in in_depot:                   # in asyncio
   (§195), `watch_every` an option of `open`.
 
 ## 197.9 Built and tested
-- **Locally:** `maturin develop` in a virtual environment, then
-  `pytest bindings/python/tests`.
+- **Locally:** in `bindings/python`, `maturin develop` in a virtual
+  environment, then `pytest`.
 - **CI:** on Linux, macOS and Windows, a wheel built with maturin, put
   into a fresh virtual environment, and the tests run against it; on
   the oldest Python (3.11) and the newest. The wheels are kept as the

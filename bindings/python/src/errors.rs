@@ -203,9 +203,17 @@ pub(crate) fn io(py: Python<'_>, error: std::io::Error, path: Option<&str>) -> P
     }
     match (error.raw_os_error(), path) {
         // `OSError(errno, message, path)` makes the subclass of `errno`.
-        (Some(errno), Some(path)) => {
-            let message = std::io::Error::from_raw_os_error(errno).to_string();
-            match PyOSError::type_object(py).call1((errno, message, path)) {
+        // On Windows the code is a Windows error, not an errno (3 is "the
+        // path not found" there, "no such process" as an errno): passed
+        // as `winerror`, Python turns it into its errno and subclass, as
+        // its own calls do.
+        (Some(code), Some(path)) => {
+            let message = std::io::Error::from_raw_os_error(code).to_string();
+            #[cfg(windows)]
+            let args = (0, message, path, code);
+            #[cfg(not(windows))]
+            let args = (code, message, path);
+            match PyOSError::type_object(py).call1(args) {
                 Ok(made) => PyErr::from_value(made),
                 Err(e) => e,
             }
