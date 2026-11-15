@@ -1509,7 +1509,10 @@ limit, batches and a write-ahead log. Since then:
     environment and tested on Python 3.11 and 3.14, the stubs checked
     against it with `stubtest` and `mypy --strict`, kept as the run's
     artifact; not on PyPI. The test that the GIL is let go grows its
-    data until a release build's `count` is long enough to time. The
+    data until a release build's `count` is long enough to time. On
+    Windows, an I/O error's code goes to Python as `winerror`, so a
+    missing folder is `FileNotFoundError` there too, not
+    `ProcessLookupError`. The
     module's README; Python in the README, the GUIDE's opening and the
     agent skill, with `references/python.md` mapping each command to
     its call.

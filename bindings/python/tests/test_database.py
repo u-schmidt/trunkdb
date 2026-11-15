@@ -74,6 +74,8 @@ def test_a_missing_file_is_pythons_own_error(db, tmp_path):
     with pytest.raises(FileNotFoundError) as caught:
         trunkdb.open(missing)
     assert caught.value.filename == str(missing)
+    # On Windows too, where the system's code for it isn't an errno.
+    assert caught.value.errno == errno.ENOENT
     with pytest.raises(FileNotFoundError):
         db.import_file(tmp_path / "missing.jsonl")
 

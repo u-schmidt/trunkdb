@@ -28,14 +28,26 @@ the oldest the wheel serves and the newest:
 
 The job with the oldest Rust (1.89) builds the module's crate too.
 
-## 201.2 A test that a release build outran
-The test that the GIL is let go timed a `count` over 40,000 documents
+## 201.2 What the first runs found
+**A test that a release build outran.** The test that the GIL is let go timed a `count` over 40,000 documents
 and refused to judge one shorter than 20 ms. The module's tests had run
 against a debug build until now; against the release build CI makes,
 that `count` takes 16 ms, and the test failed, each time, on "too short
 to tell". It now adds 40,000 documents at a time, up to six times, until
 the `count` takes 80 ms; then it times it as before. A `count` holding
 the GIL still fails it in release (201.5).
+
+**A Windows error taken for an errno.** An I/O error became Python's
+`OSError(errno, message, path)`, which picks its subclass by `errno`.
+On Windows, Rust's raw code is the system's, not an errno: opening a
+file in a folder that isn't there gave 3, "the path not found", which
+as an errno is `ESRCH`, so Python raised `ProcessLookupError` where
+Linux and macOS raise `FileNotFoundError`. On Windows the code now goes
+as `winerror`, `OSError(0, message, path, code)`, and Python turns it
+into its errno and subclass, as its own calls on Windows do. The test
+of a missing file now also asks for `errno` `ENOENT`, on all three.
+The module's crate was linted for Windows before the push
+(`--target x86_64-pc-windows-msvc`).
 
 ## 201.3 Installing
 Two ways, both in the module's README:
@@ -77,8 +89,8 @@ against the installed wheel.
 - **The workspace's checks,** the oldest Rust with the module's crate.
 - **Mutation:** a `count` that keeps the GIL (`py.detach` left out of
   the reads), built in release: caught by the reworked test.
-- **The workflow itself** runs only on GitHub: Windows and Linux are
-  first tried there.
+- **The workflow itself** runs only on GitHub: Windows and Linux were
+  first tried there, and found the error of 201.2.
 
 ## 201.6 Rejected
 - **`PyO3/maturin-action`,** with manylinux containers: a wheel that
