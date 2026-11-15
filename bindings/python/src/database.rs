@@ -160,7 +160,10 @@ pub(crate) struct PyDatabase {
     snapshot_memory = None,
     checkpoint_pages = None,
     checkpoint_wal_bytes = None,
+    watch_every = None,
 ))]
+// One argument for each of Python's keyword options.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     py: Python<'_>,
     path: PathBuf,
@@ -169,6 +172,7 @@ pub(crate) fn open(
     snapshot_memory: Option<usize>,
     checkpoint_pages: Option<usize>,
     checkpoint_wal_bytes: Option<u64>,
+    watch_every: Option<f64>,
 ) -> PyResult<PyDatabase> {
     let mut options = db::OpenOptions::default().read_only(read_only);
     if let Some(n) = cache_size {
@@ -182,6 +186,14 @@ pub(crate) fn open(
     }
     if let Some(n) = checkpoint_wal_bytes {
         options = options.checkpoint_wal_bytes(n);
+    }
+    if let Some(every) = watch_every {
+        if !(every.is_finite() && every > 0.0 && every <= 86_400.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "watch_every is a number of seconds, more than 0, at most a day",
+            ));
+        }
+        options = options.watch_every(std::time::Duration::from_secs_f64(every));
     }
     let shown = path.display().to_string();
     let db = py
@@ -227,6 +239,16 @@ impl PyDatabase {
     /// Drops a collection, its documents and indexes; whether it was there.
     fn drop_collection(&self, py: Python<'_>, name: String) -> PyResult<bool> {
         run(py, &self.state, move |db| db.drop_collection(&name))
+    }
+
+    /// A `Commit` for each batch committed from now on, with what it
+    /// inserted, updated and deleted, and the collections it dropped.
+    fn subscribe(&self, py: Python<'_>) -> PyResult<crate::live::Changes> {
+        let changes = run(py, &self.state, |db| db.subscribe())?;
+        Ok(crate::live::Changes::new(
+            crate::live::Source::Changes(changes),
+            None,
+        ))
     }
 
     /// The database as it is now, kept for reads however it is written to

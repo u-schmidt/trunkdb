@@ -393,6 +393,47 @@ impl Collection {
         })
     }
 
+    /// A live query of `filter`: first an `Entered` for each document it
+    /// finds, then, as each commit commits, what came to match it
+    /// (`Entered`), what no longer does (`Left`), and what was written
+    /// that still does (`Changed`). With an `order by`, and a `limit` or
+    /// none, each event says where in the list.
+    #[pyo3(signature = (filter = "", params = None))]
+    fn watch(
+        &self,
+        py: Python<'_>,
+        filter: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<crate::live::LiveQuery> {
+        let filter = filter_of(py, filter, params)?;
+        let query = self.write(py, move |c| c.watch(filter))?;
+        Ok(crate::live::LiveQuery::new(
+            crate::live::Source::Query(query),
+            Some(self.name.clone()),
+        ))
+    }
+
+    /// A live aggregate: first a `RowEntered` for each row of
+    /// `aggregate` over what `filter` finds, then, as each commit to the
+    /// collection commits, the rows that came (`RowEntered`), left
+    /// (`RowLeft`), or changed (`RowChanged`). `params` as `aggregate`'s.
+    #[pyo3(signature = (filter, aggregate, params = None))]
+    fn watch_aggregate(
+        &self,
+        py: Python<'_>,
+        filter: &str,
+        aggregate: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<crate::live::LiveAggregate> {
+        let params = convert::params_in(params)?;
+        let (filter, aggregate) = text::aggregate_args(py, filter, aggregate, &params)?;
+        let live = self.write(py, move |c| c.watch_aggregate(filter, &aggregate))?;
+        Ok(crate::live::LiveAggregate::new(
+            crate::live::Source::Aggregate(live),
+            Some(self.name.clone()),
+        ))
+    }
+
     /// Makes an index on `fields`, a name or a list of names, unless there
     /// is one; whether this call made it.
     #[pyo3(signature = (fields, *, unique = false, sparse = false))]
