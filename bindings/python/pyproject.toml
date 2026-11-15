@@ -1,0 +1,32 @@
+# trunkdb for Python (SPEC §197): built with maturin, `pip install .`
+# or `maturin develop` in a virtual environment. Not on PyPI.
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "trunkdb"
+description = "An embedded, single-file document database: documents as dicts, a text query language, snapshots."
+requires-python = ">=3.11"
+license = "MIT"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Repository = "https://github.com/u-schmidt/trunkdb"
+
+[tool.maturin]
+# The compiled module inside the package in python/.
+module-name = "trunkdb._trunkdb"
+python-source = "python"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A database, snapshot or cursor left unclosed is a ResourceWarning: an
+# error in the tests, unless one asks for it.
+filterwarnings = ["error"]
