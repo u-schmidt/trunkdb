@@ -135,7 +135,7 @@ fn cursor(
 ) -> PyResult<Cursor> {
     let filter = filter_of(py, filter, params)?;
     let opened = read(py, reader, move |r| r.cursor(filter))?;
-    Ok(Cursor::new(db, opened))
+    Cursor::new(py, db, opened)
 }
 
 fn aggregate<'py>(

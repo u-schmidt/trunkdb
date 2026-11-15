@@ -121,8 +121,56 @@ fn from_py(py: Python<'_>, error: PyErr) -> Bad {
 
 // ---- Into trunkdb ----
 
+/// The containers a value is inside, outermost first, each by its
+/// address: a container among them holds itself, and more of them than
+/// `Document::MAX_NESTING` nest deeper than a document may. Checked as
+/// each is entered, so neither recurses off the end of the stack.
+struct Within(Vec<usize>);
+
+impl Within {
+    fn new() -> Within {
+        Within(Vec::new())
+    }
+
+    /// `container` entered, or why it can't be.
+    fn enter(&mut self, container: &Bound<'_, PyAny>) -> Result<(), Bad> {
+        let address = container.as_ptr() as usize;
+        if self.0.contains(&address) {
+            return Err(Bad::new(
+                value_error,
+                format!(
+                    "a {} that holds itself: a document can't",
+                    type_name(container)
+                ),
+            ));
+        }
+        if self.0.len() >= Document::MAX_NESTING {
+            return Err(Bad::new(
+                value_error,
+                format!(
+                    "nested deeper than a document may, {} levels",
+                    Document::MAX_NESTING
+                ),
+            ));
+        }
+        self.0.push(address);
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.0.pop();
+    }
+}
+
 /// A dict as a document's object, its keys `str` only.
-pub(crate) fn dict_to_map(dict: &Bound<'_, PyDict>) -> Result<Map, Bad> {
+fn dict_to_map(dict: &Bound<'_, PyDict>, within: &mut Within) -> Result<Map, Bad> {
+    within.enter(dict.as_any())?;
+    let map = dict_items(dict, within);
+    within.leave();
+    map
+}
+
+fn dict_items(dict: &Bound<'_, PyDict>, within: &mut Within) -> Result<Map, Bad> {
     let mut map = Map::with_capacity(dict.len());
     for (key, value) in dict.iter() {
         let Ok(key) = key.cast::<PyString>() else {
@@ -136,14 +184,29 @@ pub(crate) fn dict_to_map(dict: &Bound<'_, PyDict>) -> Result<Map, Bad> {
             ));
         };
         let key = key.to_str().map_err(|e| from_py(dict.py(), e))?;
-        let value = to_document(&value).map_err(|bad| bad.key(key))?;
+        let value = to_document(&value, within).map_err(|bad| bad.key(key))?;
         map.insert(key.to_string(), value);
     }
     Ok(map)
 }
 
+/// A list's or a tuple's items as a document's array.
+fn items_to_array<'py>(
+    container: &Bound<'py, PyAny>,
+    items: impl Iterator<Item = Bound<'py, PyAny>>,
+    within: &mut Within,
+) -> Result<Document, Bad> {
+    within.enter(container)?;
+    let array = (items.enumerate())
+        .map(|(at, item)| to_document(&item, within).map_err(|bad| bad.index(at)))
+        .collect::<Result<_, _>>()
+        .map(Document::Array);
+    within.leave();
+    array
+}
+
 /// A Python value as a document's value.
-pub(crate) fn to_document(value: &Bound<'_, PyAny>) -> Result<Document, Bad> {
+fn to_document(value: &Bound<'_, PyAny>, within: &mut Within) -> Result<Document, Bad> {
     let py = value.py();
     if value.is_none() {
         return Ok(Document::Null);
@@ -186,19 +249,13 @@ pub(crate) fn to_document(value: &Bound<'_, PyAny>) -> Result<Document, Bad> {
         return Ok(Document::Binary(bytes));
     }
     if let Ok(dict) = value.cast::<PyDict>() {
-        return dict_to_map(dict).map(Document::Object);
+        return dict_to_map(dict, within).map(Document::Object);
     }
     if let Ok(list) = value.cast::<PyList>() {
-        return (list.iter().enumerate())
-            .map(|(at, item)| to_document(&item).map_err(|bad| bad.index(at)))
-            .collect::<Result<_, _>>()
-            .map(Document::Array);
+        return items_to_array(value, list.iter(), within);
     }
     if let Ok(tuple) = value.cast::<PyTuple>() {
-        return (tuple.iter().enumerate())
-            .map(|(at, item)| to_document(&item).map_err(|bad| bad.index(at)))
-            .collect::<Result<_, _>>()
-            .map(Document::Array);
+        return items_to_array(value, tuple.iter(), within);
     }
     if let Ok(id) = value.cast::<PyDocId>() {
         return Ok(Document::Id(id.get().0));
@@ -425,7 +482,7 @@ pub(crate) fn documents_out<'py>(
 /// document.
 pub(crate) fn document_in(value: &Bound<'_, PyAny>, root: &str) -> PyResult<Document> {
     match value.cast::<PyDict>() {
-        Ok(dict) => dict_to_map(dict)
+        Ok(dict) => dict_to_map(dict, &mut Within::new())
             .map(Document::Object)
             .map_err(|bad| bad.into_err(root)),
         Err(_) => Err(PyTypeError::new_err(format!(
@@ -475,7 +532,8 @@ pub(crate) fn params_in(value: Option<&Bound<'_, PyAny>>) -> PyResult<db::query:
             )));
         };
         let name = name.to_str()?;
-        let value = to_document(&value).map_err(|bad| bad.into_err(&format!(":{name}")))?;
+        let value = to_document(&value, &mut Within::new())
+            .map_err(|bad| bad.into_err(&format!(":{name}")))?;
         params = params.set(name, value);
     }
     Ok(params)

@@ -1488,7 +1488,8 @@ limit, batches and a write-ahead log. Since then:
     one `abi3` wheel for Python 3.11 and after; not on PyPI. Documents
     as dicts of Python's own types both ways, `DocId` for ids,
     `datetime` in UTC with a naive one refused, nanoseconds cut to
-    microseconds; `Database`, `Collection`, `Snapshot` and its `View`s,
+    microseconds, a container that holds itself or nests past 64
+    levels refused; `Database`, `Collection`, `Snapshot` and its `View`s,
     `Cursor`, `Upserted`; batches as op dicts or JSON lines, reports as
     dicts; `trunkdb.Error` and a class per kind, their details as
     attributes; the GIL let go around every call; closing as a file

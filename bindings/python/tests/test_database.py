@@ -243,6 +243,38 @@ def test_a_database_closes_once_the_calls_under_way_return(tmp_path):
         assert again.collection("tasks").count() == 2000
 
 
+def test_a_close_while_another_thread_makes_snapshots_and_cursors(tmp_path):
+    # A snapshot or cursor made while the database closes, outside the
+    # GIL, is closed with it: none holds the file after.
+    path = tmp_path / "race.trunkdb"
+    with trunkdb.open(path) as db:
+        db.collection("t").insert_many([{"n": n} for n in range(200)])
+    for _ in range(20):
+        db = trunkdb.open(path)
+        tasks = db.collection("t")
+        made = []
+        started = threading.Event()
+
+        def take():
+            started.set()
+            while True:
+                try:
+                    made.append(db.snapshot())
+                    made.append(tasks.cursor())
+                except ValueError:
+                    return
+
+        taker = threading.Thread(target=take)
+        taker.start()
+        started.wait()
+        time.sleep(0.002)
+        db.close()
+        taker.join()
+        assert made and all(m.closed for m in made)
+        with trunkdb.open(path):
+            pass
+
+
 def test_unclosed_things_warn_as_a_file_does(tmp_path):
     with pytest.warns(ResourceWarning, match="unclosed database"):
         db = trunkdb.open(tmp_path / "u.trunkdb")

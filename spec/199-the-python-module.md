@@ -54,6 +54,15 @@ batch's op by `ops[2]`. A `datetime` is taken to UTC by its own
 `timezone.utc`. A kind of value trunkdb gains after these bindings is a
 `ValueError` naming it, never dropped.
 
+A dict or list that holds itself, `doc["self"] = doc`, is a
+`ValueError` at the path where it comes round again; one nested deeper
+than a document may (`Document::MAX_NESTING`, 64 levels, the document
+the first) is one where it goes past. Each container is checked as it
+is entered, by the containers the value is inside, so neither recurses
+until the stack ends and takes the interpreter with it; the same value
+twice, side by side, is no loop. Found in review: before, both crashed
+Python.
+
 ## 199.4 Errors
 As §197.5, and:
 
@@ -80,6 +89,14 @@ As §197.5, and:
   of the database, outside the GIL, as the last handle writes what its
   log holds. A call under way has its own handle, so the file closes
   when it returns (197.6).
+- **A snapshot or cursor made as the database closes is closed too.**
+  It is made outside the GIL, and a `close` on another thread may come
+  between its making and its keeping. It is kept only while, its list
+  locked, the database is still open; otherwise it is closed at once and
+  the call is `ValueError("closed database")`. A `close` takes the
+  database before the list, so each one is either in the list it closes
+  or sees it closed. Found in review: before, one could be kept after
+  the close and hold the file, so that it couldn't be opened again.
 - **A collection, a snapshot and a cursor keep their database alive,**
   as a file's methods do: `trunkdb.open(p).collection("t")` is a
   collection that works, not one of a database already freed.
@@ -102,7 +119,7 @@ The classes are `frozen`, their state behind Rust's locks, so a
 `Database` and anything made from it is used from any thread.
 
 ## 199.7 Checked
-- **pytest, 61 tests,** on Python 3.11 and 3.14, warnings errors
+- **pytest, 64 tests,** on Python 3.11 and 3.14, warnings errors
   (`filterwarnings = ["error"]`), so a database, snapshot or cursor a
   test leaves open fails it.
 - **The stubs against the module:** mypy's `stubtest` finds nothing;
@@ -117,7 +134,9 @@ The classes are `frozen`, their state behind Rust's locks, so a
   naive `datetime` refused, zones east and west across midnight,
   `datetime` order in a filter, a time with a zone refused,
   nanoseconds cut, a year past 9999 refused by path, `DocId` both ways,
-  hashed, pickled and in time order, a given `_id` kept.
+  hashed, pickled and in time order, a given `_id` kept; a dict and a
+  list that hold themselves, the same value twice; 64 levels kept, 65
+  and 100,000 refused.
 - `test_collection.py`: every read and write of §197.3 with its
   parameters, a value no text uses, a parameter without a value, a
   filter's offset, a cursor's end and its snapshot, an aggregate's
@@ -128,7 +147,8 @@ The classes are `frozen`, their state behind Rust's locks, so a
   beside one; batches as dicts and as lines, a dry run, a failed
   precondition's and an unread line's `line`; reports, export and
   import; a closed database through every kind of call; a close
-  during a call; the three warnings; the exception through a
+  during a call; a close while another thread takes snapshots and
+  cursors, twenty times, the file opened after; the three warnings; the exception through a
   cursor's `for`, in a process of its own; four threads writing; and
   another thread running inside one long read, away from its ends.
 
@@ -152,6 +172,10 @@ Each alone, the module rebuilt and the tests run, the file restored:
 | an aggregate's filter bound to every value | passed at first, the test's values all the filter's; caught once the aggregate's `having` had one of its own |
 | a read holding the GIL | passed at first, the other thread running between five calls; caught once its times were looked for inside one call, away from its ends |
 | a duplicate's `existing` its own id | caught: a unique index's error |
+| a container that holds itself not looked for | caught: a dict and a list that hold themselves |
+| no limit to nesting | caught: 100,000 levels |
+| the limit one level late | caught: 65 levels |
+| a snapshot or cursor kept after the close | caught: a close while another thread takes them, the file still held |
 
 ## 199.10 Rejected
 - **One `Collection` class for snapshots too,** its writes raising

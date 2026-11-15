@@ -70,11 +70,25 @@ impl DbState {
             .ok_or_else(|| errors::closed("database"))
     }
 
-    /// `child` closed with the database.
-    pub(crate) fn adopt(&self, child: Weak<dyn Closes>) {
-        let mut children = lock(&self.children);
-        children.retain(|c| c.strong_count() > 0);
-        children.push(child);
+    /// `child` closed with the database; closed now if the database
+    /// closed while it was made. A `close` takes the database before its
+    /// children, so, with the children locked, a database still open
+    /// will close `child` too.
+    pub(crate) fn adopt<C: Closes + 'static>(
+        &self,
+        py: Python<'_>,
+        child: &Arc<C>,
+    ) -> PyResult<()> {
+        {
+            let mut children = lock(&self.children);
+            if self.db.is_open() {
+                children.retain(|c| c.strong_count() > 0);
+                children.push(Arc::downgrade(child) as Weak<dyn Closes>);
+                return Ok(());
+            }
+        }
+        py.detach(|| child.close());
+        Err(errors::closed("database"))
     }
 
     fn close(&self, py: Python<'_>) {
@@ -223,7 +237,7 @@ impl PyDatabase {
         let state = &slf.get().state;
         let taken = run(py, state, |db| db.snapshot())?;
         let slot = Arc::new(Slot::new(taken));
-        state.adopt(Arc::downgrade(&slot) as Weak<dyn Closes>);
+        state.adopt(py, &slot)?;
         Ok(Snapshot {
             db: slf.clone().unbind(),
             slot,
@@ -520,14 +534,18 @@ pub(crate) struct Cursor {
 }
 
 impl Cursor {
-    pub(crate) fn new(db: Py<PyDatabase>, cursor: db::Cursor<Document>) -> Cursor {
+    pub(crate) fn new(
+        py: Python<'_>,
+        db: Py<PyDatabase>,
+        cursor: db::Cursor<Document>,
+    ) -> PyResult<Cursor> {
         let slot = Arc::new(Slot::new(cursor));
-        (db.get().state).adopt(Arc::downgrade(&slot) as Weak<dyn Closes>);
-        Cursor {
+        (db.get().state).adopt(py, &slot)?;
+        Ok(Cursor {
             db,
             slot,
             ended: AtomicBool::new(false),
-        }
+        })
     }
 }
 

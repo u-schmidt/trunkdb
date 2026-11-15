@@ -162,3 +162,37 @@ def test_a_given_id_is_kept_and_the_text_of_an_id_finds_it(tasks):
     assert tasks.get(str(given))["n"] == 1
     with pytest.raises(TypeError, match="an id is a DocId or its text"):
         tasks.get(42)
+
+
+def nested(levels):
+    """A document `levels` deep, the document itself the first."""
+    inner = []
+    for _ in range(levels - 2):
+        inner = [inner]
+    return {"a": inner}
+
+
+def test_a_container_that_holds_itself_is_refused(tasks):
+    doc = {"n": 1}
+    doc["self"] = doc
+    with pytest.raises(ValueError, match=r"^self: a dict that holds itself"):
+        tasks.insert(doc)
+    items = [1]
+    items.append(items)
+    with pytest.raises(ValueError, match=r"^tags\[1\]: a list that holds itself"):
+        tasks.insert({"tags": items})
+    with pytest.raises(ValueError, match=r"^:t\[1\]: a list that holds itself"):
+        tasks.find("tags = :t", {"t": items})
+    # The same value twice is no loop.
+    shared = {"x": 1}
+    id = tasks.insert({"a": shared, "b": [shared, shared]})
+    assert tasks.get(id)["b"] == [{"x": 1}, {"x": 1}]
+
+
+def test_a_document_nests_as_deep_as_trunkdb_allows(tasks):
+    id = tasks.insert(nested(64))
+    assert tasks.get(id)["a"] == nested(64)["a"]
+    with pytest.raises(ValueError, match="nested deeper than a document may, 64 levels"):
+        tasks.insert(nested(65))
+    with pytest.raises(ValueError, match="nested deeper"):
+        tasks.insert(nested(100_000))
