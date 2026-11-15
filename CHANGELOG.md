@@ -1495,3 +1495,12 @@ limit, batches and a write-ahead log. Since then:
     attributes; the GIL let go around every call; closing as a file
     closes, with a `ResourceWarning` for one left open; type stubs.
     Live queries are the next step.
+172. **Live queries in Python** (§200, step 3 of §197):
+    `Collection.watch`, `Collection.watch_aggregate` and
+    `Database.subscribe`, as `LiveQuery`, `LiveAggregate` and `Changes`;
+    read by `next(timeout)` with `ended`, by `for`, and by `async for`,
+    which reads one event per wait so a `break` leaves nothing behind,
+    and a cancelled wait keeps its event; Ctrl-C ends a wait; events as
+    frozen dataclasses for `match`: `Entered`, `Left`, `Changed`,
+    `RowEntered`, `RowLeft`, `RowChanged`, `Commit` of `Change`s;
+    `open(..., watch_every=)` for a read-only open beside a writer.

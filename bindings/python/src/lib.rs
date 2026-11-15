@@ -7,6 +7,7 @@ mod collection;
 mod convert;
 mod database;
 mod errors;
+mod live;
 mod text;
 
 use pyo3::prelude::*;
@@ -28,6 +29,9 @@ fn _trunkdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<collection::Collection>()?;
     m.add_class::<collection::View>()?;
     m.add_class::<convert::PyDocId>()?;
+    m.add_class::<live::LiveQuery>()?;
+    m.add_class::<live::LiveAggregate>()?;
+    m.add_class::<live::Changes>()?;
     errors::add(m)?;
     Ok(())
 }
