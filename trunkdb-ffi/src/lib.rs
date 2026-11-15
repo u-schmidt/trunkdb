@@ -12,14 +12,13 @@
 mod error;
 mod handle;
 mod live;
-mod report;
 mod text;
 
 #[cfg(test)]
 mod tests;
 
 use db::query::{Aggregate, Filter};
-use db::{BatchLineError, BatchLines, Database, DocId, Document, OpKind, Snapshot, Upserted};
+use db::{BatchLineError, BatchLines, Database, DocId, Document, IndexInfo, Snapshot, Upserted};
 use error::{Fail, run};
 use handle::{CURSOR, DATABASE, LIVE, SNAPSHOT, close, hand_out, value};
 use live::Live;
@@ -234,7 +233,8 @@ unsafe fn aggregate_args(
         let aggregate_names = text::names_in::<Aggregate>(aggregate_text);
         let filter_names: Vec<&str> = filter_names.iter().map(String::as_str).collect();
         let aggregate_names: Vec<&str> = aggregate_names.iter().map(String::as_str).collect();
-        text::unused(&params, &[&filter_names, &aggregate_names])?;
+        let names = [filter_names, aggregate_names].concat();
+        text::unused(&params, &names)?;
         Ok((filter, aggregate))
     }
 }
@@ -242,6 +242,12 @@ unsafe fn aggregate_args(
 /// JSON's text, to hand out.
 fn json_out(value: Value) -> *mut c_char {
     owned(value.to_string())
+}
+
+/// A report's document as JSON, to hand out: the library's shape (SPEC
+/// §198), its ids and the rest as an export writes them.
+fn report_out(report: Document) -> *mut c_char {
+    owned(report.to_string())
 }
 
 // ---- General ----
@@ -349,7 +355,7 @@ pub unsafe extern "C" fn trunkdb_checkpoint(db: *const trunkdb_db) -> i32 {
 pub unsafe extern "C" fn trunkdb_compact(db: *const trunkdb_db, report: *mut *mut c_char) -> i32 {
     run(|| unsafe {
         let report = out(report, std::ptr::null_mut(), "report")?;
-        *report = json_out(report::compacted(&database(db)?.compact()?));
+        *report = report_out(database(db)?.compact()?.to_document());
         Ok(())
     })
 }
@@ -361,7 +367,7 @@ pub unsafe extern "C" fn trunkdb_compact(db: *const trunkdb_db, report: *mut *mu
 pub unsafe extern "C" fn trunkdb_check(db: *const trunkdb_db, report: *mut *mut c_char) -> i32 {
     run(|| unsafe {
         let report = out(report, std::ptr::null_mut(), "report")?;
-        *report = json_out(report::check(&database(db)?.check()?));
+        *report = report_out(database(db)?.check()?.to_document());
         Ok(())
     })
 }
@@ -372,7 +378,7 @@ pub unsafe extern "C" fn trunkdb_check(db: *const trunkdb_db, report: *mut *mut 
 pub unsafe extern "C" fn trunkdb_stats(db: *const trunkdb_db, report: *mut *mut c_char) -> i32 {
     run(|| unsafe {
         let report = out(report, std::ptr::null_mut(), "report")?;
-        *report = json_out(report::stats(&database(db)?.stats()?));
+        *report = report_out(database(db)?.stats()?.to_document());
         Ok(())
     })
 }
@@ -421,7 +427,7 @@ pub unsafe extern "C" fn trunkdb_export(
             db::Error::Io(e) if e.kind() != std::io::ErrorKind::InvalidInput => io(path, e),
             e => Fail::from(e),
         })?;
-        *summary = json_out(report::summary(&done));
+        *summary = report_out(done.to_document());
         Ok(())
     })
 }
@@ -446,7 +452,7 @@ pub unsafe extern "C" fn trunkdb_import(
         }
         let file = std::fs::File::open(path).map_err(|e| io(path, e))?;
         let done = db.import_with(std::io::BufReader::new(file), import)?;
-        *summary = json_out(report::summary(&done));
+        *summary = report_out(done.to_document());
         Ok(())
     })
 }
@@ -532,7 +538,11 @@ pub unsafe extern "C" fn trunkdb_indexes(
 ) -> i32 {
     run(|| unsafe {
         let indexes = out(indexes, std::ptr::null_mut(), "indexes")?;
-        *indexes = json_out(report::indexes(&writer(db, collection)?.indexes()?));
+        *indexes = report_out(Document::Array(
+            (writer(db, collection)?.indexes()?.iter())
+                .map(IndexInfo::to_document)
+                .collect(),
+        ));
         Ok(())
     })
 }
@@ -821,18 +831,6 @@ fn line_fail(error: BatchLineError) -> Fail {
     }
 }
 
-fn op_name(kind: OpKind) -> &'static str {
-    match kind {
-        OpKind::Insert => "insert",
-        OpKind::Update => "update",
-        OpKind::Delete => "delete",
-        OpKind::Upsert => "upsert",
-        OpKind::Require => "require",
-        OpKind::RequireNone => "require_none",
-        _ => "op",
-    }
-}
-
 /// Runs a batch of ops, one JSON object a line, as `trunkdb batch` reads
 /// them, all committed or none; with `dry_run`, each run and rolled
 /// back. `params` holds the values for every line's filter. `written`
@@ -866,25 +864,7 @@ pub unsafe extern "C" fn trunkdb_batch(
                 None => fail,
             }
         })?;
-        let mut list = Vec::new();
-        for (at, op) in ops.ops().iter().enumerate() {
-            let mut entry = serde_json::Map::new();
-            entry.insert("line".into(), json!(op.line()));
-            entry.insert("op".into(), json!(op_name(op.kind())));
-            entry.insert("count".into(), json!(done.counts()[at]));
-            let upserted = done.upserted(at);
-            if !dry_run && let Some(id) = ids[at].or_else(|| upserted.map(|u| u.id())) {
-                entry.insert("id".into(), json!(id.to_string()));
-            }
-            if let Some(upserted) = upserted {
-                entry.insert(
-                    "inserted".into(),
-                    json!(matches!(upserted, Upserted::Inserted(_))),
-                );
-            }
-            list.push(Value::Object(entry));
-        }
-        *written = json_out(json!({"ops": list, "total": done.total(), "dry_run": dry_run}));
+        *written = report_out(ops.report(&done, &ids, dry_run));
         Ok(())
     })
 }

@@ -108,12 +108,10 @@ where
     })
 }
 
-/// A value of `params` that neither of two texts has a parameter of.
-pub(crate) fn unused(params: &Params, texts: &[&[&str]]) -> Result<(), Fail> {
-    match params
-        .names()
-        .find(|name| !texts.iter().any(|names| names.contains(name)))
-    {
+/// A value of `params` that none of a call's texts has a parameter of,
+/// `names` theirs together (`Params::unused`).
+pub(crate) fn unused(params: &Params, names: &[&str]) -> Result<(), Fail> {
+    match params.unused(names) {
         Some(name) => Err(Fail::parse(
             "params",
             format!("a value for :{name}, which no text of the call has a parameter of"),

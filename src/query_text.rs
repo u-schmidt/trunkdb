@@ -360,6 +360,14 @@ impl Params {
             .collect();
         Params { values }
     }
+
+    /// The first value none of `names` is the name of: where a call's
+    /// texts are each bound to `only` their own, a value none of them
+    /// has a parameter of, which the call refuses as `bind` does (SPEC
+    /// §163.4, §198). `names` are every text's parameters together.
+    pub fn unused(&self, names: &[&str]) -> Option<&str> {
+        self.names().find(|name| !names.contains(name))
+    }
 }
 
 /// Why a document isn't a template's values (SPEC §178).

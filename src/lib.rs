@@ -87,6 +87,7 @@ mod pattern;
 pub mod query;
 mod query_text;
 mod release;
+mod reports;
 mod select;
 mod serde_bridge;
 mod serde_stored;
