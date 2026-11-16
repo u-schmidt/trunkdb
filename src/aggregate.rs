@@ -554,6 +554,25 @@ impl Aggregate {
     /// given. Refused as `aggregate` refuses (`check`).
     pub fn apply(&self, docs: impl IntoIterator<Item = Document>) -> crate::Result<Vec<Document>> {
         self.check()?;
+        // One time for the whole call (SPEC §203.2): the columns' matchers
+        // are made before `docs` is read, and `having`'s after it, so a
+        // slow iterator would otherwise see the clock move between them.
+        let resolved;
+        let this = match self.has_now() {
+            true => {
+                resolved = self.now_is(crate::DateTime::now());
+                &resolved
+            }
+            false => self,
+        };
+        this.apply_resolved(docs)
+    }
+
+    /// `apply`, every comparison with the clock already resolved.
+    fn apply_resolved(
+        &self,
+        docs: impl IntoIterator<Item = Document>,
+    ) -> crate::Result<Vec<Document>> {
         let mut groups = Groups::new(self);
         let docs: Vec<Document> = docs.into_iter().collect();
         let window =

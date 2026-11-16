@@ -45,10 +45,14 @@ $ trunkdb find app.trunkdb devices 'last_seen < now - 10m'
   `upsert_fields`) when the batch runs it, under the writer's lock.
   Snapshots and views read through these.
 - **In memory,** `Filter::matches`, `Filter::apply`,
-  `Condition::matches` and `Aggregate::apply` take the time as their
-  matcher is made, once per call. So does any read that didn't resolve
-  first: the matcher reads the clock where the condition reaches it.
-  Correct either way; resolved first, an index bounds the read.
+  `Condition::matches` and `Aggregate::apply` resolve first too, with
+  one time for the whole call. `Aggregate::apply` makes its columns'
+  matchers before it reads the documents and `having`'s after: with a
+  time read for each, a slow iterator saw the clock move between them,
+  and a row could count a date-time as not yet past in a column and as
+  past in `having` (found in review). A matcher made from a condition
+  no one resolved reads the clock itself, a last resort nothing in the
+  crate reaches.
 - **`Filter::now_is(time)`,** public: the filter as it reads at
   `time`. A program that wants an answer it can repeat says the time
   itself; the tests do.
@@ -111,7 +115,8 @@ $ trunkdb find app.trunkdb devices 'last_seen < now - 10m'
     filter, `explain_aggregate`'s `now`;
   - `now_is`: two hours ago none silent, in a day all four;
   - in memory: `matches`, `apply`, `Aggregate::apply`; inside `has`;
-    on a path with `[*]`;
+    on a path with `[*]`; one time for a slow `Aggregate::apply`, a
+    document 50 ms ahead counted by a column and refused by `having`;
   - the text read and printed, `now - 300s` as `now - 5m`, `now + 0s`
     as `now`, a field named `now`;
   - refused: `=`, `!=`, `contains`, a number without a unit, no
@@ -151,6 +156,7 @@ $ trunkdb find app.trunkdb devices 'last_seen < now - 10m'
 | `forward` and `back` stopping at the wrong end | `forward…`, `back…` |
 | A batch's precondition not resolved | what it refuses |
 | The live refusal dropped | live queries refused, nested comparisons |
+| `Aggregate::apply` with a time per matcher | a slow check in memory |
 
 One survives, and can't be caught: a column's conditions left
 unresolved. The matcher then reads the clock as it is made, in the

@@ -817,7 +817,16 @@ impl Condition {
     /// Whether `doc` meets the condition, checked in memory as `find`
     /// checks a document. A `custom` condition's panic goes on here.
     pub fn matches(&self, doc: &Document) -> bool {
-        Matcher::of(self)
+        // One time for every comparison with the clock in it (SPEC §203.2).
+        let resolved;
+        let this = match self.has_now() {
+            true => {
+                resolved = self.now_is(crate::DateTime::now());
+                &resolved
+            }
+            false => self,
+        };
+        Matcher::of(this)
             .matches(doc)
             .unwrap_or_else(|panicked| panicked.resume())
     }
@@ -1449,9 +1458,21 @@ impl Filter {
     /// memory as `find` checks a document; sort, skip, limit and select play
     /// no part.
     pub fn matches(&self, doc: &Document) -> bool {
-        self.matcher()
+        self.at_now()
+            .matcher()
             .matches(doc)
             .unwrap_or_else(|panicked| panicked.resume())
+    }
+
+    /// The filter with one time for every comparison with the clock in
+    /// it, read now (SPEC §203.2), for a check in memory; itself where it
+    /// has none. Not refused, as `resolved` refuses: a check in memory
+    /// can't fail, and compares as the operator says.
+    fn at_now(&self) -> std::borrow::Cow<'_, Filter> {
+        match self.has_now() {
+            true => std::borrow::Cow::Owned(self.clone().now_is(crate::DateTime::now())),
+            false => std::borrow::Cow::Borrowed(self),
+        }
     }
 
     /// The conditions with their paths parsed, to check document after
@@ -1634,7 +1655,8 @@ impl Filter {
         items: impl IntoIterator<Item = T>,
         doc_of: impl Fn(&T) -> &Document,
     ) -> Vec<T> {
-        let matcher = self.matcher();
+        let resolved = self.at_now();
+        let matcher = resolved.matcher();
         let results: Vec<T> = items
             .into_iter()
             .filter(|item| {
@@ -3196,8 +3218,9 @@ impl<'f> Matcher<'f> {
                     _ => None,
                 },
             },
-            // Made once per read, as `Filter::resolved` would take the
-            // time: where a read didn't, the matcher does.
+            // Every read and every check in memory resolves first, with
+            // one time for the whole of it (SPEC §203.2); this is the
+            // last resort of one that didn't, its own time per condition.
             Condition::AgainstNow { field, op, offset } => Matcher::AgainstNow {
                 path: Path::new(field),
                 op,

@@ -398,3 +398,39 @@ fn nested_comparisons_with_the_clock_count() {
         assert!(devices.explain_run(filter).unwrap().now.is_some(), "{text}");
     }
 }
+
+/// One time for a whole check in memory: `Aggregate::apply` makes its
+/// columns' matchers before it reads the documents and `having`'s after.
+/// A document 50 ms ahead, read by a slow iterator, is counted as at or
+/// after now by a column; with the time read again for `having`, the
+/// same time would also be before now, and the row would come out.
+#[test]
+fn a_slow_check_in_memory_compares_with_one_time() {
+    // A document 50 ms ahead of now, made fresh for each call.
+    let ahead = || -> Document {
+        let now = DateTime::now();
+        let nanos = i128::from(now.unix_seconds()) * 1_000_000_000
+            + i128::from(now.subsec_nanos())
+            + 50_000_000;
+        let secs = nanos.div_euclid(1_000_000_000) as i64;
+        let at = DateTime::from_unix(secs, nanos.rem_euclid(1_000_000_000) as u32).unwrap();
+        format!(r#"{{"at": {{"$date": "{at}"}}}}"#).parse().unwrap()
+    };
+    let slowly = |doc: Document| {
+        std::iter::once(doc).inspect(|_| std::thread::sleep(Duration::from_millis(200)))
+    };
+    let aggregate = Aggregate::new()
+        .count()
+        .filter(Condition::against_now("at", Op::Gte, Offset::NONE))
+        .named("n")
+        .max("at")
+        .named("last");
+    let rows = aggregate.apply(slowly(ahead())).unwrap();
+    assert_eq!(rows[0].get("n"), Some(&Document::Int(1)));
+    // The one row counts it as not yet past, so its `last` isn't either.
+    let contradiction = aggregate.having(Condition::against_now("last", Op::Lt, Offset::NONE));
+    assert_eq!(
+        contradiction.apply(slowly(ahead())).unwrap(),
+        Vec::<Document>::new()
+    );
+}
