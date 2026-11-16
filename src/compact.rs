@@ -217,6 +217,7 @@ mod tests {
     use crate::id::IdGenerator;
     use crate::query::Filter;
     use crate::storage::PAGE_SIZE;
+    use crate::testing::fresh_db;
     use std::path::Path;
 
     fn object(pairs: &[(&str, Document)]) -> Document {
@@ -480,8 +481,7 @@ mod tests {
     #[test]
     fn a_rebuilt_index_has_full_leaves() {
         use crate::storage::{PageStore, PageType, SlottedPage};
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let docs = db.collection::<Document>("docs");
         docs.ensure_index("v").unwrap();
         let mut rng = crate::testing::XorShift(0x9E37_79B9_7F4A_7C15);
@@ -519,8 +519,7 @@ mod tests {
 
     #[test]
     fn an_empty_database_compacts_to_its_header_and_catalog() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let docs = db.collection::<Document>("docs");
         docs.insert(v(Document::Int(1))).unwrap();
         assert!(db.drop_collection("docs").unwrap());
@@ -700,8 +699,7 @@ mod tests {
     /// new page.
     #[test]
     fn the_next_insert_uses_the_room_on_the_last_page() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let docs = db.collection::<Document>("docs");
         // About 8 to a page: 2 pages, the second mostly empty.
         let ids: Vec<DocId> = (0..20)
@@ -719,8 +717,7 @@ mod tests {
 
     #[test]
     fn ids_stay_what_they_were() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let docs = db.collection::<Document>("docs");
         let ids: Vec<DocId> = (0..50)
             .map(|i| docs.insert(v(Document::Int(i))).unwrap())

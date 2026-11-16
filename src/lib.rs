@@ -470,6 +470,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Helpers shared by tests in several modules.
 #[cfg(test)]
 pub(crate) mod testing {
+    /// A new, empty database in a temporary directory, as `test.trunkdb`
+    /// in it. The directory is deleted when the `TempDir` is dropped, so
+    /// a test keeps it alive for as long as it uses the database:
+    /// `let (_dir, db) = fresh_db();` — `_dir`, not `_`, which would drop
+    /// it at once.
+    pub fn fresh_db() -> (tempfile::TempDir, crate::Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Database::open(dir.path().join("test.trunkdb")).unwrap();
+        (dir, db)
+    }
+
     /// A number as a document, for tests that stored plain numbers
     /// before every document had to be an object (SPEC §95).
     #[derive(

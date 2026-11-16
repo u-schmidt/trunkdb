@@ -615,6 +615,7 @@ fn conditions_only(filter: &Filter, whose: &str) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::query::{Condition, Filter, Op, Update};
+    use crate::testing::fresh_db;
     use crate::testing::{Text, text};
     use crate::{Database, DocId, Document, Error};
     use serde::{Deserialize, Serialize};
@@ -655,8 +656,7 @@ mod tests {
         struct Car {
             color: String,
         }
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let cars = db.collection::<Car>("cars");
         let notes = db.collection::<Document>("notes");
         let given = DocId([5; 16]);
@@ -739,8 +739,7 @@ mod tests {
 
     #[test]
     fn later_ops_can_target_a_document_inserted_earlier_in_the_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let entries = db.collection::<Entry>("entries");
 
         let mut batch = db.batch();
@@ -759,8 +758,7 @@ mod tests {
     /// not even the insert whose id was already handed out.
     #[test]
     fn a_failing_op_rolls_back_the_whole_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let entries = db.collection::<Entry>("entries");
         let log = db.collection::<Text>("log");
         let existing = entries.insert(entry("a", 10)).unwrap();
@@ -781,8 +779,7 @@ mod tests {
 
     #[test]
     fn a_value_the_bridge_cant_represent_fails_when_added() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         #[derive(Debug, PartialEq, Serialize, Deserialize)]
         struct Counter {
             count: u64,
@@ -807,8 +804,7 @@ mod tests {
     /// left: a document inserted, replaced or changed earlier in it.
     #[test]
     fn update_fields_works_on_what_the_batch_has_so_far() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let entries = db.collection::<Entry>("entries");
         entries.ensure_index("price").unwrap();
         let (a, b) = (
@@ -845,8 +841,7 @@ mod tests {
     /// nothing isn't written.
     #[test]
     fn update_fields_in_a_batch_fails_it_whole() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let entries = db.collection::<Entry>("entries");
         let notes = db.collection::<Document>("notes");
         let a = entries.insert(entry("a", 1)).unwrap();
@@ -918,8 +913,7 @@ mod tests {
 
     #[test]
     fn a_dropped_batch_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let entries = db.collection::<Entry>("entries");
 
         let mut batch = db.batch();

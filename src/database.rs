@@ -2004,6 +2004,7 @@ mod tests {
     use crate::document::{DocId, Document};
     use crate::query::Filter;
     use crate::storage::{PAGE_SIZE, PageType};
+    use crate::testing::fresh_db;
     use crate::testing::{Num, num};
     use crate::txn::WriteOp;
     use serde::{Deserialize, Serialize};
@@ -2241,8 +2242,7 @@ mod tests {
 
     #[test]
     fn two_collections_coexist() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
 
         let users = db.collection::<Dummy>("users");
         let posts = db.collection::<Dummy>("posts");
@@ -3462,8 +3462,7 @@ mod tests {
 
     #[test]
     fn empty_batch_is_a_harmless_no_op() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         db.write_batch(Vec::new()).unwrap();
     }
 
@@ -3473,8 +3472,7 @@ mod tests {
     /// the batch reports success.
     #[test]
     fn ops_on_duplicate_or_missing_ids_fail_the_whole_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         db.write_batch(vec![insert("users", 1, 1)]).unwrap();
         let missing = DocId([9; 16]);
 
@@ -3514,8 +3512,7 @@ mod tests {
     /// and still land as one atomic, durable unit.
     #[test]
     fn write_batch_applies_ops_across_different_collections() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
 
         db.write_batch(two_collection_batch()).unwrap();
         assert_two_collection_batch_present(&db);
@@ -3991,8 +3988,7 @@ mod tests {
     /// (SPEC §123).
     #[test]
     fn the_defaults_are_4000_pages_and_a_wal_of_twice_their_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let state = db.state();
         assert_eq!(state.checkpoint_pages, 4000);
         assert_eq!(state.checkpoint_wal_bytes, 2 * 4000 * 8192);
@@ -4518,8 +4514,7 @@ mod tests {
     /// what §79 relies on.
     #[test]
     fn a_snapshot_shows_nothing_of_a_staged_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
 
         let mut state = db.state();
@@ -4547,8 +4542,7 @@ mod tests {
     /// nothing, leaves the one there was.
     #[test]
     fn only_a_commit_replaces_the_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let current = |db: &Database| db.state().current.clone();
         let same = |a: &Committed, b: &Committed| Arc::ptr_eq(&a.0, &b.0);
         let opened = current(&db);

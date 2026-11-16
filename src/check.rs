@@ -683,6 +683,7 @@ mod tests {
     use super::*;
     use crate::query::Filter;
     use crate::storage::PageType;
+    use crate::testing::fresh_db;
 
     fn object(pairs: &[(&str, Document)]) -> Document {
         Document::Object(
@@ -921,8 +922,7 @@ mod tests {
     /// a data page may be and an overflow page may not.
     #[test]
     fn an_overflow_chain_under_two_documents_is_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let docs = db.collection::<Document>("docs");
         let big = |c: &str| object(&[("pad", Document::String(c.repeat(20_000)))]);
         let a = docs.insert(big("a")).unwrap();
@@ -963,8 +963,7 @@ mod tests {
     /// another document's missing entry sets off: it's reported once.
     #[test]
     fn a_duplicate_seen_by_both_passes_is_reported_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let users = db.collection::<Document>("users");
         let long = |end: &str| Document::String("x".repeat(1200) + end);
         let aliases = |names: Vec<Document>| object(&[("aliases", Document::Array(names))]);
@@ -1166,8 +1165,7 @@ mod tests {
     /// another's `…b`. Each value counts, not each key.
     #[test]
     fn a_duplicate_among_elements_under_a_shared_key_is_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path().join("test.trunkdb")).unwrap();
+        let (_dir, db) = fresh_db();
         let users = db.collection::<Document>("users");
         let long = |end: &str| Document::String("x".repeat(1200) + end);
         let aliases = |names: Vec<Document>| object(&[("aliases", Document::Array(names))]);
