@@ -21,6 +21,7 @@ impl<'a> Scope<'a> {
     /// conditions, `None` if none does; `Error::MultipleMatches` if several
     /// do: what an upsert writes to (SPEC §29.3).
     pub(crate) fn only_match_in(self, filter: &Filter) -> crate::Result<Option<DocId>> {
+        let filter = &*filter.resolved()?;
         follow_hint(self.collection, filter, self.indexes())?;
         let names = filter.fields_with(false);
         let trace = Trace::default();
@@ -148,7 +149,8 @@ pub(crate) fn update_matching_in(
     change: &mut dyn FnMut(DocId, Document) -> crate::Result<Document>,
 ) -> crate::Result<usize> {
     // The whole documents, whatever is selected: what `change` returns
-    // is written back (SPEC §106.3).
+    // is written back (SPEC §106.3). The clock read once (SPEC §203).
+    let filter = &*filter.resolved()?;
     let found =
         Scope::new(catalog, store, collection).find_in(filter, true, None, &Trace::default())?;
     let mut changed = 0;
@@ -179,6 +181,7 @@ pub(crate) fn delete_matching_in(
     collection: &str,
     filter: &Filter,
 ) -> crate::Result<usize> {
+    let filter = &*filter.resolved()?;
     let doomed =
         Scope::new(catalog, store, collection).find_in(filter, false, None, &Trace::default())?;
     for found in &doomed {

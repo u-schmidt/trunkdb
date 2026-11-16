@@ -525,6 +525,7 @@ impl Batch {
                     filter,
                     none,
                 } => {
+                    let filter = &*filter.resolved()?;
                     let matched = Scope::new(catalog, store, collection).any_match_in(filter)?;
                     if matched == *none {
                         return Err(crate::Error::PreconditionFailed {

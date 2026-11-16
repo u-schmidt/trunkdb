@@ -1140,6 +1140,12 @@ impl Database {
         aggregate: &Aggregate,
         convert: fn(Document) -> crate::Result<R>,
     ) -> crate::Result<LiveAggregate<R>> {
+        // Nothing reads it again as time passes yet (SPEC §203.4).
+        if filter.has_now() || aggregate.has_now() {
+            return Err(crate::Error::NotLive {
+                reason: "a comparison with `now`, not yet",
+            });
+        }
         let mut writer = self
             .inner
             .writer

@@ -482,6 +482,7 @@ impl<T> Collection<T> {
     /// How `find` would run `filter`: a full scan, lookups by id in the
     /// primary index, or ranges of secondary indexes.
     pub fn explain(&self, filter: &Filter) -> crate::Result<QueryPlan> {
+        let filter = &*filter.resolved()?;
         let state = self.read()?;
         let indexes = state.catalog().indexes(&self.name);
         follow_hint(&self.name, filter, indexes)?;
@@ -550,12 +551,13 @@ impl<T> Collection<T> {
     /// instead of every document. Refused, before anything is read, as
     /// `Aggregate` says.
     pub fn aggregate(&self, filter: Filter, aggregate: &Aggregate) -> crate::Result<Vec<Document>> {
+        let (filter, aggregate, _now) = at_now(&filter, aggregate)?;
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
         let (rows, _plan) = at
             .scope(&self.name)
-            .aggregate_in(&filter, aggregate, &trace)?;
+            .aggregate_in(&filter, &aggregate, &trace)?;
         Ok(rows)
     }
 
@@ -603,14 +605,16 @@ impl<T> Collection<T> {
         aggregate: &Aggregate,
     ) -> crate::Result<Explained> {
         let started = std::time::Instant::now();
+        let (filter, aggregate, now) = at_now(&filter, aggregate)?;
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
         let (rows, plan) = at
             .scope(&self.name)
-            .aggregate_in(&filter, aggregate, &trace)?;
+            .aggregate_in(&filter, &aggregate, &trace)?;
         let mut explained = trace.explained(plan, None, None, rows.len(), started.elapsed());
         explained.hinted = filter.hint.is_some();
+        explained.now = now;
         Ok(explained)
     }
 
@@ -620,6 +624,7 @@ impl<T> Collection<T> {
     /// documents found aren't handed out.
     pub fn explain_run(&self, filter: Filter) -> crate::Result<Explained> {
         let started = std::time::Instant::now();
+        let (filter, now) = filter.resolved_owned()?;
         let state = self.read()?;
         let at = state.snapshot();
         let indexes = at.catalog.indexes(&self.name);
@@ -655,6 +660,7 @@ impl<T> Collection<T> {
         );
         explained.hinted = filter.hint.is_some();
         explained.except = filter.except.clone();
+        explained.now = now;
         explained.alternatives = at.scope(&self.name).alternatives(
             &filter,
             &explained.plan,
@@ -803,6 +809,31 @@ where
 /// The id an insert stores `doc` under (SPEC §59): the id in its `_id`
 /// field, if it has one and it isn't `DocId::NIL`; otherwise a new one.
 /// Any other `_id` (a string, `null`) is overwritten, as before.
+/// `filter` and `aggregate` as a read runs them (SPEC §203): the clock
+/// read once for both where either compares with it, and that time.
+/// Refused as `Filter::resolved` refuses.
+fn at_now<'r>(
+    filter: &'r Filter,
+    aggregate: &'r Aggregate,
+) -> crate::Result<(
+    std::borrow::Cow<'r, Filter>,
+    std::borrow::Cow<'r, Aggregate>,
+    Option<crate::DateTime>,
+)> {
+    use std::borrow::Cow;
+    if !filter.has_now() && !aggregate.has_now() {
+        return Ok((Cow::Borrowed(filter), Cow::Borrowed(aggregate), None));
+    }
+    crate::query::refuse_against_now(&filter.conditions)?;
+    aggregate.check()?;
+    let now = crate::DateTime::now();
+    Ok((
+        Cow::Owned(filter.clone().now_is(now)),
+        Cow::Owned(aggregate.now_is(now)),
+        Some(now),
+    ))
+}
+
 pub(crate) fn id_for_insert(db: &Database, doc: &Document) -> DocId {
     match doc {
         Document::Object(map) => match map.get("_id") {
@@ -1023,6 +1054,7 @@ impl Collection<Document> {
         whole_from_index: bool,
         select: Option<&Selection>,
     ) -> crate::Result<Vec<Found>> {
+        let filter = &*filter.resolved()?;
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
@@ -1069,6 +1101,7 @@ impl Collection<Document> {
     /// `limit` (SPEC §72). Without conditions it only counts the primary
     /// index's entries — no document is read.
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
+        let filter = filter.resolved()?;
         let state = self.read()?;
         let at = state.snapshot();
         at.scope(&self.name)
@@ -1091,6 +1124,9 @@ impl Collection<Document> {
         whole_from_index: bool,
         convert: Convert<T>,
     ) -> crate::Result<Cursor<T>> {
+        // The clock read once, for the candidates and every document
+        // read after them (SPEC §203).
+        let (filter, _now) = filter.resolved_owned()?;
         let select = filter.selection();
         if filter.sorted() {
             let results = self.matches_found(&filter, whole_from_index, select.as_ref())?;

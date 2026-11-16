@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use trunkdb::query::{Aggregate, Condition, Filter, Kind, Op, Regex, SortOrder, Update};
+use trunkdb::query::{Aggregate, Condition, Filter, Kind, Offset, Op, Regex, SortOrder, Update};
 use trunkdb::{
     Change, Database, DocId, Document, Error, IndexOptions, Live, LiveAggregate, LiveQuery,
     LiveRow, Map, Upserted,
@@ -146,6 +146,10 @@ pub struct Ran {
     pub custom: u64,
     /// Regex conditions made (SPEC §169).
     pub regexes: u64,
+    /// Comparisons with the clock made (SPEC §203), and live queries and
+    /// aggregates refused for one.
+    pub against_now: u64,
+    pub live_refused_now: u64,
     /// Aggregates given a window (SPEC §139).
     pub windows: u64,
     /// Aggregates given a window per group, by time or by count (SPEC
@@ -391,6 +395,7 @@ fn holds_custom(condition: &Condition) -> bool {
 fn paths(condition: &Condition, into: &mut Vec<String>) {
     match condition {
         Condition::Compare { field, .. }
+        | Condition::AgainstNow { field, .. }
         | Condition::Exists { field, .. }
         | Condition::IsKind { field, .. }
         | Condition::Size { field, .. }
@@ -757,7 +762,36 @@ impl Run<'_> {
 
     fn leaf(&mut self) -> Condition {
         {
-            match self.program.below(13) {
+            match self.program.below(14) {
+                // A comparison with the clock (SPEC §203), its edge put
+                // among the pool's date-times (-5 s, 0, 1 ns) or past
+                // them all. Each edge is far enough from the nearest one
+                // that the clock moving while the program runs, at
+                // least 2.5 s, changes no answer; the database and the
+                // model each read it themselves.
+                13 => {
+                    let path = PATHS[self.program.below(PATHS.len())];
+                    let op = [Op::Lt, Op::Lte, Op::Gt, Op::Gte][self.program.below(4)].clone();
+                    let edge: i128 = match self.program.below(5) {
+                        0 => -2_500_000_000,
+                        1 => 1_000_000_000,
+                        2 => -365 * 86_400 * 1_000_000_000,
+                        _ => i128::MAX,
+                    };
+                    self.ran.against_now += 1;
+                    let offset = match edge {
+                        // Now itself, or an hour after it: after them all.
+                        i128::MAX if self.program.one_in(2) => Offset::NONE,
+                        i128::MAX => Offset::after(Duration::from_secs(3600)),
+                        edge => {
+                            let now = trunkdb::DateTime::now();
+                            let now = i128::from(now.unix_seconds()) * 1_000_000_000
+                                + i128::from(now.subsec_nanos());
+                            Offset::before(Duration::from_nanos((now - edge) as u64))
+                        }
+                    };
+                    Condition::against_now(path, op, offset)
+                }
                 0 => Condition::exists(PATHS[self.program.below(PATHS.len())]),
                 // A regex (SPEC §169): with a fixed prefix, which an
                 // index reads as a range (a long one past a key's
@@ -1967,7 +2001,16 @@ impl Run<'_> {
                 filter = filter.limit(query.limit);
                 self.ran.live_sorted += 1;
             }
-            let query = self.docs().watch(filter.clone()).unwrap();
+            let query = match self.docs().watch(filter.clone()) {
+                Ok(query) => query,
+                // Until it is read again as time passes (SPEC §203).
+                Err(trunkdb::Error::NotLive { reason, .. }) if reason.contains("now") => {
+                    assert!(filter.to_string().contains("now"), "{}", self.at());
+                    self.ran.live_refused_now += 1;
+                    continue;
+                }
+                Err(e) => panic!("{e} at {}", self.at()),
+            };
             self.live.push(Watched {
                 filter,
                 query,
@@ -1982,10 +2025,17 @@ impl Run<'_> {
         if self.program.one_in(3) {
             aggregate = aggregate.having(self.condition_on("c0"));
         }
-        let live = self
-            .docs()
-            .watch_aggregate(filter.clone(), &aggregate)
-            .unwrap();
+        let live = match self.docs().watch_aggregate(filter.clone(), &aggregate) {
+            Ok(live) => live,
+            Err(trunkdb::Error::NotLive { reason, .. }) if reason.contains("now") => {
+                let text = format!("{filter} {aggregate}");
+                assert!(text.contains("now"), "{}", self.at());
+                self.ran.live_refused_now += 1;
+                self.live_is_model();
+                return;
+            }
+            Err(e) => panic!("{e} at {}", self.at()),
+        };
         self.aggregates.push(WatchedAggregate {
             filter,
             aggregate,

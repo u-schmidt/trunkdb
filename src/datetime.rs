@@ -52,18 +52,37 @@ impl DateTime {
         nanos: 0,
     };
 
+    /// The latest time there is: every date-time is at or before it.
+    pub(crate) const LATEST: DateTime = DateTime {
+        secs: i64::MAX,
+        nanos: NANOS_PER_SECOND - 1,
+    };
+
     /// `duration` before this time, or `EARLIEST` if that is before it
     /// (SPEC §139.2).
     pub(crate) fn back(self, duration: Duration) -> DateTime {
-        let nanos = i128::from(self.secs) * i128::from(NANOS_PER_SECOND) + i128::from(self.nanos)
-            - duration.as_nanos() as i128;
+        self.moved(-(duration.as_nanos() as i128))
+    }
+
+    /// `duration` after this time, or `LATEST` if that is after it
+    /// (SPEC §203).
+    pub(crate) fn forward(self, duration: Duration) -> DateTime {
+        self.moved(duration.as_nanos() as i128)
+    }
+
+    /// This time moved by `nanos`, stopping at `EARLIEST` and `LATEST`.
+    /// A `Duration` is at most about 2^94 nanoseconds, so the sum fits.
+    fn moved(self, nanos: i128) -> DateTime {
+        let nanos =
+            i128::from(self.secs) * i128::from(NANOS_PER_SECOND) + i128::from(self.nanos) + nanos;
         let secs = nanos.div_euclid(i128::from(NANOS_PER_SECOND));
         match i64::try_from(secs) {
             Ok(secs) => DateTime {
                 secs,
                 nanos: nanos.rem_euclid(i128::from(NANOS_PER_SECOND)) as u32,
             },
-            Err(_) => DateTime::EARLIEST,
+            Err(_) if nanos < 0 => DateTime::EARLIEST,
+            Err(_) => DateTime::LATEST,
         }
     }
 
@@ -702,6 +721,21 @@ mod tests {
         // u64::MAX seconds back from the latest time: before i64::MIN.
         assert_eq!(at(i64::MAX, 0).back(Duration::MAX), DateTime::EARLIEST);
         assert_eq!(at(0, 0).back(Duration::MAX), DateTime::EARLIEST);
+    }
+
+    /// SPEC §203: `now + d` counts forward as `back` counts back, and
+    /// stops at the latest time there is.
+    #[test]
+    fn forward_counts_forward_and_stops_at_the_latest() {
+        let d = |secs, nanos| Duration::new(secs, nanos);
+        assert_eq!(at(7, 300).forward(d(3, 200)), at(10, 500));
+        assert_eq!(at(9, 999_999_900).forward(d(0, 200)), at(10, 100));
+        assert_eq!(at(-2, 999_999_999).forward(d(1, 1)), at(0, 0));
+        assert_eq!(at(5, 0).forward(d(0, 0)), at(5, 0));
+        assert_eq!(at(i64::MAX, 999_999_998).forward(d(0, 1)), DateTime::LATEST);
+        assert_eq!(at(i64::MAX, 999_999_998).forward(d(0, 2)), DateTime::LATEST);
+        assert_eq!(at(i64::MIN, 0).forward(Duration::MAX), DateTime::LATEST);
+        assert_eq!(at(0, 0).forward(Duration::MAX), DateTime::LATEST);
     }
 
     #[test]

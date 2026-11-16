@@ -580,6 +580,24 @@ impl Aggregate {
         groups.finish(|_| unreachable!("every value is the document's"))
     }
 
+    /// Whether a condition of a column, or `having`, compares with the
+    /// clock (SPEC §203).
+    pub(crate) fn has_now(&self) -> bool {
+        (self.columns.iter()).any(|c| c.condition.as_ref().is_some_and(Condition::has_now))
+            || self.rows.has_now()
+    }
+
+    /// The aggregate with every comparison against the clock made one
+    /// against `now` (SPEC §203), as `Filter::now_is`.
+    pub(crate) fn now_is(&self, now: crate::DateTime) -> Aggregate {
+        let mut resolved = self.clone();
+        for column in &mut resolved.columns {
+            column.condition = column.condition.as_ref().map(|c| c.now_is(now));
+        }
+        resolved.rows = resolved.rows.now_is(now);
+        resolved
+    }
+
     /// Whether it can run, before anything is read (SPEC §107.2): every
     /// column named, once, not by a dot or `[*]`, nor by a group field's
     /// first step; no path with `[*]`, nor empty, nor `_id` for a value;
@@ -589,6 +607,11 @@ impl Aggregate {
         let refuse = |why: String| -> crate::Result<()> {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why).into())
         };
+        let conditions: Vec<Condition> = (self.columns.iter())
+            .filter_map(|c| c.condition.clone())
+            .chain(self.rows.conditions.iter().cloned())
+            .collect();
+        crate::query::refuse_against_now(&conditions)?;
         if let Some(window) = &self.window {
             let path = window.path.as_str();
             if path.is_empty() || path.contains("[*]") || path == ID_FIELD {

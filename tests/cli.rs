@@ -2457,3 +2457,38 @@ fn watch_refuses_what_it_cant_watch_and_ends_with_its_reader() {
     assert!(status.success(), "{status}");
     close(db);
 }
+
+/// `now` in the command's filters (SPEC §203): the clock read once per
+/// command, and `--explain` says the time it read.
+#[test]
+fn find_takes_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = path(dir.path(), "db.trunkdb");
+    let hour_ago = trunkdb::DateTime::from_unix(trunkdb::DateTime::now().unix_seconds() - 3600, 0);
+    for (name, at) in [
+        ("old", hour_ago.unwrap()),
+        ("new", trunkdb::DateTime::now()),
+    ] {
+        let doc = format!(r#"{{"name": "{name}", "at": {{"$date": "{at}"}}}}"#);
+        let output = trunkdb(&["insert", &db, "pings", &doc, "--create"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let output = trunkdb(&["find", &db, "pings", "select name where at < now - 10m"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("old") && !stdout(&output).contains("new"));
+    let output = trunkdb(&["count", &db, "pings", "at >= now - 10m"]);
+    assert_eq!(stdout(&output).trim(), "1");
+    let output = trunkdb(&["find", &db, "pings", "at < now - 10m", "--explain"]);
+    let lines: Vec<String> = stdout(&output).lines().map(String::from).collect();
+    assert!(
+        lines[1].starts_with("now: ") && lines[1].ends_with('Z'),
+        "{lines:?}"
+    );
+    let output = trunkdb(&["find", &db, "pings", "at = now"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("against `now`"),
+        "{}",
+        stderr(&output)
+    );
+}

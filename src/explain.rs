@@ -24,6 +24,10 @@ pub struct Explained {
     /// The paths the filter takes out of what it hands out (SPEC §143),
     /// as given; empty without `except`.
     pub except: Vec<String>,
+    /// The time the filter's comparisons with the clock were made
+    /// against (SPEC §203), `now` in `last_seen < now - 10m`; `None`
+    /// where it has none, and no clock was read.
+    pub now: Option<crate::DateTime>,
     /// What it read and returned, and how long it took.
     pub stats: ExecutionStats,
     /// The plans the planner passed over, and what each would have read
@@ -218,6 +222,7 @@ impl Trace {
         Explained {
             plan,
             hinted: false,
+            now: None,
             stats: ExecutionStats {
                 keys_examined: reads.iter().map(|read| read.entries).sum(),
                 documents_examined: self.examined.get(),
@@ -267,6 +272,9 @@ impl std::fmt::Display for Explained {
         };
         let hinted = if self.hinted { ", as hinted" } else { "" };
         writeln!(f, "plan: {}{hinted}", self.plan)?;
+        if let Some(now) = self.now {
+            writeln!(f, "now: {now}")?;
+        }
         for read in &self.reads {
             let bounds = match read.bounds.as_slice() {
                 [] => "the whole index".to_string(),
