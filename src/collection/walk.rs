@@ -271,7 +271,7 @@ impl<'a> Scope<'a> {
             for (_key, loc) in primary {
                 let (id, doc) = read(&loc)?;
                 let value = crate::query::value_or_null(&doc, &first.field);
-                if crate::query::is_unordered(value) && hand.matcher.matches(&doc)? {
+                if crate::values::is_unordered(value) && hand.matcher.matches(&doc)? {
                     trace.matched(1);
                     unordered.push((id, doc));
                     // Without keys after the first, id order is their order.

@@ -73,6 +73,11 @@ struct Shared {
     /// Set when a batch was durably logged but couldn't be written to the
     /// main file, even on retry — see `transact`. From then on every call
     /// fails with `Error::Poisoned` until the database is reopened.
+    ///
+    /// Read and written `Relaxed`: the flag orders nothing else, so a
+    /// thread that sees it set may not rely on any other write made
+    /// before it was set. Whatever it should carry along, such as why it
+    /// was set, needs `Release` on the store and `Acquire` on the loads.
     poisoned: AtomicBool,
     id_gen: UuidV7Generator,
     txn: GlobalLockTxnManager,

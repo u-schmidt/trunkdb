@@ -9,10 +9,9 @@ use crate::datetime::DateTime;
 use crate::document::{DocId, Document, ID_FIELD, encode_document};
 use crate::map::Map;
 use crate::path::Path;
-use crate::query::{
-    Condition, Filter, Matcher, Panicked, SortOrder, canonical, is_unordered, sort_order,
-};
+use crate::query::{Condition, Filter, Matcher, Panicked, SortOrder};
 use crate::storage::RecordLocation;
+use crate::values::{canonical, is_unordered, sort_order};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;

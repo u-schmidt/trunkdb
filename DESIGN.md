@@ -935,6 +935,8 @@ src/
 │                        moment, to keep reading
 ├── query.rs           Filter, Condition, Sort; the planner; index
 │                        entries deciding a filter
+├── values.rs          how two values compare: equality, the sort
+│                        order, operators on one value
 ├── query_text.rs      a filter as text, read and printed; templates
 ├── path.rs            field paths, parsed once per query
 ├── select.rs          projection: the fields a read hands out

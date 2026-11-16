@@ -514,7 +514,7 @@ fn a_unique_index_refuses_what_a_scan_finds_taken(sparse: bool) {
             && !matches!(value, Document::Null)
             && before.iter().any(|(other, stored)| {
                 Some(*other) != id
-                    && crate::query::equal(crate::query::value_or_null(stored, "v"), value)
+                    && crate::values::equal(crate::query::value_or_null(stored, "v"), value)
             });
 
         match (db.write_batch(vec![op.clone()]), taken) {
