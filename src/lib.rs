@@ -96,6 +96,7 @@ mod stats;
 mod storage;
 mod txn;
 mod update;
+mod values;
 
 pub use batch::{Batch, FromDocument, IntoDocument, Written};
 pub use batch_lines::{BatchLineError, BatchLines, LineOp, OpKind};

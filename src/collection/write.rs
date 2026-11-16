@@ -424,7 +424,7 @@ pub(crate) fn unique_tuples<'a>(
 /// Two `unique_tuples` tuples collide: every value equal as a filter's
 /// `Eq` sees it.
 pub(crate) fn same_values(a: &[&Document], b: &[&Document]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| crate::query::equal(a, b))
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| crate::values::equal(a, b))
 }
 
 /// Brings every secondary index from a document's `old` state to its

@@ -18,7 +18,7 @@ use crate::document::{DocId, Document};
 pub const MAX_KEY_LEN: usize = 1024;
 
 // Type tags, the first byte of an encoded value. Values of different
-// types never compare equal or ordered in `Filter` (`query::compare`), so
+// types never compare equal or ordered in `Filter` (`values::compare`), so
 // their relative order here is arbitrary; grouping them by tag is what
 // matters, so a range stays within one type.
 const TAG_NULL: u8 = 0;
@@ -253,7 +253,7 @@ pub fn encode_for(value: &Document, fields: usize) -> Option<Vec<u8>> {
 
 /// How the value a key's `part` stands for compares with the one
 /// `encoded` encodes (`encode_for`, with the key's `fields`), as
-/// `query::compare` would compare them — from the bytes alone (SPEC
+/// `values::compare` would compare them — from the bytes alone (SPEC
 /// §104.1). The encoding orders values of one type, not strictly:
 /// `a < b` implies `enc(a) <= enc(b)`. So encodings that differ order
 /// their values as the bytes do, exact or not; equal ones mean equal
@@ -382,7 +382,7 @@ fn encode_value_in(value: &Document, fields: usize) -> Option<Vec<u8>> {
     match value {
         Document::Null => Some(vec![TAG_NULL]),
         Document::Bool(b) => Some(vec![TAG_BOOL, *b as u8]),
-        // `as f64`, like `query::compare` does for `Int` vs. `Float`.
+        // `as f64`, like `values::compare` does for `Int` vs. `Float`.
         Document::Int(n) => encode_number(*n as f64),
         Document::Float(f) => encode_number(*f),
         Document::String(s) => Some(encode_escaped(
@@ -1166,11 +1166,11 @@ mod tests {
                 let encoded = encode_value_in(value, fields).unwrap();
                 let decoded = decode_part(&encoded, fields).unwrap_or_else(|| panic!("{value:?}"));
                 assert_eq!(encode_value_in(&decoded, fields).unwrap(), encoded);
-                assert!(crate::query::equal(&decoded, value), "{value:?}");
+                assert!(crate::values::equal(&decoded, value), "{value:?}");
                 for probe in probes.iter().chain(&values) {
                     assert_eq!(
-                        crate::query::compare(&decoded, probe),
-                        crate::query::compare(value, probe),
+                        crate::values::compare(&decoded, probe),
+                        crate::values::compare(value, probe),
                         "{value:?} against {probe:?}"
                     );
                 }

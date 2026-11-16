@@ -1,6 +1,7 @@
 use crate::document::{DocId, Document, ID_FIELD};
 use crate::map::Map;
-use crate::query::{Condition, Op, equal_values};
+use crate::query::{Condition, Op};
+use crate::values::equal_values;
 use std::cmp::Ordering;
 
 /// Changes to make to every document a filter finds, named by field
@@ -439,7 +440,7 @@ fn bound(
         *at = value.clone();
         return Ok(());
     }
-    match crate::query::compare(at, value) {
+    match crate::values::compare(at, value) {
         Some(ordering) if ordering == replace_if => *at = value.clone(),
         Some(_) => {}
         None => {

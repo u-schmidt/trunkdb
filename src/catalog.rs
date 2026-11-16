@@ -185,7 +185,7 @@ impl IndexMeta {
     /// by a scan (SPEC §181). `false` for an index that doesn't count.
     pub(crate) fn leaves_out(&self, doc: &crate::Document) -> bool {
         self.counts_left_out()
-            && crate::query::is_unordered(crate::query::value_or_null(doc, &self.fields[0]))
+            && crate::values::is_unordered(crate::query::value_or_null(doc, &self.fields[0]))
     }
 
     /// The field of a one-field index.
