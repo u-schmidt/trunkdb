@@ -412,6 +412,10 @@ limit and a selection, applied in that order [§72](spec/72-skip-for-paging.md)
   pattern beginning `^` and fixed text read as `starts_with`'s range
   [§169](spec/169-a-regex.md); `is_in`, one of a list of
   values, an OR of `eq`s read as a point of an index per value [§115](spec/115-a-list-of-values-in.md);
+- **comparisons with the clock**, `older_than`, `newer_than` and
+  `against_now`, `last_seen < now - 10m` in the text: the time read once
+  per read, then a comparison with that date-time, which an index
+  bounds [§203](spec/203-now-in-a-condition.md);
 - **`all`, `any_of` and `not`**, also as `&`, `|` and `!` [§36](spec/36-or-not-and-nesting.md);
 - **`exists` and `missing`**, telling a stored null from an absent field;
   `size` for array lengths [§45](spec/45-exists-and-array-size.md); `is_kind`, a value of one kind,

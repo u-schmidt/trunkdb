@@ -179,6 +179,29 @@ moments writes a moment. `trunkdb fields` says which a field holds:
 1970, `Date::from_days_since_epoch(day.days_since_epoch() + 7)`; for
 months, zones and the rest, convert to `jiff` or `chrono`.
 
+### Counted from now
+
+`now` in a comparison is the time the read takes, read once per read
+(SPEC §203); `now - 10m` and `now + 1h` move it, in the units a window
+takes (`d`, `h`, `m`, `s`, `ms`, `us`, `ns`):
+
+```rust
+use std::time::Duration;
+
+let ten_minutes = Duration::from_secs(600);
+let silent = devices.find(Filter::new().older_than("last_seen", ten_minutes))?; // last_seen < now - 10m
+let recent: Filter = "at >= now - 5m".parse()?;                                 // newer_than("at", 5 min)
+let due: Filter = "due < now + 1h and done = false".parse()?;
+```
+
+An index on the field bounds the read as for any date-time. Compare
+with `<`, `<=`, `>` or `>=`: `= now` holds for a nanosecond at most,
+and is refused. `Filter::now_is(time)` gives the filter as it reads at
+a time of your choosing, for an answer you can repeat or a test. A
+live query against `now` is refused for now: it would only be checked
+when something is written (SPEC §202 plans it read again as time
+passes).
+
 ### With `chrono` or `jiff`
 
 Store trunkdb's types, and convert where the program does calendar

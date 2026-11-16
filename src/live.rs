@@ -216,7 +216,10 @@ impl<T> Iterator for LiveQuery<T> {
 /// moves with every write before the list, and a limit without a sort
 /// has no order to keep.
 pub(crate) fn refused(filter: &Filter) -> Option<&'static str> {
-    if filter.skip > 0 {
+    if filter.has_now() {
+        // Nothing reads it again as time passes yet (SPEC §203.4).
+        Some("a comparison with `now`, not yet")
+    } else if filter.skip > 0 {
         Some("a skip")
     } else if filter.limit.is_some() && !filter.sorted() {
         Some("a limit without a sort")

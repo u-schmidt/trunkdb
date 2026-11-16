@@ -1526,3 +1526,13 @@ limit, batches and a write-ahead log. Since then:
     unchanged, byte for byte, and the C ABI is still version 2. File
     format 17, WAL version 4 and export version 4, as in 0.41.0; no
     fixture, as nothing writes a file differently (§120.9).
+174. **`now` in a condition** (§203, step 1 of the clock in a filter
+    designed in §202): `last_seen < now - 10m` in the text,
+    `Condition::older_than`, `newer_than` and `against_now` with an
+    `Offset`, and the same on `Filter`. The clock is read once per read,
+    and the condition is then a comparison with that date-time, which an
+    index bounds. Reads, writes, batches, aggregates and the command take
+    it; `Filter::now_is` gives a filter as it reads at a time of the
+    program's; `Explained::now` and `--explain` say the time read. `=`,
+    `!=`, `contains` and `starts with` against `now` are refused, and so
+    is a live query against it, until it is read again as time passes.

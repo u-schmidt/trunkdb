@@ -163,7 +163,7 @@ say what changed, and DESIGN.md says what is true now.
 146. [`count_distinct`, `first` and `last` (`aggregate.rs`, `collection.rs`)](146-count-distinct-first-and-last.md)
 147. [Unwind (`aggregate.rs`, `collection.rs`)](147-unwind.md)
 148. [Rows of the application's own (`collection.rs`, `live.rs`, `snapshot.rs`)](148-rows-of-the-applications-own.md)
-149. [WAL records of what changed, measured first (`durability/wal.rs`, `storage/file.rs`)](149-wal-records-of-what-changed-measured-first.md) — a draft, not built
+149. [WAL records of what changed, measured first (`durability/wal.rs`, `storage/file.rs`)](149-wal-records-of-what-changed-measured-first.md) — step 1 built (§203)
 150. [A binary search within B-tree pages (`index/btree.rs`)](150-a-binary-search-within-b-tree-pages.md)
 151. [A page changed again in its batch is not copied (`storage/file.rs`, `storage/scratch.rs`, `index/btree.rs`, `data.rs`)](151-a-page-changed-again-in-its-batch-is-not-copied.md)
 152. [A page changed through `SlottedPage` keeps its mark (`storage/slotted.rs`, `storage/page.rs`)](152-a-page-changed-through-slottedpage-keeps-its-mark.md)
@@ -216,3 +216,5 @@ say what changed, and DESIGN.md says what is true now.
 199. [The Python module (`bindings/python/`)](199-the-python-module.md)
 200. [Live queries in Python (`bindings/python/`)](200-live-queries-in-python.md)
 201. [Python wheels in CI (`bindings/python/`, `.github/workflows/ci.yml`)](201-python-wheels-in-ci.md)
+202. [The clock in a filter, designed first (`query.rs`, `query_text.rs`, `live.rs`, `database.rs`)](202-the-clock-in-a-filter-designed-first.md) — step 1 built (§203)
+203. [`now` in a condition (`query.rs`, `query_text.rs`, `collection/`, `aggregate.rs`, `explain.rs`, `datetime.rs`)](203-now-in-a-condition.md)

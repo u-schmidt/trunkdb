@@ -16,6 +16,55 @@ pub use crate::update::{ParseUpdateError, Update};
 use crate::values::{any_matches, fold_case, holds, is_whole, sort_order, value_matches};
 use std::sync::Arc;
 
+/// How far from the clock's time a `Condition::AgainstNow` compares
+/// (SPEC §203): `now - 10m` is `Offset::before(ten_minutes)`, `now`
+/// alone `Offset::NONE`. Past the earliest or the latest date-time there
+/// is, the time stops there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offset {
+    later: bool,
+    by: std::time::Duration,
+}
+
+impl Offset {
+    /// `now` itself.
+    pub const NONE: Offset = Offset {
+        later: false,
+        by: std::time::Duration::ZERO,
+    };
+
+    /// `now - by`.
+    pub fn before(by: std::time::Duration) -> Self {
+        Offset { later: false, by }
+    }
+
+    /// `now + by`; `now` itself where `by` is zero, as `before`.
+    pub fn after(by: std::time::Duration) -> Self {
+        Offset {
+            later: !by.is_zero(),
+            by,
+        }
+    }
+
+    /// Whether it is after `now`.
+    pub fn is_after(&self) -> bool {
+        self.later
+    }
+
+    /// How far from `now` it is, before or after.
+    pub fn duration(&self) -> std::time::Duration {
+        self.by
+    }
+
+    /// The time it stands for, `now` being `now`.
+    pub fn from(self, now: crate::DateTime) -> crate::DateTime {
+        match self.later {
+            true => now.forward(self.by),
+            false => now.back(self.by),
+        }
+    }
+}
+
 /// `#[non_exhaustive]`: a `match` on it outside this crate needs a `_`
 /// arm, so a new operator isn't a breaking change (SPEC §45.4).
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +221,21 @@ pub enum Condition {
         op: Op,
         /// What it's compared to.
         value: Document,
+    },
+    /// `field op now`, the time moved by `offset` (SPEC §203): built by
+    /// `Condition::older_than`, `newer_than` and `against_now`, and read
+    /// from `last_seen < now - 10m`. The clock is read once per read, and
+    /// the condition is then `field op <that date-time>`; it compares
+    /// with date-times alone, as `Document::DateTime` does. `<`, `<=`,
+    /// `>` and `>=` only: a read refuses any other.
+    #[non_exhaustive]
+    AgainstNow {
+        /// The field, a path (SPEC §31).
+        field: String,
+        /// How it compares.
+        op: Op,
+        /// How far from the time read the time compared is.
+        offset: Offset,
     },
     /// The field is there — even if it holds null, unlike `is_not_null`
     /// (SPEC §45.1). On a path with `[*]`: some element has it.
@@ -516,6 +580,88 @@ impl Condition {
         Self::compare(field, Op::StartsWith, prefix.into())
     }
 
+    /// `field op now`, the time moved by `offset` (SPEC §203): a read
+    /// takes the time once, and compares with it as with any date-time.
+    /// `Op::Lt`, `Lte`, `Gt` and `Gte` only: a read refuses any other
+    /// with an `InvalidInput` error, as a time held for a nanosecond at
+    /// most is never what is meant.
+    pub fn against_now(field: impl Into<String>, op: Op, offset: Offset) -> Self {
+        Condition::AgainstNow {
+            field: field.into(),
+            op,
+            offset,
+        }
+    }
+
+    /// `field < now - age` (SPEC §203): a date-time more than `age` ago,
+    /// `last_seen < now - 10m`. With `newer_than` of the same age, every
+    /// date-time is in exactly one of the two.
+    pub fn older_than(field: impl Into<String>, age: std::time::Duration) -> Self {
+        Self::against_now(field, Op::Lt, Offset::before(age))
+    }
+
+    /// `field >= now - age` (SPEC §203): a date-time at most `age` ago,
+    /// or after now, `at >= now - 5m`.
+    pub fn newer_than(field: impl Into<String>, age: std::time::Duration) -> Self {
+        Self::against_now(field, Op::Gte, Offset::before(age))
+    }
+
+    /// Whether it compares with the clock anywhere, `now` in the text
+    /// (SPEC §203).
+    pub(crate) fn has_now(&self) -> bool {
+        match self {
+            Condition::AgainstNow { .. } => true,
+            Condition::ElemMatch { condition, .. } | Condition::Not(condition) => {
+                condition.has_now()
+            }
+            Condition::All(conditions) | Condition::Any(conditions) => {
+                conditions.iter().any(Condition::has_now)
+            }
+            _ => false,
+        }
+    }
+
+    /// Its comparison with the clock that a read refuses, if one is: any
+    /// but `<`, `<=`, `>` and `>=` (SPEC §203).
+    pub(crate) fn refused_against_now(&self) -> Option<&Op> {
+        match self {
+            Condition::AgainstNow { op, .. } => {
+                (!matches!(op, Op::Lt | Op::Lte | Op::Gt | Op::Gte)).then_some(op)
+            }
+            Condition::ElemMatch { condition, .. } | Condition::Not(condition) => {
+                condition.refused_against_now()
+            }
+            Condition::All(conditions) | Condition::Any(conditions) => {
+                conditions.iter().find_map(Condition::refused_against_now)
+            }
+            _ => None,
+        }
+    }
+
+    /// The condition with every comparison against the clock made one
+    /// against `now` (SPEC §203).
+    pub(crate) fn now_is(&self, now: crate::DateTime) -> Condition {
+        match self {
+            Condition::AgainstNow { field, op, offset } => Condition::Compare {
+                field: field.clone(),
+                op: op.clone(),
+                value: Document::DateTime(offset.from(now)),
+            },
+            Condition::ElemMatch { field, condition } => Condition::ElemMatch {
+                field: field.clone(),
+                condition: Box::new(condition.now_is(now)),
+            },
+            Condition::Not(condition) => Condition::Not(Box::new(condition.now_is(now))),
+            Condition::All(conditions) => {
+                Condition::All(conditions.iter().map(|c| c.now_is(now)).collect())
+            }
+            Condition::Any(conditions) => {
+                Condition::Any(conditions.iter().map(|c| c.now_is(now)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
     /// The field is a string `regex` matches somewhere in (SPEC §169).
     #[cfg(feature = "regex")]
     pub fn regex(field: impl Into<String>, regex: Regex) -> Self {
@@ -671,7 +817,16 @@ impl Condition {
     /// Whether `doc` meets the condition, checked in memory as `find`
     /// checks a document. A `custom` condition's panic goes on here.
     pub fn matches(&self, doc: &Document) -> bool {
-        Matcher::of(self)
+        // One time for every comparison with the clock in it (SPEC §203.2).
+        let resolved;
+        let this = match self.has_now() {
+            true => {
+                resolved = self.now_is(crate::DateTime::now());
+                &resolved
+            }
+            false => self,
+        };
+        Matcher::of(this)
             .matches(doc)
             .unwrap_or_else(|panicked| panicked.resume())
     }
@@ -858,6 +1013,71 @@ impl Filter {
     /// field reads only the strings that begin with it.
     pub fn starts_with(self, field: impl Into<String>, prefix: impl Into<String>) -> Self {
         self.condition(field, Op::StartsWith, prefix.into())
+    }
+
+    /// Adds `field < now - age`: see `Condition::older_than` (SPEC §203).
+    pub fn older_than(self, field: impl Into<String>, age: std::time::Duration) -> Self {
+        self.and(Condition::older_than(field, age))
+    }
+
+    /// Adds `field >= now - age`: see `Condition::newer_than` (SPEC §203).
+    pub fn newer_than(self, field: impl Into<String>, age: std::time::Duration) -> Self {
+        self.and(Condition::newer_than(field, age))
+    }
+
+    /// The filter as it reads at the time `now` (SPEC §203): every
+    /// comparison against the clock made one against `now`, as a read
+    /// makes it with the time it takes. A program that wants an answer
+    /// it can repeat, or a test, says the time itself.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use trunkdb::{DateTime, query::Filter};
+    ///
+    /// let silent = Filter::new().older_than("last_seen", Duration::from_secs(600));
+    /// let noon: DateTime = "2026-11-16T12:00:00Z".parse()?;
+    /// assert_eq!(
+    ///     silent.now_is(noon).to_string(),
+    ///     r#"last_seen < datetime("2026-11-16T11:50:00Z")"#
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn now_is(mut self, now: crate::DateTime) -> Self {
+        if self.has_now() {
+            self.conditions = self.conditions.iter().map(|c| c.now_is(now)).collect();
+        }
+        self
+    }
+
+    /// Whether a condition compares with the clock (SPEC §203).
+    pub(crate) fn has_now(&self) -> bool {
+        self.conditions.iter().any(Condition::has_now)
+    }
+
+    /// `resolved`, for a filter the read owns: no copy where it has no
+    /// comparison with the clock; with the time read where it has.
+    pub(crate) fn resolved_owned(self) -> crate::Result<(Filter, Option<crate::DateTime>)> {
+        if !self.has_now() {
+            return Ok((self, None));
+        }
+        refuse_against_now(&self.conditions)?;
+        let now = crate::DateTime::now();
+        Ok((self.now_is(now), Some(now)))
+    }
+
+    /// The filter a read runs (SPEC §203): with the clock read once, and
+    /// every comparison against it made one against that time; itself
+    /// where it has none, which is most filters, at no cost. Refused
+    /// where it compares with the clock by an operator other than `<`,
+    /// `<=`, `>` or `>=`.
+    pub(crate) fn resolved(&self) -> crate::Result<std::borrow::Cow<'_, Filter>> {
+        if !self.has_now() {
+            return Ok(std::borrow::Cow::Borrowed(self));
+        }
+        refuse_against_now(&self.conditions)?;
+        Ok(std::borrow::Cow::Owned(
+            self.clone().now_is(crate::DateTime::now()),
+        ))
     }
 
     /// The field is a string `regex` matches somewhere in (SPEC §169):
@@ -1238,9 +1458,21 @@ impl Filter {
     /// memory as `find` checks a document; sort, skip, limit and select play
     /// no part.
     pub fn matches(&self, doc: &Document) -> bool {
-        self.matcher()
+        self.at_now()
+            .matcher()
             .matches(doc)
             .unwrap_or_else(|panicked| panicked.resume())
+    }
+
+    /// The filter with one time for every comparison with the clock in
+    /// it, read now (SPEC §203.2), for a check in memory; itself where it
+    /// has none. Not refused, as `resolved` refuses: a check in memory
+    /// can't fail, and compares as the operator says.
+    fn at_now(&self) -> std::borrow::Cow<'_, Filter> {
+        match self.has_now() {
+            true => std::borrow::Cow::Owned(self.clone().now_is(crate::DateTime::now())),
+            false => std::borrow::Cow::Borrowed(self),
+        }
     }
 
     /// The conditions with their paths parsed, to check document after
@@ -1277,6 +1509,7 @@ impl Filter {
         fn of<'a>(condition: &'a Condition, names: &mut Vec<&'a str>) -> Option<()> {
             match condition {
                 Condition::Compare { field, .. }
+                | Condition::AgainstNow { field, .. }
                 | Condition::Exists { field }
                 | Condition::IsKind { field, .. }
                 | Condition::Size { field, .. }
@@ -1376,7 +1609,10 @@ impl Filter {
                 // a regex (§169.3).
                 #[cfg(feature = "regex")]
                 Condition::Regex { .. } => None,
-                Condition::Exists { .. }
+                // A read compares with the time it took (SPEC §203); one
+                // that didn't take it decides on documents.
+                Condition::AgainstNow { .. }
+                | Condition::Exists { .. }
                 | Condition::IsKind { .. }
                 | Condition::Size { .. }
                 | Condition::ElemMatch { .. }
@@ -1419,7 +1655,8 @@ impl Filter {
         items: impl IntoIterator<Item = T>,
         doc_of: impl Fn(&T) -> &Document,
     ) -> Vec<T> {
-        let matcher = self.matcher();
+        let resolved = self.at_now();
+        let matcher = resolved.matcher();
         let results: Vec<T> = items
             .into_iter()
             .filter(|item| {
@@ -1768,8 +2005,11 @@ fn bounds_for<'a>(
         Condition::ElemMatch { field, condition } => {
             bounds_for(&within(field, condition), indexes, ids)
         }
-        // Nothing tells what a closure lets through (SPEC §136.4).
+        // Nothing tells what a closure lets through (SPEC §136.4). A
+        // comparison with the clock bounds a read once it took the time
+        // (SPEC §203), as a comparison with a date-time.
         Condition::Not(_)
+        | Condition::AgainstNow { .. }
         | Condition::Exists { .. }
         | Condition::IsKind { .. }
         | Condition::Size { .. }
@@ -1800,6 +2040,15 @@ fn within(field: &str, condition: &Condition) -> Condition {
             field: path(inner),
             op: op.clone(),
             value: value.clone(),
+        },
+        Condition::AgainstNow {
+            field: inner,
+            op,
+            offset,
+        } => Condition::AgainstNow {
+            field: path(inner),
+            op: op.clone(),
+            offset: *offset,
         },
         Condition::Exists { field: inner } => Condition::Exists { field: path(inner) },
         Condition::IsKind { field: inner, kind } => Condition::IsKind {
@@ -2691,7 +2940,8 @@ impl<'f> EntryMatcher<'f> {
                 // The regex needs the whole string (SPEC §169.3).
                 #[cfg(feature = "regex")]
                 Condition::Regex { .. } => return None,
-                Condition::Exists { .. }
+                Condition::AgainstNow { .. }
+                | Condition::Exists { .. }
                 | Condition::IsKind { .. }
                 | Condition::Size { .. }
                 | Condition::ElemMatch { .. }
@@ -2842,6 +3092,22 @@ thread_local! {
     pub(crate) static FILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// An `InvalidInput` error where one of `conditions` compares with the
+/// clock by an operator a read refuses (SPEC §203).
+pub(crate) fn refuse_against_now(conditions: &[Condition]) -> crate::Result<()> {
+    match conditions.iter().find_map(Condition::refused_against_now) {
+        None => Ok(()),
+        Some(op) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`{}` against `now` holds for a nanosecond at most: compare with <, <=, > or >=",
+                crate::query_text::op_text(op)
+            ),
+        )
+        .into()),
+    }
+}
+
 /// Whether `condition` names `_id` anywhere.
 fn names_id(condition: &Condition) -> bool {
     match condition {
@@ -2903,6 +3169,14 @@ pub(crate) enum Matcher<'f> {
         value: &'f Document,
         needle: Option<String>,
     },
+    /// A comparison with the clock that a read didn't resolve (SPEC
+    /// §203): `value` the time it stands for when the matcher was made,
+    /// compared as `Compare` compares.
+    AgainstNow {
+        path: Path<'f>,
+        op: &'f Op,
+        value: Document,
+    },
     Exists(Path<'f>),
     IsKind {
         path: Path<'f>,
@@ -2943,6 +3217,14 @@ impl<'f> Matcher<'f> {
                     (Op::Contains, Document::String(needle)) => Some(fold_case(needle)),
                     _ => None,
                 },
+            },
+            // Every read and every check in memory resolves first, with
+            // one time for the whole of it (SPEC §203.2); this is the
+            // last resort of one that didn't, its own time per condition.
+            Condition::AgainstNow { field, op, offset } => Matcher::AgainstNow {
+                path: Path::new(field),
+                op,
+                value: Document::DateTime(offset.from(crate::DateTime::now())),
             },
             Condition::Exists { field } => Matcher::Exists(Path::new(field)),
             Condition::IsKind { field, kind } => Matcher::IsKind {
@@ -3011,6 +3293,10 @@ impl<'f> Matcher<'f> {
                     true => path.values(doc).into_iter().any(holds),
                 }
             }
+            Matcher::AgainstNow { path, op, value } => match path.is_multi() {
+                false => value_matches(op, path.value_or_null(doc), value),
+                true => any_matches(op, value, path.values(doc)),
+            },
             Matcher::Exists(path) => !path.present(doc).is_empty(),
             Matcher::IsKind { path, kind } => path.present(doc).into_iter().any(|v| kind.of(v)),
             // The lengths of the arrays at the path — none if it isn't
@@ -3191,6 +3477,11 @@ mod tests {
                         return any_matches(op, value, walk(doc, field, true));
                     }
                     value_matches(op, value_or_null(doc, field), value)
+                }
+                // Newer than the model (SPEC §203): as a comparison with
+                // the time it stands for now.
+                Condition::AgainstNow { .. } => {
+                    matches(&condition.now_is(crate::DateTime::now()), doc)
                 }
                 Condition::Exists { field } => !walk(doc, field, false).is_empty(),
                 Condition::IsKind { field, kind } => walk(doc, field, false)

@@ -71,6 +71,8 @@ fn main() {
                 total.reported += ran.reported;
                 total.custom += ran.custom;
                 total.regexes += ran.regexes;
+                total.against_now += ran.against_now;
+                total.live_refused_now += ran.live_refused_now;
                 total.live_events += ran.live_events;
                 total.live_sorted += ran.live_sorted;
                 total.distinct_and_ends += ran.distinct_and_ends;
@@ -122,6 +124,10 @@ fn main() {
     println!("  reported changed (§135): {}", total.reported);
     println!("  custom conditions (§136): {}", total.custom);
     println!("  regex conditions (§169): {}", total.regexes);
+    println!(
+        "  comparisons with the clock (§203): {}, live ones refused {}",
+        total.against_now, total.live_refused_now
+    );
     println!("  live query events (§138): {}", total.live_events);
     println!(
         "  sorted live queries (§145): {}, {} events",

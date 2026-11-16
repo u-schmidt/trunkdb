@@ -9,7 +9,9 @@
 use crate::aggregate::{Column, GroupWindow, Kind, Size, Window};
 use crate::datetime::{Date, DateTime, Time};
 use crate::document::{DocId, Document};
-use crate::query::{Aggregate, Condition, Filter, Hint, Kind as ValueKind, Op, Sort, SortOrder};
+use crate::query::{
+    Aggregate, Condition, Filter, Hint, Kind as ValueKind, Offset, Op, Sort, SortOrder,
+};
 use std::collections::BTreeMap;
 use std::fmt::{self, Formatter, Write};
 use std::marker::PhantomData;
@@ -1115,8 +1117,54 @@ impl<'t> Parser<'t> {
                 "a comparison (=, !=, <, <=, >, >=, contains, starts with, matches, is null, in, has)",
             );
         };
+        self.skip_space();
+        let start = self.at;
+        if self.keyword("now") {
+            if !matches!(op, Op::Lt | Op::Lte | Op::Gt | Op::Gte) {
+                return self.error_at(
+                    start,
+                    format!(
+                        "`{}` against `now` holds for a nanosecond at most: compare with <, <=, > or >=",
+                        op_text(&op)
+                    ),
+                );
+            }
+            let offset = self.offset()?;
+            return Ok(Condition::AgainstNow { field, op, offset });
+        }
         let value = self.value()?;
         Ok(Condition::Compare { field, op, value })
+    }
+
+    /// What may follow `now` (SPEC §203): `- 10m`, `+ 1h`, or nothing.
+    /// The duration is written out, a number and its unit, as a window's
+    /// is (§157); a parameter isn't one.
+    fn offset(&mut self) -> Parsed<Offset> {
+        let later = match () {
+            _ if self.eat("-") => false,
+            _ if self.eat("+") => true,
+            _ => return Ok(Offset::NONE),
+        };
+        self.skip_space();
+        let start = self.at;
+        let rest = self.rest();
+        let len = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if len == 0 {
+            return self.expected("a duration after `now`, like 10m");
+        }
+        let n: usize = rest[..len]
+            .parse()
+            .or_else(|_| self.error(format!("`{}` is too large", &rest[..len])))?;
+        self.at += len;
+        let Some(duration) = self.unit_after(start, n)? else {
+            return self.expected("a unit after the number (d, h, m, s, ms, us, ns)");
+        };
+        Ok(match later {
+            true => Offset::after(duration),
+            false => Offset::before(duration),
+        })
     }
 
     /// A regex after `matches` (SPEC §169): a string, or a parameter whose
@@ -1785,6 +1833,14 @@ fn write_condition(f: &mut Formatter<'_>, condition: &Condition, least: u8) -> f
             write_path(f, field)?;
             write!(f, " is {}", kind.name())?;
         }
+        Condition::AgainstNow { field, op, offset } => {
+            write_path(f, field)?;
+            write!(f, " {} now", op_text(op))?;
+            if !offset.duration().is_zero() {
+                let sign = if offset.is_after() { '+' } else { '-' };
+                write!(f, " {sign} {}", DurationText(offset.duration()))?;
+            }
+        }
         #[cfg(feature = "regex")]
         Condition::Regex { field, regex } => {
             write_path(f, field)?;
@@ -1894,7 +1950,7 @@ fn write_joined(
     Ok(())
 }
 
-fn op_text(op: &Op) -> &'static str {
+pub(crate) fn op_text(op: &Op) -> &'static str {
     match op {
         Op::Eq => "=",
         Op::Ne => "!=",
