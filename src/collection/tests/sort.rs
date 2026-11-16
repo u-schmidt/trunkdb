@@ -135,7 +135,10 @@ fn a_sort_with_a_limit_holds_few_matches() {
         let state = docs.read().unwrap();
         let at = state.snapshot();
         let trace = Trace::default();
-        let found = find_in(at.catalog, &at.store, "docs", &filter, true, None, &trace).unwrap();
+        let found = at
+            .scope("docs")
+            .find_in(&filter, true, None, &trace)
+            .unwrap();
         (found.len(), trace.held_most())
     };
     assert_eq!(held(Filter::new().sort_asc("v").limit(10)), (10, 21));
@@ -171,7 +174,7 @@ fn entries_stream_and_stop_where_the_reader_stops() {
         let state = docs.read().unwrap();
         let at = state.snapshot();
         let (trace, mut taken) = (Trace::default(), 0);
-        let stopped = each_entry(at.catalog, &at.store, "docs", &filter, &trace, |_| {
+        let stopped = at.scope("docs").each_entry(&filter, &trace, |_| {
             taken += 1;
             match taken {
                 3 => Err(std::io::Error::other("enough")),
@@ -181,18 +184,12 @@ fn entries_stream_and_stop_where_the_reader_stops() {
         assert!(stopped.is_err(), "{filter:?}");
         assert_eq!(trace.entries_read(), 3, "{filter:?}: read no further");
         let mut taken = Vec::new();
-        each_entry(
-            at.catalog,
-            &at.store,
-            "docs",
-            &filter,
-            &Trace::default(),
-            |(key, _)| {
+        at.scope("docs")
+            .each_entry(&filter, &Trace::default(), |(key, _)| {
                 taken.push(key::doc_id(&key));
                 Ok::<(), std::io::Error>(())
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         let once: std::collections::HashSet<_> = taken.iter().collect();
         assert_eq!(once.len(), taken.len(), "{filter:?}: each document once");
         // A range may hold more than its conditions match, checked after.

@@ -2,7 +2,6 @@
 //! files share; each topic file holds one part of the spec.
 
 use super::count::LEAVES_COUNTED;
-use super::find::{each_entry, find_in};
 use super::walk::Spans;
 use super::write::{apply_unchecked, index_keys, stale_indexes};
 use super::*;

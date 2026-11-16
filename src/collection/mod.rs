@@ -1,5 +1,5 @@
 use crate::aggregate::Aggregate;
-use crate::catalog::{Catalog, IndexInfo, IndexMeta, IndexOptions};
+use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
 use crate::database::{Committed, Database, ReadGuard};
@@ -23,17 +23,51 @@ mod tests;
 mod walk;
 mod write;
 
-use count::count_matches;
-pub(crate) use count::{aggregate_in, any_match_in};
 pub(crate) use find::{Found, document_at, find_at};
-use find::{answer_for, candidate_entries, find_in, first_only, stored_at};
-use plan::{alternatives, follow_hint, plan_for};
+use find::{answer_for, first_only, stored_at};
+use plan::{follow_hint, plan_for};
 pub(crate) use write::{
     apply_write_op, delete_matching_in, get_or_create_meta, index_keys, invalid_input,
-    only_match_in, only_objects_in_old_file, rekey_old_indexes, same_values, unique_tuples,
-    update_by_id, update_matching_in, upsert_fields_in,
+    only_objects_in_old_file, rekey_old_indexes, same_values, unique_tuples, update_by_id,
+    update_matching_in, upsert_fields_in,
 };
 use write::{build_index, found, primary_key_error};
+
+/// One collection as a read sees it: the catalog that names its
+/// indexes, the pages its documents and index entries are on, and its
+/// name. The reads behind `Collection` — finding, counting, aggregating,
+/// walking an index, weighing a plan — are its methods, spread over this
+/// module's files, as these three always go together.
+///
+/// The pages are a snapshot's for a read, or the writer's staged ones
+/// for the reads a batch makes as it goes (SPEC §162).
+#[derive(Clone, Copy)]
+pub(crate) struct Scope<'a> {
+    catalog: &'a Catalog,
+    store: &'a dyn PageStore,
+    collection: &'a str,
+}
+
+impl<'a> Scope<'a> {
+    pub(crate) fn new(catalog: &'a Catalog, store: &'a dyn PageStore, collection: &'a str) -> Self {
+        Scope {
+            catalog,
+            store,
+            collection,
+        }
+    }
+
+    /// The collection's secondary indexes; none if it doesn't exist yet.
+    fn indexes(self) -> &'a [IndexMeta] {
+        self.catalog.indexes(self.collection)
+    }
+
+    /// The collection's entry in the catalog; `None` if it doesn't exist
+    /// yet.
+    fn meta(self) -> Option<&'a CollectionMeta> {
+        self.catalog.get(self.collection)
+    }
+}
 
 /// What `ensure_index`, `ensure_unique_index` and `drop_index` take: one
 /// field — `"age"`, `"address.city"`, `"tags[*]"` — or several, for a
@@ -519,9 +553,9 @@ impl<T> Collection<T> {
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
-        let (rows, _plan) = aggregate_in(
-            at.catalog, &at.store, &self.name, &filter, aggregate, &trace,
-        )?;
+        let (rows, _plan) = at
+            .scope(&self.name)
+            .aggregate_in(&filter, aggregate, &trace)?;
         Ok(rows)
     }
 
@@ -572,9 +606,9 @@ impl<T> Collection<T> {
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
-        let (rows, plan) = aggregate_in(
-            at.catalog, &at.store, &self.name, &filter, aggregate, &trace,
-        )?;
+        let (rows, plan) = at
+            .scope(&self.name)
+            .aggregate_in(&filter, aggregate, &trace)?;
         let mut explained = trace.explained(plan, None, None, rows.len(), started.elapsed());
         explained.hinted = filter.hint.is_some();
         Ok(explained)
@@ -609,15 +643,9 @@ impl<T> Collection<T> {
         };
         let trace = Trace::default();
         let select = filter.selection();
-        let found = find_in(
-            at.catalog,
-            &at.store,
-            &self.name,
-            &filter,
-            true,
-            select.as_ref(),
-            &trace,
-        )?;
+        let found = at
+            .scope(&self.name)
+            .find_in(&filter, true, select.as_ref(), &trace)?;
         let mut explained = trace.explained(
             plan,
             sort,
@@ -627,10 +655,7 @@ impl<T> Collection<T> {
         );
         explained.hinted = filter.hint.is_some();
         explained.except = filter.except.clone();
-        explained.alternatives = alternatives(
-            at.catalog,
-            &at.store,
-            &self.name,
+        explained.alternatives = at.scope(&self.name).alternatives(
             &filter,
             &explained.plan,
             explained.stats.keys_examined,
@@ -1001,15 +1026,8 @@ impl Collection<Document> {
         let state = self.read()?;
         let at = state.snapshot();
         let trace = Trace::default();
-        find_in(
-            at.catalog,
-            &at.store,
-            &self.name,
-            filter,
-            whole_from_index,
-            select,
-            &trace,
-        )
+        at.scope(&self.name)
+            .find_in(filter, whole_from_index, select, &trace)
     }
 
     /// Every document matching `filter`. An `Object` document carries its
@@ -1053,13 +1071,8 @@ impl Collection<Document> {
     pub fn count(&self, filter: Filter) -> crate::Result<usize> {
         let state = self.read()?;
         let at = state.snapshot();
-        count_matches(
-            at.catalog,
-            &at.store,
-            &self.name,
-            &filter,
-            &Trace::default(),
-        )
+        at.scope(&self.name)
+            .count_matches(&filter, &Trace::default())
     }
 
     /// A streaming `find`: yields matches one at a time, holding only
@@ -1096,13 +1109,9 @@ impl Collection<Document> {
         let state = kept.read()?;
         let at = state.snapshot();
         follow_hint(&self.name, &filter, at.catalog.indexes(&self.name))?;
-        let (entries, indexed) = candidate_entries(
-            at.catalog,
-            &at.store,
-            &self.name,
-            &filter,
-            &Trace::default(),
-        )?;
+        let (entries, indexed) = at
+            .scope(&self.name)
+            .candidate_entries(&filter, &Trace::default())?;
         // Where the entries decide (SPEC §100), a rejected one is left
         // out, and a match is kept as decided: passed over by a skip
         // unread. Where they may answer the selection (§106.5), with its
@@ -1229,7 +1238,7 @@ impl Collection<Document> {
         store: &dyn PageStore,
         filter: &Filter,
     ) -> crate::Result<Option<DocId>> {
-        only_match_in(catalog, store, &self.name, filter)
+        Scope::new(catalog, store, &self.name).only_match_in(filter)
     }
 }
 

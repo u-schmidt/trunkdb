@@ -1,8 +1,8 @@
 //! Walks in index order: handing out matches in the order an index
 //! gives them, or merged by id across several ranges.
 
+use super::Scope;
 use super::find::{Candidate, Source};
-use crate::catalog::Catalog;
 use crate::data::{self};
 use crate::document::{DocId, Document};
 use crate::explain::Trace;
@@ -15,287 +15,285 @@ use crate::select::{Answer, Selection};
 use crate::storage::{PageStore, RecordLocation};
 use std::sync::Arc;
 
-/// `find` for a filter `Filter::index_order` chose (SPEC §34.2): walks the
-/// index in sort order (`BTreeIndex::walk`, SPEC §49), checks each
-/// document against the whole filter, and stops as soon as `limit`
-/// match — the entries and documents after that are never read. Already
-/// filtered, sorted, skipped and limited.
-///
-/// Entries are read in groups that share the values of the served sort
-/// keys (`OrderedRead::served`). A group comes in id order, which is sort
-/// order when those values are all equal (`key::part_is_exact`) and no
-/// sort key is left for memory; otherwise the group is read whole and
-/// sorted by every key (SPEC §47) — the rare group whose values may
-/// differ (huge numbers, cut strings), or the documents equal in the
-/// served keys, for the keys after them. Values no one-field index holds
-/// (§34.1: arrays, NaN, ...) sort after everything: if the index runs
-/// out before the limit and no range condition on the sort field ruled
-/// them out, a scan finds them.
-///
-/// A compound index (SPEC §43.3) is read within the values its first
-/// fields are fixed to — by id within a group, which fields after the
-/// served ones would otherwise order. It holds every document, the
-/// unordered values too, under a tag of their own that sorts last:
-/// right for an ascending walk, and a descending one holds those groups
-/// back until it has passed what they must follow (`Held`).
-///
-/// A walk in id order leaves most of that idle: each key is one id, a
-/// group of its own and exact. That's the primary index, for a sort by
-/// `_id` (SPEC §96), and a range of a secondary one whose `Eq`s fix every
-/// field, whose keys differ only in their ids (§103). Every document in
-/// either has an ordered value: nothing to look for afterwards.
-///
-/// Each document is checked on the fields the filter and sort name, and
-/// handed out undecoded (SPEC §99). Where the index covers the filter
-/// (SPEC §100), an entry of an exact group decides without its document,
-/// which is read only if handed out.
-///
-/// Where the walk's order is the order handed out — forward, or by id;
-/// every field fixed or served, or every key its own group, so that
-/// ties are in key order;
-/// nothing sorted in memory or held — an exact group is never collected:
-/// each entry is handed out as it's walked, its key lent from its leaf
-/// (SPEC §101.5). The matches a skip passes over are counted, not kept,
-/// and a leaf whose ends decide it is passed whole (§101.3).
-pub(super) fn walk_in_index_order(
-    catalog: &Catalog,
-    store: &dyn PageStore,
-    collection: &str,
-    filter: &Filter,
-    order: OrderedRead,
-    select: Option<&Selection>,
-    trace: &Trace,
-) -> crate::Result<Vec<Candidate>> {
-    let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
-        unreachable!("index_order needs a sort and a limit");
-    };
-    let mut page = Page {
-        results: Vec::new(),
-        skipped: 0,
-        skip: filter.skip,
-        limit,
-    };
-    if limit == 0 {
-        return Ok(page.results);
-    }
-    let name = order.name();
-    let (root, fields, compound) = match order.index {
-        Some(index) => (index.root, index.fields.len(), index.is_compound()),
-        None => match catalog.get(collection) {
-            Some(meta) => (meta.index_root, 1, false),
-            None => return Ok(page.results),
-        },
-    };
-    // Each key a group of its own: one id, in id order (SPEC §96, §103).
-    let by_id = order.by_id;
-    // An index that counts none left out spares the scan (SPEC §181).
-    let unordered_can_match = order.range.is_none()
-        && !compound
-        && !by_id
-        && order.index.is_none_or(|index| index.left_out != Some(0));
-    let backward = first.order == SortOrder::Desc;
-    let walk = trace.read(name, order.by, backward);
-    let mut entries = BTreeIndex::new(root).walk(
-        store,
-        order.range.unwrap_or_else(KeyRange::everything),
-        backward,
-    );
-    let (at, end) = (order.fixed, order.fixed + order.served);
-    let spans = Spans {
-        at,
-        end,
-        fields,
-        by_id,
-    };
-    let in_memory = filter.sort.len() > order.served;
-    // A walk by id gives the whole order: every key exact, nothing
-    // unordered (SPEC §96, §103), so only the conditions' fields are
-    // looked at.
-    let names = filter.fields_with(!by_id || in_memory);
-    let mut decider = Covering::new(filter, order.index, false).map(|c| c.decider(filter));
-    if decider.is_some() {
-        trace.covering(walk);
-    }
-    // A match its entry decided, and kept for the page, is answered from
-    // its entry where it can be (SPEC §106.5).
-    let fields_of = order.index.map_or(&[][..], |index| &index.fields[..]);
-    let hand = HandOut {
-        answer: select
-            .filter(|_| decider.is_some())
-            .and_then(|select| Answer::new(select, fields_of)),
-        matcher: filter.matcher(),
-        trace,
-    };
-    let mut records = data::Records::new(store, catalog.names());
-    let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
-        trace.examined();
-        let stored = records.stored(*loc)?;
-        let fields = stored.fields(names.as_deref())?;
-        Ok((Source::Read(stored), fields))
-    };
-    // Hands out one collected group's matches; `true` once the page is
-    // full.
-    let take = |group: &mut Group,
-                decider: &mut Option<Decider>,
-                read: &mut dyn FnMut(&RecordLocation) -> std::io::Result<Candidate>,
-                page: &mut Page|
-     -> crate::Result<bool> {
-        // Ties in id order: fields after the served ones would order them
-        // otherwise, and a backward walk hands them out last id first.
-        group.sort_by_key(|(key, _)| key::doc_id(key));
-        if spans.exact(&group[0].0) && !in_memory {
-            for (key, loc) in group.iter() {
-                if hand.one(key, *loc, decider, read, page)? {
+impl<'a> Scope<'a> {
+    /// `find` for a filter `Filter::index_order` chose (SPEC §34.2): walks the
+    /// index in sort order (`BTreeIndex::walk`, SPEC §49), checks each
+    /// document against the whole filter, and stops as soon as `limit`
+    /// match — the entries and documents after that are never read. Already
+    /// filtered, sorted, skipped and limited.
+    ///
+    /// Entries are read in groups that share the values of the served sort
+    /// keys (`OrderedRead::served`). A group comes in id order, which is sort
+    /// order when those values are all equal (`key::part_is_exact`) and no
+    /// sort key is left for memory; otherwise the group is read whole and
+    /// sorted by every key (SPEC §47) — the rare group whose values may
+    /// differ (huge numbers, cut strings), or the documents equal in the
+    /// served keys, for the keys after them. Values no one-field index holds
+    /// (§34.1: arrays, NaN, ...) sort after everything: if the index runs
+    /// out before the limit and no range condition on the sort field ruled
+    /// them out, a scan finds them.
+    ///
+    /// A compound index (SPEC §43.3) is read within the values its first
+    /// fields are fixed to — by id within a group, which fields after the
+    /// served ones would otherwise order. It holds every document, the
+    /// unordered values too, under a tag of their own that sorts last:
+    /// right for an ascending walk, and a descending one holds those groups
+    /// back until it has passed what they must follow (`Held`).
+    ///
+    /// A walk in id order leaves most of that idle: each key is one id, a
+    /// group of its own and exact. That's the primary index, for a sort by
+    /// `_id` (SPEC §96), and a range of a secondary one whose `Eq`s fix every
+    /// field, whose keys differ only in their ids (§103). Every document in
+    /// either has an ordered value: nothing to look for afterwards.
+    ///
+    /// Each document is checked on the fields the filter and sort name, and
+    /// handed out undecoded (SPEC §99). Where the index covers the filter
+    /// (SPEC §100), an entry of an exact group decides without its document,
+    /// which is read only if handed out.
+    ///
+    /// Where the walk's order is the order handed out — forward, or by id;
+    /// every field fixed or served, or every key its own group, so that
+    /// ties are in key order;
+    /// nothing sorted in memory or held — an exact group is never collected:
+    /// each entry is handed out as it's walked, its key lent from its leaf
+    /// (SPEC §101.5). The matches a skip passes over are counted, not kept,
+    /// and a leaf whose ends decide it is passed whole (§101.3).
+    pub(super) fn walk_in_index_order(
+        self,
+        filter: &Filter,
+        order: OrderedRead,
+        select: Option<&Selection>,
+        trace: &Trace,
+    ) -> crate::Result<Vec<Candidate>> {
+        let (Some(first), Some(limit)) = (filter.sort.first(), filter.limit) else {
+            unreachable!("index_order needs a sort and a limit");
+        };
+        let mut page = Page {
+            results: Vec::new(),
+            skipped: 0,
+            skip: filter.skip,
+            limit,
+        };
+        if limit == 0 {
+            return Ok(page.results);
+        }
+        let name = order.name();
+        let (root, fields, compound) = match order.index {
+            Some(index) => (index.root, index.fields.len(), index.is_compound()),
+            None => match self.meta() {
+                Some(meta) => (meta.index_root, 1, false),
+                None => return Ok(page.results),
+            },
+        };
+        // Each key a group of its own: one id, in id order (SPEC §96, §103).
+        let by_id = order.by_id;
+        // An index that counts none left out spares the scan (SPEC §181).
+        let unordered_can_match = order.range.is_none()
+            && !compound
+            && !by_id
+            && order.index.is_none_or(|index| index.left_out != Some(0));
+        let backward = first.order == SortOrder::Desc;
+        let walk = trace.read(name, order.by, backward);
+        let mut entries = BTreeIndex::new(root).walk(
+            self.store,
+            order.range.unwrap_or_else(KeyRange::everything),
+            backward,
+        );
+        let (at, end) = (order.fixed, order.fixed + order.served);
+        let spans = Spans {
+            at,
+            end,
+            fields,
+            by_id,
+        };
+        let in_memory = filter.sort.len() > order.served;
+        // A walk by id gives the whole order: every key exact, nothing
+        // unordered (SPEC §96, §103), so only the conditions' fields are
+        // looked at.
+        let names = filter.fields_with(!by_id || in_memory);
+        let mut decider = Covering::new(filter, order.index, false).map(|c| c.decider(filter));
+        if decider.is_some() {
+            trace.covering(walk);
+        }
+        // A match its entry decided, and kept for the page, is answered from
+        // its entry where it can be (SPEC §106.5).
+        let fields_of = order.index.map_or(&[][..], |index| &index.fields[..]);
+        let hand = HandOut {
+            answer: select
+                .filter(|_| decider.is_some())
+                .and_then(|select| Answer::new(select, fields_of)),
+            matcher: filter.matcher(),
+            trace,
+        };
+        let mut records = data::Records::new(self.store, self.catalog.names());
+        let mut read = |loc: &RecordLocation| -> std::io::Result<Candidate> {
+            trace.examined();
+            let stored = records.stored(*loc)?;
+            let fields = stored.fields(names.as_deref())?;
+            Ok((Source::Read(stored), fields))
+        };
+        // Hands out one collected group's matches; `true` once the page is
+        // full.
+        let take = |group: &mut Group,
+                    decider: &mut Option<Decider>,
+                    read: &mut dyn FnMut(&RecordLocation) -> std::io::Result<Candidate>,
+                    page: &mut Page|
+         -> crate::Result<bool> {
+            // Ties in id order: fields after the served ones would order them
+            // otherwise, and a backward walk hands them out last id first.
+            group.sort_by_key(|(key, _)| key::doc_id(key));
+            if spans.exact(&group[0].0) && !in_memory {
+                for (key, loc) in group.iter() {
+                    if hand.one(key, *loc, decider, read, page)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+            let docs = group
+                .iter()
+                .map(|(_key, loc)| read(loc))
+                .collect::<Result<Vec<_>, _>>()?;
+            let unlimited = Filter {
+                skip: 0,
+                limit: None,
+                ..filter.clone()
+            };
+            let found = unlimited.apply_to(docs, |(_id, doc)| doc);
+            trace.matched(found.len());
+            for found in found {
+                if page.push(found) {
                     return Ok(true);
                 }
             }
-            return Ok(false);
-        }
-        let docs = group
-            .iter()
-            .map(|(_key, loc)| read(loc))
-            .collect::<Result<Vec<_>, _>>()?;
-        let unlimited = Filter {
-            skip: 0,
-            limit: None,
-            ..filter.clone()
+            Ok(false)
         };
-        let found = unlimited.apply_to(docs, |(_id, doc)| doc);
-        trace.matched(found.len());
-        for found in found {
-            if page.push(found) {
-                return Ok(true);
+        let mut held = Held::new(backward && compound && !by_id, spans, first.order);
+        let direct =
+            (!backward || by_id) && !in_memory && !held.active && (by_id || spans.end == fields);
+        // The group being collected, and the served bytes it shares.
+        let mut group: Group = Vec::new();
+        let mut shared: Vec<u8> = Vec::new();
+        loop {
+            if trace.spent() {
+                return Ok(page.results); // an alternative's budget (SPEC §133.4)
             }
-        }
-        Ok(false)
-    };
-    let mut held = Held::new(backward && compound && !by_id, spans, first.order);
-    let direct =
-        (!backward || by_id) && !in_memory && !held.active && (by_id || spans.end == fields);
-    // The group being collected, and the served bytes it shares.
-    let mut group: Group = Vec::new();
-    let mut shared: Vec<u8> = Vec::new();
-    loop {
-        if trace.spent() {
-            return Ok(page.results); // an alternative's budget (SPEC §133.4)
-        }
-        if direct && group.is_empty() {
-            // A run of a leaf passed at once (`Walk::run`): its entries
-            // all rejected, or all matches the skip passes over — where
-            // the group its last entry is in, which may go on past it, is
-            // exact.
-            let mut run = |most: usize| -> std::io::Result<_> {
-                Ok(entries.run(most)?.map(|leaf| {
-                    let decided = decider
-                        .as_mut()
-                        .and_then(|d| d.decide_all(leaf.lowest, leaf.highest));
-                    (decided, leaf.entries, spans.exact(leaf.highest))
-                }))
-            };
-            // How many it passes, and whether they are matches the skip
-            // passes over.
-            let budget = page.skip.saturating_sub(page.skipped);
-            let passed = match run(usize::MAX)? {
-                Some((Some(false), n, _)) => Some((n, false)),
-                Some((Some(true), n, true)) if n <= budget => Some((n, true)),
-                // The skip ends inside it: the part it passes over.
-                Some((Some(true), _, _)) => match run(budget)? {
-                    Some((Some(true), n, true)) => Some((n, true)),
+            if direct && group.is_empty() {
+                // A run of a leaf passed at once (`Walk::run`): its entries
+                // all rejected, or all matches the skip passes over — where
+                // the group its last entry is in, which may go on past it, is
+                // exact.
+                let mut run = |most: usize| -> std::io::Result<_> {
+                    Ok(entries.run(most)?.map(|leaf| {
+                        let decided = decider
+                            .as_mut()
+                            .and_then(|d| d.decide_all(leaf.lowest, leaf.highest));
+                        (decided, leaf.entries, spans.exact(leaf.highest))
+                    }))
+                };
+                // How many it passes, and whether they are matches the skip
+                // passes over.
+                let budget = page.skip.saturating_sub(page.skipped);
+                let passed = match run(usize::MAX)? {
+                    Some((Some(false), n, _)) => Some((n, false)),
+                    Some((Some(true), n, true)) if n <= budget => Some((n, true)),
+                    // The skip ends inside it: the part it passes over.
+                    Some((Some(true), _, _)) => match run(budget)? {
+                        Some((Some(true), n, true)) => Some((n, true)),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            };
-            if let Some((n, matched)) = passed {
-                if matched {
-                    trace.matched(n);
-                    page.skipped += n;
+                };
+                if let Some((n, matched)) = passed {
+                    if matched {
+                        trace.matched(n);
+                        page.skipped += n;
+                    }
+                    trace.entries(walk, n);
+                    entries.pass_leaf();
+                    continue;
                 }
-                trace.entries(walk, n);
-                entries.pass_leaf();
-                continue;
             }
-        }
-        let entry = entries.step().transpose()?;
-        trace.entries(walk, usize::from(entry.is_some()));
-        let ends_group =
-            !group.is_empty() && entry.is_none_or(|(key, _)| spans.group(key) != shared.as_slice());
-        if ends_group {
-            let next = entry.map(|(key, _)| key);
-            if held.active {
-                for mut ready in held.pass(std::mem::take(&mut group), next) {
-                    if take(&mut ready, &mut decider, &mut read, &mut page)? {
+            let entry = entries.step().transpose()?;
+            trace.entries(walk, usize::from(entry.is_some()));
+            let ends_group = !group.is_empty()
+                && entry.is_none_or(|(key, _)| spans.group(key) != shared.as_slice());
+            if ends_group {
+                let next = entry.map(|(key, _)| key);
+                if held.active {
+                    for mut ready in held.pass(std::mem::take(&mut group), next) {
+                        if take(&mut ready, &mut decider, &mut read, &mut page)? {
+                            return Ok(page.results);
+                        }
+                    }
+                } else {
+                    if take(&mut group, &mut decider, &mut read, &mut page)? {
                         return Ok(page.results);
                     }
+                    group.clear();
                 }
-            } else {
+            }
+            let Some((key, loc)) = entry else {
+                break;
+            };
+            if direct && group.is_empty() && spans.exact(key) {
+                if hand.one(key, loc, &mut decider, &mut read, &mut page)? {
+                    return Ok(page.results);
+                }
+                continue;
+            }
+            if group.is_empty() {
+                shared.clear();
+                shared.extend_from_slice(spans.group(key));
+            }
+            #[cfg(test)]
+            crate::index::KEYS_COPIED.with(|n| n.set(n.get() + 1));
+            group.push((key.to_vec(), loc));
+            // An id is a group of its own (SPEC §96, §103): handed out
+            // without reading the next key to see the group end.
+            if by_id {
                 if take(&mut group, &mut decider, &mut read, &mut page)? {
                     return Ok(page.results);
                 }
                 group.clear();
             }
         }
-        let Some((key, loc)) = entry else {
-            break;
-        };
-        if direct && group.is_empty() && spans.exact(key) {
-            if hand.one(key, loc, &mut decider, &mut read, &mut page)? {
+        if unordered_can_match {
+            let meta = self.meta().expect("an indexed collection exists");
+            let mut unordered = Vec::new();
+            let primary = BTreeIndex::new(meta.index_root).scan(self.store)?;
+            let scan = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
+            trace.entries(scan, primary.len());
+            if trace.spent() {
                 return Ok(page.results);
             }
-            continue;
-        }
-        if group.is_empty() {
-            shared.clear();
-            shared.extend_from_slice(spans.group(key));
-        }
-        #[cfg(test)]
-        crate::index::KEYS_COPIED.with(|n| n.set(n.get() + 1));
-        group.push((key.to_vec(), loc));
-        // An id is a group of its own (SPEC §96, §103): handed out
-        // without reading the next key to see the group end.
-        if by_id {
-            if take(&mut group, &mut decider, &mut read, &mut page)? {
-                return Ok(page.results);
+            let wanted = page.skip.saturating_add(limit);
+            for (_key, loc) in primary {
+                let (id, doc) = read(&loc)?;
+                let value = crate::query::value_or_null(&doc, &first.field);
+                if crate::query::is_unordered(value) && hand.matcher.matches(&doc)? {
+                    trace.matched(1);
+                    unordered.push((id, doc));
+                    // Without keys after the first, id order is their order.
+                    if !in_memory && page.passed() + unordered.len() == wanted {
+                        break;
+                    }
+                }
             }
-            group.clear();
-        }
-    }
-    if unordered_can_match {
-        let meta = catalog
-            .get(collection)
-            .expect("an indexed collection exists");
-        let mut unordered = Vec::new();
-        let primary = BTreeIndex::new(meta.index_root).scan(store)?;
-        let scan = trace.read(crate::document::ID_FIELD.to_string(), Vec::new(), false);
-        trace.entries(scan, primary.len());
-        if trace.spent() {
-            return Ok(page.results);
-        }
-        let wanted = page.skip.saturating_add(limit);
-        for (_key, loc) in primary {
-            let (id, doc) = read(&loc)?;
-            let value = crate::query::value_or_null(&doc, &first.field);
-            if crate::query::is_unordered(value) && hand.matcher.matches(&doc)? {
-                trace.matched(1);
-                unordered.push((id, doc));
-                // Without keys after the first, id order is their order.
-                if !in_memory && page.passed() + unordered.len() == wanted {
+            let unlimited = Filter {
+                conditions: Vec::new(),
+                skip: 0,
+                limit: None,
+                ..filter.clone()
+            };
+            for found in unlimited.apply_to(unordered, |(_id, doc)| doc) {
+                if page.push(found) {
                     break;
                 }
             }
         }
-        let unlimited = Filter {
-            conditions: Vec::new(),
-            skip: 0,
-            limit: None,
-            ..filter.clone()
-        };
-        for found in unlimited.apply_to(unordered, |(_id, doc)| doc) {
-            if page.push(found) {
-                break;
-            }
-        }
+        Ok(page.results)
     }
-    Ok(page.results)
 }
 
 /// Hands out a walk's entries one by one, in order (SPEC §101.5): each

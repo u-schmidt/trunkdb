@@ -265,6 +265,13 @@ pub(crate) struct Reading<'a> {
     pub(crate) store: SnapshotStore<'a>,
 }
 
+impl Reading<'_> {
+    /// One collection of this snapshot, to read.
+    pub(crate) fn scope<'s>(&'s self, collection: &'s str) -> crate::collection::Scope<'s> {
+        crate::collection::Scope::new(self.catalog, &self.store, collection)
+    }
+}
+
 /// A read under way (SPEC §80): the snapshot it took when it began,
 /// which it reads to its end whatever is committed meanwhile. The
 /// writer's store isn't reachable from here, so no read path can go past

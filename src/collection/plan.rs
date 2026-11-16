@@ -1,12 +1,12 @@
 //! Which plan a read follows: the index it uses, the alternatives
 //! `explain` weighs, and the hints it refuses.
+use super::Scope;
 
-use super::find::find_in;
-use crate::catalog::{Catalog, IndexMeta};
+use crate::catalog::IndexMeta;
 use crate::explain::{Alternative, EntryCount, Trace};
 use crate::index::{BTreeIndex, KeyRange};
 use crate::query::{Covering, Filter, QueryPlan};
-use crate::storage::{PageId, PageStore};
+use crate::storage::PageId;
 
 /// The plan `find` follows for `filter` among a collection's `indexes`
 /// — what `explain` says.
@@ -53,136 +53,135 @@ const ALTERNATIVE_LEAVES: usize = 1_000;
 #[cfg(test)]
 const ALTERNATIVE_LEAVES: usize = 4;
 
-/// The plans `explain_run` passed over (SPEC §133): `filter` hinted to
-/// each index, to `_id` and to a scan, and without its hint if it has
-/// one — each the planner's own plan for that hint (§132.2) — less the
-/// hints it can't follow and the plans already listed, `plan` first,
-/// the one it ran, which read `read` entries.
-pub(super) fn alternatives(
-    catalog: &Catalog,
-    store: &dyn PageStore,
-    collection: &str,
-    filter: &Filter,
-    plan: &QueryPlan,
-    read: u64,
-) -> crate::Result<Vec<Alternative>> {
-    let indexes = catalog.indexes(collection);
-    let mut hinted: Vec<Filter> = Vec::new();
-    if filter.hint.is_some() {
-        hinted.push(Filter {
-            hint: None,
-            ..filter.clone()
-        });
-    }
-    hinted.extend(
-        indexes
-            .iter()
-            .map(|i| filter.clone().use_index(i.fields.clone())),
-    );
-    hinted.push(filter.clone().use_index(crate::document::ID_FIELD));
-    hinted.push(filter.clone().no_index());
-    let mut listed = vec![plan.clone()];
-    let mut found = Vec::new();
-    for hinted in hinted {
-        if follow_hint(collection, &hinted, indexes).is_err() {
-            continue;
+impl<'a> Scope<'a> {
+    /// The plans `explain_run` passed over (SPEC §133): `filter` hinted to
+    /// each index, to `_id` and to a scan, and without its hint if it has
+    /// one — each the planner's own plan for that hint (§132.2) — less the
+    /// hints it can't follow and the plans already listed, `plan` first,
+    /// the one it ran, which read `read` entries.
+    pub(super) fn alternatives(
+        self,
+        filter: &Filter,
+        plan: &QueryPlan,
+        read: u64,
+    ) -> crate::Result<Vec<Alternative>> {
+        let indexes = self.indexes();
+        let mut hinted: Vec<Filter> = Vec::new();
+        if filter.hint.is_some() {
+            hinted.push(Filter {
+                hint: None,
+                ..filter.clone()
+            });
         }
-        let other = plan_for(&hinted, indexes);
-        if listed.contains(&other) {
-            continue;
-        }
-        listed.push(other.clone());
-        let (entries, reads_documents) =
-            would_read(catalog, store, collection, &hinted, &other, read)?;
-        found.push(Alternative {
-            plan: other,
-            fewer: matches!(entries, EntryCount::Exactly(n) if n < read),
-            entries,
-            reads_documents,
-        });
-    }
-    Ok(found)
-}
-
-/// What `filter`, run as `plan`, would read (SPEC §133.3, §133.4): its
-/// index entries, and whether it reads a document for each. A range or
-/// a scan counted a leaf at a time, through `ALTERNATIVE_LEAVES` at
-/// most; ids by how many; a walk in sort order walked, as far as `read`.
-fn would_read(
-    catalog: &Catalog,
-    store: &dyn PageStore,
-    collection: &str,
-    filter: &Filter,
-    plan: &QueryPlan,
-    read: u64,
-) -> crate::Result<(EntryCount, bool)> {
-    let indexes = catalog.indexes(collection);
-    let checks = |index: Option<&IndexMeta>| Covering::new(filter, index, false).is_none();
-    let Some(meta) = catalog.get(collection) else {
-        return Ok((EntryCount::Exactly(0), false));
-    };
-    let counted = |ranges: Vec<(PageId, KeyRange)>| -> std::io::Result<EntryCount> {
-        let (mut entries, mut leaves) = (0, 0);
-        for (root, range) in ranges {
-            let left = ALTERNATIVE_LEAVES.saturating_sub(leaves);
-            let counted = BTreeIndex::new(root).count_at_most(store, range, left)?;
-            entries += counted.entries as u64;
-            leaves += counted.leaves;
-            if !counted.whole {
-                return Ok(EntryCount::MoreThan(entries));
+        hinted.extend(
+            indexes
+                .iter()
+                .map(|i| filter.clone().use_index(i.fields.clone())),
+        );
+        hinted.push(filter.clone().use_index(crate::document::ID_FIELD));
+        hinted.push(filter.clone().no_index());
+        let mut listed = vec![plan.clone()];
+        let mut found = Vec::new();
+        for hinted in hinted {
+            if follow_hint(self.collection, &hinted, indexes).is_err() {
+                continue;
             }
+            let other = plan_for(&hinted, indexes);
+            if listed.contains(&other) {
+                continue;
+            }
+            listed.push(other.clone());
+            let (entries, reads_documents) = self.would_read(&hinted, &other, read)?;
+            found.push(Alternative {
+                plan: other,
+                fewer: matches!(entries, EntryCount::Exactly(n) if n < read),
+                entries,
+                reads_documents,
+            });
         }
-        Ok(EntryCount::Exactly(entries))
-    };
-    Ok(match plan {
-        QueryPlan::ById => {
-            let ids = filter.ids().map_or(0, |ids| ids.len());
-            (EntryCount::Exactly(ids as u64), checks(None))
-        }
-        QueryPlan::Scan => {
-            let all = vec![(meta.index_root, KeyRange::everything())];
-            (counted(all)?, checks(None))
-        }
-        QueryPlan::IndexOrder { .. } | QueryPlan::IndexUnion { in_order: true, .. } => {
-            let reads = match filter.index_order(indexes) {
-                Some(order) => checks(order.index),
-                None => {
-                    let ranges = filter.merged_by_id(indexes).expect("a merge's plan");
-                    let first = ranges[0].index;
-                    !ranges.iter().all(|r| std::ptr::eq(r.index, first)) || checks(Some(first))
+        Ok(found)
+    }
+
+    /// What `filter`, run as `plan`, would read (SPEC §133.3, §133.4): its
+    /// index entries, and whether it reads a document for each. A range or
+    /// a scan counted a leaf at a time, through `ALTERNATIVE_LEAVES` at
+    /// most; ids by how many; a walk in sort order walked, as far as `read`.
+    fn would_read(
+        self,
+        filter: &Filter,
+        plan: &QueryPlan,
+        read: u64,
+    ) -> crate::Result<(EntryCount, bool)> {
+        let indexes = self.indexes();
+        let checks = |index: Option<&IndexMeta>| Covering::new(filter, index, false).is_none();
+        let Some(meta) = self.meta() else {
+            return Ok((EntryCount::Exactly(0), false));
+        };
+        let counted = |ranges: Vec<(PageId, KeyRange)>| -> std::io::Result<EntryCount> {
+            let (mut entries, mut leaves) = (0, 0);
+            for (root, range) in ranges {
+                let left = ALTERNATIVE_LEAVES.saturating_sub(leaves);
+                let counted = BTreeIndex::new(root).count_at_most(self.store, range, left)?;
+                entries += counted.entries as u64;
+                leaves += counted.leaves;
+                if !counted.whole {
+                    return Ok(EntryCount::MoreThan(entries));
                 }
-            };
-            let trace = Trace::with_budget(read);
-            find_in(catalog, store, collection, filter, false, None, &trace)?;
-            let entries = match trace.spent() {
-                true => EntryCount::MoreThan(read),
-                false => EntryCount::Exactly(trace.entries_read()),
-            };
-            (entries, reads)
-        }
-        _ => {
-            let crate::query::IndexReads { ids, ranges } =
-                filter.index_reads(indexes).expect("a range's plan");
-            let reads = match &ranges[..] {
-                _ if !ids.is_empty() => true,
-                [] => false,
-                [first, rest @ ..] if rest.iter().all(|r| std::ptr::eq(r.index, first.index)) => {
-                    checks(Some(first.index))
-                }
-                _ => true,
-            };
-            let ranges = ranges
-                .into_iter()
-                .map(|r| (r.index.root, r.range))
-                .collect();
-            // Ids by how many, as for `ById` (SPEC §164.4).
-            let entries = match counted(ranges)? {
-                EntryCount::Exactly(n) => EntryCount::Exactly(n + ids.len() as u64),
-                EntryCount::MoreThan(n) => EntryCount::MoreThan(n + ids.len() as u64),
-            };
-            (entries, reads)
-        }
-    })
+            }
+            Ok(EntryCount::Exactly(entries))
+        };
+        Ok(match plan {
+            QueryPlan::ById => {
+                let ids = filter.ids().map_or(0, |ids| ids.len());
+                (EntryCount::Exactly(ids as u64), checks(None))
+            }
+            QueryPlan::Scan => {
+                let all = vec![(meta.index_root, KeyRange::everything())];
+                (counted(all)?, checks(None))
+            }
+            QueryPlan::IndexOrder { .. } | QueryPlan::IndexUnion { in_order: true, .. } => {
+                let reads = match filter.index_order(indexes) {
+                    Some(order) => checks(order.index),
+                    None => {
+                        let ranges = filter.merged_by_id(indexes).expect("a merge's plan");
+                        let first = ranges[0].index;
+                        !ranges.iter().all(|r| std::ptr::eq(r.index, first)) || checks(Some(first))
+                    }
+                };
+                let trace = Trace::with_budget(read);
+                self.find_in(filter, false, None, &trace)?;
+                let entries = match trace.spent() {
+                    true => EntryCount::MoreThan(read),
+                    false => EntryCount::Exactly(trace.entries_read()),
+                };
+                (entries, reads)
+            }
+            _ => {
+                let crate::query::IndexReads { ids, ranges } =
+                    filter.index_reads(indexes).expect("a range's plan");
+                let reads = match &ranges[..] {
+                    _ if !ids.is_empty() => true,
+                    [] => false,
+                    [first, rest @ ..]
+                        if rest.iter().all(|r| std::ptr::eq(r.index, first.index)) =>
+                    {
+                        checks(Some(first.index))
+                    }
+                    _ => true,
+                };
+                let ranges = ranges
+                    .into_iter()
+                    .map(|r| (r.index.root, r.range))
+                    .collect();
+                // Ids by how many, as for `ById` (SPEC §164.4).
+                let entries = match counted(ranges)? {
+                    EntryCount::Exactly(n) => EntryCount::Exactly(n + ids.len() as u64),
+                    EntryCount::MoreThan(n) => EntryCount::MoreThan(n + ids.len() as u64),
+                };
+                (entries, reads)
+            }
+        })
+    }
 }
 
 /// Refuses a hint the plan can't follow (SPEC §132.3), before anything

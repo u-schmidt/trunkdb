@@ -10,7 +10,7 @@
 
 use crate::aggregate::Aggregate;
 use crate::changes::{Change, Inbox};
-use crate::collection::aggregate_in;
+
 use crate::database::Reading;
 use crate::document::{DocId, Document, encode_document};
 use crate::explain::Trace;
@@ -1029,7 +1029,7 @@ fn rows_at(
         ..aggregate.clone()
     };
     let trace = Trace::default();
-    let (all, _plan) = aggregate_in(at.catalog, &at.store, collection, filter, &every, &trace)?;
+    let (all, _plan) = at.scope(collection).aggregate_in(filter, &every, &trace)?;
     let result = aggregate.rows.apply(all.clone());
     Ok((all, result))
 }
