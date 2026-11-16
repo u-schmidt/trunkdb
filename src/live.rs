@@ -544,16 +544,21 @@ impl Watcher {
     /// Its next moment, found on `at` (SPEC §204): nothing for one that
     /// doesn't compare with the clock.
     pub(crate) fn schedule(&mut self, at: &Reading<'_>, every: Duration) -> crate::Result<()> {
-        if let Some(clock) = &mut self.clock {
-            clock.due = next_moment(
-                at,
-                &self.collection,
-                &self.filter.edges(),
-                clock.read,
-                every,
-            )?;
+        if let Some(clock) = self.clock {
+            let due = self.moment_at(at, clock.read, every)?;
+            self.clock = Some(Clock { due, ..clock });
         }
         Ok(())
+    }
+
+    /// Its next moment on `at`, read against `now`.
+    fn moment_at(
+        &self,
+        at: &Reading<'_>,
+        now: DateTime,
+        every: Duration,
+    ) -> crate::Result<DateTime> {
+        next_moment(at, &self.collection, &self.filter.edges(), now, every)
     }
 
     /// `schedule`, ending it with the error where it fails. `false` once
@@ -566,6 +571,21 @@ impl Watcher {
                 false
             }
         }
+    }
+
+    /// Its next moment, `found` already where it compares with the clock
+    /// (SPEC §205), and ended with the error where finding it failed.
+    /// `false` once it has ended.
+    fn moved_on(&mut self, found: Option<crate::Result<DateTime>>) -> bool {
+        match (found, &mut self.clock) {
+            (Some(Ok(due)), Some(clock)) => clock.due = due,
+            (Some(Err(e)), _) => {
+                let _ = self.sender.send(Err(e));
+                return false;
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Read again on `at` against `now`, its moment come (SPEC §204):
@@ -1377,12 +1397,23 @@ impl AggregateWatcher {
     /// comparisons with the clock and its columns'; `having`'s are on its
     /// rows, which no seek finds, and read again `every` apart.
     fn schedule(&mut self, at: &Reading<'_>, every: Duration) -> crate::Result<()> {
-        if let Some(clock) = &mut self.clock {
-            let mut edges = self.filter.edges();
-            edges.extend(self.aggregate.edges());
-            clock.due = next_moment(at, &self.collection, &edges, clock.read, every)?;
+        if let Some(clock) = self.clock {
+            let due = self.moment_at(at, clock.read, every)?;
+            self.clock = Some(Clock { due, ..clock });
         }
         Ok(())
+    }
+
+    /// Its next moment on `at`, read against `now`.
+    fn moment_at(
+        &self,
+        at: &Reading<'_>,
+        now: DateTime,
+        every: Duration,
+    ) -> crate::Result<DateTime> {
+        let mut edges = self.filter.edges();
+        edges.extend(self.aggregate.edges());
+        next_moment(at, &self.collection, &edges, now, every)
     }
 
     /// `schedule`, ending it with the error where it fails. `false` once
@@ -1395,6 +1426,21 @@ impl AggregateWatcher {
                 false
             }
         }
+    }
+
+    /// Its next moment, `found` already where it compares with the clock
+    /// (SPEC §205), and ended with the error where finding it failed.
+    /// `false` once it has ended.
+    fn moved_on(&mut self, found: Option<crate::Result<DateTime>>) -> bool {
+        match (found, &mut self.clock) {
+            (Some(Ok(due)), Some(clock)) => clock.due = due,
+            (Some(Err(e)), _) => {
+                let _ = self.sender.send(Err(e));
+                return false;
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Run again on `at` against `now`, its moment come (SPEC §204), and
@@ -1532,43 +1578,56 @@ pub(crate) fn poll(
     let read = |clock: Option<Clock>| {
         committed || clock.zip(now).is_some_and(|(clock, now)| clock.is_due(now))
     };
+    // Every read of the look before anything is reported, the next
+    // moments too: a snapshot ended under any of them is tried again
+    // whole at the next look, none ended for it.
+    let moment = |clock: Option<Clock>, find: &dyn Fn(DateTime) -> crate::Result<DateTime>| {
+        clock.and(now).map(find)
+    };
     let rereads: Vec<_> = (watchers.iter())
-        .map(|w| read(w.clock).then(|| w.reread(at, now)))
+        .map(|w| {
+            read(w.clock).then(|| {
+                let found = moment(w.clock, &|now| w.moment_at(at, now, every));
+                (w.reread(at, now), found)
+            })
+        })
         .collect();
     let rows: Vec<_> = (aggregates.iter())
-        .map(|a| read(a.clock).then(|| a.rows(at, now)))
+        .map(|a| {
+            read(a.clock).then(|| {
+                let found = moment(a.clock, &|now| a.moment_at(at, now, every));
+                (a.rows(at, now), found)
+            })
+        })
         .collect();
-    let too_old = |read: Option<Result<(), &crate::Error>>| {
-        matches!(read, Some(Err(crate::Error::SnapshotTooOld)))
+    let too_old = |e: Option<&crate::Error>| matches!(e, Some(crate::Error::SnapshotTooOld));
+    let failed = |read: Option<&crate::Error>, found: &Option<crate::Result<DateTime>>| {
+        too_old(read) || too_old(found.as_ref().and_then(|f| f.as_ref().err()))
     };
-    if rereads
-        .iter()
-        .any(|r| too_old(r.as_ref().map(|r| r.as_ref().map(|_| ()))))
-        || rows
-            .iter()
-            .any(|r| too_old(r.as_ref().map(|r| r.as_ref().map(|_| ()))))
+    if (rereads.iter().flatten()).any(|(r, f)| failed(r.as_ref().err(), f))
+        || (rows.iter().flatten()).any(|(r, f)| failed(r.as_ref().err(), f))
     {
         return false;
     }
     let mut rereads = rereads.into_iter();
     watchers.retain_mut(|w| {
-        let Some(reread) = rereads.next().expect("one each") else {
+        let Some((reread, found)) = rereads.next().expect("one each") else {
             return true;
         };
         if let Some(now) = now {
             w.read_whole_at(now);
         }
-        w.reread_into(reread, at) && (w.clock.is_none() || w.rescheduled(at, every))
+        w.reread_into(reread, at) && w.moved_on(found)
     });
     let mut rows = rows.into_iter();
     aggregates.retain_mut(|a| {
-        let Some(rows) = rows.next().expect("one each") else {
+        let Some((rows, found)) = rows.next().expect("one each") else {
             return true;
         };
         if let (Some(clock), Some(now)) = (&mut a.clock, now) {
             clock.read_whole_at(now);
         }
-        a.report(rows) && (a.clock.is_none() || a.rescheduled(at, every))
+        a.report(rows) && a.moved_on(found)
     });
     true
 }

@@ -21,6 +21,12 @@ trunkdb watch fleet.trunkdb devices "last_seen < now - 10m"
   snapshot the look read: one seek through an index, else every
   `clock_every`. Found anew after every reread, which is whole, so
   every document is checked at the new time.
+- **Every read of a look before anything is reported,** the seeks for
+  the next moments with the rereads: a snapshot the writer asks to let
+  go under any of them (`Error::SnapshotTooOld`, §189) has the whole
+  look tried again at the next, as §195 does, and no live query ended.
+  Found in review: the seeks came after the reports, and one ended
+  there ended its live query.
 - **The first read** takes the time once, reads the matches against it,
   and keeps the time and the matches to compare with, as §195 keeps them.
 - **What is reported** is §195.2's: the matches read again compared with
@@ -96,11 +102,15 @@ and take `now` with nothing new.
 | An aggregate's rows not at the look's time | the aggregate, after the writer closed |
 | An aggregate not moved to the look's time | a look before the moment |
 | An aggregate's moment not found anew | a look before the moment |
+| A live query's or aggregate's moment found, not kept | a look before the moment |
 | A read-only open alone refuses it | alone |
 | No `trunkdb-clock` thread at all | alone, and eight tests in the writer's process |
 
-Two survive:
+Three survive:
 - **The first read resolved by `find` itself,** as §204.8 says.
+- **A seek for the next moment that fails as too old ending the live
+  query:** only a snapshot ended between a look's reread and its seek
+  could tell, which no test can time.
 - **`trunkdb-clock` beside a writer too:** it would read again against
   the state the open began with, but the look, every 5 ms in the
   tests, reads first at each moment and leaves it nothing due; only a
