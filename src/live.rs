@@ -625,6 +625,9 @@ impl Watcher {
     /// After a commit checked at `now`: read again where its moment has
     /// come, else its next moment found anew where the commit wrote to its
     /// collection, as a document written may be the soonest (SPEC §204).
+    /// Never later than the one kept: the commit checked only the
+    /// documents it wrote, so one read again `every` apart is still due
+    /// `every` after its last whole read, however often it is written to.
     /// `false` once it has ended.
     fn after_commit(
         &mut self,
@@ -639,10 +642,14 @@ impl Watcher {
         if clock.is_due(now) {
             return self.tick(at, now, every);
         }
-        match changes.iter().any(|c| c.collection() == self.collection) {
-            true => self.rescheduled(at, every),
-            false => true,
+        if !changes.iter().any(|c| c.collection() == self.collection) {
+            return true;
         }
+        let going_on = self.rescheduled(at, every);
+        if let Some(found) = &mut self.clock {
+            found.due = found.due.min(clock.due);
+        }
+        going_on
     }
 
     /// Kept by a read-only open beside a writer (SPEC §195), `seen` what

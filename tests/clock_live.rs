@@ -182,6 +182,39 @@ fn without_an_index_every_clock_every() {
     assert!(before(DateTime::now(), AGE) > seen(&doc));
 }
 
+/// Without an index, writes to the collection more often than
+/// `clock_every` don't put the reread off: a silent device is reported
+/// while another reports every 20 ms.
+#[test]
+fn writes_more_often_than_clock_every_dont_put_it_off() {
+    let (_dir, db) = open(OpenOptions::default().clock_every(Duration::from_millis(200)));
+    let devices = db.collection::<Document>("devices");
+    let van = devices.insert(device("van", DateTime::now())).unwrap();
+    let car = devices.insert(device("car", DateTime::now())).unwrap();
+    let live = devices
+        .watch(Filter::new().older_than("last_seen", AGE))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let entered = loop {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "never reported while written to"
+        );
+        devices
+            .update(&car, device("car", DateTime::now()))
+            .unwrap();
+        if let Some(event) = live.try_recv() {
+            break event.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let Live::Entered { id, doc, .. } = entered else {
+        panic!("not entered: {entered:?}");
+    };
+    assert_eq!(id, van);
+    assert!(before(DateTime::now(), AGE) > seen(&doc));
+}
+
 /// Inside `has`, whose path starts at an element, no seek finds the
 /// moment: read again every `clock_every`, as without an index.
 #[test]

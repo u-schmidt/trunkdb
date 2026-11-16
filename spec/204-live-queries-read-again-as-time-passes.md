@@ -46,7 +46,10 @@ for event in silent {
   for until a write.
 - **Found anew** at the start, after each reread, and after each commit
   that writes to the collection, as a document written may be the
-  soonest.
+  soonest; there never later than the one kept, as the commit checked
+  only the documents it wrote: one read again `every` apart is still
+  due `every` after its last whole read, however often the collection
+  is written to.
 
 ## 204.3 Read again
 - **The thread, `trunkdb-clock`:** started by the first live query or
@@ -105,7 +108,8 @@ clock for others.
     any device is there;
   - the silent ones come first, then each at its moment, in order;
   - `newer_than` loses each as it ages;
-  - without an index, and inside `has`, every `clock_every`;
+  - without an index, and inside `has`, every `clock_every`; and
+    without an index while another device reports every 20 ms;
   - a sorted list with a limit: the older out from 0, the newer in at 0;
     and one that only loses, each leaving as it ages;
   - as a commit reports: a `select` cuts it, nothing more comes;
@@ -136,6 +140,7 @@ clock for others.
 | A comparison inside `has` sought | the next moment |
 | No index used, `clock_every` always | the next moment |
 | A write doesn't find the moment anew | an index finds the moment, a device that goes silent |
+| A write puts the moment later | writes more often than `clock_every` |
 | The clock's reread reports no `Left` | `newer_than` loses them, inside `has` |
 | The clock's reread reports no `Entered` | a device that goes silent, and six more |
 | A sorted list not settled by the clock | a sorted list moves |
