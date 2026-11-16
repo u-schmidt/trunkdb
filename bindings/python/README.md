@@ -114,6 +114,11 @@ with vans.watch("zone = :z", {"z": "depot"}) as in_depot:
 - **Opened read-only beside the application** (`read_only=True`, while
   another process writes), a feed hears of the writer's commits by
   looking every `watch_every` seconds, a tenth of a second unless set.
+- **Against the clock,** `watch("last_seen < now - 10m")` is read again
+  as time passes, with nothing written: a device that stops reporting
+  is `Entered` ten minutes after its last reading, `Left` when it
+  reports again. An index on `last_seen` finds the moment; without one,
+  it is read again every second.
 
 ## Testing it
 

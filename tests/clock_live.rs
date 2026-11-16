@@ -290,14 +290,17 @@ fn a_live_aggregate_ages_out() {
         }
         readings.insert(doc).unwrap();
     };
+    // Ages a second, the readings half of it apart: they age out at
+    // moments of their own unless the clock thread is held up half a
+    // second, when one reread would see both gone at once.
+    let age = Duration::from_secs(1);
     reading("van");
     let per_device = Aggregate::new().group_by("device").count().named("n");
     let live = readings
-        .watch_aggregate(Filter::new().newer_than("last_seen", AGE), &per_device)
+        .watch_aggregate(Filter::new().newer_than("last_seen", age), &per_device)
         .unwrap();
     assert!(matches!(next_row(&live), LiveRow::Entered { .. }));
-    // Apart enough that the two age out at moments of their own.
-    std::thread::sleep(AGE / 3);
+    std::thread::sleep(age / 2);
     reading("van");
     let LiveRow::Changed { row, .. } = next_row(&live) else {
         panic!("not changed");

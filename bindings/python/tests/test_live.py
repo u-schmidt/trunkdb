@@ -9,6 +9,7 @@ import sys
 import textwrap
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -405,3 +406,42 @@ def test_watch_every_is_a_number_of_seconds(tmp_path):
     for wrong in (0, -1, float("inf")):
         with pytest.raises(ValueError, match="watch_every"):
             trunkdb.open(tmp_path / "w.trunkdb", watch_every=wrong)
+
+
+def test_a_live_query_against_now_sees_a_device_go_silent(tmp_path):
+    """SPEC §204, §206: read again as time passes, with nothing written,
+    in the writer's process and beside it."""
+    age = timedelta(milliseconds=300)
+    path = tmp_path / "fleet.trunkdb"
+    with trunkdb.open(path) as db:
+        devices = db.collection("devices")
+        devices.ensure_index("last_seen")
+        seen = datetime.now(timezone.utc)
+        van = devices.insert({"name": "van", "last_seen": seen})
+        with (
+            devices.watch("last_seen < now - 300ms") as silent,
+            devices.watch_aggregate("last_seen >= now - 300ms", "count() as n") as reporting,
+        ):
+            assert silent.next(0) is None, "seen just now"
+            assert reporting.next(0) == RowEntered({}, {"n": 1})
+            match silent.next(10):
+                case Entered(id=id, doc=doc):
+                    assert id == van and doc["last_seen"] == seen
+                case other:
+                    pytest.fail(f"not entered: {other}")
+            assert datetime.now(timezone.utc) - seen > age, "never before its moment"
+            assert reporting.next(10) == RowChanged({}, {"n": 0})
+
+        # Beside the writer, read-only: the look reads it again at the moment.
+        with trunkdb.open(path, read_only=True, watch_every=0.02) as reader:
+            with reader.collection("devices").watch("last_seen < now - 300ms") as silent:
+                assert silent.next(5) == Entered(van, devices.get(van), None)
+                again = datetime.now(timezone.utc)
+                devices.update(van, {"name": "van", "last_seen": again})
+                assert isinstance(silent.next(10), Left)
+                match silent.next(10):
+                    case Entered(doc=doc):
+                        assert doc["last_seen"] == again
+                    case other:
+                        pytest.fail(f"not silent again: {other}")
+                assert datetime.now(timezone.utc) - again > age
