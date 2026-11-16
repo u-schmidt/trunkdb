@@ -116,7 +116,8 @@ $ trunkdb find app.trunkdb devices 'last_seen < now - 10m'
   - `now_is`: two hours ago none silent, in a day all four;
   - in memory: `matches`, `apply`, `Aggregate::apply`; inside `has`;
     on a path with `[*]`; one time for a slow `Aggregate::apply`, a
-    document 50 ms ahead counted by a column and refused by `having`;
+    document a second ahead (50 ms until CI stalled past it) counted
+    by a column and refused by `having`;
   - the text read and printed, `now - 300s` as `now - 5m`, `now + 0s`
     as `now`, a field named `now`;
   - refused: `=`, `!=`, `contains`, a number without a unit, no

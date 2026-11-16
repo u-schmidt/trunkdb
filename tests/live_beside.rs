@@ -112,11 +112,13 @@ fn a_live_query_beside_a_writer_reports_what_it_commits() {
 fn several_commits_between_two_looks_come_as_one() {
     let (dir, writer) = open();
     let vans_w = vans(&writer);
+    // Two seconds between looks, so four commits fit before the first
+    // even where each waits on a slow disk.
     let reader = Database::open_with(
         dir.path().join("live.trunkdb"),
         OpenOptions::default()
             .read_only(true)
-            .watch_every(Duration::from_millis(300)),
+            .watch_every(Duration::from_secs(2)),
     )
     .unwrap();
     let live = vans(&reader).watch(in_depot()).unwrap();
@@ -126,7 +128,7 @@ fn several_commits_between_two_looks_come_as_one() {
     let b = vans_w.insert(van("b", "depot", 0)).unwrap();
     vans_w.delete(&b).unwrap();
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < Duration::from_millis(1500),
         "the writes took too long to tell"
     );
     // In with what the last commit left; `b` came and went unseen.
