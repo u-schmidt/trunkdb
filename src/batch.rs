@@ -1,6 +1,6 @@
 use crate::catalog::Catalog;
 use crate::collection::{
-    Collection, Upserted, any_match_in, apply_write_op, delete_matching_in, update_by_id,
+    Collection, Scope, Upserted, apply_write_op, delete_matching_in, update_by_id,
     update_matching_in, upsert_fields_in,
 };
 use crate::database::Database;
@@ -525,7 +525,7 @@ impl Batch {
                     filter,
                     none,
                 } => {
-                    let matched = any_match_in(catalog, store, collection, filter)?;
+                    let matched = Scope::new(catalog, store, collection).any_match_in(filter)?;
                     if matched == *none {
                         return Err(crate::Error::PreconditionFailed {
                             collection: collection.clone(),

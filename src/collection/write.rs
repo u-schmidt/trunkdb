@@ -1,8 +1,9 @@
 //! Writes: applying a batch's ops to data and index pages, keeping
 //! secondary and unique indexes right, and building or rekeying them.
 
+use super::Scope;
 use super::Upserted;
-use super::find::{Wants, find_in, read_candidates};
+use super::find::Wants;
 use super::plan::follow_hint;
 use crate::catalog::{Catalog, CollectionMeta, IndexMeta, IndexOptions};
 use crate::data::{self};
@@ -15,42 +16,46 @@ use crate::storage::{PageId, PageStore, RecordLocation};
 use crate::txn::WriteOp;
 use std::sync::Arc;
 
-/// The id of the one document of `collection` matching `filter`'s
-/// conditions, `None` if none does; `Error::MultipleMatches` if several
-/// do: what an upsert writes to (SPEC §29.3).
-pub(crate) fn only_match_in(
-    catalog: &Catalog,
-    store: &dyn PageStore,
-    collection: &str,
-    filter: &Filter,
-) -> crate::Result<Option<DocId>> {
-    follow_hint(collection, filter, catalog.indexes(collection))?;
-    let names = filter.fields_with(false);
-    let trace = Trace::default();
-    let matcher = filter.matcher();
-    let candidates = read_candidates(
-        catalog,
-        store,
-        collection,
-        filter,
-        names.as_deref(),
-        Wants::default(),
-        &trace,
-    )?
-    .0;
-    let mut matches: Vec<DocId> = Vec::new();
-    for (source, fields) in candidates {
-        if source.decided() || matcher.matches(&fields)? {
-            matches.push(source.id());
+impl<'a> Scope<'a> {
+    /// The id of the one document of `collection` matching `filter`'s
+    /// conditions, `None` if none does; `Error::MultipleMatches` if several
+    /// do: what an upsert writes to (SPEC §29.3).
+    pub(crate) fn only_match_in(self, filter: &Filter) -> crate::Result<Option<DocId>> {
+        follow_hint(self.collection, filter, self.indexes())?;
+        let names = filter.fields_with(false);
+        let trace = Trace::default();
+        let matcher = filter.matcher();
+        let candidates = self
+            .read_candidates(filter, names.as_deref(), Wants::default(), &trace)?
+            .0;
+        let mut matches: Vec<DocId> = Vec::new();
+        for (source, fields) in candidates {
+            if source.decided() || matcher.matches(&fields)? {
+                matches.push(source.id());
+            }
+        }
+        match matches[..] {
+            [] => Ok(None),
+            [id] => Ok(Some(id)),
+            _ => Err(crate::Error::MultipleMatches {
+                collection: self.collection.to_string(),
+                count: matches.len(),
+            }),
         }
     }
-    match matches[..] {
-        [] => Ok(None),
-        [id] => Ok(Some(id)),
-        _ => Err(crate::Error::MultipleMatches {
-            collection: collection.to_string(),
-            count: matches.len(),
-        }),
+
+    /// Where document `id` of `collection` lives — `Error::NotFound` if the
+    /// collection or the document doesn't exist.
+    fn locate(self, id: &DocId) -> crate::Result<(CollectionMeta, RecordLocation)> {
+        let not_found = || crate::Error::NotFound {
+            collection: self.collection.to_string(),
+            id: *id,
+        };
+        let meta = *self.meta().ok_or_else(not_found)?;
+        let loc = BTreeIndex::new(meta.index_root)
+            .lookup(self.store, &key::primary(*id))?
+            .ok_or_else(not_found)?;
+        Ok((meta, loc))
     }
 }
 
@@ -67,7 +72,7 @@ pub(crate) fn upsert_fields_in(
     update: &Update,
     accept: &mut dyn FnMut(&Document) -> crate::Result<()>,
 ) -> crate::Result<(Upserted, bool)> {
-    if let Some(found) = only_match_in(catalog, store, collection, filter)? {
+    if let Some(found) = Scope::new(catalog, store, collection).only_match_in(filter)? {
         let changed = update_by_id(catalog, store, collection, found, update, accept)?;
         return Ok((Upserted::Updated(found), changed));
     }
@@ -108,7 +113,7 @@ pub(crate) fn update_by_id(
     update: &Update,
     accept: &mut dyn FnMut(&Document) -> crate::Result<()>,
 ) -> crate::Result<bool> {
-    let (_, loc) = locate(catalog, store, collection, &id)?;
+    let (_, loc) = Scope::new(catalog, store, collection).locate(&id)?;
     let old = with_id(data::get_record(store, catalog.names(), loc)?.1, id);
     let mut new = old.clone();
     update
@@ -144,15 +149,8 @@ pub(crate) fn update_matching_in(
 ) -> crate::Result<usize> {
     // The whole documents, whatever is selected: what `change` returns
     // is written back (SPEC §106.3).
-    let found = find_in(
-        catalog,
-        store,
-        collection,
-        filter,
-        true,
-        None,
-        &Trace::default(),
-    )?;
+    let found =
+        Scope::new(catalog, store, collection).find_in(filter, true, None, &Trace::default())?;
     let mut changed = 0;
     for found in found {
         let (id, old) = (found.id(), found.decode(None)?);
@@ -181,15 +179,8 @@ pub(crate) fn delete_matching_in(
     collection: &str,
     filter: &Filter,
 ) -> crate::Result<usize> {
-    let doomed = find_in(
-        catalog,
-        store,
-        collection,
-        filter,
-        false,
-        None,
-        &Trace::default(),
-    )?;
+    let doomed =
+        Scope::new(catalog, store, collection).find_in(filter, false, None, &Trace::default())?;
     for found in &doomed {
         let op = WriteOp::Delete(collection.to_string(), found.id());
         apply_write_op(catalog, store, &op)?;
@@ -302,7 +293,7 @@ pub(super) fn apply_unchecked(
             save_current_data_page(catalog, store, collection, &meta, current)
         }
         WriteOp::Update(collection, id, doc) => {
-            let (meta, loc) = locate(catalog, store, collection, id)?;
+            let (meta, loc) = Scope::new(catalog, store, collection).locate(id)?;
             let mut index = BTreeIndex::new(meta.index_root);
             let doc = with_id(doc.clone(), *id);
             refuse_too_deep(collection, id, &doc)?;
@@ -331,7 +322,7 @@ pub(super) fn apply_unchecked(
             save_current_data_page(catalog, store, collection, &meta, current)
         }
         WriteOp::Delete(collection, id) => {
-            let (meta, loc) = locate(catalog, store, collection, id)?;
+            let (meta, loc) = Scope::new(catalog, store, collection).locate(id)?;
             let mut index = BTreeIndex::new(meta.index_root);
             let names = catalog.names().clone();
             let (secondary, free) = catalog.indexes_and_free_space(collection);
@@ -344,25 +335,6 @@ pub(super) fn apply_unchecked(
             count_left_out(catalog, store, collection, left_out)
         }
     }
-}
-
-/// Where document `id` of `collection` lives — `Error::NotFound` if the
-/// collection or the document doesn't exist.
-fn locate(
-    catalog: &Catalog,
-    store: &dyn PageStore,
-    collection: &str,
-    id: &DocId,
-) -> crate::Result<(CollectionMeta, RecordLocation)> {
-    let not_found = || crate::Error::NotFound {
-        collection: collection.to_string(),
-        id: *id,
-    };
-    let meta = *catalog.get(collection).ok_or_else(not_found)?;
-    let loc = BTreeIndex::new(meta.index_root)
-        .lookup(store, &key::primary(*id))?
-        .ok_or_else(not_found)?;
-    Ok((meta, loc))
 }
 
 /// The document stored at `loc`, if the collection has secondary indexes
