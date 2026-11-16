@@ -10,9 +10,15 @@ tested against the clock. Nothing in the library changes.
   device, with `newer_than` in its filter.
 - **Why the first:** the devices already silent come first; `Entered`
   holds the device's last document; an index on `last_seen` finds the
-  next with one seek. The aggregate never reports a device silent
-  before it started, and reads ten minutes of every device's readings
-  each time one ages out.
+  next with one seek, and each time one goes silent the live query
+  reads again the devices silent then (§204.3), not every device's
+  readings. The aggregate never reports a device silent before it
+  started, and reads ten minutes of every device's readings each time
+  one ages out.
+- **What each costs, as it is** (found in review): the GUIDE first said
+  the document per device reads one index entry per device that goes
+  silent; it reads every device silent at that moment, through the
+  index.
 - **Whose clock** (§202.6): store the time a reading arrived where
   devices' clocks can't be trusted.
 - **From another process** (§205): the same beside the application,

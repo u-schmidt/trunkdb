@@ -897,8 +897,10 @@ for event in silent {
 - **`Entered` holds the device's document:** its last position and
   time, what an alert wants.
 - **The index on `last_seen`** finds the next device to go silent with
-  one seek, and nothing is read until then. Without it, the live query
-  is read whole every `OpenOptions::clock_every` (1 s).
+  one seek, and nothing is read until then. Then the live query is
+  read again whole, through the index: every device silent at that
+  moment, not only the one that just went. Without the index, it is
+  read whole every `OpenOptions::clock_every` (1 s).
 - **Store the time a reading arrived,** `DateTime::now()` as you write
   it, where devices' clocks can't be trusted: `now` is your machine's
   clock, and a reading stamped by a device five minutes behind would
@@ -929,8 +931,9 @@ for event in reporting {
 It needs no second collection, but a device silent before it started
 is never in it, so never reported, and each time a reading ages out it
 reads ten minutes of every device's readings again: with a reading a
-second, about once a second. The document per device reads one entry
-of an index per device that goes silent.
+second, about once a second. The document per device reads the
+devices silent at that moment, each time one goes silent: a few where
+devices come back soon, many where a fleet stays parked overnight.
 
 **From another process.** An admin tool, a dashboard, or C# and Python
 opened read-only beside the application see the same: the look that
