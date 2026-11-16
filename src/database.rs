@@ -94,6 +94,35 @@ struct Shared {
     /// The checkpoints skipped for readers in other processes, for
     /// `snapshot_info` (SPEC §185.5).
     skipped: Arc<Skipped>,
+    /// Wakes the clock's thread (SPEC §204) before its time, where a
+    /// commit or a new live query brought a moment nearer.
+    bell: Arc<Bell>,
+}
+
+/// What wakes the clock's thread (SPEC §204): rung, it wakes; else it
+/// sleeps as long as it was told. Apart from `Shared`, so a sleeping
+/// thread doesn't keep the database open.
+#[derive(Default)]
+struct Bell {
+    rung: Mutex<bool>,
+    woken: std::sync::Condvar,
+}
+
+impl Bell {
+    fn ring(&self) {
+        *self.rung.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.woken.notify_one();
+    }
+
+    /// Sleeps for `wait`, or until rung.
+    fn sleep(&self, wait: Duration) {
+        let rung = self.rung.lock().unwrap_or_else(|p| p.into_inner());
+        let mut rung = match self.woken.wait_timeout_while(rung, wait, |rung| !*rung) {
+            Ok((rung, _)) => rung,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
+        *rung = false;
+    }
 }
 
 /// How many checkpoints were skipped because a reader in another process
@@ -168,6 +197,13 @@ pub(crate) struct Writer {
     /// The state it last read them on: the next look reads again only
     /// where the writer committed since.
     watched: Option<Watched>,
+    /// `OpenOptions::clock_every` (SPEC §204).
+    clock_every: Duration,
+    /// Whether the clock's thread runs: from the first live query or
+    /// aggregate that compares with the clock until it finds none.
+    clocking: bool,
+    /// When the clock's thread wakes next, unless rung.
+    clock_wakes: Option<crate::DateTime>,
     /// Test-only: called once, by the next batch, when it is logged and
     /// flushed and not yet published — to see what goes on beside it.
     #[cfg(test)]
@@ -318,6 +354,7 @@ pub struct OpenOptions {
     wait_for_readers: Duration,
     let_go_wal_bytes: Option<u64>,
     watch_every: Duration,
+    clock_every: Duration,
 }
 
 impl Default for OpenOptions {
@@ -332,6 +369,7 @@ impl Default for OpenOptions {
             wait_for_readers: DEFAULT_WAIT_FOR_READERS,
             let_go_wal_bytes: None,
             watch_every: DEFAULT_WATCH_EVERY,
+            clock_every: DEFAULT_CLOCK_EVERY,
         }
     }
 }
@@ -493,7 +531,36 @@ impl OpenOptions {
         self.watch_every = every;
         self
     }
+
+    /// How often a live query or aggregate that compares with the clock
+    /// is read again where no index tells when its result can next change
+    /// (SPEC §204). Default: 1 s.
+    ///
+    /// `last_seen < now - 10m` changes for a document when the clock
+    /// passes its `last_seen` and ten minutes. With an index on
+    /// `last_seen`, one seek finds the soonest such moment, and a thread
+    /// of trunkdb's (`trunkdb-clock`) reads the live query again then.
+    /// Without one, or for a comparison inside `has` or in `having`, it
+    /// reads it again this often. Shorter reports sooner, longer reads
+    /// less.
+    pub fn clock_every(mut self, every: Duration) -> Self {
+        self.clock_every = every;
+        self
+    }
 }
+
+/// How often a live query against the clock that no index serves is
+/// read again, unless `OpenOptions::clock_every` says otherwise (SPEC
+/// §204).
+const DEFAULT_CLOCK_EVERY: Duration = Duration::from_secs(1);
+
+/// The longest the clock's thread sleeps at a time (SPEC §204): it reads
+/// the clock again at least this often, so a clock set back or forward
+/// is seen within it.
+const CLOCK_SLEEPS_AT_MOST: Duration = Duration::from_secs(1);
+
+/// The shortest it sleeps: moments closer than this are read for together.
+const CLOCK_SLEEPS_AT_LEAST: Duration = Duration::from_millis(1);
 
 /// How often a read-only open beside a writer looks for its live
 /// queries, unless `OpenOptions::watch_every` says otherwise (SPEC
@@ -583,6 +650,19 @@ fn readers_gone(
 }
 
 impl Writer {
+    /// The soonest moment a live query or aggregate against the clock
+    /// can change with nothing written (SPEC §204): `None` where none
+    /// compares with it.
+    fn soonest(&self) -> Option<crate::DateTime> {
+        (self.watchers.iter().filter_map(live::Watcher::due))
+            .chain(
+                self.aggregates
+                    .iter()
+                    .filter_map(live::AggregateWatcher::due),
+            )
+            .min()
+    }
+
     /// Sends a commit's changes to every subscriber, dropping those
     /// whose `Changes` is gone. Nothing for a batch whose writes left
     /// every document as it was.
@@ -996,6 +1076,9 @@ impl Database {
                     watch_every: options.watch_every,
                     watching: false,
                     watched: None,
+                    clock_every: options.clock_every,
+                    clocking: false,
+                    clock_wakes: None,
                     #[cfg(test)]
                     after_log: None,
                 }),
@@ -1007,6 +1090,7 @@ impl Database {
                 recovered,
                 beside,
                 skipped,
+                bell: Arc::default(),
             }),
         }
     }
@@ -1096,6 +1180,8 @@ impl Database {
         if let Some(reason) = live::refused(&filter) {
             return Err(crate::Error::NotLive { reason });
         }
+        crate::query::refuse_against_now(&filter.conditions)?;
+        self.refuse_clock_read_only(filter.has_now())?;
         let mut writer = self
             .inner
             .writer
@@ -1107,9 +1193,22 @@ impl Database {
         let (sender, receiver) = mpsc::channel();
         let watcher = match &self.inner.beside {
             None => {
+                // Against the clock, read once, the time kept (SPEC §204).
+                let read_at = filter.has_now().then(crate::DateTime::now);
+                let first = live::first_read(&filter);
+                let first = match read_at {
+                    Some(now) => first.now_is(now),
+                    None => first,
+                };
                 let now = Collection::<Document>::new(self.clone(), collection)
-                    .matches_with_ids(&live::first_read(&filter))?;
-                live::Watcher::start(collection.to_string(), filter, now, sender)?
+                    .matches_with_ids(&first)?;
+                let mut watcher =
+                    live::Watcher::start(collection.to_string(), filter, now, sender, read_at)?;
+                if read_at.is_some() {
+                    let current = self.current();
+                    watcher.schedule(&current.reading(&self.inner.pages), writer.clock_every)?;
+                }
+                watcher
             }
             // Beside a writer in another process, read again as it
             // commits (SPEC §195): the first matches whole, to compare,
@@ -1123,11 +1222,14 @@ impl Database {
                 };
                 let now = crate::collection::find_at(&at, collection, &first)?;
                 let seen = live::seen(&now);
-                live::Watcher::start(collection.to_string(), filter, now, sender)?.polled(seen)
+                live::Watcher::start(collection.to_string(), filter, now, sender, None)?
+                    .polled(seen)
             }
         };
         self.watch_beside(&mut writer)?;
+        let due = watcher.due();
         writer.watchers.push(watcher);
+        self.keep_time(&mut writer, due)?;
         Ok(LiveQuery::new(receiver, convert))
     }
 
@@ -1140,12 +1242,8 @@ impl Database {
         aggregate: &Aggregate,
         convert: fn(Document) -> crate::Result<R>,
     ) -> crate::Result<LiveAggregate<R>> {
-        // Nothing reads it again as time passes yet (SPEC §203.4).
-        if filter.has_now() || aggregate.has_now() {
-            return Err(crate::Error::NotLive {
-                reason: "a comparison with `now`, not yet",
-            });
-        }
+        crate::query::refuse_against_now(&filter.conditions)?;
+        self.refuse_clock_read_only(filter.has_now() || aggregate.has_now())?;
         let mut writer = self
             .inner
             .writer
@@ -1165,9 +1263,12 @@ impl Database {
             collection,
             filter,
             aggregate.clone(),
+            writer.clock_every,
         )?;
         self.watch_beside(&mut writer)?;
+        let due = watcher.due();
         writer.aggregates.push(watcher);
+        self.keep_time(&mut writer, due)?;
         Ok(LiveAggregate::new(receiver, convert))
     }
 
@@ -1197,6 +1298,88 @@ impl Database {
             })?;
         writer.watching = true;
         Ok(())
+    }
+
+    /// A live query or aggregate against the clock, refused by a
+    /// read-only open: nothing there reads it again as time passes yet
+    /// (SPEC §204; §202's step 3).
+    fn refuse_clock_read_only(&self, has_now: bool) -> crate::Result<()> {
+        let read_only = self.inner.beside.is_some()
+            || (self.inner.writer.lock())
+                .map_err(|_| crate::Error::Poisoned)?
+                .durability
+                .is_none();
+        match has_now && read_only {
+            true => Err(crate::Error::NotLive {
+                reason: "a comparison with `now` in a read-only open, not yet",
+            }),
+            false => Ok(()),
+        }
+    }
+
+    /// Where a live query or aggregate compares with the clock, its
+    /// moment `due` (SPEC §204): starts the thread that reads them again
+    /// as time passes, unless it runs, or wakes it where `due` is sooner
+    /// than it would wake. It holds the database weakly, and ends with
+    /// it, or once it finds none left.
+    fn keep_time(&self, writer: &mut Writer, due: Option<crate::DateTime>) -> crate::Result<()> {
+        let Some(due) = due else {
+            return Ok(());
+        };
+        if writer.clocking {
+            if writer.clock_wakes.is_none_or(|wakes| due < wakes) {
+                self.inner.bell.ring();
+            }
+            return Ok(());
+        }
+        let shared = Arc::downgrade(&self.inner);
+        let bell = self.inner.bell.clone();
+        std::thread::Builder::new()
+            .name("trunkdb-clock".to_string())
+            .spawn(move || {
+                loop {
+                    let Some(inner) = shared.upgrade() else {
+                        return;
+                    };
+                    let Some(wait) = (Database { inner }).tick() else {
+                        return;
+                    };
+                    bell.sleep(wait);
+                }
+            })?;
+        writer.clocking = true;
+        Ok(())
+    }
+
+    /// One turn of `keep_time`'s thread: each live query and aggregate
+    /// whose moment has come read again, under the writer's lock, so in
+    /// order with the commits. How long to sleep until the next; `None`,
+    /// the thread to end, once none compares with the clock.
+    fn tick(&self) -> Option<Duration> {
+        let Ok(mut writer) = self.inner.writer.lock() else {
+            return None;
+        };
+        let writer = &mut *writer;
+        let now = crate::DateTime::now();
+        let current = self.current();
+        let at = current.reading(&self.inner.pages);
+        live::tick(
+            &mut writer.watchers,
+            &mut writer.aggregates,
+            &at,
+            now,
+            writer.clock_every,
+        );
+        let Some(soonest) = writer.soonest() else {
+            writer.clocking = false;
+            writer.clock_wakes = None;
+            return None;
+        };
+        let wait = soonest
+            .since(now)
+            .clamp(CLOCK_SLEEPS_AT_LEAST, CLOCK_SLEEPS_AT_MOST);
+        writer.clock_wakes = Some(now.forward(wait));
+        Some(wait)
     }
 
     /// One look of `watch_beside`'s thread: where the writer committed
@@ -1565,8 +1748,16 @@ impl Database {
             if live && !changes.is_empty() {
                 let current = self.current();
                 let at = current.reading(&self.inner.pages);
-                live::check(&mut writer.watchers, &changes, &at);
-                live::check_aggregates(&mut writer.aggregates, &changes, &at);
+                // One time for every comparison with the clock (SPEC §204).
+                let now = writer.soonest().map(|_| crate::DateTime::now());
+                let every = writer.clock_every;
+                live::check(&mut writer.watchers, &changes, &at, now, every);
+                live::check_aggregates(&mut writer.aggregates, &changes, &at, now, every);
+                if let (Some(soonest), Some(wakes)) = (writer.soonest(), writer.clock_wakes)
+                    && soonest < wakes
+                {
+                    self.inner.bell.ring();
+                }
             }
             writer.report(changes);
         }

@@ -70,6 +70,19 @@ impl DateTime {
         self.moved(duration.as_nanos() as i128)
     }
 
+    /// How long after `earlier` this time is: zero where it isn't after
+    /// it (SPEC §204).
+    pub(crate) fn since(self, earlier: DateTime) -> Duration {
+        let nanos =
+            |t: DateTime| i128::from(t.secs) * i128::from(NANOS_PER_SECOND) + i128::from(t.nanos);
+        let apart = nanos(self) - nanos(earlier);
+        match u64::try_from(apart) {
+            Ok(apart) => Duration::from_nanos(apart),
+            Err(_) if apart < 0 => Duration::ZERO,
+            Err(_) => Duration::MAX,
+        }
+    }
+
     /// This time moved by `nanos`, stopping at `EARLIEST` and `LATEST`.
     /// A `Duration` is at most about 2^94 nanoseconds, so the sum fits.
     fn moved(self, nanos: i128) -> DateTime {

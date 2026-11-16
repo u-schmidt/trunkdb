@@ -147,9 +147,9 @@ pub struct Ran {
     /// Regex conditions made (SPEC §169).
     pub regexes: u64,
     /// Comparisons with the clock made (SPEC §203), and live queries and
-    /// aggregates refused for one.
+    /// aggregates made with one (§204).
     pub against_now: u64,
-    pub live_refused_now: u64,
+    pub live_now: u64,
     /// Aggregates given a window (SPEC §139).
     pub windows: u64,
     /// Aggregates given a window per group, by time or by count (SPEC
@@ -2003,14 +2003,14 @@ impl Run<'_> {
             }
             let query = match self.docs().watch(filter.clone()) {
                 Ok(query) => query,
-                // Until it is read again as time passes (SPEC §203).
-                Err(trunkdb::Error::NotLive { reason, .. }) if reason.contains("now") => {
-                    assert!(filter.to_string().contains("now"), "{}", self.at());
-                    self.ran.live_refused_now += 1;
-                    continue;
-                }
                 Err(e) => panic!("{e} at {}", self.at()),
             };
+            // Against the clock, read again as time passes (SPEC §204):
+            // no edge comes near a value while a program runs, so it
+            // reports what the model has, as any.
+            if filter.to_string().contains("now") {
+                self.ran.live_now += 1;
+            }
             self.live.push(Watched {
                 filter,
                 query,
@@ -2027,15 +2027,11 @@ impl Run<'_> {
         }
         let live = match self.docs().watch_aggregate(filter.clone(), &aggregate) {
             Ok(live) => live,
-            Err(trunkdb::Error::NotLive { reason, .. }) if reason.contains("now") => {
-                let text = format!("{filter} {aggregate}");
-                assert!(text.contains("now"), "{}", self.at());
-                self.ran.live_refused_now += 1;
-                self.live_is_model();
-                return;
-            }
             Err(e) => panic!("{e} at {}", self.at()),
         };
+        if format!("{filter} {aggregate}").contains("now") {
+            self.ran.live_now += 1;
+        }
         self.aggregates.push(WatchedAggregate {
             filter,
             aggregate,

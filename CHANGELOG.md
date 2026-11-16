@@ -1536,3 +1536,12 @@ limit, batches and a write-ahead log. Since then:
     program's; `Explained::now` and `--explain` say the time read. `=`,
     `!=`, `contains` and `starts with` against `now` are refused, and so
     is a live query against it, until it is read again as time passes.
+175. **Live queries read again as time passes** (§204, step 2 of
+    §202): `watch` and `watch_aggregate` take a comparison with `now`.
+    A thread, `trunkdb-clock`, reads each again at the next moment its
+    result can change with nothing written, found with one seek through
+    an index on the field, or every `OpenOptions::clock_every` (1 s)
+    without one: a device that stops reporting is `Entered` in
+    `last_seen < now - 10m` ten minutes later. A commit checks what it
+    wrote against the time it reads. A read-only open refuses it until
+    step 3.

@@ -216,5 +216,6 @@ say what changed, and DESIGN.md says what is true now.
 199. [The Python module (`bindings/python/`)](199-the-python-module.md)
 200. [Live queries in Python (`bindings/python/`)](200-live-queries-in-python.md)
 201. [Python wheels in CI (`bindings/python/`, `.github/workflows/ci.yml`)](201-python-wheels-in-ci.md)
-202. [The clock in a filter, designed first (`query.rs`, `query_text.rs`, `live.rs`, `database.rs`)](202-the-clock-in-a-filter-designed-first.md) — step 1 built (§203)
+202. [The clock in a filter, designed first (`query.rs`, `query_text.rs`, `live.rs`, `database.rs`)](202-the-clock-in-a-filter-designed-first.md) — steps 1 and 2 built (§203, §204)
 203. [`now` in a condition (`query.rs`, `query_text.rs`, `collection/`, `aggregate.rs`, `explain.rs`, `datetime.rs`)](203-now-in-a-condition.md)
+204. [Live queries read again as time passes (`live.rs`, `database.rs`, `query.rs`, `aggregate.rs`)](204-live-queries-read-again-as-time-passes.md)

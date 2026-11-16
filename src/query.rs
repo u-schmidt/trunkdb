@@ -638,6 +638,31 @@ impl Condition {
         }
     }
 
+    /// Where it compares with the clock, the edges a live query finds
+    /// its next moment by (SPEC §204): one for each comparison of a
+    /// document's own path, inside a NOT, an AND or an OR as well;
+    /// `Edge::Unbounded` for one inside `has`, whose path starts at an
+    /// element.
+    pub(crate) fn edges<'c>(&'c self, edges: &mut Vec<Edge<'c>>) {
+        match self {
+            Condition::AgainstNow { field, op, offset } => edges.push(Edge::Seek {
+                field,
+                op,
+                offset: *offset,
+            }),
+            Condition::ElemMatch { condition, .. } => {
+                if condition.has_now() {
+                    edges.push(Edge::Unbounded);
+                }
+            }
+            Condition::Not(condition) => condition.edges(edges),
+            Condition::All(conditions) | Condition::Any(conditions) => {
+                conditions.iter().for_each(|c| c.edges(edges))
+            }
+            _ => {}
+        }
+    }
+
     /// The condition with every comparison against the clock made one
     /// against `now` (SPEC §203).
     pub(crate) fn now_is(&self, now: crate::DateTime) -> Condition {
@@ -1052,6 +1077,13 @@ impl Filter {
     /// Whether a condition compares with the clock (SPEC §203).
     pub(crate) fn has_now(&self) -> bool {
         self.conditions.iter().any(Condition::has_now)
+    }
+
+    /// Its comparisons with the clock, as edges (SPEC §204).
+    pub(crate) fn edges(&self) -> Vec<Edge<'_>> {
+        let mut edges = Vec::new();
+        self.conditions.iter().for_each(|c| c.edges(&mut edges));
+        edges
     }
 
     /// `resolved`, for a filter the read owns: no copy where it has no
@@ -3090,6 +3122,55 @@ thread_local! {
     /// Entries the bytes didn't decide, their values put into a document
     /// to be checked (SPEC §104.3), for tests.
     pub(crate) static FILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Where a condition compares with the clock (SPEC §204): what a live
+/// query's next moment is found from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Edge<'c> {
+    /// `field op now ± offset`, on a document's own path.
+    Seek {
+        field: &'c str,
+        op: &'c Op,
+        offset: Offset,
+    },
+    /// One whose moments a seek can't find: inside `has`, or in
+    /// `having`, on an aggregate's rows.
+    Unbounded,
+}
+
+impl Edge<'_> {
+    /// For `Seek`, the condition that finds, as of `now`, the date-times
+    /// the edge hasn't passed yet, the soonest first; and, of one found,
+    /// the moment the edge passes it. Both edges move forward with the
+    /// clock, so a date-time it has passed stays passed: `<` and `>=`
+    /// change for `p` once `now ± offset` is after it, `<=` and `>` once
+    /// it is at it.
+    pub(crate) fn ahead(&self, now: crate::DateTime) -> Option<Condition> {
+        let Edge::Seek { field, op, offset } = self else {
+            return None;
+        };
+        let at = Document::DateTime(offset.from(now));
+        Some(match op {
+            Op::Lte | Op::Gt => Condition::gt(*field, at),
+            _ => Condition::gte(*field, at),
+        })
+    }
+
+    /// The moment the edge passes `p`, a date-time `ahead` found.
+    pub(crate) fn passes(&self, p: crate::DateTime) -> crate::DateTime {
+        let Edge::Seek { op, offset, .. } = self else {
+            unreachable!("only a seek finds a date-time");
+        };
+        let at = match offset.is_after() {
+            true => p.back(offset.duration()),
+            false => p.forward(offset.duration()),
+        };
+        match op {
+            Op::Lte | Op::Gt => at,
+            _ => at.forward(std::time::Duration::from_nanos(1)),
+        }
+    }
 }
 
 /// An `InvalidInput` error where one of `conditions` compares with the

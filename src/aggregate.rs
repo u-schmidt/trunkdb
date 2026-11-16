@@ -606,6 +606,20 @@ impl Aggregate {
             || self.rows.has_now()
     }
 
+    /// Its comparisons with the clock, as edges (SPEC §204): its
+    /// columns' conditions, on the documents; `having`'s, on its rows,
+    /// unbounded.
+    pub(crate) fn edges(&self) -> Vec<crate::query::Edge<'_>> {
+        let mut edges = Vec::new();
+        for condition in self.columns.iter().filter_map(|c| c.condition.as_ref()) {
+            condition.edges(&mut edges);
+        }
+        if self.rows.has_now() {
+            edges.push(crate::query::Edge::Unbounded);
+        }
+        edges
+    }
+
     /// The aggregate with every comparison against the clock made one
     /// against `now` (SPEC §203), as `Filter::now_is`.
     pub(crate) fn now_is(&self, now: crate::DateTime) -> Aggregate {
