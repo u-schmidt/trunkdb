@@ -405,32 +405,259 @@ fn commits_and_the_clock_take_turns() {
     assert!(live.recv_timeout(AGE).is_none(), "nothing more");
 }
 
-/// A read-only open has nothing yet that reads a live query again as time
-/// passes (§202's step 3): refused there, with `NotLive`.
+/// A read-only open beside the writer `_writer` holds, at `dir`,
+/// looking every 5 ms, `clock_every` as `options` says.
+fn beside(dir: &tempfile::TempDir, options: OpenOptions) -> Database {
+    let options = options
+        .read_only(true)
+        .watch_every(Duration::from_millis(5));
+    Database::open_with(dir.path().join("clock.trunkdb"), options).unwrap()
+}
+
+/// Beside a writer (SPEC §205), the look reads a live query against the
+/// clock again at its moment, with nothing committed: a device goes
+/// silent, through an index, `Left` when the writer has it report again.
 #[test]
-fn a_read_only_open_refuses_it_for_now() {
+fn beside_a_writer_a_device_goes_silent() {
     let (dir, db) = open(OpenOptions::default());
     let devices = db.collection::<Document>("devices");
+    devices.ensure_index("last_seen").unwrap();
+    let van = devices.insert(device("van", DateTime::now())).unwrap();
+    let reader = beside(
+        &dir,
+        OpenOptions::default().clock_every(Duration::from_secs(3600)),
+    );
+    let live = (reader.collection::<Document>("devices"))
+        .watch(Filter::new().older_than("last_seen", AGE))
+        .unwrap();
+    assert!(live.try_recv().is_none(), "seen just now: not silent");
+    let Live::Entered { id, doc, .. } = next(&live) else {
+        panic!("not entered");
+    };
+    assert_eq!(id, van);
+    assert!(before(DateTime::now(), AGE) > seen(&doc));
+    let again = DateTime::now();
+    devices.update(&van, device("van", again)).unwrap();
+    assert!(matches!(next(&live), Live::Left { id, .. } if id == van));
+    let Live::Entered { doc, .. } = next(&live) else {
+        panic!("not silent again");
+    };
+    assert_eq!(seen(&doc), again, "as the writer left it");
+    assert!(before(DateTime::now(), AGE) > again);
+}
+
+/// Beside a writer, without an index: every `clock_every`, as in the
+/// writer's process.
+#[test]
+fn beside_a_writer_without_an_index() {
+    let (dir, db) = open(OpenOptions::default());
+    let devices = db.collection::<Document>("devices");
+    let van = devices.insert(device("van", DateTime::now())).unwrap();
+    let reader = beside(
+        &dir,
+        OpenOptions::default().clock_every(Duration::from_millis(50)),
+    );
+    let live = (reader.collection::<Document>("devices"))
+        .watch(Filter::new().older_than("last_seen", AGE))
+        .unwrap();
+    let Live::Entered { id, doc, .. } = next(&live) else {
+        panic!("not entered");
+    };
+    assert_eq!(id, van);
+    assert!(before(DateTime::now(), AGE) > seen(&doc));
+}
+
+/// Beside a writer, a live aggregate against the clock runs again at
+/// its moment: a device's count falls as its readings age, then its row
+/// leaves.
+#[test]
+fn beside_a_writer_a_live_aggregate_ages_out() {
+    let (dir, db) = open(OpenOptions::default());
+    let readings = db.collection::<Document>("readings");
+    readings.ensure_index("last_seen").unwrap();
+    readings
+        .insert(device("van", before(DateTime::now(), AGE / 2)))
+        .unwrap();
+    readings.insert(device("van", DateTime::now())).unwrap();
+    let reader = beside(&dir, OpenOptions::default());
+    let per_device = Aggregate::new().group_by("name").count().named("n");
+    let live = (reader.collection::<Document>("readings"))
+        .watch_aggregate(Filter::new().newer_than("last_seen", AGE), &per_device)
+        .unwrap();
+    let count = |row: &LiveRow| match row {
+        LiveRow::Entered { row, .. } | LiveRow::Changed { row, .. } => row.get("n").cloned(),
+        _ => None,
+    };
+    assert_eq!(count(&next_row(&live)), Some(Document::Int(2)));
+    assert_eq!(count(&next_row(&live)), Some(Document::Int(1)));
+    assert!(matches!(next_row(&live), LiveRow::Left { row: None, .. }));
+}
+
+/// Beside a writer, a look reads nothing where no moment has come for
+/// it and nothing was committed: before the device goes silent, and
+/// after, with nothing ahead, while another live query, without an
+/// index, is read again every look. Conditions of the test's own count
+/// the documents a live query and a live aggregate are given.
+#[test]
+fn beside_a_writer_a_look_before_the_moment_reads_nothing() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let age = Duration::from_secs(1);
+    let (dir, db) = open(OpenOptions::default());
+    let devices = db.collection::<Document>("devices");
+    devices.ensure_index("last_seen").unwrap();
     devices.insert(device("van", DateTime::now())).unwrap();
+    let reader = beside(
+        &dir,
+        OpenOptions::default().clock_every(Duration::from_millis(5)),
+    );
+    let read = Arc::new(AtomicUsize::new(0));
+    let counting = |read: &Arc<AtomicUsize>| {
+        let counted = read.clone();
+        Filter::new()
+            .older_than("last_seen", age)
+            .and(trunkdb::query::Condition::custom(["name"], move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                true
+            }))
+    };
+    let devices = reader.collection::<Document>("devices");
+    let live = devices.watch(counting(&read)).unwrap();
+    let silent = Aggregate::new().count().named("n");
+    let counted = devices.watch_aggregate(counting(&read), &silent).unwrap();
+    let LiveRow::Entered { .. } = next_row(&counted) else {
+        panic!("no first row");
+    };
+    let _often = (reader.collection::<Document>("others"))
+        .watch(Filter::new().older_than("at", age))
+        .unwrap();
+    let steady = |what: &str| {
+        std::thread::sleep(Duration::from_millis(50));
+        let first = read.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(read.load(Ordering::Relaxed), first, "twenty looks {what}");
+    };
+    steady("before the moment");
+    assert!(matches!(next(&live), Live::Entered { .. }));
+    let LiveRow::Changed { row, .. } = next_row(&counted) else {
+        panic!("the count not changed");
+    };
+    assert_eq!(row.get("n"), Some(&Document::Int(1)));
+    steady("with nothing ahead");
+    drop(db);
+}
+
+/// Beside a writer, a live query against the clock started after the
+/// look has read the writer's last commit: its moment is found when it
+/// starts, as no commit comes to find it.
+#[test]
+fn beside_a_writer_a_live_query_started_later() {
+    let (dir, db) = open(OpenOptions::default());
+    let devices = db.collection::<Document>("devices");
+    devices.ensure_index("last_seen").unwrap();
+    let van = devices.insert(device("van", DateTime::now())).unwrap();
+    let reader = beside(
+        &dir,
+        OpenOptions::default().clock_every(Duration::from_secs(3600)),
+    );
+    let devices = reader.collection::<Document>("devices");
+    let all = devices.watch(Filter::new()).unwrap();
+    assert!(matches!(next(&all), Live::Entered { .. }));
+    std::thread::sleep(Duration::from_millis(50));
+    let live = devices
+        .watch(Filter::new().older_than("last_seen", AGE))
+        .unwrap();
+    let Live::Entered { id, .. } = next(&live) else {
+        panic!("not entered");
+    };
+    assert_eq!(id, van);
+    drop(db);
+}
+
+/// A read-only open in a directory it may not write, where no writer has
+/// made the lock files, is alone (SPEC §185.6, §205): nothing commits and
+/// nothing looks, and `trunkdb-clock` alone reads its live queries and
+/// aggregates again.
+#[cfg(unix)]
+#[test]
+fn a_read_only_open_alone_sees_a_device_go_silent() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, db) = open(OpenOptions::default());
+    let devices = db.collection::<Document>("devices");
+    devices.ensure_index("last_seen").unwrap();
+    let van = devices.insert(device("van", DateTime::now())).unwrap();
+    drop(devices);
+    drop(db);
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name != "clock.trunkdb" && name != "clock.trunkdb.wal" {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let set =
+        |mode| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+    set(0o555);
+    let root = std::fs::File::create(dir.path().join("probe")).is_ok();
+    let reader = Database::open_with(
+        dir.path().join("clock.trunkdb"),
+        OpenOptions::default().read_only(true),
+    );
+    set(0o755);
+    if root {
+        return;
+    }
+    let reader = reader.unwrap();
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().count() <= 2,
+        "no lock files: alone"
+    );
+    expect_silent(&reader, van);
+}
+
+/// A read-only open after the writer closed, its lock files there: the
+/// look keeps time, as beside a writer.
+#[test]
+fn a_read_only_open_after_the_writer_closed() {
+    let (dir, db) = open(OpenOptions::default());
+    let devices = db.collection::<Document>("devices");
+    devices.ensure_index("last_seen").unwrap();
+    let van = devices.insert(device("van", DateTime::now())).unwrap();
+    drop(devices);
+    drop(db);
     let reader = Database::open_with(
         dir.path().join("clock.trunkdb"),
         OpenOptions::default().read_only(true),
     )
     .unwrap();
+    expect_silent(&reader, van);
+}
+
+/// `van`, seen just now, goes silent in `reader`'s live query, and
+/// leaves its live aggregate's count.
+fn expect_silent(reader: &Database, van: trunkdb::DocId) {
     let devices = reader.collection::<Document>("devices");
-    let silent = Filter::new().older_than("last_seen", AGE);
-    assert!(matches!(
-        devices.watch(silent.clone()),
-        Err(Error::NotLive { .. })
-    ));
+    let live = devices
+        .watch(Filter::new().older_than("last_seen", AGE))
+        .unwrap();
     let n = Aggregate::new().count().named("n");
-    assert!(matches!(
-        devices.watch_aggregate(silent, &n),
-        Err(Error::NotLive { .. })
-    ));
-    // Without the clock, as before.
-    assert!(devices.watch(Filter::new()).is_ok());
-    drop(db);
+    let counted = devices
+        .watch_aggregate(Filter::new().newer_than("last_seen", AGE), &n)
+        .unwrap();
+    assert!(live.try_recv().is_none(), "seen just now: not silent");
+    let Live::Entered { id, doc, .. } = next(&live) else {
+        panic!("not entered");
+    };
+    assert_eq!(id, van);
+    assert!(before(DateTime::now(), AGE) > seen(&doc));
+    let LiveRow::Entered { row, .. } = next_row(&counted) else {
+        panic!("no first row");
+    };
+    assert_eq!(row.get("n"), Some(&Document::Int(1)));
+    let LiveRow::Changed { row, .. } = next_row(&counted) else {
+        panic!("the count not changed");
+    };
+    assert_eq!(row.get("n"), Some(&Document::Int(0)));
 }
 
 /// `=` against `now` is refused as by any read, before anything is kept.

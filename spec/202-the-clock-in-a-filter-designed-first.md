@@ -1,7 +1,8 @@
 # 202. The clock in a filter, designed first (`query.rs`, `query_text.rs`, `live.rs`, `database.rs`)
 
-**Designed 2026-11-16; step 1 built the same day (§203), and step 2
-(§204); where they changed what this says, §203.5 and §204.5 list it.** It takes up the first deferred
+**Designed 2026-11-16; step 1 built the same day (§203), step 2
+(§204) and step 3 (§205); where they changed what this says, §203.5,
+§204.5 and §205.5 list it.** It takes up the first deferred
 item of "Changes as they happen" in ROADMAP.md, a window counted back
 from the clock (§139.2), now that a program asks for it. Its four
 questions were answered the same day, each as proposed (202.10).

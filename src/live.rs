@@ -346,6 +346,13 @@ impl Clock {
     fn is_due(&self, now: DateTime) -> bool {
         self.due <= now || now < self.read || self.went_back
     }
+
+    /// Read again whole against `now`: whatever the clock did before is
+    /// seen.
+    fn read_whole_at(&mut self, now: DateTime) {
+        self.read = now;
+        self.went_back = false;
+    }
 }
 
 /// The soonest moment after `now` that one of `edges` passes a document
@@ -520,6 +527,14 @@ impl Watcher {
         }
     }
 
+    /// Read again whole against `now`, where it compares with the clock.
+    fn read_whole_at(&mut self, now: DateTime) {
+        if let Some(clock) = &mut self.clock {
+            clock.read_whole_at(now);
+            self.resolved = Some(self.filter.clone().now_is(now));
+        }
+    }
+
     /// The soonest moment it can change with nothing written, where it
     /// compares with the clock (SPEC §204).
     pub(crate) fn due(&self) -> Option<DateTime> {
@@ -529,16 +544,21 @@ impl Watcher {
     /// Its next moment, found on `at` (SPEC §204): nothing for one that
     /// doesn't compare with the clock.
     pub(crate) fn schedule(&mut self, at: &Reading<'_>, every: Duration) -> crate::Result<()> {
-        if let Some(clock) = &mut self.clock {
-            clock.due = next_moment(
-                at,
-                &self.collection,
-                &self.filter.edges(),
-                clock.read,
-                every,
-            )?;
+        if let Some(clock) = self.clock {
+            let due = self.moment_at(at, clock.read, every)?;
+            self.clock = Some(Clock { due, ..clock });
         }
         Ok(())
+    }
+
+    /// Its next moment on `at`, read against `now`.
+    fn moment_at(
+        &self,
+        at: &Reading<'_>,
+        now: DateTime,
+        every: Duration,
+    ) -> crate::Result<DateTime> {
+        next_moment(at, &self.collection, &self.filter.edges(), now, every)
     }
 
     /// `schedule`, ending it with the error where it fails. `false` once
@@ -553,14 +573,26 @@ impl Watcher {
         }
     }
 
+    /// Its next moment, `found` already where it compares with the clock
+    /// (SPEC §205), and ended with the error where finding it failed.
+    /// `false` once it has ended.
+    fn moved_on(&mut self, found: Option<crate::Result<DateTime>>) -> bool {
+        match (found, &mut self.clock) {
+            (Some(Ok(due)), Some(clock)) => clock.due = due,
+            (Some(Err(e)), _) => {
+                let _ = self.sender.send(Err(e));
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+
     /// Read again on `at` against `now`, its moment come (SPEC §204):
     /// what time moved in or out reported, as a commit would have, and
     /// its next moment found. `false` once it has ended.
     fn tick(&mut self, at: &Reading<'_>, now: DateTime, every: Duration) -> bool {
-        self.moved_to(now);
-        if let Some(clock) = &mut self.clock {
-            clock.went_back = false;
-        }
+        self.read_whole_at(now);
         let going_on = match self.ticked(at) {
             Ok(going_on) => going_on,
             Err(e) => {
@@ -663,13 +695,19 @@ impl Watcher {
     /// those that changed since the last read: a match whose document is
     /// not as it was, or new; and one that matched and doesn't, as it is
     /// now. A document that matches neither then nor now doesn't matter
-    /// to it.
-    fn reread(&self, at: &Reading<'_>) -> crate::Result<Reread> {
+    /// to it. Where it compares with the clock, against `now` (SPEC
+    /// §205).
+    fn reread(&self, at: &Reading<'_>, now: Option<DateTime>) -> crate::Result<Reread> {
         let before = self
             .seen
             .as_ref()
             .expect("only one kept beside a writer is read again");
-        let found = crate::collection::find_at(at, &self.collection, &whole_read(&self.filter))?;
+        let read = whole_read(&self.filter);
+        let read = match (self.clock, now) {
+            (Some(_), Some(now)) => read.now_is(now),
+            _ => read,
+        };
+        let found = crate::collection::find_at(at, &self.collection, &read)?;
         let list = match &self.kept {
             Kept::Matching(_) => None,
             Kept::Window(_) => {
@@ -1336,7 +1374,7 @@ impl AggregateWatcher {
             sender,
             clock,
         };
-        let (_all, result) = watcher.rows(at)?;
+        let (_all, result) = watcher.rows(at, None)?;
         for row in result {
             watcher
                 .rows
@@ -1359,12 +1397,23 @@ impl AggregateWatcher {
     /// comparisons with the clock and its columns'; `having`'s are on its
     /// rows, which no seek finds, and read again `every` apart.
     fn schedule(&mut self, at: &Reading<'_>, every: Duration) -> crate::Result<()> {
-        if let Some(clock) = &mut self.clock {
-            let mut edges = self.filter.edges();
-            edges.extend(self.aggregate.edges());
-            clock.due = next_moment(at, &self.collection, &edges, clock.read, every)?;
+        if let Some(clock) = self.clock {
+            let due = self.moment_at(at, clock.read, every)?;
+            self.clock = Some(Clock { due, ..clock });
         }
         Ok(())
+    }
+
+    /// Its next moment on `at`, read against `now`.
+    fn moment_at(
+        &self,
+        at: &Reading<'_>,
+        now: DateTime,
+        every: Duration,
+    ) -> crate::Result<DateTime> {
+        let mut edges = self.filter.edges();
+        edges.extend(self.aggregate.edges());
+        next_moment(at, &self.collection, &edges, now, every)
     }
 
     /// `schedule`, ending it with the error where it fails. `false` once
@@ -1379,12 +1428,26 @@ impl AggregateWatcher {
         }
     }
 
+    /// Its next moment, `found` already where it compares with the clock
+    /// (SPEC §205), and ended with the error where finding it failed.
+    /// `false` once it has ended.
+    fn moved_on(&mut self, found: Option<crate::Result<DateTime>>) -> bool {
+        match (found, &mut self.clock) {
+            (Some(Ok(due)), Some(clock)) => clock.due = due,
+            (Some(Err(e)), _) => {
+                let _ = self.sender.send(Err(e));
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+
     /// Run again on `at` against `now`, its moment come (SPEC §204), and
     /// its next moment found. `false` once it has ended.
     fn tick(&mut self, at: &Reading<'_>, now: DateTime, every: Duration) -> bool {
         if let Some(clock) = &mut self.clock {
-            clock.moved_to(now);
-            clock.went_back = false;
+            clock.read_whole_at(now);
         }
         self.rerun(at) && self.rescheduled(at, every)
     }
@@ -1394,18 +1457,23 @@ impl AggregateWatcher {
     /// those that came in or changed, in their order now. `false` once it
     /// has ended.
     fn rerun(&mut self, at: &Reading<'_>) -> bool {
-        let rows = self.rows(at);
+        let rows = self.rows(at, None);
         self.report(rows)
     }
 
     /// Its rows on `at`: every row, and the result. With a clock, as of
-    /// the time it was last made against (SPEC §204).
-    fn rows(&self, at: &Reading<'_>) -> crate::Result<(Vec<Document>, Vec<Document>)> {
+    /// `now`, or the time it was last made against (SPEC §204).
+    fn rows(
+        &self,
+        at: &Reading<'_>,
+        now: Option<DateTime>,
+    ) -> crate::Result<(Vec<Document>, Vec<Document>)> {
         match self.clock {
             None => rows_at(at, &self.collection, &self.filter, &self.aggregate),
             Some(clock) => {
-                let filter = self.filter.clone().now_is(clock.read);
-                let aggregate = self.aggregate.now_is(clock.read);
+                let read = now.unwrap_or(clock.read);
+                let filter = self.filter.clone().now_is(read);
+                let aggregate = self.aggregate.now_is(read);
                 rows_at(at, &self.collection, &filter, &aggregate)
             }
         }
@@ -1492,29 +1560,88 @@ pub(crate) fn check_aggregates(
 }
 
 /// A read-only open beside a writer in another process (SPEC §195):
-/// every live query and aggregate read again on `at`, what is new since
-/// it last read reported, and those that have ended dropped. `false`,
-/// having reported nothing, where `at` was ended under the reads
-/// (`Error::SnapshotTooOld`, §189): the next look tries again.
+/// each live query and aggregate read again on `at`, what is new since
+/// it last read reported, and those that have ended dropped. Every one
+/// where the writer `committed` since the last look; else those against
+/// the clock whose moment has come (SPEC §205). Against the clock, read
+/// at `now` and their next moments found, `every` apart without an
+/// index. `false`, having reported nothing, where `at` was ended under
+/// the reads (`Error::SnapshotTooOld`, §189): the next look tries again.
 pub(crate) fn poll(
     watchers: &mut Vec<Watcher>,
     aggregates: &mut Vec<AggregateWatcher>,
     at: &Reading<'_>,
+    now: Option<DateTime>,
+    every: Duration,
+    committed: bool,
 ) -> bool {
-    let rereads: Vec<_> = watchers.iter().map(|w| w.reread(at)).collect();
-    let rows: Vec<_> = aggregates.iter().map(|a| a.rows(at)).collect();
-    let too_old =
-        |read: Result<(), &crate::Error>| matches!(read, Err(crate::Error::SnapshotTooOld));
-    if rereads.iter().any(|r| too_old(r.as_ref().map(|_| ())))
-        || rows.iter().any(|r| too_old(r.as_ref().map(|_| ())))
+    let read = |clock: Option<Clock>| {
+        committed || clock.zip(now).is_some_and(|(clock, now)| clock.is_due(now))
+    };
+    // Every read of the look before anything is reported, the next
+    // moments too: a snapshot ended under any of them is tried again
+    // whole at the next look, none ended for it.
+    let moment = |clock: Option<Clock>, find: &dyn Fn(DateTime) -> crate::Result<DateTime>| {
+        clock.and(now).map(find)
+    };
+    let rereads: Vec<_> = (watchers.iter())
+        .map(|w| {
+            read(w.clock).then(|| {
+                let found = moment(w.clock, &|now| w.moment_at(at, now, every));
+                (w.reread(at, now), found)
+            })
+        })
+        .collect();
+    let rows: Vec<_> = (aggregates.iter())
+        .map(|a| {
+            read(a.clock).then(|| {
+                let found = moment(a.clock, &|now| a.moment_at(at, now, every));
+                (a.rows(at, now), found)
+            })
+        })
+        .collect();
+    let too_old = |e: Option<&crate::Error>| matches!(e, Some(crate::Error::SnapshotTooOld));
+    let failed = |read: Option<&crate::Error>, found: &Option<crate::Result<DateTime>>| {
+        too_old(read) || too_old(found.as_ref().and_then(|f| f.as_ref().err()))
+    };
+    if (rereads.iter().flatten()).any(|(r, f)| failed(r.as_ref().err(), f))
+        || (rows.iter().flatten()).any(|(r, f)| failed(r.as_ref().err(), f))
     {
         return false;
     }
     let mut rereads = rereads.into_iter();
-    watchers.retain_mut(|w| w.reread_into(rereads.next().expect("one each"), at));
+    watchers.retain_mut(|w| {
+        let Some((reread, found)) = rereads.next().expect("one each") else {
+            return true;
+        };
+        if let Some(now) = now {
+            w.read_whole_at(now);
+        }
+        w.reread_into(reread, at) && w.moved_on(found)
+    });
     let mut rows = rows.into_iter();
-    aggregates.retain_mut(|a| a.report(rows.next().expect("one each")));
+    aggregates.retain_mut(|a| {
+        let Some((rows, found)) = rows.next().expect("one each") else {
+            return true;
+        };
+        if let (Some(clock), Some(now)) = (&mut a.clock, now) {
+            clock.read_whole_at(now);
+        }
+        a.report(rows) && a.moved_on(found)
+    });
     true
+}
+
+/// Whether, the time being `now`, a live query or aggregate against the
+/// clock is to be read again (SPEC §205).
+pub(crate) fn any_due(
+    watchers: &[Watcher],
+    aggregates: &[AggregateWatcher],
+    now: DateTime,
+) -> bool {
+    (watchers.iter().filter_map(|w| w.clock))
+        .chain(aggregates.iter().filter_map(|a| a.clock))
+        .any(|clock| clock.is_due(now))
 }
 
 /// Ends every live query and aggregate with `e`: a read-only open beside
@@ -1647,7 +1774,7 @@ mod tests {
         // writer's own process would read again for.
         vans.delete(&fast).unwrap();
         let state = db.read().unwrap();
-        let reread = watcher.reread(&state.snapshot());
+        let reread = watcher.reread(&state.snapshot(), None);
         let nowhere = empty.read().unwrap();
         assert!(watcher.reread_into(reread, &nowhere.snapshot()));
         let events: Vec<_> = receiver.try_iter().map(Result::unwrap).collect();
