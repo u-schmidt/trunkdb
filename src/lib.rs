@@ -187,9 +187,9 @@ pub enum Error {
     #[error("a live query can't have {reason}")]
     NotLive {
         /// What the filter has: "a skip" or "a limit without a sort"
-        /// (SPEC §145), or a comparison with the clock, which a live
-        /// query can't have until it is read again as time passes (SPEC
-        /// §203.4).
+        /// (SPEC §145); or, in a read-only open, a comparison with the
+        /// clock, which nothing there reads again as time passes yet
+        /// (SPEC §204.1).
         reason: &'static str,
     },
     /// A batch tried to insert a document whose id its collection already

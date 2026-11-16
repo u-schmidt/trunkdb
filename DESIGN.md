@@ -269,6 +269,14 @@ documents, and hands those that changed to the same `changed` and
 `settle` a commit's go through; live aggregates run again. Several
 commits between two looks come as one
 [§195](spec/195-live-queries-beside-a-writer.md).
+A live query or aggregate against the clock keeps the time it was read
+against and its next moment: per comparison, the soonest date-time its
+edge hasn't passed, one seek where an index orders the field, plus the
+age; else `now + clock_every`. A thread, `trunkdb-clock`, sleeps until
+the soonest, at most a second, and under the writer's lock reads each
+due one again against the new time, handing what came and went to the
+same `settle`; a commit checks what it wrote against one time read
+for it, then reads again those due [§204](spec/204-live-queries-read-again-as-time-passes.md).
 
 ## 6. Documents and data pages
 

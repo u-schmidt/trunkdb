@@ -197,10 +197,22 @@ let due: Filter = "due < now + 1h and done = false".parse()?;
 An index on the field bounds the read as for any date-time. Compare
 with `<`, `<=`, `>` or `>=`: `= now` holds for a nanosecond at most,
 and is refused. `Filter::now_is(time)` gives the filter as it reads at
-a time of your choosing, for an answer you can repeat or a test. A
-live query against `now` is refused for now: it would only be checked
-when something is written (SPEC §202 plans it read again as time
-passes).
+a time of your choosing, for an answer you can repeat or a test.
+
+A live query or aggregate against `now` is read again as time passes
+(SPEC §204), so a device that stops reporting is seen with nothing
+written:
+
+```rust
+let silent = devices.watch(Filter::new().older_than("last_seen", ten_minutes))?;
+```
+
+With an index on `last_seen`, a thread of trunkdb's (`trunkdb-clock`)
+finds the moment the next device goes silent with one seek, and reads
+the live query again then; without one, every
+`OpenOptions::clock_every` (1 s). Time moves a document in or out of a
+live query and changes none: `Entered` and `Left`, never `Changed`. A
+read-only open refuses it for now.
 
 ### With `chrono` or `jiff`
 

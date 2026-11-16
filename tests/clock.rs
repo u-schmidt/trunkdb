@@ -313,30 +313,28 @@ fn what_it_refuses() {
     ));
 }
 
-/// Until a live query is read again as time passes (SPEC §202, step 2),
-/// one against the clock is refused: it would go stale between commits.
+/// A live query or aggregate against the clock is taken (SPEC §204):
+/// in the filter, and in a column's condition.
 #[test]
-fn a_live_query_against_now_is_refused_for_now() {
+fn a_live_query_against_now_is_taken() {
     let (_dir, db) = open();
     let devices = devices(&db);
     let silent = Filter::new().older_than("last_seen", 10 * MINUTE);
-    assert!(matches!(
-        devices.watch(silent.clone()),
-        Err(Error::NotLive { .. })
-    ));
+    let live = devices.watch(silent.clone()).unwrap();
+    let entered: Vec<Document> = std::iter::from_fn(|| live.try_recv())
+        .map(|event| match event.unwrap() {
+            trunkdb::Live::Entered { doc, .. } => doc,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(names(entered), ["hour", "twenty"]);
     let n = Aggregate::new().count().named("n");
-    assert!(matches!(
-        devices.watch_aggregate(silent, &n),
-        Err(Error::NotLive { .. })
-    ));
+    assert!(devices.watch_aggregate(silent, &n).is_ok());
     let column = Aggregate::new()
         .count()
         .filter(Condition::older_than("last_seen", 10 * MINUTE))
         .named("n");
-    assert!(matches!(
-        devices.watch_aggregate(Filter::new(), &column),
-        Err(Error::NotLive { .. })
-    ));
+    assert!(devices.watch_aggregate(Filter::new(), &column).is_ok());
 }
 
 #[test]
@@ -378,8 +376,8 @@ fn the_edge_is_newer() {
     }
 }
 
-/// A comparison with the clock anywhere in a filter makes it one a live
-/// query refuses for now: inside `has`, a NOT, an OR.
+/// A comparison with the clock anywhere in a filter counts: inside
+/// `has`, a NOT, an OR. A live query takes each.
 #[test]
 fn nested_comparisons_with_the_clock_count() {
     let (_dir, db) = open();
@@ -390,10 +388,7 @@ fn nested_comparisons_with_the_clock_count() {
         "name = \"x\" or last_seen < now",
     ] {
         let filter: Filter = text.parse().unwrap();
-        assert!(
-            matches!(devices.watch(filter.clone()), Err(Error::NotLive { .. })),
-            "{text}"
-        );
+        assert!(devices.watch(filter.clone()).is_ok(), "{text}");
         // And a read takes the time: `explain_run` says it.
         assert!(devices.explain_run(filter).unwrap().now.is_some(), "{text}");
     }
