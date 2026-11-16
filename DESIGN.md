@@ -52,7 +52,7 @@ them are real now; `InMemoryIndex` remains, for tests.
 | Transactions | `TransactionManager` | `GlobalLockTxnManager`: one batch at a time, all or nothing | `txn/` |
 | Durability | `Durability` | `WalDurability`: a page-image write-ahead log | `durability/` |
 | Queries | — | `Filter`, `Condition`, `Sort`; a fixed-rule planner | `query.rs` |
-| API | — | `Database`, `Collection<T>`, `Batch`, `Cursor`, `Snapshot`, `View<T>` | `database.rs`, `collection.rs`, `batch.rs`, `cursor.rs`, `snapshot.rs` |
+| API | — | `Database`, `Collection<T>`, `Batch`, `Cursor`, `Snapshot`, `View<T>` | `database.rs`, `collection/`, `batch.rs`, `cursor.rs`, `snapshot.rs` |
 
 `PageStore` is the one seam that isn't meant to be faked: everything
 above it works in pages, never in file offsets. Index and data code
@@ -919,8 +919,14 @@ src/
 ├── lib.rs             public re-exports, the crate's Error type
 ├── database.rs        Database: open, recovery, the commit protocol,
 │                        checkpoints, OpenOptions
-├── collection.rs      Collection<T>: CRUD, find, indexes, update_many,
-│                        update_fields
+├── collection/        Collection<T>: CRUD, find, indexes, update_many,
+│   │                    update_fields (mod.rs); and behind it:
+│   ├── plan.rs        the plan a read follows, explain's alternatives
+│   ├── find.rs        finding by id, through an index or by a scan
+│   ├── walk.rs        walks in index order, merges by id
+│   ├── count.rs       count and aggregates, from entries or documents
+│   ├── write.rs       a batch's ops applied; indexes kept and built
+│   └── tests/         its tests, one file per part of the spec
 ├── batch.rs           Batch: typed atomic multi-op writes
 ├── batch_lines.rs     BatchLines: a batch's ops read from JSON lines
 ├── changes.rs         Changes, Commit, Change: what each commit changed
