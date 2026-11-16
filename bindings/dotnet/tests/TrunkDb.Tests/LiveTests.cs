@@ -13,6 +13,15 @@ public sealed class Van
 
 public sealed record ZoneCount(string Zone, ulong N);
 
+public sealed class Device
+{
+    public DocId Id { get; set; }
+    public string Name { get; set; } = "";
+    public DateTime LastSeen { get; set; }
+}
+
+public sealed record Count(ulong N);
+
 /// <summary>Changes as they happen (SPEC §194): subscriptions, live queries and live aggregates.</summary>
 public sealed class LiveTests : IDisposable
 {
@@ -249,5 +258,43 @@ public sealed class LiveTests : IDisposable
         changes.Dispose();
         Assert.True(reader.Join(Wait), "the loop ended");
         Assert.Equal(1, count);
+    }
+
+    /// <summary>
+    /// A live query and aggregate against <c>now</c> (SPEC §204, §205, §206): read again
+    /// as time passes, with nothing written, in the writer's process and beside it.
+    /// </summary>
+    [Fact]
+    public void A_live_query_against_now_sees_a_device_go_silent()
+    {
+        var age = TimeSpan.FromMilliseconds(300);
+        using var db = Open();
+        var devices = db.Collection<Device>("devices");
+        devices.EnsureIndex("lastSeen");
+        var van = new Device { Name = "van", LastSeen = DateTime.UtcNow };
+        devices.Insert(van);
+
+        using (var silent = devices.Watch("lastSeen < now - 300ms"))
+        using (var reporting = devices.WatchAggregate<Count>("lastSeen >= now - 300ms", "count() as n"))
+        {
+            Assert.Empty(Waiting(silent));
+            Assert.Equal(new Count(1), Assert.IsType<RowEvent<Count>.Entered>(Assert.Single(Waiting(reporting))).Row);
+            var entered = Assert.IsType<LiveEvent<Device>.Entered>(silent.Next(Wait));
+            Assert.Equal(van.Id, entered.Id);
+            Assert.Equal(van.LastSeen, entered.Document.LastSeen);
+            Assert.True(DateTime.UtcNow - van.LastSeen > age, "never before its moment");
+            Assert.Equal(new Count(0), Assert.IsType<RowEvent<Count>.Changed>(reporting.Next(Wait)).Row);
+        }
+
+        // Beside the writer, read-only: the look reads it again at the moment.
+        using var reader = Database.Open(Path.Combine(directory, "app.trunkdb"), new OpenOptions { ReadOnly = true });
+        using var beside = reader.Collection<Device>("devices").Watch("lastSeen < now - 300ms");
+        Assert.Equal(van.Id, Assert.IsType<LiveEvent<Device>.Entered>(beside.Next(Wait)).Id);
+        van.LastSeen = DateTime.UtcNow;
+        devices.Update(van);
+        Assert.Equal(van.Id, Assert.IsType<LiveEvent<Device>.Left>(beside.Next(Wait)).Id);
+        var again = Assert.IsType<LiveEvent<Device>.Entered>(beside.Next(Wait));
+        Assert.Equal(van.LastSeen, again.Document.LastSeen);
+        Assert.True(DateTime.UtcNow - van.LastSeen > age, "never before its moment");
     }
 }

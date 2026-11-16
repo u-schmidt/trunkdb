@@ -1551,3 +1551,9 @@ limit, batches and a write-ahead log. Since then:
     with nothing committed, those whose moment has come, found as in the
     writer's process; alone, `trunkdb-clock` reads them. `trunkdb watch`,
     C# and Python beside the application see a device go silent.
+177. **Devices that go silent** (§206, step 4 of §202): the GUIDE's
+    recipe, a document per device with `last_seen` watched against
+    `now`, or a live aggregate on the readings alone, and why the
+    first; a live query and aggregate against `now` tested in C# and
+    Python, in the writer's process and read-only beside it; the
+    bindings' READMEs and the agent skill say so.

@@ -81,6 +81,11 @@ await foreach (var e in inDepot.ReadAllAsync(token))
   another process writes the file), `Watch` and `WatchAggregate` report
   that process's commits too, read again every 100 ms: several commits
   between two looks come as one. `Subscribe` reports nothing there.
+- **Against the clock,** `Watch("lastSeen < now - 10m")` is read again
+  as time passes, with nothing written: a device that stops reporting
+  is `Entered` ten minutes after its last reading, `Left` when it
+  reports again. An index on `lastSeen` finds the moment; without one,
+  it is read again every second.
 
 ## The library
 

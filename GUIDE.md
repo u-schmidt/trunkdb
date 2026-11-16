@@ -803,7 +803,9 @@ std::thread::spawn(move || {
 
 - **Five minutes back from the newest reading, not from the clock:**
   only a write changes the answer. A server that stops reporting ages
-  out as the others report on, and its alert ends with `Left`.
+  out as the others report on, and its alert ends with `Left`. Five
+  minutes back from the clock is a filter, `at >= now - 5m`, and read
+  again as time passes ("Devices that go silent").
 - **Every row first,** as `Entered`, then only what changed: a row in
   or out of the result, or `Changed` where a value really changed.
 - **`Left` has the row as it is now,** under the limit, or `None` once
@@ -846,6 +848,99 @@ let lately = Aggregate::new()
   Bound the filter, `gte("at", an hour ago)`, where there are many
   readings; live, it runs whole at every commit.
 - In the text: `window at 10 per group`, `window at 5m per group`.
+
+## Devices that go silent
+
+A tracker sends each device's position every second or two. One
+standing still sends the same position; one switched off, out of range
+or broken sends nothing. Telling the two apart is a question about
+time passing with nothing written, and a comparison with `now` in a
+live query answers it (SPEC §202): trunkdb reads it again at the
+moment the answer can change.
+
+**A document per device** (the way to go). Beside the readings, keep
+one document per device, its `last_seen` set by each reading, in the
+same batch:
+
+```rust
+use std::time::Duration;
+use trunkdb::{DateTime, Live};
+
+#[derive(Serialize, Deserialize)]
+struct Device {
+    name: String,
+    last_seen: DateTime,
+}
+
+let devices = db.collection::<Device>("devices");
+devices.ensure_index("last_seen")?;           // finds the next to go silent
+
+// Each reading, with its device's time, in one batch:
+let mut batch = db.batch();
+batch.insert(&readings, reading)?;
+batch.update_fields(&devices, &device_id, &Update::new().set("last_seen", DateTime::now()))?;
+batch.commit()?;
+
+let silent = devices.watch(Filter::new().older_than("last_seen", Duration::from_secs(600)))?;
+for event in silent {
+    match event? {
+        Live::Entered { doc, .. } => println!("{} silent since {}", doc.name, doc.last_seen),
+        Live::Left { doc: Some(doc), .. } => println!("{} reports again", doc.name),
+        _ => {}
+    }
+}
+```
+
+- **The devices already silent come first,** as `Entered`, then each
+  as it goes silent, ten minutes after its last reading, with nothing
+  written; `Left` when it reports again.
+- **`Entered` holds the device's document:** its last position and
+  time, what an alert wants.
+- **The index on `last_seen`** finds the next device to go silent with
+  one seek, and nothing is read until then. Without it, the live query
+  is read whole every `OpenOptions::clock_every` (1 s).
+- **Store the time a reading arrived,** `DateTime::now()` as you write
+  it, where devices' clocks can't be trusted: `now` is your machine's
+  clock, and a reading stamped by a device five minutes behind would
+  look five minutes older.
+
+**On the readings alone.** A live aggregate counts each device's
+readings of the last ten minutes; a device that stops reporting ages
+out, its row `Left`, and `Entered` when it reports again:
+
+```rust
+use trunkdb::LiveRow;
+
+readings.ensure_index("at")?;
+let per_device = Aggregate::new().group_by("device").count().named("n");
+let reporting = readings.watch_aggregate(
+    Filter::new().newer_than("at", Duration::from_secs(600)),
+    &per_device,
+)?;
+for event in reporting {
+    match event? {
+        LiveRow::Left { group, row: None, .. } => println!("{group:?} went silent"),
+        LiveRow::Entered { group, .. } => println!("{group:?} reports"),
+        _ => {}
+    }
+}
+```
+
+It needs no second collection, but a device silent before it started
+is never in it, so never reported, and each time a reading ages out it
+reads ten minutes of every device's readings again: with a reading a
+second, about once a second. The document per device reads one entry
+of an index per device that goes silent.
+
+**From another process.** An admin tool, a dashboard, or C# and Python
+opened read-only beside the application see the same: the look that
+reads their live queries again at each commit (every
+`OpenOptions::watch_every`, 100 ms) reads them again at the moment too
+(SPEC §205), and `trunkdb watch` prints it:
+
+```text
+trunkdb watch fleet.trunkdb devices "last_seen < now - 10m"
+```
 
 ## Telling the planner which index
 

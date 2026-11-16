@@ -60,8 +60,9 @@ narrow questions:
    none.
 
 `trunkdb watch <file> <collection> '<filter>'` prints what matches,
-then what the running app changes, one JSON event a line, and **doesn't
-end on its own**: run it only when the user wants to follow changes,
+then what the running app changes, one JSON event a line (a filter
+against `now`, `last_seen < now - 10m`, also as time passes: devices
+going silent), and **doesn't end on its own**: run it only when the user wants to follow changes,
 and end it after a few lines (`| head -n 5`) or let the user stop it.
 
 `info`, `fields` and `check` take `--json` at the end: `info` and
