@@ -1545,3 +1545,9 @@ limit, batches and a write-ahead log. Since then:
     `last_seen < now - 10m` ten minutes later. A commit checks what it
     wrote against the time it reads. A read-only open refuses it until
     step 3.
+176. **The clock in a read-only open** (§205, step 3 of §202): a
+    read-only open takes a live query or aggregate against `now`. Beside
+    a writer, the look that reads again at each commit also reads again,
+    with nothing committed, those whose moment has come, found as in the
+    writer's process; alone, `trunkdb-clock` reads them. `trunkdb watch`,
+    C# and Python beside the application see a device go silent.

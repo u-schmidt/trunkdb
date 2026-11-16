@@ -212,7 +212,9 @@ finds the moment the next device goes silent with one seek, and reads
 the live query again then; without one, every
 `OpenOptions::clock_every` (1 s). Time moves a document in or out of a
 live query and changes none: `Entered` and `Left`, never `Changed`. A
-read-only open refuses it for now.
+read-only open takes it too (SPEC §205): beside the application, the
+look that reads again at each commit (`OpenOptions::watch_every`, 100
+ms) also reads again at the moment; alone, the thread does.
 
 ### With `chrono` or `jiff`
 

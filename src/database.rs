@@ -1181,7 +1181,6 @@ impl Database {
             return Err(crate::Error::NotLive { reason });
         }
         crate::query::refuse_against_now(&filter.conditions)?;
-        self.refuse_clock_read_only(filter.has_now())?;
         let mut writer = self
             .inner
             .writer
@@ -1191,10 +1190,10 @@ impl Database {
             return Err(crate::Error::Poisoned);
         }
         let (sender, receiver) = mpsc::channel();
+        // Against the clock, read once, the time kept (SPEC §204, §205).
+        let read_at = filter.has_now().then(crate::DateTime::now);
         let watcher = match &self.inner.beside {
             None => {
-                // Against the clock, read once, the time kept (SPEC §204).
-                let read_at = filter.has_now().then(crate::DateTime::now);
                 let first = live::first_read(&filter);
                 let first = match read_at {
                     Some(now) => first.now_is(now),
@@ -1211,8 +1210,9 @@ impl Database {
                 watcher
             }
             // Beside a writer in another process, read again as it
-            // commits (SPEC §195): the first matches whole, to compare,
-            // the hint steering this read as it does the first anywhere.
+            // commits, and as time passes (SPEC §195, §205): the first
+            // matches whole, to compare, the hint steering this read as
+            // it does the first anywhere.
             Some(side) => {
                 let current = side.snapshot()?;
                 let at = current.reading(&self.inner.pages);
@@ -1220,10 +1220,17 @@ impl Database {
                     hint: filter.hint.clone(),
                     ..live::whole_read(&filter)
                 };
+                let first = match read_at {
+                    Some(now) => first.now_is(now),
+                    None => first,
+                };
                 let now = crate::collection::find_at(&at, collection, &first)?;
                 let seen = live::seen(&now);
-                live::Watcher::start(collection.to_string(), filter, now, sender, None)?
-                    .polled(seen)
+                let mut watcher =
+                    live::Watcher::start(collection.to_string(), filter, now, sender, read_at)?
+                        .polled(seen);
+                watcher.schedule(&at, writer.clock_every)?;
+                watcher
             }
         };
         self.watch_beside(&mut writer)?;
@@ -1243,7 +1250,6 @@ impl Database {
         convert: fn(Document) -> crate::Result<R>,
     ) -> crate::Result<LiveAggregate<R>> {
         crate::query::refuse_against_now(&filter.conditions)?;
-        self.refuse_clock_read_only(filter.has_now() || aggregate.has_now())?;
         let mut writer = self
             .inner
             .writer
@@ -1300,30 +1306,16 @@ impl Database {
         Ok(())
     }
 
-    /// A live query or aggregate against the clock, refused by a
-    /// read-only open: nothing there reads it again as time passes yet
-    /// (SPEC §204; §202's step 3).
-    fn refuse_clock_read_only(&self, has_now: bool) -> crate::Result<()> {
-        let read_only = self.inner.beside.is_some()
-            || (self.inner.writer.lock())
-                .map_err(|_| crate::Error::Poisoned)?
-                .durability
-                .is_none();
-        match has_now && read_only {
-            true => Err(crate::Error::NotLive {
-                reason: "a comparison with `now` in a read-only open, not yet",
-            }),
-            false => Ok(()),
-        }
-    }
-
     /// Where a live query or aggregate compares with the clock, its
     /// moment `due` (SPEC §204): starts the thread that reads them again
     /// as time passes, unless it runs, or wakes it where `due` is sooner
     /// than it would wake. It holds the database weakly, and ends with
-    /// it, or once it finds none left.
+    /// it, or once it finds none left. A read-only open with no writer
+    /// has it too (SPEC §205); one beside a writer, whose look keeps
+    /// time, doesn't.
     fn keep_time(&self, writer: &mut Writer, due: Option<crate::DateTime>) -> crate::Result<()> {
-        let Some(due) = due else {
+        // Beside a writer, the look keeps time (SPEC §205).
+        let Some(due) = due.filter(|_| self.inner.beside.is_none()) else {
             return Ok(());
         };
         if writer.clocking {
@@ -1384,7 +1376,8 @@ impl Database {
 
     /// One look of `watch_beside`'s thread: where the writer committed
     /// since the last, each live query and aggregate read again, and what
-    /// changed reported. `false`, the thread to end, once none is left.
+    /// changed reported; else each against the clock whose moment has
+    /// come (SPEC §205). `false`, the thread to end, once none is left.
     fn look(&self) -> bool {
         let Some(side) = &self.inner.beside else {
             return false;
@@ -1410,15 +1403,23 @@ impl Database {
             }
         };
         let watched = current.watched();
-        if writer
-            .watched
-            .as_ref()
-            .is_some_and(|last| last.is(&watched))
-        {
+        let committed = !(writer.watched.as_ref()).is_some_and(|last| last.is(&watched));
+        // Against the clock, the time read once for the look (SPEC §205).
+        let now = writer.soonest().map(|_| crate::DateTime::now());
+        let due = now.is_some_and(|now| live::any_due(&writer.watchers, &writer.aggregates, now));
+        if !committed && !due {
             return true;
         }
         let at = current.reading(&self.inner.pages);
-        if live::poll(&mut writer.watchers, &mut writer.aggregates, &at) {
+        let every = writer.clock_every;
+        if live::poll(
+            &mut writer.watchers,
+            &mut writer.aggregates,
+            &at,
+            now,
+            every,
+            committed,
+        ) {
             writer.watched = Some(watched);
         }
         true

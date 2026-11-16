@@ -277,6 +277,10 @@ the soonest, at most a second, and under the writer's lock reads each
 due one again against the new time, handing what came and went to the
 same `settle`; a commit checks what it wrote against one time read
 for it, then reads again those due [§204](spec/204-live-queries-read-again-as-time-passes.md).
+Beside a writer, the look keeps time instead: it reads the clock once,
+and where nothing was committed reads again only those whose moment
+has come; a read-only open alone has the thread
+[§205](spec/205-the-clock-in-a-read-only-open.md).
 
 ## 6. Documents and data pages
 

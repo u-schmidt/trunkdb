@@ -26,6 +26,7 @@ for event in silent {
 - **A read-only open refuses it,** beside a writer or alone, with
   `Error::NotLive`, "a comparison with `now` in a read-only open, not
   yet": nothing there reads it again as time passes until step 3.
+  (Step 3, §205, takes it.)
 
 ## 204.2 The next moment
 - **One seek for each comparison** (§202.5): for `field < now - d` and
