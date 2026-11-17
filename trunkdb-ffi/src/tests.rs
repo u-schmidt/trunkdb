@@ -632,6 +632,42 @@ fn snapshots_and_cursors() {
     assert!(json(report)["pages_after"].is_u64());
 }
 
+/// What a database says about itself (SPEC §208): a writer, then a
+/// reader beside it; and a null report refused.
+#[test]
+fn open_info() {
+    let db = Open::new();
+    let mut report = null_mut();
+    ok(unsafe { trunkdb_open_info(db.db, &mut report) });
+    let info = json(report);
+    let file = db.dir.path().join("app.trunkdb");
+    assert_eq!(info["path"], file.to_str().unwrap());
+    assert_eq!(info["wal_path"], format!("{}.wal", file.to_str().unwrap()));
+    assert_eq!(info["mode"], "writer");
+    assert_eq!(info["read_only"], false);
+    assert_eq!(info["poisoned"], false);
+    assert_eq!(info["options"]["watch_every"], 0.1);
+    assert!(info["options"]["cache_size"].as_u64().unwrap() > 0);
+
+    let mut reader = null_mut();
+    let read_only = c(r#"{"read_only": true}"#);
+    ok(unsafe {
+        trunkdb_open(
+            db.path("app.trunkdb").as_ptr(),
+            read_only.as_ptr(),
+            &mut reader,
+        )
+    });
+    ok(unsafe { trunkdb_open_info(reader, &mut report) });
+    let info = json(report);
+    assert_eq!(info["mode"], "read_only_beside_writer");
+    assert_eq!(info["read_only"], true);
+    ok(unsafe { trunkdb_close(reader) });
+
+    let code = unsafe { trunkdb_open_info(db.db, null_mut()) };
+    fails(code, TRUNKDB_INVALID_ARGUMENT);
+}
+
 /// The reports: check, stats, compact, an export and its import.
 #[test]
 fn reports_and_backups() {

@@ -191,6 +191,27 @@ def test_reports_are_dicts(db, tasks):
     assert tasks.indexes() == [{"fields": ["n"], "unique": True, "sparse": False}]
 
 
+def test_a_database_says_its_file_mode_and_options(tmp_path):
+    path = tmp_path / "info.trunkdb"
+    with trunkdb.open(path, cache_size=1 << 20, watch_every=0.25) as db:
+        assert db.path == str(path)
+        assert db.read_only is False
+        info = db.open_info()
+        assert info["path"] == str(path)
+        assert info["wal_path"] == str(path) + ".wal"
+        assert info["mode"] == "writer"
+        assert info["read_only"] is False and info["poisoned"] is False
+        assert info["options"]["cache_size"] == 1 << 20
+        assert info["options"]["watch_every"] == 0.25
+        assert info["options"]["clock_every"] == 1.0
+        with trunkdb.open(path, read_only=True) as reader:
+            assert reader.read_only is True
+            assert reader.path == str(path)
+            assert reader.open_info()["mode"] == "read_only_beside_writer"
+    with pytest.raises(ValueError, match="^closed database$"):
+        db.path
+
+
 def test_export_and_import(db, tasks, tmp_path):
     tasks.insert_many([{"n": n} for n in range(3)])
     summary = db.export(tmp_path / "out.jsonl")

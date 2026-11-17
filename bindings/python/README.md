@@ -56,8 +56,9 @@ Not on PyPI. Either:
 - **`update(id, doc)`** replaces the document whole;
   **`update_many(filter, update)`** takes MongoDB's operators,
   `{"$inc": {"hits": 1}}`.
-- **Reports** (`check()`, `stats()`, `compact()`, `indexes()`,
-  `export(path)`) are dicts.
+- **Reports** (`check()`, `stats()`, `open_info()`, `compact()`,
+  `indexes()`, `export(path)`) are dicts; `db.path` is the file worked
+  on, its symlinks followed, and `db.read_only` says whether it writes.
 
 ## Errors
 

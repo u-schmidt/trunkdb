@@ -39,8 +39,9 @@
 
 // The version of these functions: a library whose `trunkdb_abi_version`
 // differs from the header's is not the one the program was built for.
-// 2 added the live handles (SPEC §194).
-#define TRUNKDB_ABI_VERSION 2
+// 2 added the live handles (SPEC §194), 3 `trunkdb_open_info` (SPEC
+// §208).
+#define TRUNKDB_ABI_VERSION 3
 
 // The call did what it says.
 #define TRUNKDB_OK 0
@@ -178,6 +179,15 @@ int32_t trunkdb_check(const trunkdb_db *db,
 // collection's documents, sizes and indexes, as JSON.
 int32_t trunkdb_stats(const trunkdb_db *db,
                       char **report);
+
+// What the database says about itself: `{"path": …, "wal_path": …,
+// "mode": "writer", "read_only": false, "poisoned": false, "options":
+// {…}}`. The path is the file, its symlinks followed; `mode` is
+// `writer`, `read_only_beside_writer` or `read_only_alone`; the options
+// as the open uses them, each duration in seconds. It answers on a
+// poisoned database too, where other calls fail.
+int32_t trunkdb_open_info(const trunkdb_db *db,
+                          char **report);
 
 // The collections' names, a JSON array in name order.
 int32_t trunkdb_collections(const trunkdb_db *db,

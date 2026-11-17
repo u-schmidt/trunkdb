@@ -1577,3 +1577,11 @@ limit, batches and a write-ahead log. Since then:
     fix found by fuzzing. File format 17, WAL version 4 and export
     version 4, as in 0.42.0; no fixture, as nothing writes a file
     differently (§120.9).
+179. **What a database says about itself** (§208): `Database::path`, the
+    file worked on, its symlinks followed; `is_read_only`; and
+    `open_info`, an `OpenInfo` with the WAL's path, the `OpenMode`
+    (`Writer`, `ReadOnlyBesideWriter`, `ReadOnlyAlone`), whether a
+    failed write has poisoned it, and the options as the open uses
+    them. The C ABI's `trunkdb_open_info`, ABI version 3; in C#,
+    `db.Path`, `db.IsReadOnly` and `db.OpenInfo()`; in Python,
+    `db.path`, `db.read_only` and `db.open_info()`.

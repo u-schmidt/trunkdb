@@ -29,8 +29,9 @@ use text::{optional, owned, text};
 
 /// The version of these functions: a library whose `trunkdb_abi_version`
 /// differs from the header's is not the one the program was built for.
-/// 2 added the live handles (SPEC §194).
-pub const TRUNKDB_ABI_VERSION: u32 = 2;
+/// 2 added the live handles (SPEC §194), 3 `trunkdb_open_info` (SPEC
+/// §208).
+pub const TRUNKDB_ABI_VERSION: u32 = 3;
 
 /// The call did what it says.
 pub const TRUNKDB_OK: i32 = 0;
@@ -379,6 +380,21 @@ pub unsafe extern "C" fn trunkdb_stats(db: *const trunkdb_db, report: *mut *mut 
     run(|| unsafe {
         let report = out(report, std::ptr::null_mut(), "report")?;
         *report = report_out(database(db)?.stats()?.to_document());
+        Ok(())
+    })
+}
+
+/// What the database says about itself: `{"path": …, "wal_path": …,
+/// "mode": "writer", "read_only": false, "poisoned": false, "options":
+/// {…}}`. The path is the file, its symlinks followed; `mode` is
+/// `writer`, `read_only_beside_writer` or `read_only_alone`; the options
+/// as the open uses them, each duration in seconds. It answers on a
+/// poisoned database too, where other calls fail.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trunkdb_open_info(db: *const trunkdb_db, report: *mut *mut c_char) -> i32 {
+    run(|| unsafe {
+        let report = out(report, std::ptr::null_mut(), "report")?;
+        *report = report_out(database(db)?.open_info().to_document());
         Ok(())
     })
 }

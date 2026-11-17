@@ -119,6 +119,8 @@ int main(int argc, char **argv) {
     has(text, "\"ok\":true");
     OK(trunkdb_stats(db, &text));
     has(text, "\"wal_bytes\"");
+    OK(trunkdb_open_info(db, &text));
+    has(text, "\"mode\":\"writer\"");
     OK(trunkdb_checkpoint(db));
     OK(trunkdb_compact(db, &text));
     has(text, "\"pages_after\"");
