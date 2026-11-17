@@ -221,3 +221,4 @@ say what changed, and DESIGN.md says what is true now.
 204. [Live queries read again as time passes (`live.rs`, `database.rs`, `query.rs`, `aggregate.rs`)](204-live-queries-read-again-as-time-passes.md)
 205. [The clock in a read-only open (`live.rs`, `database.rs`)](205-the-clock-in-a-read-only-open.md)
 206. [Devices that go silent (`GUIDE.md`, `bindings/`)](206-devices-that-go-silent.md)
+207. [The last handle closes the file (`database.rs`)](207-the-last-handle-closes-the-file.md)
