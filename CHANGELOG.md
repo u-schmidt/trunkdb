@@ -1557,3 +1557,9 @@ limit, batches and a write-ahead log. Since then:
     first; a live query and aggregate against `now` tested in C# and
     Python, in the writer's process and read-only beside it; the
     bindings' READMEs and the agent skill say so.
+178. **The last handle closes the file** (§207, found by fuzzing): a
+    drop that came while `trunkdb-clock` or `trunkdb-live` was in a
+    turn left the database to close on that thread afterwards, so an
+    open right after was refused as still open for writing. The last
+    handle now waits for a turn under way, and the file is closed when
+    its drop returns.

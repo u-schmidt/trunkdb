@@ -678,3 +678,73 @@ fn equal_to_now_is_refused() {
     };
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+/// A condition of the test's own, true for every document, that runs
+/// `inside` in a turn of `trunkdb-clock` only (SPEC §207).
+fn in_a_tick(inside: impl Fn() + Send + Sync + 'static) -> trunkdb::query::Condition {
+    trunkdb::query::Condition::custom(["name"], move |_| {
+        if std::thread::current().name() == Some("trunkdb-clock") {
+            inside();
+        }
+        true
+    })
+}
+
+/// The last handle dropped while `trunkdb-clock` reads a live query
+/// again: the drop waits for the turn, so the file is closed when it
+/// returns, and opens again at once (SPEC §207). Found by the fuzzer's
+/// reopen, which a turn under way had refused as open for writing.
+#[test]
+fn the_last_handle_closes_the_file_in_the_middle_of_a_tick() {
+    let (dir, db) = open(OpenOptions::default().clock_every(Duration::from_millis(5)));
+    let devices = db.collection::<Document>("devices");
+    devices.insert(device("van", DateTime::now())).unwrap();
+    let (inside, ticking) = std::sync::mpsc::sync_channel(1);
+    let inside = std::sync::Mutex::new(inside);
+    let filter = Filter::new()
+        .newer_than("last_seen", Duration::from_secs(3600))
+        .and(in_a_tick(move || {
+            let _ = inside.lock().unwrap().try_send(());
+            std::thread::sleep(Duration::from_millis(300));
+        }));
+    let live = devices.watch(filter).unwrap();
+    ticking.recv_timeout(PATIENCE).expect("a tick");
+    drop(devices);
+    drop(db);
+    Database::open(dir.path().join("clock.trunkdb")).unwrap();
+    drop(live);
+}
+
+/// A condition that drops the application's last handle, in a turn of
+/// `trunkdb-clock`: the drop doesn't wait for its own turn, and the file
+/// is closed when the turn ends (SPEC §207).
+#[test]
+fn the_last_handle_dropped_in_a_tick_closes_the_file_after_it() {
+    use std::sync::{Arc, Mutex};
+    let (dir, db) = open(OpenOptions::default().clock_every(Duration::from_millis(5)));
+    let devices = db.collection::<Document>("devices");
+    devices.insert(device("van", DateTime::now())).unwrap();
+    let held: Arc<Mutex<Option<Database>>> = Arc::default();
+    let (gone, dropped) = std::sync::mpsc::sync_channel(1);
+    let gone = Mutex::new(gone);
+    let holding = held.clone();
+    let filter = Filter::new()
+        .newer_than("last_seen", Duration::from_secs(3600))
+        .and(in_a_tick(move || {
+            if let Some(last) = holding.lock().unwrap().take() {
+                drop(last);
+                let _ = gone.lock().unwrap().try_send(());
+            }
+        }));
+    let live = devices.watch(filter).unwrap();
+    drop(devices);
+    *held.lock().unwrap() = Some(db);
+    dropped.recv_timeout(PATIENCE).expect("dropped in a tick");
+    let path = dir.path().join("clock.trunkdb");
+    let started = std::time::Instant::now();
+    while let Err(e) = Database::open(&path) {
+        assert!(started.elapsed() < PATIENCE, "never closed: {e:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(live);
+}

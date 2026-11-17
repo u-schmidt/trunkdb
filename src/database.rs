@@ -44,7 +44,80 @@ use std::time::{Duration, Instant};
 /// - A document's encoded size: `u32::MAX` bytes (4 GiB).
 #[derive(Clone)]
 pub struct Database {
+    /// The application's, shared by its clones; `None` in a turn of one
+    /// of trunkdb's threads. Before `inner`, so dropped first: the last
+    /// handle waits for a turn under way to let go (SPEC §207).
+    _handles: Option<Arc<Handles>>,
     inner: Arc<Shared>,
+}
+
+/// The application's handles to one open, apart from trunkdb's threads
+/// (`trunkdb-clock`, `trunkdb-live`), which hold the database only for a
+/// turn (SPEC §207). The last handle gone, no turn begins, and one under
+/// way is waited for, so the file is closed, and its lock let go, when
+/// the drop returns.
+struct Handles {
+    turns: Arc<Turns>,
+}
+
+impl Drop for Handles {
+    fn drop(&mut self) {
+        self.turns.close();
+    }
+}
+
+/// The turns of trunkdb's threads under way (SPEC §207), by thread.
+#[derive(Default)]
+struct Turns {
+    state: Mutex<TurnsState>,
+    ended: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct TurnsState {
+    closed: bool,
+    under_way: Vec<std::thread::ThreadId>,
+}
+
+impl Turns {
+    fn lock(&self) -> MutexGuard<'_, TurnsState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The database for one turn, unless the application's last handle
+    /// is gone.
+    fn begin(&self, shared: &Weak<Shared>) -> Option<Database> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        let inner = shared.upgrade()?;
+        state.under_way.push(std::thread::current().id());
+        Some(Database {
+            _handles: None,
+            inner,
+        })
+    }
+
+    /// The turn over: the database let go first, then counted as ended.
+    fn end(&self, db: Database) {
+        drop(db);
+        let me = std::thread::current().id();
+        self.lock().under_way.retain(|&thread| thread != me);
+        self.ended.notify_all();
+    }
+
+    /// No turn begins after; one under way is waited for. Not one of
+    /// this very thread: a custom condition that drops the last handle,
+    /// in a turn, closes the file when the turn ends.
+    fn close(&self) {
+        let me = std::thread::current().id();
+        let mut state = self.lock();
+        state.closed = true;
+        while state.under_way.iter().any(|&thread| thread != me) {
+            state = self.ended.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+    }
 }
 
 /// What every clone shares (SPEC §79). Readers and the writer meet in
@@ -97,6 +170,9 @@ struct Shared {
     /// Wakes the clock's thread (SPEC §204) before its time, where a
     /// commit or a new live query brought a moment nearer.
     bell: Arc<Bell>,
+    /// The turns of trunkdb's threads, which the last handle waits for
+    /// (SPEC §207).
+    turns: Arc<Turns>,
 }
 
 /// What wakes the clock's thread (SPEC §204): rung, it wakes; else it
@@ -1048,7 +1124,11 @@ impl Database {
         let checkpoint_wal_bytes = options.checkpoint_wal_bytes.unwrap_or(
             (options.checkpoint_pages as u64).saturating_mul(2 * crate::storage::PAGE_SIZE as u64),
         );
+        let turns = Arc::new(Turns::default());
         Self {
+            _handles: Some(Arc::new(Handles {
+                turns: turns.clone(),
+            })),
             inner: Arc::new(Shared {
                 pages: store.pages.clone(),
                 current: ShardedLock::new(current),
@@ -1091,6 +1171,7 @@ impl Database {
                 beside,
                 skipped,
                 bell: Arc::default(),
+                turns,
             }),
         }
     }
@@ -1288,16 +1369,19 @@ impl Database {
             return Ok(());
         }
         let shared = Arc::downgrade(&self.inner);
+        let turns = self.inner.turns.clone();
         let every = writer.watch_every;
         std::thread::Builder::new()
             .name("trunkdb-live".to_string())
             .spawn(move || {
                 loop {
                     std::thread::sleep(every);
-                    let Some(inner) = shared.upgrade() else {
+                    let Some(db) = turns.begin(&shared) else {
                         return;
                     };
-                    if !(Database { inner }).look() {
+                    let looking = db.look();
+                    turns.end(db);
+                    if !looking {
                         return;
                     }
                 }
@@ -1325,15 +1409,18 @@ impl Database {
             return Ok(());
         }
         let shared = Arc::downgrade(&self.inner);
+        let turns = self.inner.turns.clone();
         let bell = self.inner.bell.clone();
         std::thread::Builder::new()
             .name("trunkdb-clock".to_string())
             .spawn(move || {
                 loop {
-                    let Some(inner) = shared.upgrade() else {
+                    let Some(db) = turns.begin(&shared) else {
                         return;
                     };
-                    let Some(wait) = (Database { inner }).tick() else {
+                    let wait = db.tick();
+                    turns.end(db);
+                    let Some(wait) = wait else {
                         return;
                     };
                     bell.sleep(wait);
