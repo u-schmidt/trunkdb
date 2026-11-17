@@ -173,6 +173,13 @@ struct Shared {
     /// The turns of trunkdb's threads, which the last handle waits for
     /// (SPEC §207).
     turns: Arc<Turns>,
+    /// The file, its symlinks followed (SPEC §127): set at the open,
+    /// read without a lock (SPEC §208).
+    path: PathBuf,
+    /// How it was opened (SPEC §208).
+    mode: crate::OpenMode,
+    /// The options it was opened with, as it uses them (SPEC §208).
+    settings: crate::OpenSettings,
 }
 
 /// What wakes the clock's thread (SPEC §204): rung, it wakes; else it
@@ -1124,6 +1131,27 @@ impl Database {
         let checkpoint_wal_bytes = options.checkpoint_wal_bytes.unwrap_or(
             (options.checkpoint_pages as u64).saturating_mul(2 * crate::storage::PAGE_SIZE as u64),
         );
+        let let_go_wal_bytes = match options.let_go_wal_bytes {
+            Some(0) => u64::MAX,
+            Some(bytes) => bytes,
+            None => checkpoint_wal_bytes.saturating_mul(4),
+        };
+        let mode = match (&durability, &beside) {
+            (Some(_), _) => crate::OpenMode::Writer,
+            (None, Some(_)) => crate::OpenMode::ReadOnlyBesideWriter,
+            (None, None) => crate::OpenMode::ReadOnlyAlone,
+        };
+        let settings = crate::OpenSettings {
+            cache_size: options.cache_size,
+            checkpoint_pages: options.checkpoint_pages,
+            checkpoint_wal_bytes,
+            snapshot_memory: options.snapshot_memory,
+            checkpoint_wait: options.checkpoint_wait,
+            wait_for_readers: options.wait_for_readers,
+            let_go_wal_bytes: (let_go_wal_bytes != u64::MAX).then_some(let_go_wal_bytes),
+            watch_every: options.watch_every,
+            clock_every: options.clock_every,
+        };
         let turns = Arc::new(Turns::default());
         Self {
             _handles: Some(Arc::new(Handles {
@@ -1140,11 +1168,7 @@ impl Database {
                     checkpoint_wal_bytes,
                     locks,
                     checkpoint_wait: options.checkpoint_wait,
-                    let_go_wal_bytes: match options.let_go_wal_bytes {
-                        Some(0) => u64::MAX,
-                        Some(bytes) => bytes,
-                        None => checkpoint_wal_bytes.saturating_mul(4),
-                    },
+                    let_go_wal_bytes,
                     through_gate: false,
                     gate_waited: None,
                     asked_in_vain: None,
@@ -1172,12 +1196,41 @@ impl Database {
                 skipped,
                 bell: Arc::default(),
                 turns,
+                path: path.to_path_buf(),
+                mode,
+                settings,
             }),
         }
     }
 
     pub(crate) fn wal_path(&self) -> &Path {
         &self.inner.wal_path
+    }
+
+    /// The file this database works on: the path given to the open, its
+    /// symlinks followed to the file they lead to (SPEC §127, §208).
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    /// Whether this database refuses writes: opened with
+    /// `OpenOptions::read_only` (SPEC §88, §187, §208).
+    pub fn is_read_only(&self) -> bool {
+        self.inner.mode.is_read_only()
+    }
+
+    /// What this database says about itself (SPEC §208): the file it
+    /// works on and its WAL, how it was opened, whether a failed write
+    /// has stopped it, and the options it was opened with. All but
+    /// `poisoned` are as they were at the open.
+    pub fn open_info(&self) -> crate::OpenInfo {
+        crate::OpenInfo {
+            path: self.inner.path.clone(),
+            wal_path: self.inner.wal_path.clone(),
+            mode: self.inner.mode,
+            poisoned: self.inner.poisoned.load(Ordering::Relaxed),
+            options: self.inner.settings.clone(),
+        }
     }
 
     pub(crate) fn scratch_path(&self) -> &Path {
@@ -4953,6 +5006,7 @@ mod tests {
     fn a_failed_log_that_cannot_be_taken_back_poisons() {
         let (_dir, _path, db) = open_temp();
         db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
+        assert!(!db.open_info().poisoned);
         {
             let mut state = db.state();
             state.wal().failing_logs = 1;
@@ -4969,6 +5023,11 @@ mod tests {
             posts.get(&DocId([1; 16])),
             Err(crate::Error::Poisoned)
         ));
+        // It says so, where every other call refuses (SPEC §208).
+        assert!(db.open_info().poisoned);
+        assert!(
+            db.clone().open_info().to_document().get("poisoned") == Some(&Document::Bool(true))
+        );
     }
 
     // --- Writers beside the readers (SPEC §79) ---

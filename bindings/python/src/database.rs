@@ -319,6 +319,28 @@ impl PyDatabase {
         report(py, done.to_document())
     }
 
+    /// What the database says about itself (SPEC §208): `{"path": ...,
+    /// "wal_path": ..., "mode": "writer", "read_only": False, "poisoned":
+    /// False, "options": {...}}`, each duration in seconds. It answers on
+    /// a poisoned database too, where other calls raise.
+    fn open_info(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let db = self.state.get()?;
+        report(py, db.open_info().to_document())
+    }
+
+    /// The file this database works on: the path opened, its symlinks
+    /// followed (SPEC §208).
+    #[getter]
+    fn path(&self) -> PyResult<String> {
+        Ok(self.state.get()?.path().to_string_lossy().into_owned())
+    }
+
+    /// Whether this database refuses writes: opened with `read_only=True`.
+    #[getter]
+    fn read_only(&self) -> PyResult<bool> {
+        Ok(self.state.get()?.is_read_only())
+    }
+
     /// Where the file's space goes: the file, its pages by use, and each
     /// collection's documents, sizes and indexes.
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {

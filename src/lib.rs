@@ -81,6 +81,7 @@ mod json;
 mod live;
 pub mod map;
 mod names;
+mod open_info;
 mod path;
 #[cfg(feature = "regex")]
 mod pattern;
@@ -113,6 +114,7 @@ pub use export::{ImportOptions, Summary, Verified, verify_export};
 pub use json::ParseDocumentError;
 pub use live::{Live, LiveAggregate, LiveQuery, LiveRow};
 pub use map::Map;
+pub use open_info::{OpenInfo, OpenMode, OpenSettings};
 pub use release::{RELEASE, Release};
 pub use serde_bridge::DocumentError;
 pub use snapshot::{Snapshot, SnapshotInfo, View};

@@ -988,6 +988,32 @@ numbers show how much a hint saves. Past about 100,000 entries, it
 says "more than". A walk in sort order is followed only as far as the
 query itself read.
 
+## What a database says about itself
+
+A `Database` says which file it works on, how it was opened and what it
+uses, for a log line, an admin screen or an error message (SPEC §208):
+
+```rust
+println!("{} ({})", db.path().display(), if db.is_read_only() { "read-only" } else { "writer" });
+
+let info = db.open_info();
+match info.mode {
+    OpenMode::Writer => {}
+    OpenMode::ReadOnlyBesideWriter => println!("reading what another process commits"),
+    OpenMode::ReadOnlyAlone => println!("reading the file as it was when opened"),
+    _ => {}
+}
+if info.poisoned {
+    // a write failed and couldn't be finished: open the file again
+}
+println!("cache {} bytes, WAL at {}", info.options.cache_size, info.wal_path.display());
+```
+
+`path` is the file itself: opened through a symlink, the file it leads
+to, beside which the WAL is. The options are those the open uses, its
+defaults for any not set. `stats`, `file_info` and `snapshot_info` say
+what is in the file and what snapshots cost.
+
 ## Backups, restores and upgrades
 
 An export is the backup: every collection, its indexes and every

@@ -11,7 +11,7 @@ use crate::compact::Compacted;
 use crate::document::{DocId, Document};
 use crate::map::Map;
 use crate::stats::{IndexStats, Stats};
-use crate::{IndexInfo, Release, Summary, Written};
+use crate::{IndexInfo, OpenInfo, Release, Summary, Written};
 
 /// An object of `fields`, in their order.
 fn object<const N: usize>(fields: [(&str, Document); N]) -> Document {
@@ -95,6 +95,51 @@ impl FileInfo {
             ("free_pages", int(self.free_pages)),
             ("created_by", release(self.created_by)),
             ("written_by", release(self.written_by)),
+        ])
+    }
+}
+
+/// A duration as seconds, a float: as Python's options take one.
+fn seconds(duration: std::time::Duration) -> Document {
+    Document::Float(duration.as_secs_f64())
+}
+
+/// A path as its text; one that isn't UTF-8 with U+FFFD for what isn't.
+fn path(path: &std::path::Path) -> Document {
+    Document::String(path.to_string_lossy().into_owned())
+}
+
+impl OpenInfo {
+    /// The file, the mode, `poisoned` and the options (SPEC §208): `{"path":
+    /// …, "wal_path": …, "mode": "writer", "read_only": false, "poisoned":
+    /// false, "options": {"cache_size": …, "watch_every": 0.1, …}}`, each
+    /// duration in seconds, `let_go_wal_bytes` null where readers are never
+    /// asked.
+    pub fn to_document(&self) -> Document {
+        let o = &self.options;
+        object([
+            ("path", path(&self.path)),
+            ("wal_path", path(&self.wal_path)),
+            ("mode", Document::String(self.mode.name().into())),
+            ("read_only", Document::Bool(self.mode.is_read_only())),
+            ("poisoned", Document::Bool(self.poisoned)),
+            (
+                "options",
+                object([
+                    ("cache_size", int(o.cache_size)),
+                    ("checkpoint_pages", int(o.checkpoint_pages)),
+                    ("checkpoint_wal_bytes", int(o.checkpoint_wal_bytes)),
+                    ("snapshot_memory", int(o.snapshot_memory)),
+                    ("checkpoint_wait", seconds(o.checkpoint_wait)),
+                    ("wait_for_readers", seconds(o.wait_for_readers)),
+                    (
+                        "let_go_wal_bytes",
+                        o.let_go_wal_bytes.map_or(Document::Null, int),
+                    ),
+                    ("watch_every", seconds(o.watch_every)),
+                    ("clock_every", seconds(o.clock_every)),
+                ]),
+            ),
         ])
     }
 }

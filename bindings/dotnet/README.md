@@ -46,6 +46,9 @@ class TaskItem
 - **Errors** are a `TrunkDbException` with its `Code` and `Detail`; catch
   `DuplicateValueException`, `ParseException` and the others by kind.
 - **Threads:** one `Database` for the whole program, from any thread.
+- **What it is:** `db.Path`, the file worked on, its symlinks followed;
+  `db.IsReadOnly`; `db.OpenInfo()`, with the log's path, the
+  `OpenMode`, whether a failed write stopped it, and the options in use.
 
 ## Changes as they happen
 

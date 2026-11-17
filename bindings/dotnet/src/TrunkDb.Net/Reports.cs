@@ -84,3 +84,72 @@ public sealed record IndexStats(
 
 /// <summary>What opening recovered from the log.</summary>
 public sealed record RecoveredStats(ulong Pages, bool InMemory);
+
+/// <summary>How a database was opened (SPEC §208).</summary>
+[System.Text.Json.Serialization.JsonConverter(typeof(OpenModeConverter))]
+public enum OpenMode
+{
+    /// <summary>The one open that writes the file.</summary>
+    Writer,
+
+    /// <summary>Read-only by the lock files: each call reads what a writer in another process committed.</summary>
+    ReadOnlyBesideWriter,
+
+    /// <summary>Read-only, holding the file shared: the file as it was at the open.</summary>
+    ReadOnlyAlone,
+}
+
+/// <summary>
+/// What a database says about itself (SPEC §208): the file it works on,
+/// its symlinks followed, and its log; how it was opened; whether a
+/// failed write stopped it; the options it uses.
+/// </summary>
+public sealed record OpenInfo(
+    string Path, string WalPath, OpenMode Mode, bool ReadOnly, bool Poisoned, OpenSettings Options);
+
+/// <summary>The options a database was opened with, as it uses them; trunkdb's defaults for those not set.</summary>
+public sealed record OpenSettings(
+    ulong CacheSize,
+    ulong CheckpointPages,
+    ulong CheckpointWalBytes,
+    ulong SnapshotMemory,
+    [property: System.Text.Json.Serialization.JsonConverter(typeof(SecondsConverter))] TimeSpan CheckpointWait,
+    [property: System.Text.Json.Serialization.JsonConverter(typeof(SecondsConverter))] TimeSpan WaitForReaders,
+    ulong? LetGoWalBytes,
+    [property: System.Text.Json.Serialization.JsonConverter(typeof(SecondsConverter))] TimeSpan WatchEvery,
+    [property: System.Text.Json.Serialization.JsonConverter(typeof(SecondsConverter))] TimeSpan ClockEvery);
+
+/// <summary>A mode as the C ABI names it: <c>writer</c>, <c>read_only_beside_writer</c>, <c>read_only_alone</c>.</summary>
+internal sealed class OpenModeConverter : System.Text.Json.Serialization.JsonConverter<OpenMode>
+{
+    public override OpenMode Read(
+        ref System.Text.Json.Utf8JsonReader reader, Type typeToConvert, System.Text.Json.JsonSerializerOptions options) =>
+        reader.GetString() switch
+        {
+            "writer" => OpenMode.Writer,
+            "read_only_beside_writer" => OpenMode.ReadOnlyBesideWriter,
+            "read_only_alone" => OpenMode.ReadOnlyAlone,
+            var other => throw new System.Text.Json.JsonException($"an open mode this wrapper doesn't know: {other}"),
+        };
+
+    public override void Write(
+        System.Text.Json.Utf8JsonWriter writer, OpenMode value, System.Text.Json.JsonSerializerOptions options) =>
+        writer.WriteStringValue(value switch
+        {
+            OpenMode.Writer => "writer",
+            OpenMode.ReadOnlyBesideWriter => "read_only_beside_writer",
+            _ => "read_only_alone",
+        });
+}
+
+/// <summary>A duration as the C ABI writes it: seconds, a number.</summary>
+internal sealed class SecondsConverter : System.Text.Json.Serialization.JsonConverter<TimeSpan>
+{
+    public override TimeSpan Read(
+        ref System.Text.Json.Utf8JsonReader reader, Type typeToConvert, System.Text.Json.JsonSerializerOptions options) =>
+        TimeSpan.FromTicks((long)Math.Round(reader.GetDouble() * TimeSpan.TicksPerSecond));
+
+    public override void Write(
+        System.Text.Json.Utf8JsonWriter writer, TimeSpan value, System.Text.Json.JsonSerializerOptions options) =>
+        writer.WriteNumberValue(value.TotalSeconds);
+}

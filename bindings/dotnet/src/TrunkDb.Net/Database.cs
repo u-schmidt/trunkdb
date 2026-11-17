@@ -149,6 +149,28 @@ public sealed class Database : IDisposable
         return Report<CheckReport>(report);
     }
 
+    /// <summary>
+    /// What the database says about itself (SPEC §208): its file, its log,
+    /// how it was opened, whether a failed write stopped it, and its options.
+    /// Answers on a poisoned database too, where other calls throw.
+    /// </summary>
+    public OpenInfo OpenInfo()
+    {
+        Native.Check(Native.trunkdb_open_info(handle, out var report));
+        return Report<OpenInfo>(report);
+    }
+
+    /// <summary>The file this database works on: the path opened, its symlinks followed.</summary>
+    public string Path => Opened.Path;
+
+    /// <summary>Whether this database refuses writes: opened with <see cref="OpenOptions.ReadOnly"/>.</summary>
+    public bool IsReadOnly => Opened.ReadOnly;
+
+    /// <summary>What doesn't change after the open, asked once.</summary>
+    private OpenInfo Opened => opened ??= OpenInfo();
+
+    private OpenInfo? opened;
+
     /// <summary>Where the file's pages go, and each collection's sizes.</summary>
     public DatabaseStats Stats()
     {

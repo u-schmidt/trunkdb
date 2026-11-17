@@ -15,7 +15,7 @@ internal static partial class Native
     private const string Library = "trunkdb";
 
     /// <summary>The ABI this wrapper is written against.</summary>
-    internal const uint AbiVersion = 2;
+    internal const uint AbiVersion = 3;
 
     internal const int Ok = 0;
 
@@ -53,6 +53,9 @@ internal static partial class Native
 
     [LibraryImport(Library)]
     internal static partial int trunkdb_stats(DatabaseHandle db, out IntPtr report);
+
+    [LibraryImport(Library)]
+    internal static partial int trunkdb_open_info(DatabaseHandle db, out IntPtr report);
 
     [LibraryImport(Library)]
     internal static partial int trunkdb_collections(DatabaseHandle db, out IntPtr names);

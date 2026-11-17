@@ -48,9 +48,31 @@ public sealed class DatabaseTests : IDisposable
     [Fact]
     public void The_library_is_trunkdbs_release_and_speaks_its_abi()
     {
-        Assert.Equal(2u, Database.AbiVersion);
+        Assert.Equal(3u, Database.AbiVersion);
         var version = typeof(Database).Assembly.GetName().Version!;
         Assert.Equal($"{version.Major}.{version.Minor}.{version.Build}", Database.LibraryVersion);
+    }
+
+    [Fact]
+    public void A_database_says_its_file_mode_and_options()
+    {
+        using var db = Open(options: new OpenOptions { CacheSize = 1 << 20 });
+        Assert.Equal(File("app.trunkdb"), db.Path);
+        Assert.False(db.IsReadOnly);
+        var info = db.OpenInfo();
+        Assert.Equal(File("app.trunkdb"), info.Path);
+        Assert.Equal(File("app.trunkdb") + ".wal", info.WalPath);
+        Assert.Equal(OpenMode.Writer, info.Mode);
+        Assert.False(info.Poisoned);
+        Assert.Equal(1ul << 20, info.Options.CacheSize);
+        Assert.Equal(TimeSpan.FromMilliseconds(100), info.Options.WatchEvery);
+        Assert.Equal(TimeSpan.FromSeconds(1), info.Options.ClockEvery);
+        Assert.NotNull(info.Options.LetGoWalBytes);
+
+        using var reader = Open(options: new OpenOptions { ReadOnly = true });
+        Assert.True(reader.IsReadOnly);
+        Assert.Equal(File("app.trunkdb"), reader.Path);
+        Assert.Equal(OpenMode.ReadOnlyBesideWriter, reader.OpenInfo().Mode);
     }
 
     [Fact]
