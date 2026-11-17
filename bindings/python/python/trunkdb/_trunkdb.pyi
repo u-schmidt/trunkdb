@@ -86,7 +86,7 @@ def open(
     """Opens the database at `path`, creating it if it isn't there."""
 
 def version() -> str:
-    """trunkdb's release, as "0.42.0"."""
+    """trunkdb's release, as "0.43.0"."""
 
 @final
 class DocId:

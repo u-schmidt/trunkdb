@@ -1563,3 +1563,17 @@ limit, batches and a write-ahead log. Since then:
     open right after was refused as still open for writing. The last
     handle now waits for a turn under way, and the file is closed when
     its drop returns.
+
+    Items 174–178 → 0.43.0. Additions only: nothing a program has to
+    change. **The clock in a filter** (§202–§206): `now` and
+    `now ± duration` in a condition, `Condition::older_than`,
+    `newer_than` and `against_now`, read once per read; live queries and
+    aggregates against it read again as time passes, in the writer's
+    process by `trunkdb-clock`, beside a writer by the look, so a device
+    gone silent is seen with nothing written; `OpenOptions::clock_every`
+    and `Filter::now_is` are new. `now` is not reserved: a field named
+    `now` stays a field. The C ABI, C# and Python take it as text, the
+    C ABI still version 2. **The last handle closes the file** (§207), a
+    fix found by fuzzing. File format 17, WAL version 4 and export
+    version 4, as in 0.42.0; no fixture, as nothing writes a file
+    differently (§120.9).

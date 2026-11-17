@@ -1,6 +1,6 @@
 [package]
 name = "trunkdb-python"
-version = "0.42.0"
+version = "0.43.0"
 edition = "2024"
 rust-version = "1.89"
 description = "trunkdb for Python: the library as a module, documents as dicts (SPEC §197)."
