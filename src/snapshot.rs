@@ -5,7 +5,7 @@ use crate::catalog::IndexInfo;
 use crate::check::{CheckReport, FileInfo};
 use crate::collection::Collection;
 use crate::cursor::Cursor;
-use crate::database::{Revision, Database, ReadGuard};
+use crate::database::{Database, ReadGuard, Revision};
 use crate::document::{DocId, Document};
 use crate::export::Summary;
 use crate::query::{Aggregate, Explained, Filter, QueryPlan};

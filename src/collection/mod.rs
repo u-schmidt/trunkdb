@@ -2,7 +2,7 @@ use crate::aggregate::Aggregate;
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
-use crate::database::{Revision, Database, ReadGuard};
+use crate::database::{Database, ReadGuard, Revision};
 use crate::document::{DocId, Document};
 use crate::explain::Trace;
 use crate::id::IdGenerator;
