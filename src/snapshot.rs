@@ -5,7 +5,7 @@ use crate::catalog::IndexInfo;
 use crate::check::{CheckReport, FileInfo};
 use crate::collection::Collection;
 use crate::cursor::Cursor;
-use crate::database::{Committed, Database, ReadGuard};
+use crate::database::{Database, ReadGuard, Revision};
 use crate::document::{DocId, Document};
 use crate::export::Summary;
 use crate::query::{Aggregate, Explained, Filter, QueryPlan};
@@ -68,7 +68,7 @@ use std::io::Write;
 #[derive(Clone)]
 pub struct Snapshot {
     db: Database,
-    at: Committed,
+    at: Revision,
 }
 
 impl std::fmt::Debug for Snapshot {

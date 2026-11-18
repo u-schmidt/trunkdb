@@ -2,7 +2,7 @@ use crate::aggregate::Aggregate;
 use crate::catalog::{Catalog, CollectionMeta, IndexInfo, IndexMeta, IndexOptions};
 use crate::cursor::{Convert, Cursor, Pending};
 use crate::data::{self, Stored};
-use crate::database::{Committed, Database, ReadGuard};
+use crate::database::{Database, ReadGuard, Revision};
 use crate::document::{DocId, Document};
 use crate::explain::Trace;
 use crate::id::IdGenerator;
@@ -187,7 +187,7 @@ pub struct Collection<T> {
     /// cursor: SPEC §82); the last one, as of each call, if `None`. A
     /// handle with a commit never writes: nothing outside this crate can
     /// reach a write method on one.
-    at: Option<Committed>,
+    at: Option<Revision>,
     /// `fn() -> T`, not `T`: the handle holds no `T`, so whether it's
     /// `Send`/`Sync` shouldn't depend on whether `T` is — a plain
     /// `PhantomData<T>` would make it so.
@@ -214,7 +214,7 @@ impl<T> Collection<T> {
 
     /// A handle that reads the collection as of `at`, every time (SPEC
     /// §82).
-    pub(crate) fn pinned(db: Database, name: impl Into<String>, at: Committed) -> Self {
+    pub(crate) fn pinned(db: Database, name: impl Into<String>, at: Revision) -> Self {
         Self {
             at: Some(at),
             ..Self::new(db, name)
