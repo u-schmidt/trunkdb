@@ -132,7 +132,7 @@ struct Shared {
     /// keeps the snapshot, not the lock, and reads it whatever is
     /// committed meanwhile (SPEC §80). Each thread takes it through a
     /// lock of its own, as `gate` and the pages' lock (SPEC §193).
-    current: ShardedLock<Committed>,
+    current: ShardedLock<Revision>,
     /// Held shared by every read for as long as it reads, and alone by a
     /// batch that replaces the whole file (`compact`), from before its
     /// commit to after it: the one kind of batch that can't keep the
@@ -259,7 +259,7 @@ pub(crate) struct Writer {
     /// they were replaced, oldest first: the ones a reader may still be
     /// reading (SPEC §80). Weak, so a snapshot ends when its last reader
     /// lets go, and is found gone here.
-    past: Vec<Weak<CommittedInner>>,
+    past: Vec<Weak<RevisionInner>>,
     /// Where each commit's changes go (SPEC §135), one sender for each
     /// `Changes` handed out. A sender whose `Changes` is gone is dropped
     /// at the next report. While there is none, batches record nothing.
@@ -297,9 +297,9 @@ pub(crate) struct Writer {
 /// pages, and the catalog as that commit left it. Shared, not copied: a
 /// clone is the same snapshot.
 #[derive(Clone)]
-pub(crate) struct Committed(Arc<CommittedInner>);
+pub(crate) struct Revision(Arc<RevisionInner>);
 
-struct CommittedInner {
+struct RevisionInner {
     commit: Commit,
     catalog: Catalog,
     /// A reader's beside a writer (SPEC §185): the pages it built for
@@ -311,9 +311,9 @@ struct CommittedInner {
     _hold: Option<ReadersHold>,
 }
 
-impl Committed {
+impl Revision {
     fn new(commit: Commit, catalog: Catalog) -> Self {
-        Committed(Arc::new(CommittedInner {
+        Revision(Arc::new(RevisionInner {
             commit,
             catalog,
             own: None,
@@ -324,7 +324,7 @@ impl Committed {
     /// A reader's snapshot beside a writer (SPEC §185): `store`'s last
     /// commit, read from its pages, under `hold`.
     fn beside(store: &FileStore, catalog: Catalog, hold: ReadersHold) -> Self {
-        Committed(Arc::new(CommittedInner {
+        Revision(Arc::new(RevisionInner {
             commit: store.last_commit(),
             catalog,
             own: Some(store.pages.clone()),
@@ -363,7 +363,7 @@ impl Committed {
 }
 
 /// A state a read-only open beside a writer read its live queries on
-/// (SPEC §195): `Committed::watched`. Weak, so the pages go when the
+/// (SPEC §195): `Revision::watched`. Weak, so the pages go when the
 /// reader builds new ones, and aren't mistaken for any built later.
 struct Watched {
     pages: Option<Weak<Pages>>,
@@ -402,7 +402,7 @@ impl Reading<'_> {
 /// the snapshot by mistake (SPEC §78).
 pub(crate) struct ReadGuard<'a> {
     pages: &'a Pages,
-    snapshot: Committed,
+    snapshot: Revision,
     /// Keeps a batch that replaces the whole file from committing under
     /// this read (`Shared::gate`). Not held by a read of a snapshot
     /// somebody keeps (SPEC §82): that snapshot refuses such a batch
@@ -1124,7 +1124,7 @@ impl Database {
         recovered: Option<crate::Recovered>,
         beside: Option<ReaderSide>,
     ) -> Self {
-        let current = Committed::new(store.last_commit(), catalog);
+        let current = Revision::new(store.last_commit(), catalog);
         let skipped = Arc::new(Skipped::default());
         // Saturating: a `checkpoint_pages` past 2^50 would overflow, and
         // wrap to a limit of next to nothing (SPEC §89).
@@ -1619,7 +1619,7 @@ impl Database {
     /// Access for a read of `kept`, a commit somebody keeps (`pin`): the
     /// same commit every time, whatever has been committed since (SPEC
     /// §82). It waits for nothing. Poisoned as for `read`.
-    pub(crate) fn read_at(&self, kept: &Committed) -> crate::Result<ReadGuard<'_>> {
+    pub(crate) fn read_at(&self, kept: &Revision) -> crate::Result<ReadGuard<'_>> {
         if self.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
@@ -1643,7 +1643,7 @@ impl Database {
     /// keep the versions it reads, and `compact` is refused. Taken under
     /// the gate, so a `compact` that has found no snapshot kept doesn't
     /// get one before it has committed. Poisoned as for `read`.
-    pub(crate) fn pin(&self) -> crate::Result<Committed> {
+    pub(crate) fn pin(&self) -> crate::Result<Revision> {
         if self.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
@@ -1870,7 +1870,7 @@ impl Database {
             }
             let live = writer.live();
             writer.store.commit_beside(&live);
-            let snapshot = Committed::new(writer.store.last_commit(), catalog);
+            let snapshot = Revision::new(writer.store.last_commit(), catalog);
             std::mem::replace(&mut *current, snapshot)
         };
         drop(alone);
@@ -1922,7 +1922,7 @@ impl Database {
     }
 
     /// The last commit, shared: the lock is held only to take it.
-    fn current(&self) -> Committed {
+    fn current(&self) -> Revision {
         self.inner
             .current
             .read()
@@ -1947,7 +1947,7 @@ impl Database {
     }
 
     /// The last commit, to replace, with no read taking it meanwhile.
-    fn current_locked(&self) -> ShardedLockWriteGuard<'_, Committed> {
+    fn current_locked(&self) -> ShardedLockWriteGuard<'_, Revision> {
         self.inner
             .current
             .write()
@@ -1984,7 +1984,7 @@ impl Database {
 #[cfg(test)]
 pub(crate) struct TestState<'a> {
     writer: MutexGuard<'a, Writer>,
-    current: Committed,
+    current: Revision,
     pages: &'a Pages,
 }
 
@@ -2099,7 +2099,7 @@ struct Kept {
     /// older versions those still open read. Those ended are dropped
     /// each time one is handed out, so a reader that polls a WAL that
     /// doesn't change keeps one or two here, not one a call.
-    past: Vec<Weak<CommittedInner>>,
+    past: Vec<Weak<RevisionInner>>,
     /// Whether a snapshot has ended since the pages last forgot the
     /// versions kept for it (`FileStore::forget`).
     ended: bool,
@@ -2167,7 +2167,7 @@ impl ReaderSide {
     /// A snapshot of the database as it is now, holding the readers'
     /// lock for as long as it lives: the store kept from the last one,
     /// caught up, or a new one where it can't be (SPEC §188).
-    fn snapshot(&self) -> crate::Result<Committed> {
+    fn snapshot(&self) -> crate::Result<Revision> {
         let mut kept = self
             .kept
             .lock()
@@ -2192,7 +2192,7 @@ impl ReaderSide {
             result
         })?;
         let kept = kept.as_mut().expect("a snapshot built has its store kept");
-        let snapshot = Committed::beside(&kept.store, kept.catalog.clone(), hold);
+        let snapshot = Revision::beside(&kept.store, kept.catalog.clone(), hold);
         kept.prune();
         kept.past.push(Arc::downgrade(&snapshot.0));
         Ok(snapshot)
@@ -4894,7 +4894,7 @@ mod tests {
     fn only_a_commit_replaces_the_snapshot() {
         let (_dir, db) = fresh_db();
         let current = |db: &Database| db.state().current.clone();
-        let same = |a: &Committed, b: &Committed| Arc::ptr_eq(&a.0, &b.0);
+        let same = |a: &Revision, b: &Revision| Arc::ptr_eq(&a.0, &b.0);
         let opened = current(&db);
 
         db.write_batch(vec![insert("posts", 1, 10)]).unwrap();
@@ -5496,7 +5496,7 @@ mod tests {
             }
             let mut rng = crate::testing::XorShift(0x9E3779B97F4A7C15 ^ (seed as u64 + 1));
             let mut model: Model = NAMES.into_iter().map(|name| (name, Vec::new())).collect();
-            let mut open: Vec<(Committed, Model)> = Vec::new();
+            let mut open: Vec<(Revision, Model)> = Vec::new();
             let mut next_id = 0u128;
             let (mut refused, mut compacted, mut most_open) = (0, 0, 0);
             let mut too_old = 0;
