@@ -1585,3 +1585,12 @@ limit, batches and a write-ahead log. Since then:
     them. The C ABI's `trunkdb_open_info`, ABI version 3; in C#,
     `db.Path`, `db.IsReadOnly` and `db.OpenInfo()`; in Python,
     `db.path`, `db.read_only` and `db.open_info()`.
+180. **Groups by a date-time cut to a unit** (§209, designed; §210, its
+    step 1): `Aggregate::group_by_trunc(path, Trunc)`, a date-time cut
+    down to the start of its unit (`Trunc::every(duration)`, `Week`,
+    `Month`, `Year`), and `group_by_date(path)`, its day as a `Date`, in
+    UTC; `trunc(at, 15m)`, `trunc(at, month)` and `date(at)` in an
+    aggregate's `group by`, so C#, Python and `trunkdb aggregate` take
+    them; the row holds the cut value at the field's path; a date cut by
+    whole days, any other value grouped as it is; read from documents,
+    an index's entries answering them in step 2.

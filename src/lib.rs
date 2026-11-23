@@ -95,6 +95,7 @@ mod serde_stored;
 mod snapshot;
 mod stats;
 mod storage;
+mod trunc;
 mod txn;
 mod update;
 mod values;

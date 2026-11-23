@@ -12,6 +12,7 @@ use crate::document::{DocId, Document};
 use crate::query::{
     Aggregate, Condition, Filter, Hint, Kind as ValueKind, Offset, Op, Sort, SortOrder,
 };
+use crate::trunc::{Cut, Trunc};
 use std::collections::BTreeMap;
 use std::fmt::{self, Formatter, Write};
 use std::marker::PhantomData;
@@ -842,7 +843,14 @@ impl<'t> Parser<'t> {
         }
         if self.keyword("group") {
             self.expect_keyword("by")?;
-            aggregate.group_by = self.paths()?;
+            loop {
+                let (path, cut) = self.group_field()?;
+                aggregate.group_by.push(path);
+                aggregate.cuts.push(cut);
+                if !self.eat(",") {
+                    break;
+                }
+            }
         }
         if self.keyword("having") {
             aggregate.rows.conditions = match self.condition()? {
@@ -939,6 +947,59 @@ impl<'t> Parser<'t> {
         match self.unit_after(start, n)? {
             Some(duration) => Ok(Size::Time(duration)),
             None => Ok(Size::Count(n)),
+        }
+    }
+
+    /// A group field: a path, `trunc(path, unit)` or `date(path)` (SPEC
+    /// §210). A field named `trunc` or `date` is a path where no `(`
+    /// follows it.
+    fn group_field(&mut self) -> Parsed<(String, Option<Cut>)> {
+        if self.at_function("trunc") {
+            self.keyword("trunc");
+            self.expect("(")?;
+            let path = self.path()?;
+            self.expect(",")?;
+            let unit = self.trunc_unit()?;
+            self.expect(")")?;
+            return Ok((path, Some(Cut::Trunc(unit))));
+        }
+        if self.at_function("date") {
+            self.keyword("date");
+            self.expect("(")?;
+            let path = self.path()?;
+            self.expect(")")?;
+            return Ok((path, Some(Cut::Date)));
+        }
+        Ok((self.path()?, None))
+    }
+
+    /// `trunc`'s unit: a duration, as a window's (`15m`), or `week`,
+    /// `month` or `year` (SPEC §210).
+    fn trunc_unit(&mut self) -> Parsed<Trunc> {
+        for (word, unit) in [
+            ("week", Trunc::Week),
+            ("month", Trunc::Month),
+            ("year", Trunc::Year),
+        ] {
+            if self.keyword(word) {
+                return Ok(unit);
+            }
+        }
+        self.skip_space();
+        let start = self.at;
+        if self.rest().starts_with(':') {
+            return self.error("a parameter can't stand for a unit");
+        }
+        if !self.rest().starts_with(|c: char| c.is_ascii_digit()) {
+            return self.expected("a duration such as `1m`, or `week`, `month` or `year`");
+        }
+        let n = self.count()?;
+        match self.unit_after(start, n)? {
+            Some(duration) if duration.is_zero() => {
+                self.error_at(start, "a duration of zero cuts nothing")
+            }
+            Some(duration) => Ok(Trunc::Every(duration)),
+            None => self.expected("a unit after the number: ns, us, ms, s, m, h or d"),
         }
     }
 
@@ -1495,7 +1556,29 @@ impl fmt::Display for Aggregate {
         }
         if !self.group_by.is_empty() {
             write!(f, "{gap}group by ")?;
-            write_list(f, &self.group_by, |f, path| write_path(f, path))?;
+            for (i, path) in self.group_by.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                match self.cut(i) {
+                    None => write_path(f, path)?,
+                    Some(Cut::Date) => {
+                        f.write_str("date(")?;
+                        write_path(f, path)?;
+                        f.write_str(")")?;
+                    }
+                    Some(Cut::Trunc(unit)) => {
+                        f.write_str("trunc(")?;
+                        write_path(f, path)?;
+                        match unit {
+                            Trunc::Every(duration) => write!(f, ", {})", DurationText(duration))?,
+                            Trunc::Week => f.write_str(", week)")?,
+                            Trunc::Month => f.write_str(", month)")?,
+                            Trunc::Year => f.write_str(", year)")?,
+                        }
+                    }
+                }
+            }
             gap = " ";
         }
         let rows = &self.rows;
@@ -2717,7 +2800,16 @@ mod tests {
             }
         }
         for _ in 0..rng.below(3) {
-            aggregate = aggregate.group_by(random_aggregate_path(rng));
+            let path = random_aggregate_path(rng);
+            aggregate = match rng.below(8) {
+                0 => aggregate.group_by_date(path),
+                1 => aggregate.group_by_trunc(path, Trunc::Month),
+                2 => {
+                    let nanos = 1 + rng.below(100_000_000_000) as u64;
+                    aggregate.group_by_trunc(path, Trunc::every(Duration::from_nanos(nanos)))
+                }
+                _ => aggregate.group_by(path),
+            };
         }
         if rng.below(3) == 0 {
             aggregate = aggregate.having(random_condition(rng, 2));
@@ -2804,6 +2896,41 @@ mod tests {
         );
         assert_eq!(read("").to_string(), "");
         assert_eq!(read("group by a, b").group_by, ["a", "b"]);
+        // A cut group field, and fields named as the functions are.
+        for (text, written) in [
+            (
+                "count() as n group by trunc(created, 1m)",
+                "count() as n group by trunc(created, 1m)",
+            ),
+            (
+                "group by TRUNC ( at , 60s ), server",
+                "group by trunc(at, 1m), server",
+            ),
+            ("group by trunc(at, 90s)", "group by trunc(at, 90s)"),
+            ("group by trunc(at, 24h)", "group by trunc(at, 1d)"),
+            (
+                "group by trunc(at, week), trunc(b, Month), trunc(c, year)",
+                "group by trunc(at, week), trunc(b, month), trunc(c, year)",
+            ),
+            ("group by date(created)", "group by date(created)"),
+            (
+                "group by trunc(`a b`.c, 1ms)",
+                "group by trunc(`a b`.c, 1ms)",
+            ),
+            ("group by trunc, date", "group by trunc, date"),
+        ] {
+            assert_eq!(read(text).to_string(), written, "{text}");
+        }
+        let cut = read("group by trunc(at, 15m), date(day), plain");
+        assert_eq!(cut.group_by, ["at", "day", "plain"]);
+        assert_eq!(
+            cut.cuts,
+            [
+                Some(Cut::Trunc(Trunc::every(Duration::from_secs(900)))),
+                Some(Cut::Date),
+                None
+            ]
+        );
         // Its words are paths and names where a clause can't start.
         let words = read("count() as having, sum(group) as as group by group having having > 1");
         assert_eq!(words.group_by, ["group"]);
@@ -2849,6 +2976,19 @@ mod tests {
             ("count() as n limit x", "expected a number"),
             ("count(hours) as n", "count() takes no path"),
             ("group by a count() as n", "expected the end"),
+            ("group by trunc(at)", "expected `,`"),
+            ("group by trunc(at, 0s)", "a duration of zero cuts nothing"),
+            ("group by trunc(at, 5)", "expected a unit after the number"),
+            (
+                "group by trunc(at, day)",
+                "expected a duration such as `1m`",
+            ),
+            (
+                "group by trunc(at, :unit)",
+                "a parameter can't stand for a unit",
+            ),
+            ("group by trunc(at, 1m", "expected `)`"),
+            ("group by date(at, 1d)", "expected `)`"),
         ] {
             let message = error(text);
             assert!(message.contains(says), "{text}: {message}");

@@ -32,6 +32,12 @@ public sealed record Kinds(
 
 public sealed record Group(string Status, ulong N, double Hours);
 
+public sealed record Reading(DateTime At, string Server);
+
+public sealed record PerHour(DateTime At, ulong N);
+
+public sealed record PerDay(DateOnly At, ulong N);
+
 /// <summary>Every method of the wrapper, against the library cargo built (SPEC §180).</summary>
 public sealed class DatabaseTests : IDisposable
 {
@@ -290,6 +296,29 @@ public sealed class DatabaseTests : IDisposable
 
         tasks.EnsureIndex("status");
         Assert.Contains("plan: index on", tasks.Explain("status = :s", new { s = "open" }));
+    }
+
+    [Fact]
+    public void Aggregates_group_by_a_date_time_cut_to_an_hour_or_a_day()
+    {
+        using var db = Open();
+        var readings = db.Collection<Reading>("readings");
+        var at = (int hour, int minute) => new DateTime(2026, 11, 23, hour, minute, 30, DateTimeKind.Utc).AddTicks(1234);
+        readings.InsertMany([
+            new Reading(at(14, 1), "a"),
+            new Reading(at(14, 59), "b"),
+            new Reading(at(15, 0), "a"),
+        ]);
+
+        var perHour = readings.Aggregate<PerHour>(null, "count() as n group by trunc(at, 1h)");
+        Assert.Equal(
+            [
+                new PerHour(new DateTime(2026, 11, 23, 14, 0, 0, DateTimeKind.Utc), 2),
+                new PerHour(new DateTime(2026, 11, 23, 15, 0, 0, DateTimeKind.Utc), 1),
+            ],
+            perHour);
+        var perDay = readings.Aggregate<PerDay>(null, "count() as n group by date(at)");
+        Assert.Equal([new PerDay(new DateOnly(2026, 11, 23), 3)], perDay);
     }
 
     [Fact]

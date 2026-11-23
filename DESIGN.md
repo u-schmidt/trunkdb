@@ -542,7 +542,11 @@ sum, average, or find the smallest and largest value
 [§107](spec/107-aggregates.md); count the different values, or take the first or last
 document's, by id or `by` a field [§146](spec/146-count-distinct-first-and-last.md). `unwind(path)` makes each
 document one per element of an array first, the groups and columns
-seeing the elements, read from documents [§147](spec/147-unwind.md). A missing field groups with null, values a
+seeing the elements, read from documents [§147](spec/147-unwind.md). A group field may be a date-time cut
+to the start of its unit, `group_by_trunc(path, Trunc::every(60 s))`,
+`Trunc::Month`, or its day as a date, `group_by_date`, in UTC; any
+other value grouped as it is; read from documents for now
+[§209](spec/209-groups-by-a-date-time-cut-to-a-unit-designed-first.md), [§210](spec/210-a-group-field-cut-to-a-unit.md). A missing field groups with null, values a
 filter finds equal are one group, and sums are exact (a fixed-point
 integer as wide as every float), so the plan doesn't change the answer.
 A mean is that exact total divided, then rounded once [§131](spec/131-a-mean-rounded-once.md).

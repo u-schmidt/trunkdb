@@ -12,6 +12,7 @@ use crate::path::Path;
 pub use crate::pattern::{Regex, RegexError};
 pub use crate::query_text::{BindError, Params, ParseFilterError, ParseParamsError, Template};
 use crate::select::Selection;
+pub use crate::trunc::Trunc;
 pub use crate::update::{ParseUpdateError, Update};
 use crate::values::{any_matches, fold_case, holds, is_whole, sort_order, value_matches};
 use std::sync::Arc;

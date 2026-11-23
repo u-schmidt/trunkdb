@@ -28,7 +28,7 @@ In this order, each one optional:
 | `window <path> <duration> per group` | of each group, those within the duration of that group's own newest: `window at 5m per group` |
 | `unwind <path>, …` | each document once per element of the array at `<path>`, the element in its place, MongoDB's `$unwind` |
 | columns | `<function> as <name>`, between commas |
-| `group by <path>, …` | one row per different value (or values) |
+| `group by <path>, …` | one row per different value (or values); a path may be `trunc(<path>, <unit>)` or `date(<path>)` |
 | `having <condition>` | keeps the rows a condition on columns and group values holds for, as a filter's |
 | `order by <name> [desc], …` | the rows' order; by group values, ascending, without it |
 | `limit <n>`, `offset <n>` | as for a filter |
@@ -40,6 +40,14 @@ stopped reporting; a window per group keeps its last documents. Both
 may be given, the one of all first. A window per group reads every
 match: bound the filter on the path where there are many. Neither
 goes with a filter's sort, skip or limit.
+
+A date-time is stored to the nanosecond, so `group by at` makes a group
+of nearly every document. `trunc(at, 1m)` groups by its minute instead:
+the start of its minute, hour (`1h`), day (`1d`), any duration (`15m`),
+`week` (from Monday), `month` or `year`, in UTC, counted down, never
+rounded. `date(at)` groups by its day, as a date. The row holds the cut
+value at the field's own path (`at`), which `having` and `order by`
+name. A value that is no date-time groups as it is.
 
 ## Columns
 
@@ -68,6 +76,8 @@ unwind items sum(items.qty) as sold group by items.sku        -- per element
 count() as n, count() filter (where late = true) as late
   group by team having late > 0                               -- teams with late tasks
 window at 5m avg(load) as mean group by server                -- the last five minutes
+count() as n group by trunc(at, 1m)                           -- per minute
+count() as n, avg(load) as mean group by server, date(at)     -- per server and day
 window at 10 per group avg(load) as mean group by server      -- each one's last ten
 last(status order by changed) as now group by ticket          -- each one's newest
 ```
