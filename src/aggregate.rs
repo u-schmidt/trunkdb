@@ -11,6 +11,7 @@ use crate::map::Map;
 use crate::path::Path;
 use crate::query::{Condition, Filter, Matcher, Panicked, SortOrder};
 use crate::storage::RecordLocation;
+use crate::trunc::{Cut, Trunc};
 use crate::values::{canonical, is_unordered, sort_order};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,6 +75,9 @@ use std::time::Duration;
 #[derive(Debug, Clone, Default)]
 pub struct Aggregate {
     pub(crate) group_by: Vec<String>,
+    /// What each group field's value is cut to before it is grouped,
+    /// beside `group_by`: `None` for a plain one (SPEC §210).
+    pub(crate) cuts: Vec<Option<Cut>>,
     pub(crate) columns: Vec<Column>,
     /// `having`, the row sort, skip and limit: what a filter does to
     /// documents, done to the rows.
@@ -136,17 +140,17 @@ pub(crate) enum Size {
 impl GroupWindow {
     /// The indices of `docs` it keeps, in order: each document's group
     /// read at `group_by` as `Groups` reads it, before any unwind.
-    fn keep(&self, group_by: &[String], docs: &[(Document, Order)]) -> Vec<usize> {
-        let group_paths: Vec<Path<'_>> = group_by.iter().map(|p| Path::new(p)).collect();
+    fn keep(&self, aggregate: &Aggregate, docs: &[(Document, Order)]) -> Vec<usize> {
+        let group_paths: Vec<Path<'_>> = aggregate.group_by.iter().map(|p| Path::new(p)).collect();
         let path = Path::new(&self.path);
         let mut groups: BTreeMap<GroupKey, Vec<usize>> = BTreeMap::new();
         for (i, (doc, _)) in docs.iter().enumerate() {
             let key = GroupKey(
-                (group_paths.iter())
-                    .map(|p| p.value_or_null(doc))
-                    .map(|value| match is_unordered(value) {
-                        true => canonical(value),
-                        false => value.clone(),
+                (group_paths.iter().enumerate())
+                    .map(|(i, p)| cut(aggregate.cut(i), p.value_or_null(doc)))
+                    .map(|value| match is_unordered(&value) {
+                        true => canonical(&value),
+                        false => value,
                     })
                     .collect(),
             );
@@ -190,11 +194,19 @@ pub(crate) fn per_group(
     let Some(window) = &aggregate.per_group else {
         return docs;
     };
-    let kept = window.keep(&aggregate.group_by, &docs);
+    let kept = window.keep(aggregate, &docs);
     let mut docs: Vec<Option<(Document, Order)>> = docs.into_iter().map(Some).collect();
     kept.into_iter()
         .map(|i| docs[i].take().expect("each kept once"))
         .collect()
+}
+
+/// `value` as group field's `cut` makes it (SPEC §210).
+fn cut(cut: Option<Cut>, value: &Document) -> Document {
+    match cut {
+        Some(cut) => cut.apply(value),
+        None => value.clone(),
+    }
 }
 
 /// One column of a row.
@@ -441,7 +453,54 @@ impl Aggregate {
     /// fields. A dotted path is nested in the row as stored.
     pub fn group_by(mut self, path: impl Into<String>) -> Self {
         self.group_by.push(path.into());
+        self.cuts.push(None);
         self
+    }
+
+    /// Groups by the date-time at `path` cut down to the start of `unit`
+    /// too (SPEC §209): per minute, per hour, per month. The row holds
+    /// the cut value at `path`. `group by trunc(path, 15m)` in the text.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use trunkdb::query::{Aggregate, Trunc};
+    ///
+    /// // {"created": 2026-11-23T14:37:00Z, "n": 12}, a row per minute.
+    /// let per_minute = Aggregate::new()
+    ///     .group_by_trunc("created", Trunc::every(Duration::from_secs(60)))
+    ///     .count().named("n");
+    /// # let _ = per_minute;
+    /// ```
+    ///
+    /// A date is cut by whole days, weeks, months or years to a date; any
+    /// value that is neither is grouped as it is, so a document stored
+    /// with another type shows as a group of its own. In UTC, as a
+    /// date-time is stored: see [`Trunc`].
+    pub fn group_by_trunc(mut self, path: impl Into<String>, unit: Trunc) -> Self {
+        self.group_by.push(path.into());
+        self.cuts.push(Some(Cut::Trunc(unit)));
+        self
+    }
+
+    /// Groups by the day of the date-time at `path` too, a `Date`, in UTC
+    /// (SPEC §209): `group by date(path)` in the text. Where
+    /// `group_by_trunc(path, Trunc::every(one day))` gives midnight as a
+    /// date-time, this gives the date. A date is grouped as it is, and
+    /// so is any other value.
+    pub fn group_by_date(mut self, path: impl Into<String>) -> Self {
+        self.group_by.push(path.into());
+        self.cuts.push(Some(Cut::Date));
+        self
+    }
+
+    /// Group field `i`'s cut, if it has one.
+    pub(crate) fn cut(&self, i: usize) -> Option<Cut> {
+        self.cuts.get(i).copied().flatten()
+    }
+
+    /// Whether some group field is cut.
+    pub(crate) fn has_cuts(&self) -> bool {
+        self.cuts.iter().any(Option::is_some)
     }
 
     /// A column counting the group's documents, to be `named`:
@@ -698,6 +757,12 @@ impl Aggregate {
                 ));
             }
         }
+        if let Some(path) = (self.group_by.iter().enumerate())
+            .find(|(i, _)| self.cut(*i) == Some(Cut::Trunc(Trunc::Every(Duration::ZERO))))
+            .map(|(_, path)| path)
+        {
+            return refuse(format!("`{path}` cut to a duration of zero"));
+        }
         for (i, a) in self.group_by.iter().enumerate() {
             for (j, b) in self.group_by.iter().enumerate() {
                 let inside =
@@ -750,7 +815,9 @@ impl Aggregate {
     /// doesn't hand out (§147). `count_distinct` takes what entries hand
     /// out, exact, as `min` and `max` do.
     pub(crate) fn needs_documents(&self) -> bool {
-        !self.unwind.is_empty()
+        // A cut group field: from its documents until §209's step 2.
+        self.has_cuts()
+            || !self.unwind.is_empty()
             || self.per_group.is_some()
             || (self.columns.iter()).any(|c| matches!(c.kind, Kind::Sum | Kind::First | Kind::Last))
     }
@@ -1189,8 +1256,8 @@ impl<'a> Groups<'a> {
         order: Order,
         at: Option<RecordLocation>,
     ) -> Result<(), Panicked> {
-        let group: Vec<Document> = (self.group_paths.iter())
-            .map(|path| path.value_or_null(doc).clone())
+        let group: Vec<Document> = (self.group_paths.iter().enumerate())
+            .map(|(i, path)| cut(self.aggregate.cut(i), path.value_or_null(doc)))
             .collect();
         let values: Vec<Option<Document>> = (self.column_paths.iter())
             .map(|path| path.as_ref().and_then(|p| p.field_value(doc)).cloned())

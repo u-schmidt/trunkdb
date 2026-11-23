@@ -311,6 +311,9 @@ impl Date {
     /// 1970-01-01.
     pub const UNIX_EPOCH: Date = Date { days: 0 };
 
+    /// The day `DateTime`'s earliest time falls on (SPEC §210).
+    pub(crate) const FIRST_DAY: Date = Date { days: Date::FIRST };
+
     /// The day `DateTime`'s earliest time falls on, and its latest.
     const FIRST: i64 = i64::MIN.div_euclid(SECONDS_PER_DAY);
     const LAST: i64 = i64::MAX.div_euclid(SECONDS_PER_DAY);

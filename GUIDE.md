@@ -769,6 +769,43 @@ A column's condition is decided from
 the entries too, where the index holds the fields it names.
 `explain_aggregate` says how it ran.
 
+### Per minute, per day
+
+A date-time is stored to the nanosecond, so grouping by it makes a
+group of nearly every document. `group_by_trunc` cuts it down to the
+start of its minute, hour, day, week, month or year first, SQL's
+`date_trunc`; `group_by_date` takes its day, as a `Date` (SPEC §209):
+
+```rust
+use std::time::Duration;
+use trunkdb::query::{Aggregate, Trunc};
+
+let per_minute = db.collection::<Document>("readings").aggregate(
+    Filter::new().gte("at", since),
+    &Aggregate::new()
+        .group_by("server")
+        .group_by_trunc("at", Trunc::every(Duration::from_secs(60)))
+        .count().named("n")
+        .avg("load").named("mean"),
+)?;
+// [{"server": "a", "at": 2026-11-23T14:37:00Z, "n": 58, "mean": 0.4}, ...]
+```
+
+- **As text:** `count() as n group by server, trunc(at, 1m)`;
+  `trunc(at, 15m)`, `trunc(at, 1d)`, `trunc(at, week)`, `trunc(at,
+  month)`, `trunc(at, year)`; `date(at)` for the day as a date.
+- **The row holds the bucket's start** at the field's own path, `at`
+  here; `having` and `order by` name it so.
+- **In UTC:** a day is a UTC day, as date-times are stored. A local day
+  needs a field of your own for now.
+- **Cut down, never rounded:** 14:37:59.9 is in 14:37. A duration is
+  counted from 1970, so `15m` starts at :00, :15, :30 and :45.
+- **A date** is cut by whole days, weeks, months or years; **any other
+  value** (a number, text, `null`) groups as it is, so a document stored
+  with the wrong type shows up as a row of its own.
+- **It reads the documents for now:** an index on the date-time bounds
+  the filter's range, but its entries don't answer the groups yet.
+
 ## The last five minutes, live
 
 `window` keeps the documents close to the newest one, and

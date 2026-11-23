@@ -103,6 +103,22 @@ def test_aggregate_each_text_its_own_params(team):
         team.aggregate("", "count() as n", {"stray": 1})
 
 
+def test_aggregate_groups_by_a_date_time_cut_to_an_hour_or_a_day(tasks):
+    utc = dt.timezone.utc
+    for hour, minute in [(14, 1), (14, 59), (15, 0)]:
+        at = dt.datetime(2026, 11, 23, hour, minute, 30, 1234, tzinfo=utc)
+        tasks.insert({"at": at})
+    assert tasks.aggregate("", "count() as n group by trunc(at, 1h)") == [
+        {"at": dt.datetime(2026, 11, 23, 14, tzinfo=utc), "n": 2},
+        {"at": dt.datetime(2026, 11, 23, 15, tzinfo=utc), "n": 1},
+    ]
+    assert tasks.aggregate("", "count() as n group by date(at)") == [
+        {"at": dt.date(2026, 11, 23), "n": 3},
+    ]
+    with pytest.raises(trunkdb.ParseError, match="zero"):
+        tasks.aggregate("", "count() as n group by trunc(at, 0s)")
+
+
 def test_explain_says_how(team):
     team.ensure_index("status")
     said = team.explain("status = :s", {"s": "open"})
