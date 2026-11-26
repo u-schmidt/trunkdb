@@ -47,6 +47,9 @@ ABI changed.
   says nothing of the servers between them.
 - **A row's value read from a document** where its entry didn't hold
   it as stored (a number) is cut as the match's was.
+- **Groups with no cut field as before:** where no group field is cut,
+  an entry's group bytes are its key's own, borrowed, nothing decoded or
+  copied (§107.5); where one is, only that field's value is decoded.
 
 ## 212.2 Measured
 `cargo run --release --bin trunc` (§211.1), the same machine and data,
@@ -77,6 +80,14 @@ ABI changed.
   allocation. The count per bucket shows the floor a seek per bucket
   gives; reaching it means walking a leaf part by part, as §172 does for
   a count, which is left for a measurement that asks.
+- **No cost to groups without a cut.** A review found the first
+  version decoding every group field's value, a text's an allocation,
+  and copying the group bytes for every entry: `cargo run --release
+  --bin aggregate`'s groups from entries were 30 to 40 % slower than
+  before §212, `per tenant` on `(tenant, tries)` 18 ms where it was
+  13. With only a cut field decoded and the key's bytes borrowed where
+  none is, they are as before: 13.1 to 13.3 ms against 13.0, `per
+  status` 345 µs against 320, the cut rows above unchanged.
 - **Without a filter,** an aggregate first counts the index's entries
   to know it holds every document (§107.5, rule 4): about 2.4 ms, the
   difference between the rows with and without one. A filter on the field skips
@@ -109,13 +120,17 @@ ABI changed.
   before it cut the same (the check in `end`); `None` for other kinds
   and at the latest time.
 - `tests/group_cuts.rs`: with an index on the field and one on
-  `(server, at)`, the rows now from entries, no document read.
+  `(server, at)`, the rows now from entries, no document read; GUIDE's
+  per-minute example from entries on `(at, server, load)` with `at >=
+  since`, and on `(server, at, load)` with `server` fixed (on that
+  index with `at` alone the planner reads the documents, which the
+  guide first said it didn't).
 - **The `queries` fuzz target** cuts one group field in four, by a
   second, a minute, a month, or to its day, which puts the pool's
   date-times of 1970-01-01 in one group with its date. 2,000 random
   programs passed on the code as built, 2,785 group fields cut among
-  them, and 5,300 on the first version (212.2); the summary counts the
-  cut group fields.
+  them, and 5,300 on the first version (212.2), 1,500 more after the
+  review's fix, 2,094 cut; the summary counts the cut group fields.
 
 ## 212.5 Mutations
 Fourteen made; twelve caught: a cut field not the last allowed a whole
@@ -125,7 +140,12 @@ group not cut; cuts sent to documents again; a bucket that ignores the
 values before the cut field; a bucket's end included in it; an end a
 unit late; a week's end a day late; December's end in February.
 
-Two not caught, both making no difference to an answer:
+Two not caught, both making no difference to an answer, and two
+more that only cost time, as the review's fix does: every group
+field's value decoded, not only a cut one's; the group bytes copied
+where none is cut. The aggregate bench above is what holds them.
+
+Of the first fourteen, two not caught:
 - **A bucket's end not checked:** the check guards against a wrong
   end, and the ends are right, which the unit test holds unit by unit.
 - **A bucket kept past an entry read from its document:** the bucket

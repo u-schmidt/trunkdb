@@ -343,30 +343,6 @@ impl<'a> Scope<'a> {
             Some(cut) => cut.apply(&value),
             None => value,
         };
-        // What tells an entry's group: its key's bytes up to the last
-        // group field, a cut field's encoded as cut. `false` for a key
-        // with fewer values.
-        let group_bytes = |key: &[u8], bytes: &mut Vec<u8>| -> bool {
-            bytes.clear();
-            let mut parts = key::each_part(key::value_part(key));
-            for cuts in &cuts_at {
-                let Some(part) = parts.next() else {
-                    return false;
-                };
-                match cut_value(part, fields) {
-                    Some(value) if !cuts.is_empty() => {
-                        for cut in cuts {
-                            match key::encode_for(&cut.apply(&value), fields) {
-                                Some(encoded) => bytes.extend_from_slice(&encoded),
-                                None => return false,
-                            }
-                        }
-                    }
-                    _ => bytes.extend_from_slice(part),
-                }
-            }
-            true
-        };
         // Whether every key from `low` to `high` is in one group: their
         // group bytes the same, and where a cut field's value differs, it
         // the last group field and both ends of one type, so every value
@@ -374,10 +350,9 @@ impl<'a> Scope<'a> {
         // cuts to the same bucket, a cut keeping order (§209.6).
         let (mut low_bytes, mut high_bytes) = (Vec::new(), Vec::new());
         let mut one_group = |low: &[u8], high: &[u8]| -> bool {
-            if !group_bytes(low, &mut low_bytes)
-                || !group_bytes(high, &mut high_bytes)
-                || low_bytes != high_bytes
-            {
+            let low_group = group_bytes(low, &cuts_at, fields, &mut low_bytes);
+            let high_group = group_bytes(high, &cuts_at, fields, &mut high_bytes);
+            if low_group.is_none() || low_group != high_group {
                 return false;
             }
             let lows = key::each_part(key::value_part(low));
@@ -491,8 +466,8 @@ impl<'a> Scope<'a> {
                     trace.matched(n);
                     (0..n).for_each(|_| trace.answered_from_entry());
                     groups.add_counted(group, n as u64, &takes, order, None);
-                    last_group =
-                        group_bytes(leaf.lowest, &mut entry_bytes).then(|| entry_bytes.clone());
+                    last_group = group_bytes(leaf.lowest, &cuts_at, fields, &mut entry_bytes)
+                        .map(<[u8]>::to_vec);
                     bucket = bucket_of(leaf.lowest);
                     #[cfg(test)]
                     LEAVES_COUNTED.with(|c| c.set(c.get() + 1));
@@ -550,8 +525,8 @@ impl<'a> Scope<'a> {
                     groups.add_entry_to_last(values, takes, Order::id(id), loc);
                     continue;
                 }
-                let told = group_bytes(key, &mut entry_bytes);
-                if told && last_group.as_deref() == Some(&entry_bytes[..]) {
+                let told = group_bytes(key, &cuts_at, fields, &mut entry_bytes);
+                if told.is_some() && last_group.as_deref() == told {
                     trace.matched(1);
                     trace.answered_from_entry();
                     groups.add_entry_to_last(values, takes, Order::id(id), loc);
@@ -562,13 +537,13 @@ impl<'a> Scope<'a> {
                         value_of(parts[at]).map(|(value, stored)| (cut(i, value), stored))
                     })
                     .collect::<Option<Vec<_>>>();
-                if let (Some(group), true) = (group, told) {
+                if let (Some(group), Some(told)) = (group, told) {
                     trace.matched(1);
                     trace.answered_from_entry();
                     groups.add_entry(group, values, takes, Order::id(id), loc);
                     let last = last_group.get_or_insert_with(Vec::new);
                     last.clear();
-                    last.extend_from_slice(&entry_bytes);
+                    last.extend_from_slice(told);
                     bucket = bucket_of(key);
                     continue;
                 }
@@ -675,6 +650,42 @@ fn aggregate_selection(aggregate: &Aggregate) -> Selection {
 thread_local! {
     /// Leaves an aggregate counted whole (SPEC §107.5), on this thread.
     pub(super) static LEAVES_COUNTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What tells an entry's group: its key's values up to the last group
+/// field, `cuts_at.len()` of them, a cut field's encoded as cut (SPEC
+/// §212). Where no field is cut, the key's own bytes, borrowed, nothing
+/// decoded or copied (§107.5). `None` for a key with fewer values.
+fn group_bytes<'k>(
+    key: &'k [u8],
+    cuts_at: &[Vec<Cut>],
+    fields: usize,
+    bytes: &'k mut Vec<u8>,
+) -> Option<&'k [u8]> {
+    let value_part = key::value_part(key);
+    let mut parts = key::each_part(value_part);
+    if cuts_at.iter().all(Vec::is_empty) {
+        let len = (0..cuts_at.len()).try_fold(0, |len, _| Some(len + parts.next()?.len()))?;
+        return Some(&value_part[..len]);
+    }
+    bytes.clear();
+    for cuts in cuts_at {
+        let part = parts.next()?;
+        // Only a cut field's value is decoded; a date-time or a date is
+        // all a cut changes.
+        match (!cuts.is_empty())
+            .then(|| cut_value(part, fields))
+            .flatten()
+        {
+            Some(value) => {
+                for cut in cuts {
+                    bytes.extend_from_slice(&key::encode_for(&cut.apply(&value), fields)?);
+                }
+            }
+            None => bytes.extend_from_slice(part),
+        }
+    }
+    Some(bytes)
 }
 
 /// A cut field's bucket in an index walked in order (SPEC §212): the
