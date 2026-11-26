@@ -9,7 +9,9 @@ step, linked from each part below. What's done and what's open is in
 
 When this file and a spec section disagree, the newer spec section
 describes the code. This file should be updated with every change that
-alters what it says.
+alters what it says. It says how things were only where that still
+matters today, as for a file an older release wrote; how each part
+came to be is in the spec section it links.
 
 ## 1. What it is
 
@@ -33,8 +35,9 @@ workload, and a small sync app that replaced MongoDB with it [§5](spec/05-refer
 
 Deliberately not there: a cost-based planner (the planner follows
 fixed rules, `explain` says which, and a hint in the query picks the
-index where the rules can't know better), joins, several writers at once,
-several processes on one file, encryption and schema validation [§6](spec/06-v0-feature-set.md).
+index where the rules can't know better), joins, several writers at once
+(one process writes a file, and any number read it beside it [§187](spec/187-readers-beside-a-writer-built.md)),
+encryption and schema validation [§6](spec/06-v0-feature-set.md).
 Aggregates were on that list; they came back in [§107](spec/107-aggregates.md).
 
 ## 2. Layers
@@ -66,41 +69,48 @@ they come from [§8](spec/08-ownership-one-refcell-boundary-not-one-per-componen
 |---|---|
 | `app.trunkdb` | the database: pages of 8 KB |
 | `app.trunkdb.wal` | the write-ahead log: whole page images, one record per commit, several for a commit over 32 MiB |
+| `app.trunkdb.writer` | a lock, held exclusively by the one process that writes, for as long as it has the file open |
+| `app.trunkdb.readers` | a lock, shared by every process reading beside the writer while it reads; taken exclusively by whatever writes the database file |
+| `app.trunkdb.gate` | a lock a reader passes before it takes `.readers`, and the writer shuts to get its turn between readers |
+| `app.trunkdb.letgo` | one byte, never locked: 1 while the writer asks the readers to let go |
+| `app.trunkdb.compact` | a compaction's image, its name removed as soon as it is open [§108](spec/108-compaction-built-in-a-file.md) |
 
-Both are named after the database file. An open through a symlink
-follows it to the file first, so every name for it finds one WAL; a
-hard link is a second name the open can't tell apart, and isn't
-supported [§127](spec/127-a-database-opened-through-a-symlink.md).
+All are named after the database file. An open through a symlink
+follows it to the file first, so every name for it finds one WAL and
+one set of lock files; a hard link is a second name the open can't
+tell apart, and isn't supported [§127](spec/127-a-database-opened-through-a-symlink.md).
 
-The database file holds an OS advisory lock (`flock`, `LockFileEx`)
-while it's open, so a second `open` fails at once instead of reading a
-file another process is writing [§21](spec/21-an-exclusive-file-lock-and-a-format-version.md). Within one process, a handle is
-cloned, not opened twice. On Unix a process the application starts
-holds a copy of the file from its fork to its exec, and with it the
-lock: a database dropped in that moment is still held until the exec [§98](spec/98-a-lock-held-by-a-starting-process.md). A read-only open (`OpenOptions::read_only`)
-takes the lock shared: read-only opens go together, and none goes
-beside an open that writes [§88](spec/88-a-read-only-open.md).
+**The lock files** hold nothing but `.letgo`'s byte. They are made by
+whoever needs one first, a writer making all four at its open, their
+directory synced as for any new file [§182](spec/182-files-made-new-and-their-names-synced.md),
+and they are never removed: a lock file removed while another process
+opens it leaves two files, and two "exclusive" locks
+[§185.6](spec/185-readers-in-other-processes-designed-first.md) [§187](spec/187-readers-beside-a-writer-built.md).
+Each holds one lock, as std's locks (`flock`, `LockFileEx`) cover a
+whole file. No lock stays on the database file or its WAL: on Windows
+a lock keeps other processes from reading or writing the file it is on.
 
-From format 17 the locks are in three files beside the database,
-`<path>.writer`, `<path>.readers` and `<path>.gate`, and none stays on
-the database or its WAL, where on Windows a lock keeps other processes
-from reading or writing [§185](spec/185-readers-in-other-processes-designed-first.md). One process writes, holding `.writer`; any
-number of read-only opens in other processes read beside it, each call
-on a snapshot of the file and the WAL as they are, holding `.readers`
-shared while it reads. A reader keeps what it built, and the next call
-reads only the batches the WAL gained since, starting again from the
-file after a checkpoint [§188](spec/188-a-reader-that-catches-up.md). A read-only open takes 0.14 ms, and
-each call about 15 µs on top of its lookup, for the locks and the look
-at the WAL [§192](spec/192-a-reader-reads-only-what-it-checks.md).
-Past a second limit of the WAL's length, a checkpoint asks the readers
-to let go, through `<path>.letgo`; a watcher thread in each reading
-process ends its snapshots, a forgotten one too
-[§189](spec/189-a-reader-too-long-is-asked-to-let-go.md). Whatever writes the file, a
-checkpoint, `compact` or an open that recovers, takes `.readers`
-exclusively, and shuts `.gate` so that no new read begins: a checkpoint
-beside a reader is left for later, and the WAL grows meanwhile; an open
-that has to write waits a bounded time, then fails. A file at 16, or
-one without lock files a reader can make, is read as §88 has it [§187](spec/187-readers-beside-a-writer-built.md).
+- **One process writes.** An open that writes takes `.writer`
+  exclusively, without waiting; a second one, in this process or
+  another, fails at once with an `Io` error of kind `WouldBlock`.
+  Within one process a handle is cloned, not opened twice. On Unix a
+  process the application starts holds a copy of the locks from its
+  fork to its exec: a database dropped in that moment is still held
+  until the exec [§21](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§98](spec/98-a-lock-held-by-a-starting-process.md).
+- **Any number read beside it.** A read-only open
+  (`OpenOptions::read_only`), in any process, takes no lock at its
+  open; each read takes `.gate` and `.readers` for as long as it
+  reads. How they share the file with the writer is in §9
+  [§185](spec/185-readers-in-other-processes-designed-first.md) [§187](spec/187-readers-beside-a-writer-built.md).
+- **Older releases are kept out by the format.** A writer holds the
+  database file itself exclusively for the moment of its open, and
+  stamps it format 17, which releases before 0.40.0 refuse: they know
+  only the lock on the file.
+- **Where the lock files can't be used,** a file an older release
+  wrote last (format 16 or below) or a directory the reader may not
+  write before any writer has made them, a read-only open takes the
+  database file's lock shared instead: other read-only opens go beside
+  it, an open that writes doesn't [§88](spec/88-a-read-only-open.md).
 
 Between checkpoints the newest pages are only in the WAL. The main file
 is complete on its own after `db.checkpoint()`, and after the last
@@ -147,10 +157,11 @@ cell is long enough for its entry [§55](spec/55-fuzzing.md).
 themselves, and allocation takes from it first [§7](spec/07-page-layout.md). The file doesn't
 shrink until a compaction [§41](spec/41-compaction.md).
 
-**The format version** is 16 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md) [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md) [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md) [§173](spec/173-a-date-and-a-time-of-day.md) [§181](spec/181-documents-an-index-leaves-out-counted.md). A build opens its own format and
-the older ones that are valid files of it (6 to 15), and stamps them
-with the current one at open; it refuses newer ones, and older ones
-that need converting. Opening a 6–9 file with secondary indexes checks
+**The format version** is 17 [§21.2](spec/21-an-exclusive-file-lock-and-a-format-version.md) [§59](spec/59-a-struct-carries-its-own-id.md) [§62](spec/62-an-index-key-for-ids.md) [§69](spec/69-a-date-time-type.md) [§95](spec/95-only-objects.md) [§166](spec/166-binary-in-indexes-in-the-order-of-its-bytes.md) [§170](spec/170-field-names-stored-once.md) [§171](spec/171-index-leaves-stored-after-an-anchor.md) [§173](spec/173-a-date-and-a-time-of-day.md) [§181](spec/181-documents-an-index-leaves-out-counted.md) [§187](spec/187-readers-beside-a-writer-built.md). A build opens its own format and
+the older ones that are valid files of it (6 to 16), and an open that
+writes stamps them with the current one; it refuses newer ones, and
+older ones that need converting. 17 changed no page: it says that
+whoever opens the file has to know the lock files of §3. Opening a 6–9 file with secondary indexes checks
 them once and rebuilds any that a document holds an id in, since ids
 had no key before 10 [§62](spec/62-an-index-key-for-ids.md). Opening a 6–11 file checks that every document
 is an object, by its type byte, and refuses the file, unchanged, if one
@@ -605,6 +616,19 @@ are shared, each with a lock of its own [§79](spec/79-writers-beside-the-reader
   `Arc`), and a change copies it first [§64](spec/64-shared-pages.md), once a batch: a page
   the batch changed already is changed in place [§151](spec/151-a-page-changed-again-in-its-batch-is-not-copied.md).
 
+Each read-write lock is sharded (`crossbeam_utils::sync::ShardedLock`):
+eight locks, each in a cache line of its own; a thread reading takes
+the one its thread index picks, one writing takes all eight. Readers
+on different cores so never share the line a lock's count is in
+[§193](spec/193-readers-in-parallel-past-four.md).
+
+trunkdb's own threads, `trunkdb-live` and `trunkdb-clock` (§5), hold
+the database weakly, and strongly only for one turn. The application's
+last handle waits for a turn under way, and closes the database on the
+application's thread before its drop returns: the WAL written back,
+the file and its locks let go, so an open right after it succeeds
+[§207](spec/207-the-last-handle-closes-the-file.md).
+
 **Nobody waits for anybody**, but for two short locks and `compact`:
 - a batch is staged, logged and flushed beside the readers, and
   published by putting its pages into a map and swapping the snapshot.
@@ -657,6 +681,73 @@ with a snapshot open for 15 seconds as with none. It kept 13 MiB over
 34,000 commits on Linux, 1.4 MiB over the 3,300 an M1 Pro's slower
 flush allows ([§191.6](spec/191-measured-again-against-sqlite-redb-and-sled.md)).
 
+**Readers in other processes** [§185](spec/185-readers-in-other-processes-designed-first.md)
+[§187](spec/187-readers-beside-a-writer-built.md): a read-only open in
+another process reads beside the one that writes, through the lock
+files of §3 (`storage/lock_files.rs`). They keep one promise: nothing
+writes the database file while a reader in another process reads it.
+The writer's own process works as above; this is what crosses
+processes.
+
+- **A read** passes the gate, taking `.gate` shared and letting go of
+  it, which waits while the writer has it shut; then holds `.readers`
+  shared, and reads the database as it is: the file, and the WAL's
+  whole batches over it, in memory, never written back. Each call
+  reads at a moment of its own; a `Snapshot` or a cursor keeps one.
+  The process holds `.readers` once, its snapshots and threads
+  counting who holds it, and the last lets go; every new snapshot
+  passes the gate all the same, or threads reading in turn would keep
+  the writer out for good.
+- **A reader catches up** rather than starting again [§188](spec/188-a-reader-that-catches-up.md):
+  it keeps the pages it read, its catalog, and where it stopped in the
+  WAL, with the bytes of the last batch it read. The next read checks
+  that the file's header and those bytes are unchanged, and reads only
+  the batches the WAL gained since. A checkpoint between them changes
+  the header, and a batch taken back and another logged in its place
+  changes those bytes: then it starts again from the file. A read-only
+  open takes 0.14 ms, and each call about 15 µs on top of its lookup,
+  for the locks and the look at the WAL [§192](spec/192-a-reader-reads-only-what-it-checks.md).
+- **A checkpoint** writes the file, so it takes `.readers`
+  exclusively. Due after a commit, it tries without waiting; beside a
+  reader it is left for later. The next commit shuts the gate, so that
+  no new read begins, and waits up to `checkpoint_wait` (50 ms) for the
+  reads under way; a reader still there, it is left again, and the WAL
+  grows meanwhile. `snapshot_info` counts the checkpoints left. An
+  explicit `Database::checkpoint` beside a reader fails with
+  `WouldBlock`; the last handle's drop leaves the WAL to the next open.
+  `compact` is refused with `Error::SnapshotOpen`, as beside a kept
+  snapshot.
+- **A reader that reads too long**, a snapshot kept, or forgotten in a
+  tool, would keep every checkpoint out
+  [§189](spec/189-a-reader-too-long-is-asked-to-let-go.md). Once the WAL
+  has grown past `let_go_wal_bytes` (four times `checkpoint_wal_bytes`),
+  the checkpoint, its gate shut, writes 1 to `.letgo`. A watcher thread
+  in each reading process looks at it every 20 ms while its process
+  holds `.readers`, ends every snapshot the process holds, and lets go.
+  Their reads fail with `Error::SnapshotTooOld`; a new read reads the
+  database as it is then. The writer writes 0 again before it opens the
+  gate, whether it got its turn or not.
+- **An open that has to write the file** waits for the readers: one
+  whose WAL holds batches, after a crash or after a close whose last
+  checkpoint was left for a reader, and one that stamps an older file
+  17. It shuts the gate, asks the readers to let go, and waits up to
+  `wait_for_readers` (5 s). Readers still there, it fails with
+  `WouldBlock`, having written nothing. An open with nothing to write
+  waits for nobody.
+- **What a reader may see that the writer's process doesn't:** a batch
+  a moment before it is durable, if the writer's flush then fails and
+  the batch is taken back: a state no later read shows. A WAL read as
+  it is written may end in half a record; a reader that finds damage,
+  or a WAL shorter than it was, reads again a few times before it
+  reports it [§185.4](spec/185-readers-in-other-processes-designed-first.md).
+- **On Windows** a read is refused for the moment a writer's open
+  holds the database file; it is tried again for up to a second, then
+  fails with `Error::SnapshotTooOld`
+  [§185.11](spec/185-readers-in-other-processes-designed-first.md).
+
+Live queries and aggregates in such a reader are polled, every
+`watch_every`, as §5 has it [§195](spec/195-live-queries-beside-a-writer.md).
+
 **Measured** [§58](spec/58-measuring-reader-waits.md) (`bench/`, `reader_wait`): a writer committing
 once or ten times a second costs readers nothing measurable. One that
 commits back to back made them wait tens of milliseconds, up to half a
@@ -673,7 +764,7 @@ eight 3.5 times.
 ## 10. The API
 
 - `Database::open(path)`, or `open_with(path, OpenOptions)` with
-  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md), `snapshot_memory` [§83](spec/83-a-limit-on-the-memory-snapshots-take.md) and `read_only` [§88](spec/88-a-read-only-open.md).
+  `cache_size` [§50](spec/50-a-page-cache.md) and `checkpoint_pages` [§53](spec/53-a-configurable-checkpoint-threshold.md) `checkpoint_wal_bytes` [§76](spec/76-a-wal-size-limit.md), `snapshot_memory` [§83](spec/83-a-limit-on-the-memory-snapshots-take.md), `read_only` [§88](spec/88-a-read-only-open.md); for readers in other processes `checkpoint_wait`, `wait_for_readers` [§185.4](spec/185-readers-in-other-processes-designed-first.md) and `let_go_wal_bytes` [§189](spec/189-a-reader-too-long-is-asked-to-let-go.md); for live queries `watch_every` [§195](spec/195-live-queries-beside-a-writer.md) and `clock_every` [§204](spec/204-live-queries-read-again-as-time-passes.md).
 - `db.collection::<T>(name)`: `insert`, `get`, `update`, `upsert`,
   `delete`, `find`, `find_one`, `count`, `cursor`, `explain` [§12](spec/12-wiring-collection-document.md) [§29](spec/29-api-rounding-out-find-one-count-upsert-cursor.md),
   `explain_run` [§94](spec/94-explain-with-execution-statistics.md);
@@ -952,6 +1043,8 @@ src/
 ├── batch.rs           Batch: typed atomic multi-op writes
 ├── batch_lines.rs     BatchLines: a batch's ops read from JSON lines
 ├── changes.rs         Changes, Commit, Change: what each commit changed
+├── live.rs            live queries and aggregates: LiveQuery, the
+│                        writer's watchers, the look beside a writer
 ├── cursor.rs          Cursor: streaming find, of one moment
 ├── snapshot.rs        Snapshot and View<T>: the database at one
 │                        moment, to keep reading
@@ -962,19 +1055,25 @@ src/
 ├── query_text.rs      a filter as text, read and printed; templates
 ├── path.rs            field paths, parsed once per query
 ├── select.rs          projection: the fields a read hands out
+├── pattern.rs         Regex: a regex in a filter, behind a feature
 ├── aggregate.rs       Aggregate: count, sum, min, max, avg by group, a condition per column
+├── trunc.rs           a group field's date-time cut to a unit
 ├── explain.rs         explain and explain_run: how a query ran, and
 │                        the lines `--explain` prints
 ├── stats.rs           Database::stats: where a file's space goes
 ├── open_info.rs       OpenInfo: what an open database says about itself
+├── reports.rs         reports as documents, for the C ABI, Python
+│                        and the command's --json
 ├── update.rs          Update: operators on dotted paths, and read
 │                        from MongoDB's operators as JSON
 ├── document.rs        Document and DocId: the schema-less value type
+├── map.rs             Map: an object's fields, in their order
 ├── datetime.rs        DateTime, Date and Time, what their Document variants hold
 ├── serde_bridge.rs    any T: Serialize + DeserializeOwned <-> Document
 ├── serde_stored.rs    a stored document straight into T, for typed reads
 ├── json.rs            tagged JSON <-> Document, lossless
 ├── id.rs              IdGenerator + UuidV7Generator
+├── release.rs         Release: the releases a file's header records
 ├── catalog.rs         collections, their indexes and the field names (page 1)
 ├── names.rs           the dictionary of field names stored documents number
 ├── data.rs            documents on data pages, overflow chains
@@ -982,7 +1081,9 @@ src/
 ├── storage/
 │   ├── mod.rs         PageStore, page types
 │   ├── file.rs        FileStore: the writer's staged pages, the
-│   │                    header, the file lock
+│   │                    header, the file lock of older formats
+│   ├── lock_files.rs  .writer, .readers, .gate and .letgo: one
+│   │                    writer, readers in other processes
 │   ├── pages.rs       Pages: the file, checksums, the committed
 │   │                    pages, shared by readers and the writer
 │   ├── page.rs        Page: a page's bytes, shared, copied on change
@@ -1012,7 +1113,8 @@ src/
 ├── fuzzing.rs         hooks for fuzz/, behind a feature, hidden
 └── bin/trunkdb.rs     the `trunkdb` command (info, check, compact,
                          export, import, find, fields, count, get,
-                         aggregate, insert, update, delete, index, drop)
+                         aggregate, insert, update, delete, index, drop,
+                         batch, verify, watch)
 tests/                 the command line, and a time-series-shaped
                          workload through the public API; ui/: what
                          #[trunkdb::document] refuses, compiled
@@ -1023,6 +1125,8 @@ trunkdb-ffi/           the C ABI: trunkdb as a C library, its header
                          crate, SPEC §177, §179)
 bindings/dotnet/       the C# wrapper over the C ABI, and its tests
                          (SPEC §180)
+bindings/python/       the Python module, built with PyO3 on the
+                         library (SPEC §197, §199)
 bench/                 against SQLite, redb and sled (its own crate)
 fuzz/                  fuzz targets: damaged files, WALs, exports and
                          filter texts, and queries against a model (its own crate,
