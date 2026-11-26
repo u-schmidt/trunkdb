@@ -10,7 +10,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use trunkdb::query::{Aggregate, Condition, Filter, Kind, Offset, Op, Regex, SortOrder, Update};
+use trunkdb::query::{
+    Aggregate, Condition, Filter, Kind, Offset, Op, Regex, SortOrder, Trunc, Update,
+};
 use trunkdb::{
     Change, Database, DocId, Document, Error, IndexOptions, Live, LiveAggregate, LiveQuery,
     LiveRow, Map, Upserted,
@@ -167,6 +169,8 @@ pub struct Ran {
     pub distinct_and_ends: u64,
     /// Aggregates that unwind (SPEC §147).
     pub unwound: u64,
+    /// Group fields cut to a unit or to their day (SPEC §210, §209.6).
+    pub cut_groups: u64,
     /// Live queries with a sort (SPEC §145), and their events.
     pub live_sorted: u64,
     pub live_sorted_events: u64,
@@ -1135,7 +1139,25 @@ impl Run<'_> {
             let first = |f: &str| f.split('.').next().unwrap_or_default().to_string();
             if !grouped.iter().any(|g| first(g) == first(field)) {
                 grouped.push(field);
-                aggregate = aggregate.group_by(field);
+                // Cut one group field in four (SPEC §210): by a second, a
+                // minute or a month, or to its day, which makes the pool's
+                // date-times of 1970-01-01 one group with its date.
+                aggregate = match self.program.below(8) {
+                    0 => {
+                        self.ran.cut_groups += 1;
+                        aggregate.group_by_date(field)
+                    }
+                    1 => {
+                        self.ran.cut_groups += 1;
+                        let unit = match self.program.below(3) {
+                            0 => Trunc::every(std::time::Duration::from_secs(1)),
+                            1 => Trunc::every(std::time::Duration::from_secs(60)),
+                            _ => Trunc::Month,
+                        };
+                        aggregate.group_by_trunc(field, unit)
+                    }
+                    _ => aggregate.group_by(field),
+                };
             }
         }
         for c in 0..1 + self.program.below(3) {

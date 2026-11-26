@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 mod aggregates;
 mod and_or_not;
+mod cuts;
 mod datetime;
 mod find_one;
 mod indexes;

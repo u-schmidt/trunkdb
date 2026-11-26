@@ -182,8 +182,8 @@ fn other_values_are_grouped_as_they_are() {
 }
 
 /// An index on the cut field, or one that starts with every group
-/// field, isn't read for the groups yet (§209's step 2): the rows are
-/// the documents', not each date-time a group of its own.
+/// field, answers the groups from its entries (§212): the rows are the
+/// documents', not each date-time a group of its own.
 #[test]
 fn an_index_on_the_field_gives_the_same_rows() {
     let (_dir, db) = open();
@@ -201,7 +201,9 @@ fn an_index_on_the_field_gives_the_same_rows() {
         let run = readings
             .explain_aggregate(Filter::new(), &aggregate)
             .unwrap();
-        assert_eq!(run.stats.from_entries, 0, "{text}: {run:#?}");
+        // From the index's entries since §209's step 2: no document read.
+        assert_eq!(run.stats.documents_examined, 0, "{text}: {run:#?}");
+        assert!(run.stats.from_entries > 0, "{text}: {run:#?}");
         assert!(rows.len() < MINUTES.len(), "{text}: {rows:?}");
     }
     let ranged = readings
@@ -296,5 +298,41 @@ fn a_zero_duration_and_a_path_twice_are_refused() {
             readings.watch_aggregate(Filter::new(), &aggregate).is_err(),
             "{aggregate}"
         );
+    }
+}
+
+/// GUIDE.md's per-minute example: on `(at, server, load)`, `at >=
+/// since` walks a range of it and no document is read; on `(server,
+/// at)` one server's minutes are, with `server` fixed.
+#[test]
+fn the_guides_index_answers_its_example() {
+    let aggregate = Aggregate::new()
+        .group_by("server")
+        .group_by_trunc("at", minute())
+        .count()
+        .named("n")
+        .avg("load")
+        .named("mean");
+    let since = at("2026-11-23T14:38:00Z");
+    let cases = [
+        (vec!["at", "server", "load"], Filter::new().gte("at", since)),
+        (
+            vec!["server", "at", "load"],
+            Filter::new().eq("server", "a").gte("at", since),
+        ),
+    ];
+    for (index, filter) in cases {
+        let (_dir, db) = open();
+        let readings = readings(&db);
+        readings.ensure_index(index.clone()).unwrap();
+        insert(&readings, &MINUTES);
+        let run = readings
+            .explain_aggregate(filter.clone(), &aggregate)
+            .unwrap();
+        assert_eq!(run.stats.documents_examined, 0, "{index:?}: {run:#?}");
+        assert!(run.stats.from_entries > 0, "{index:?}: {run:#?}");
+        let rows = readings.aggregate(filter.clone(), &aggregate).unwrap();
+        let found = readings.find(filter).unwrap();
+        assert_eq!(rows, aggregate.apply(found).unwrap(), "{index:?}");
     }
 }

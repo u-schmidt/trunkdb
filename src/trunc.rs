@@ -135,6 +135,76 @@ impl Cut {
             _ => value.clone(),
         }
     }
+
+    /// The first value of `value`'s kind past its bucket, for an index
+    /// walked in order to tell a key in the bucket by its bytes alone
+    /// (SPEC §212): every value of that kind from `value` up to it cuts as
+    /// `value` does. `None` for a kind a cut leaves, and past the latest
+    /// time. Checked here: the value just before it cuts as `value` does,
+    /// and a cut keeps order, so every one between does too; an end too
+    /// soon only costs a key read the longer way.
+    pub(crate) fn end(self, value: &Document) -> Option<Document> {
+        let end = match *value {
+            Document::DateTime(time) => Document::DateTime(self.time_end(time)?),
+            Document::Date(date) => Document::Date(self.date_end(date)?),
+            _ => return None,
+        };
+        let before = match &end {
+            Document::DateTime(end) => Document::DateTime(from_nanos(nanos(*end) - 1)?),
+            Document::Date(end) => {
+                Document::Date(Date::from_days_since_epoch(end.days_since_epoch() - 1)?)
+            }
+            _ => unreachable!("a date-time or a date"),
+        };
+        (self.apply(&before) == self.apply(value)).then_some(end)
+    }
+
+    fn time_end(self, time: DateTime) -> Option<DateTime> {
+        match self {
+            Cut::Trunc(Trunc::Every(duration)) => {
+                let size = duration.as_nanos() as i128;
+                let now = nanos(time);
+                from_nanos(now - now.rem_euclid(size.max(1)) + size.max(1))
+            }
+            _ => self.date_end(time.date())?.at(Time::MIDNIGHT),
+        }
+    }
+
+    fn date_end(self, date: Date) -> Option<Date> {
+        let days = date.days_since_epoch();
+        let next = |days: i64| Date::from_days_since_epoch(days);
+        match self {
+            Cut::Date => next(days + 1),
+            Cut::Trunc(Trunc::Every(duration)) => {
+                let size = duration.as_nanos();
+                match size != 0 && size % NANOS_PER_DAY == 0 {
+                    true => {
+                        let size = i64::try_from(size / NANOS_PER_DAY).ok()?;
+                        next(days.checked_sub(days.rem_euclid(size))?.checked_add(size)?)
+                    }
+                    // Left as it is: each date its own bucket.
+                    false => next(days + 1),
+                }
+            }
+            Cut::Trunc(Trunc::Week) => next(days - (days + 3).rem_euclid(7) + 7),
+            Cut::Trunc(Trunc::Month) => match date.month() {
+                12 => Date::from_ymd(date.year() + 1, 1, 1),
+                month => Date::from_ymd(date.year(), month + 1, 1),
+            },
+            Cut::Trunc(Trunc::Year) => Date::from_ymd(date.year() + 1, 1, 1),
+        }
+    }
+}
+
+/// A date-time as nanoseconds since 1970.
+fn nanos(time: DateTime) -> i128 {
+    i128::from(time.unix_seconds()) * NANOS_PER_SECOND + i128::from(time.subsec_nanos())
+}
+
+/// Nanoseconds since 1970 as a date-time; `None` past either end.
+fn from_nanos(nanos: i128) -> Option<DateTime> {
+    let secs = i64::try_from(nanos.div_euclid(NANOS_PER_SECOND)).ok()?;
+    DateTime::from_unix(secs, nanos.rem_euclid(NANOS_PER_SECOND) as u32)
 }
 
 #[cfg(test)]
@@ -274,6 +344,56 @@ mod tests {
         ] {
             assert_eq!(hour.apply(&other), other);
             assert_eq!(Cut::Date.apply(&other), other);
+        }
+    }
+
+    /// A bucket's end is the first value past it: the one before cuts as
+    /// the value does, the end itself doesn't. Across units, kinds, before
+    /// 1970 and at the ends of time.
+    #[test]
+    fn a_bucket_ends_where_the_next_begins() {
+        let cuts = [
+            Cut::Trunc(Trunc::every(Duration::from_nanos(1))),
+            Cut::Trunc(Trunc::every(Duration::from_millis(250))),
+            Cut::Trunc(every(60)),
+            Cut::Trunc(every(7 * 3600)),
+            Cut::Trunc(every(86_400)),
+            Cut::Trunc(every(3 * 86_400)),
+            Cut::Trunc(Trunc::Week),
+            Cut::Trunc(Trunc::Month),
+            Cut::Trunc(Trunc::Year),
+            Cut::Date,
+        ];
+        let values = [
+            Document::DateTime(at("2026-11-23T14:37:52.123456789Z")),
+            Document::DateTime(at("2026-12-31T23:59:59.999999999Z")),
+            Document::DateTime(at("1969-12-31T23:59:30Z")),
+            Document::DateTime(at("1970-01-01T00:00:00Z")),
+            Document::DateTime(at("2024-02-29T12:00:00Z")),
+            Document::Date(day("2026-11-23")),
+            Document::Date(day("2026-12-31")),
+            Document::Date(day("1969-12-31")),
+            Document::Date(day("2024-02-29")),
+        ];
+        for cut in cuts {
+            for value in &values {
+                let end = cut.end(value).unwrap_or_else(|| panic!("{cut:?} {value}"));
+                assert_ne!(cut.apply(&end), cut.apply(value), "{cut:?} {value}: {end}");
+                assert_eq!(
+                    std::mem::discriminant(&end),
+                    std::mem::discriminant(value),
+                    "{cut:?} {value}"
+                );
+            }
+            for other in [
+                Document::Int(3),
+                Document::String("a".into()),
+                Document::Null,
+            ] {
+                assert_eq!(cut.end(&other), None);
+            }
+            let latest = Document::DateTime(DateTime::LATEST);
+            assert_eq!(cut.end(&latest), None, "{cut:?}");
         }
     }
 }

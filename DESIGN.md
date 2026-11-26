@@ -556,8 +556,12 @@ document one per element of an array first, the groups and columns
 seeing the elements, read from documents [§147](spec/147-unwind.md). A group field may be a date-time cut
 to the start of its unit, `group_by_trunc(path, Trunc::every(60 s))`,
 `Trunc::Month`, or its day as a date, `group_by_date`, in UTC; any
-other value grouped as it is; read from documents for now
-[§209](spec/209-groups-by-a-date-time-cut-to-a-unit-designed-first.md), [§210](spec/210-a-group-field-cut-to-a-unit.md). A missing field groups with null, values a
+other value grouped as it is. An index that holds every path the
+aggregate reads answers it as any other (below): each entry's group cut
+from its key; where the cut field is the last group field, a bucket
+told by its key's bytes against the bucket's end, worked out once, and
+a leaf of one bucket counted whole
+[§209](spec/209-groups-by-a-date-time-cut-to-a-unit-designed-first.md), [§210](spec/210-a-group-field-cut-to-a-unit.md) [§211](spec/211-groups-by-a-cut-measured.md) [§212](spec/212-groups-by-a-cut-from-index-entries.md). A missing field groups with null, values a
 filter finds equal are one group, and sums are exact (a fixed-point
 integer as wide as every float), so the plan doesn't change the answer.
 A mean is that exact total divided, then rounded once [§131](spec/131-a-mean-rounded-once.md).
@@ -951,6 +955,7 @@ cd bench && cargo run --release --bin reader_wait   # readers while a writer com
 cd bench && cargo run --release --bin long_read     # one long snapshot beside single writes
 cd bench && cargo run --release --bin select        # reads with a selection (§106)
 cd bench && cargo run --release --bin aggregate     # aggregates by group (§107, §126)
+cd bench && cargo run --release --bin trunc         # groups by a cut date-time (§211, §212)
 ```
 
 Each gap had a measured cause, fixed one at a time:
