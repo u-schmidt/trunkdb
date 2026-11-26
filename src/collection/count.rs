@@ -13,6 +13,7 @@ use crate::index::{BTreeIndex, KeyRange, key};
 use crate::query::{Condition, Covering, Decider, Filter, QueryPlan};
 use crate::select::Selection;
 use crate::storage::{PageId, PageStore};
+use crate::trunc::Cut;
 
 impl<'a> Scope<'a> {
     /// What `count` gives for `filter`: counted as an index is walked where
@@ -326,6 +327,99 @@ impl<'a> Scope<'a> {
         // The bytes up to the last group field: a leaf whose ends agree on
         // them is in one group (keys are in order, values prefix-free).
         let through = group_at.iter().max().map_or(0, |last| last + 1);
+        // A group field cut to a unit (SPEC §209.6): per index field up to
+        // the last group field, the cuts its value is grouped by, empty
+        // where a group field takes it as it is, whose bytes then decide.
+        let cuts_at: Vec<Vec<Cut>> = (0..through)
+            .map(|j| {
+                let here = || (group_at.iter().enumerate()).filter(move |&(_, &at)| at == j);
+                match here().any(|(i, _)| aggregate.cut(i).is_none()) {
+                    true => Vec::new(),
+                    false => here().filter_map(|(i, _)| aggregate.cut(i)).collect(),
+                }
+            })
+            .collect();
+        let cut = |i: usize, value: Document| match aggregate.cut(i) {
+            Some(cut) => cut.apply(&value),
+            None => value,
+        };
+        // What tells an entry's group: its key's bytes up to the last
+        // group field, a cut field's encoded as cut. `false` for a key
+        // with fewer values.
+        let group_bytes = |key: &[u8], bytes: &mut Vec<u8>| -> bool {
+            bytes.clear();
+            let mut parts = key::each_part(key::value_part(key));
+            for cuts in &cuts_at {
+                let Some(part) = parts.next() else {
+                    return false;
+                };
+                match cut_value(part, fields) {
+                    Some(value) if !cuts.is_empty() => {
+                        for cut in cuts {
+                            match key::encode_for(&cut.apply(&value), fields) {
+                                Some(encoded) => bytes.extend_from_slice(&encoded),
+                                None => return false,
+                            }
+                        }
+                    }
+                    _ => bytes.extend_from_slice(part),
+                }
+            }
+            true
+        };
+        // Whether every key from `low` to `high` is in one group: their
+        // group bytes the same, and where a cut field's value differs, it
+        // the last group field and both ends of one type, so every value
+        // between is of that type too (a key's type comes first, §34.1) and
+        // cuts to the same bucket, a cut keeping order (§209.6).
+        let (mut low_bytes, mut high_bytes) = (Vec::new(), Vec::new());
+        let mut one_group = |low: &[u8], high: &[u8]| -> bool {
+            if !group_bytes(low, &mut low_bytes)
+                || !group_bytes(high, &mut high_bytes)
+                || low_bytes != high_bytes
+            {
+                return false;
+            }
+            let lows = key::each_part(key::value_part(low));
+            let highs = key::each_part(key::value_part(high));
+            let differs = lows.zip(highs).take(through).position(|(a, b)| a != b);
+            match differs {
+                None => true,
+                Some(j) => {
+                    let kind = |key: &[u8]| {
+                        let part = key::each_part(key::value_part(key)).nth(j)?;
+                        cut_value(part, fields).map(|v| std::mem::discriminant(&v))
+                    };
+                    j + 1 == through
+                        && !cuts_at[j].is_empty()
+                        && kind(low).is_some()
+                        && kind(low) == kind(high)
+                }
+            }
+        };
+        let mut entry_bytes = Vec::new();
+        // One cut field, the last group field, the only one at its index
+        // field (SPEC §212): a key of its bucket told by its bytes, those
+        // before the cut field the bucket's and the cut field's below the
+        // bucket's end, as keys come in order. Set where a group begins.
+        let single_cut = match cuts_at.iter().position(|cuts| !cuts.is_empty()) {
+            Some(j) if j + 1 == through && cuts_at[j].len() == 1 => Some((j, cuts_at[j][0])),
+            _ => None,
+        };
+        let bucket_of = |key: &[u8]| -> Option<Bucket> {
+            let (j, cut) = single_cut?;
+            let value_part = key::value_part(key);
+            let mut parts = key::each_part(value_part);
+            let before: usize = (0..j)
+                .map(|_| parts.next().map(<[u8]>::len))
+                .sum::<Option<_>>()?;
+            let end = cut.end(&cut_value(parts.next()?, fields)?)?;
+            Some(Bucket {
+                before: value_part[..before].to_vec(),
+                end: key::encode_for(&end, fields)?,
+            })
+        };
+        let mut bucket: Option<Bucket> = None;
         let mut decider = Covering::new(filter, Some(index), false).map(|c| c.decider(filter));
         let mut column_deciders: Vec<Option<Decider>> = (conditions.iter())
             .map(|condition| {
@@ -369,13 +463,14 @@ impl<'a> Scope<'a> {
                     Some(decider) => decider.decide_all(leaf.lowest, leaf.highest),
                     None => Some(true),
                 };
-                let (low, high) = (prefix(leaf.lowest, through), prefix(leaf.highest, through));
-                let group = match (decided, low, high) {
-                    (Some(true), Some(low), Some(high)) if low == high => {
+                let group = match decided {
+                    Some(true) if one_group(leaf.lowest, leaf.highest) => {
                         let parts = key::parts(key::value_part(leaf.lowest));
-                        (group_at.iter())
-                            .map(|&i| value_of(parts[i]).filter(|(_, stored)| *stored))
-                            .map(|v| v.map(|(value, _)| value))
+                        (group_at.iter().enumerate())
+                            .map(|(i, &at)| {
+                                let (value, stored) = value_of(parts[at])?;
+                                stored.then(|| cut(i, value))
+                            })
                             .collect::<Option<Vec<Document>>>()
                     }
                     _ => None,
@@ -396,7 +491,9 @@ impl<'a> Scope<'a> {
                     trace.matched(n);
                     (0..n).for_each(|_| trace.answered_from_entry());
                     groups.add_counted(group, n as u64, &takes, order, None);
-                    last_group = low.map(<[u8]>::to_vec);
+                    last_group =
+                        group_bytes(leaf.lowest, &mut entry_bytes).then(|| entry_bytes.clone());
+                    bucket = bucket_of(leaf.lowest);
                     #[cfg(test)]
                     LEAVES_COUNTED.with(|c| c.set(c.get() + 1));
                     walk.pass_leaf();
@@ -444,28 +541,40 @@ impl<'a> Scope<'a> {
             if let Some(Some(values)) = values
                 && let Some(takes) = decided
             {
-                // Entries come in key order: one whose bytes up to the last
-                // group value are the last one's is in its group.
-                let through = prefix(key, through);
-                if last_group.is_some() && through == last_group.as_deref() {
+                // Entries come in key order: one in the last one's bucket,
+                // or whose bytes up to the last group value, cut where its
+                // field is, are the last one's, is in its group.
+                if last_group.is_some() && bucket.as_ref().is_some_and(|b| b.holds(key)) {
                     trace.matched(1);
                     trace.answered_from_entry();
                     groups.add_entry_to_last(values, takes, Order::id(id), loc);
                     continue;
                 }
-                let group = (group_at.iter())
-                    .map(|&i| value_of(parts[i]))
+                let told = group_bytes(key, &mut entry_bytes);
+                if told && last_group.as_deref() == Some(&entry_bytes[..]) {
+                    trace.matched(1);
+                    trace.answered_from_entry();
+                    groups.add_entry_to_last(values, takes, Order::id(id), loc);
+                    continue;
+                }
+                let group = (group_at.iter().enumerate())
+                    .map(|(i, &at)| {
+                        value_of(parts[at]).map(|(value, stored)| (cut(i, value), stored))
+                    })
                     .collect::<Option<Vec<_>>>();
-                if let (Some(group), Some(through)) = (group, through) {
+                if let (Some(group), true) = (group, told) {
                     trace.matched(1);
                     trace.answered_from_entry();
                     groups.add_entry(group, values, takes, Order::id(id), loc);
                     let last = last_group.get_or_insert_with(Vec::new);
                     last.clear();
-                    last.extend_from_slice(through);
+                    last.extend_from_slice(&entry_bytes);
+                    bucket = bucket_of(key);
                     continue;
                 }
             }
+            // No group from a key: the next entry finds its own, its bucket
+            // too (a bucket holds only while `last_group` does).
             last_group = None;
             // An entry that can't tell: its document, checked unless the
             // entry decided.
@@ -568,12 +677,38 @@ thread_local! {
     pub(super) static LEAVES_COUNTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The bytes of `key`'s first `n` values; `None` for a damaged key with
-/// fewer.
-fn prefix(key: &[u8], n: usize) -> Option<&[u8]> {
-    let mut parts = key::each_part(key::value_part(key));
-    let len = (0..n).try_fold(0, |len, _| Some(len + parts.next()?.len()))?;
-    Some(&key[..len])
+/// A cut field's bucket in an index walked in order (SPEC §212): the
+/// bytes of the key's values before the cut field, and the cut field's
+/// end encoded as a key encodes it.
+struct Bucket {
+    before: Vec<u8>,
+    end: Vec<u8>,
+}
+
+impl Bucket {
+    /// Whether `key`, at or after a key of the bucket, is in it: the same
+    /// values before the cut field (values are prefix-free) and the cut
+    /// field's below the end, which keeps out every later kind too, as a
+    /// key's kind comes first.
+    fn holds(&self, key: &[u8]) -> bool {
+        let value_part = key::value_part(key);
+        value_part.starts_with(&self.before)
+            && key::each_part(&value_part[self.before.len()..])
+                .next()
+                .is_some_and(|part| part < &self.end[..])
+    }
+}
+
+/// The value a key's `part` holds where a cut changes it, a date-time
+/// or a date, both exact in a key (SPEC §209.6); `None` for any other,
+/// which a cut leaves as it is, so its bytes tell its group.
+fn cut_value(part: &[u8], fields: usize) -> Option<Document> {
+    if !key::part_is_exact(part, fields) {
+        return None;
+    }
+    let mut value = Document::Null;
+    key::decode_part_into(part, fields, &mut value)?;
+    matches!(value, Document::DateTime(_) | Document::Date(_)).then_some(value)
 }
 
 /// How many entries the index at `root` has, counted leaf by leaf

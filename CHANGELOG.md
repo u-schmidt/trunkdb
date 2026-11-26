@@ -1594,3 +1594,21 @@ limit, batches and a write-ahead log. Since then:
     them; the row holds the cut value at the field's path; a date cut by
     whole days, any other value grouped as it is; read from documents,
     an index's entries answering them in step 2.
+181. **Groups by a cut, measured** (§211): a million readings a second
+    apart, counted per minute, hour and day with `trunc`, against
+    counts from the index's entries and SQLite; `cargo run --release
+    --bin trunc` in `bench/`. Step 1 builds each match from its index
+    entry where the filter bounds the field, so item 180's "read from
+    documents" holds only without one; counts from entries are 6 to
+    400 times faster, so step 2 is proposed. Nothing in the library
+    changed.
+182. **Groups by a cut, from index entries** (§212, step 2 of §209): an
+    aggregate with a `trunc` or `date` group field is answered from an
+    index that holds every path it reads, as any other aggregate is: no
+    document read, each entry's group cut from its key, a bucket told
+    by its key's bytes against where it ends, a leaf of one bucket
+    counted whole. A million readings a second apart: per minute over a
+    day 12 ms where it was 61, per hour and per day over all 5 to 16 ms
+    where they were 0.6 to 0.7 s. The rows are the same; nothing in the
+    API, the text, the file format or the ABI changed. The `queries`
+    fuzz target cuts group fields too.

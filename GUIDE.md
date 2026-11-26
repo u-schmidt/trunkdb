@@ -803,8 +803,11 @@ let per_minute = db.collection::<Document>("readings").aggregate(
 - **A date** is cut by whole days, weeks, months or years; **any other
   value** (a number, text, `null`) groups as it is, so a document stored
   with the wrong type shows up as a row of its own.
-- **It reads the documents for now:** an index on the date-time bounds
-  the filter's range, but its entries don't answer the groups yet.
+- **An index answers it** where it holds every field the aggregate
+  reads, `(server, at, load)` here: no document is read, and with the
+  cut field the last group field, a count takes a bucket a leaf at a
+  time. A million readings a second apart, per hour: 15 ms, against
+  0.7 s from the documents (SPEC §212). A `sum` still reads documents.
 
 ## The last five minutes, live
 

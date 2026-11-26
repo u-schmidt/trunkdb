@@ -498,11 +498,6 @@ impl Aggregate {
         self.cuts.get(i).copied().flatten()
     }
 
-    /// Whether some group field is cut.
-    pub(crate) fn has_cuts(&self) -> bool {
-        self.cuts.iter().any(Option::is_some)
-    }
-
     /// A column counting the group's documents, to be `named`:
     /// `.count().named("n")` gives `{"n": 340}` for a group of 340.
     pub fn count(self) -> UnnamedColumn {
@@ -815,9 +810,7 @@ impl Aggregate {
     /// doesn't hand out (§147). `count_distinct` takes what entries hand
     /// out, exact, as `min` and `max` do.
     pub(crate) fn needs_documents(&self) -> bool {
-        // A cut group field: from its documents until §209's step 2.
-        self.has_cuts()
-            || !self.unwind.is_empty()
+        !self.unwind.is_empty()
             || self.per_group.is_some()
             || (self.columns.iter()).any(|c| matches!(c.kind, Kind::Sum | Kind::First | Kind::Last))
     }
@@ -1539,11 +1532,14 @@ impl<'a> Groups<'a> {
         let mut rows = Vec::with_capacity(groups.len());
         for group in groups {
             let mut row = Document::Object(Map::new());
-            for ((seen, path), name) in (group.first.into_iter())
+            for (i, ((seen, path), name)) in (group.first.into_iter())
                 .zip(&self.group_paths)
                 .zip(&self.aggregate.group_by)
+                .enumerate()
             {
-                let value = as_stored(seen, path)?;
+                // One read from its document is cut as a match's is
+                // (SPEC §210): a number at a cut field, which a cut leaves.
+                let value = cut(self.aggregate.cut(i), &as_stored(seen, path)?);
                 put(&mut row, name, value);
             }
             for ((state, column), path) in (group.columns.into_iter())

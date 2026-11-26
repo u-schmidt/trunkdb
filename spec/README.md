@@ -223,5 +223,7 @@ say what changed, and DESIGN.md says what is true now.
 206. [Devices that go silent (`GUIDE.md`, `bindings/`)](206-devices-that-go-silent.md)
 207. [The last handle closes the file (`database.rs`)](207-the-last-handle-closes-the-file.md)
 208. [What a database says about itself (`open_info.rs`, `database.rs`, `reports.rs`, `trunkdb-ffi/`, `bindings/`)](208-what-a-database-says-about-itself.md)
-209. [Groups by a date-time cut to a unit, designed first (`aggregate.rs`, `query_text.rs`, `collection/count.rs`, `datetime.rs`)](209-groups-by-a-date-time-cut-to-a-unit-designed-first.md) — step 1 built as §210
+209. [Groups by a date-time cut to a unit, designed first (`aggregate.rs`, `query_text.rs`, `collection/count.rs`, `datetime.rs`)](209-groups-by-a-date-time-cut-to-a-unit-designed-first.md) — step 1 built as §210, step 2 as §212
 210. [A group field cut to a unit (`trunc.rs`, `aggregate.rs`, `query_text.rs`)](210-a-group-field-cut-to-a-unit.md)
+211. [Groups by a cut, measured (`bench/`)](211-groups-by-a-cut-measured.md)
+212. [Groups by a cut, from index entries (`collection/count.rs`, `trunc.rs`, `aggregate.rs`)](212-groups-by-a-cut-from-index-entries.md)

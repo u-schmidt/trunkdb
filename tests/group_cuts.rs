@@ -201,7 +201,9 @@ fn an_index_on_the_field_gives_the_same_rows() {
         let run = readings
             .explain_aggregate(Filter::new(), &aggregate)
             .unwrap();
-        assert_eq!(run.stats.from_entries, 0, "{text}: {run:#?}");
+        // From the index's entries since §209's step 2: no document read.
+        assert_eq!(run.stats.documents_examined, 0, "{text}: {run:#?}");
+        assert!(run.stats.from_entries > 0, "{text}: {run:#?}");
         assert!(rows.len() < MINUTES.len(), "{text}: {rows:?}");
     }
     let ranged = readings
